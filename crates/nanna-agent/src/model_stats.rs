@@ -132,6 +132,11 @@ pub struct ModelStatsSummary {
     pub total_cache_creation_1h_tokens: u64,
     pub cache_hit_rate: f64,
     pub consecutive_failures: u32,
+    /// When the most recent failure was recorded (epoch ms; 0 = never). A
+    /// cooldown is measured from here — measured from "now" instead, its
+    /// deadline moved with the clock and never arrived.
+    #[serde(default)]
+    pub last_failure_epoch_ms: u64,
     pub is_healthy: bool,
     pub escalation_count: u64,
 }
@@ -452,6 +457,7 @@ impl ModelStats {
             total_cache_creation_1h_tokens: self.total_cache_creation_1h_tokens,
             cache_hit_rate,
             consecutive_failures: self.consecutive_failures,
+            last_failure_epoch_ms: self.last_failure_epoch_ms,
             is_healthy: self.consecutive_failures < UNHEALTHY_THRESHOLD,
             escalation_count: self.escalations,
         }

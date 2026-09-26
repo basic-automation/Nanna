@@ -143,17 +143,22 @@ impl Browser for CdpBrowser {
         let browser_guard = self.browser.read().await;
         let browser = browser_guard.as_ref().ok_or(BrowserError::NotInitialized)?;
 
-        let page = browser
-            .new_page(url)
-            .await
-            .map_err(|e| BrowserError::NavigationFailed(e.to_string()))?;
-
-        page.wait_for_navigation()
-            .await
-            .map_err(|e| BrowserError::NavigationFailed(e.to_string()))?;
-        // Held until navigation settles, as it always was: a concurrent
-        // `close()` (which takes the write side) waits for the page to load
-        // instead of tearing the browser down underneath it.
+        // One deadline over opening the target AND the load wait. Unbounded, a
+        // page that never finished loading hung the call forever — and with it
+        // every `close()`, which queues on the write side of this lock. The lock
+        // is still held until navigation settles (so `close()` cannot tear the
+        // browser down underneath it), but now only for at most the deadline.
+        let page = bounded_operation(self.config.timeout_ms, "navigate", async {
+            let page = browser
+                .new_page(url)
+                .await
+                .map_err(|e| BrowserError::NavigationFailed(e.to_string()))?;
+            page.wait_for_navigation()
+                .await
+                .map_err(|e| BrowserError::NavigationFailed(e.to_string()))?;
+            Ok(page)
+        })
+        .await?;
         drop(browser_guard);
 
         Ok(Arc::new(CdpPage::new(page, self.config.timeout_ms)))
@@ -217,6 +222,21 @@ impl CdpPage {
     {
         bounded_operation(self.timeout_ms, operation, work).await
     }
+}
+
+/// How often `wait_for_selector` re-queries the DOM. Short next to any real
+/// render, long enough that a wait costs a handful of CDP round trips a second.
+const SELECTOR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// `s` as a JavaScript string literal, quotes included.
+///
+/// The scripts here used to splice selectors in as `'…'` with only `'`
+/// escaped, so a selector ending in `\` (or holding a newline) broke out of the
+/// literal — a syntax error at best, and script injection from whatever
+/// supplied the selector at worst. A JSON string is a valid JS string literal
+/// (ES2019 admits U+2028/U+2029), and `serde_json` escapes everything needed.
+fn js_string(s: &str) -> String {
+    serde_json::Value::String(s.to_owned()).to_string()
 }
 
 /// The deadline itself, as a free function over primitives.
@@ -370,8 +390,8 @@ impl BrowserPage for CdpPage {
             // Select all and delete
             self.page
                 .evaluate(format!(
-                    "document.querySelector('{}').value = ''",
-                    selector.replace('\'', "\\'")
+                    "document.querySelector({}).value = ''",
+                    js_string(selector)
                 ))
                 .await
                 .ok();
@@ -409,12 +429,18 @@ impl BrowserPage for CdpPage {
         // The method most obviously in need of a deadline, and the one that had
         // none: an element that never appears is not a state chromiumoxide
         // returns an error for on its own.
+        //
+        // `find_element` answers once, from the DOM as it is now, so a lone call
+        // failed at once for an element still being rendered — this "wait" never
+        // waited. Poll until it appears; the deadline is what ends a wait for an
+        // element that never does.
         self.bounded("wait_for_selector", async {
-            self.page
-                .find_element(selector)
-                .await
-                .map_err(|e| BrowserError::ElementNotFound(format!("{selector}: {e}")))?;
-            Ok(())
+            loop {
+                if self.page.find_element(selector).await.is_ok() {
+                    return Ok(());
+                }
+                tokio::time::sleep(SELECTOR_POLL_INTERVAL).await;
+            }
         })
         .await
     }
@@ -434,11 +460,11 @@ impl BrowserPage for CdpPage {
     async fn get_attribute(&self, selector: &str, attribute: &str) -> Result<Option<String>, BrowserError> {
         let script = format!(
             r"(() => {{
-                const el = document.querySelector('{}');
-                return el ? el.getAttribute('{}') : null;
+                const el = document.querySelector({});
+                return el ? el.getAttribute({}) : null;
             }})()",
-            selector.replace('\'', "\\'"),
-            attribute.replace('\'', "\\'")
+            js_string(selector),
+            js_string(attribute)
         );
 
         self.bounded("get_attribute", async {
@@ -454,8 +480,8 @@ impl BrowserPage for CdpPage {
 
     async fn exists(&self, selector: &str) -> Result<bool, BrowserError> {
         let script = format!(
-            "document.querySelector('{}') !== null",
-            selector.replace('\'', "\\'")
+            "document.querySelector({}) !== null",
+            js_string(selector)
         );
 
         self.bounded("exists", async {
@@ -471,8 +497,8 @@ impl BrowserPage for CdpPage {
 
     async fn query_all_text(&self, selector: &str) -> Result<Vec<String>, BrowserError> {
         let script = format!(
-            r"Array.from(document.querySelectorAll('{}')).map(el => el.textContent || '')",
-            selector.replace('\'', "\\'")
+            r"Array.from(document.querySelectorAll({})).map(el => el.textContent || '')",
+            js_string(selector)
         );
 
         self.bounded("query_all_text", async {
@@ -487,15 +513,49 @@ impl BrowserPage for CdpPage {
     }
 
     async fn close(&self) -> Result<(), BrowserError> {
-        // Page will be closed when dropped
-        Ok(())
+        // Dropping a chromiumoxide `Page` closes nothing — the target (tab)
+        // stays open in the browser — so every `navigate` used to leak a tab
+        // until the whole browser closed. Close the target itself.
+        self.bounded("close", async {
+            self.page
+                .clone()
+                .close()
+                .await
+                .map_err(|e| BrowserError::ExecutionFailed(e.to_string()))
+        })
+        .await
     }
 }
 
 
 #[cfg(test)]
 mod tests {
-    use super::bounded_operation;
+    use super::{bounded_operation, js_string};
+
+    /// Whatever the selector holds, the literal stays one literal.
+    #[test]
+    fn selectors_cannot_break_out_of_their_string() {
+        for hostile in [
+            r"a\",
+            "a'); alert(1); ('",
+            "a\nb",
+            "a\u{2028}b",
+            r#"[title="x"]"#,
+        ] {
+            let literal = js_string(hostile);
+            assert!(
+                literal.starts_with('"') && literal.ends_with('"'),
+                "{literal}"
+            );
+            let back: String = serde_json::from_str(&literal).expect("a JSON string");
+            assert_eq!(back, hostile, "the literal must round-trip exactly");
+        }
+        assert_eq!(
+            js_string(r"a\"),
+            r#""a\\""#,
+            "a trailing backslash is escaped"
+        );
+    }
     use crate::BrowserError;
     use std::time::Duration;
 

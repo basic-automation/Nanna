@@ -14,30 +14,23 @@ pub mod harness;
 pub mod image_util;
 mod loop_runner;
 pub mod model_stats;
-mod multi;
 mod numeric;
 pub mod planner;
 pub mod prompts;
 pub mod tool_stats;
-mod registry;
 pub mod spans;
 mod summarizer;
-mod supervisor;
 
 #[cfg(feature = "mcp")]
 pub mod mcp;
 
 // Re-export workspace crate for convenience
 pub use nanna_workspace;
-pub use nanna_workspace::{Workspace, WorkspaceFiles, WorkspaceManager, WorkspaceTemplate};
+pub use nanna_workspace::{Workspace, WorkspaceFiles, WorkspaceTemplate};
 
 pub use cancel::CancelToken;
 pub use context::{
     AgentContext, ContextIsolation, ContextSummary, ContextSummarizationConfig, plausible_summary,
-};
-pub use registry::{
-    AgentMetadata, AgentRegistry, AgentRole, AgentState as RegistryAgentState, LifecycleEvent, 
-    RegisteredAgent,
 };
 pub use loop_runner::{
     Agent, AgentConfig, AgentResponse, CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS, CLAIM_NUDGES_MAX,
@@ -49,16 +42,6 @@ pub use loop_runner::{
     budget_warning_message, claim_nudge_message, is_work_evidence_tool, min_viable_num_ctx,
     narration_nudge_message, repetition_nudge_message, thinking_spiral_nudge_message,
     tool_loop_nudge_message, wrapup_nudge_due, wrapup_nudge_message,
-};
-pub use multi::{
-    AgentCoordinator, AgentEntry, AgentMessage, BackgroundTask, CriticalPathMetrics,
-    TaskStatus, SwarmConfig, SwarmResult, SwarmTaskResult,
-    // Swarm Coordinator
-    SwarmCoordinator, DecomposedTask, DomainAgent, Subtask,
-};
-pub use supervisor::{
-    AgentState, AgentStats, HealthCheckConfig, RestartPolicy, SupervisedAgentConfig,
-    SupervisionStrategy, Supervisor, SupervisorEvent, SupervisorEventType,
 };
 pub use summarizer::{
     Summarizer,

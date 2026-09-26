@@ -175,7 +175,7 @@ jobs:
       # tauri-build copies the sidecar next to the app binary from its build
       # script. Under cargo's build-dir layout v2 the stock 2.6.3 put it in
       # `target/debug/build/` instead — silently here, because the `.exe` name
-      # collides with nothing. See `check-gui-linux` and `vendor/tauri-build`.
+      # collides with nothing. See `check-gui-linux`; fixed upstream in 2.7.0.
       - name: Assert the sidecar landed beside the app binary
         shell: bash
         run: |
@@ -193,7 +193,7 @@ jobs:
   # a *fresh* runner: the panic needs a pre-existing `build/nanna-daemon/`
   # directory (a dev tree that has built the daemon), but the misplaced copy
   # happens every time. Verified locally both ways: with the stock 2.6.3 the
-  # check passes and the assertion fails; with the vendored fix both pass.
+  # check passes and the assertion fails; with tauri-build >= 2.7.0 both pass.
   check-gui-linux:
     name: Typecheck nanna-gui (Linux)
     runs-on: ubuntu-latest
@@ -235,3 +235,37 @@ jobs:
           test -f target/debug/nanna-daemon
           test ! -e target/debug/build/nanna-daemon/nanna-daemon
           test ! -f target/debug/build/nanna-daemon
+
+  # The NEON path is compiled on no other job and was once shipped broken
+  # (trailing semicolons, 2026-09-26) and lint-dirty for months. This RUNS its
+  # tests, not just compiles them: the musl target links with the toolchain's
+  # own `rust-lld` (no cross C toolchain) and executes under qemu-user.
+  # `nanna-simd` is pure Rust, so the whole job is seconds of compile.
+  simd-aarch64:
+    name: nanna-simd on aarch64 (qemu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-20
+          targets: aarch64-unknown-linux-musl,aarch64-unknown-linux-gnu
+          components: clippy
+
+      - name: Install qemu-user
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+
+      - name: Clippy on aarch64
+        run: cargo clippy -p nanna-simd --target aarch64-unknown-linux-gnu --all-targets --locked -- -D warnings
+
+      - name: Run the NEON tests under qemu
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER: qemu-aarch64-static
+        run: cargo test -p nanna-simd --target aarch64-unknown-linux-musl --locked

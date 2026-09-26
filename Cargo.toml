@@ -1,6 +1,6 @@
 [package]
 name = "nanna"
-version = "0.3.30"
+version = "0.3.31"
 edition = "2024"
 description = "High-performance AI assistant - patron deity of your digital realm"
 repository = "https://github.com/physics515/Nanna"
@@ -65,20 +65,9 @@ members = [
     "crates/nanna-bench",
     "gui/src-tauri",
 ]
-# Third-party source carried under `[patch]` below; not ours to lint or test.
-exclude = ["vendor/tauri-build"]
-
-# tauri-build 2.6.3 + upstream tauri-apps/tauri#15831 (merged 2026-08-06, unreleased).
-# Cargo's build-dir layout v2 (default on nightly, stable from 1.100) nests OUT_DIR one level
-# deeper, and 2.6.3 assumes a fixed depth: sidecars land in `target/<profile>/build/`, and on
-# Linux/macOS the build panics (`build/nanna-daemon` is a directory). Retire this — delete
-# `vendor/tauri-build` and this table — the moment crates.io ships tauri-build > 2.6.3;
-# `tauri_build_patch_retires_with_upstream` in nanna-storage's dep tests fails until you do.
-[patch.crates-io]
-tauri-build = { path = "vendor/tauri-build" }
 
 [workspace.package]
-version = "0.3.30"
+version = "0.3.31"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"

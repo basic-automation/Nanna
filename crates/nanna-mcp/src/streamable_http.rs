@@ -33,8 +33,8 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, warn};
 
 /// How long one exchange may take, send to final response — the same bound
-/// the stdio transport puts on a request.
-pub const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// the stdio transport puts on a request ([`crate::MCP_REQUEST_TIMEOUT`]).
+pub const HTTP_REQUEST_TIMEOUT: Duration = crate::MCP_REQUEST_TIMEOUT;
 
 /// Upper bound on one SSE event's data, and on a plain JSON body.
 ///

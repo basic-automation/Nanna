@@ -44,6 +44,24 @@ value = 0.0
 source = "nanna_memory::retention::tests::dreaming_shrinks_store_while_holding_recall"
 note = "Phase (b) folds true restatements with zero LLM calls on this corpus (was 6)."
 
+[[budget]]
+id = "dreaming.timeline_compression"
+suite = "dreaming"
+metric = "timeline_compression"
+direction = "min"
+value = 0.75
+source = "nanna_timeline::compress::tests::budget_gate_timeline_fold"
+note = "A 100-event card series folds to 24 events (0.76) at DREAM_FOLD_BUDGET; deterministic, model-free."
+
+[[budget]]
+id = "dreaming.timeline_transition_retention"
+suite = "dreaming"
+metric = "timeline_transition_retention"
+direction = "min"
+value = 1.0
+source = "nanna_timeline::compress::tests::budget_gate_timeline_fold"
+note = "Every outcome (a card transition) survives the fold while the budget can hold it: 10/10."
+
 # --- Suite 4 — Long-horizon harness (deterministic half) ----------------------
 
 [[budget]]

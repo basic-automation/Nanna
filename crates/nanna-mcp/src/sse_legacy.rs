@@ -8,9 +8,9 @@
 //! only this, and the Streamable HTTP binding tells a client to fall back to
 //! it when a `POST` gets `400`/`404`/`405` without a modern error body.
 //!
-//! This replaces nothing in [`crate::HttpTransport`] (the old implementation,
-//! which assumed `<url>/sse` and "waited" for the endpoint with a sleep); it is
-//! what the daemon uses. Source:
+//! This replaced the old `HttpTransport` (which assumed `<url>/sse`,
+//! "waited" for the endpoint with a sleep, and was deleted 2026-09-26 once
+//! nothing used it); it is what the daemon uses. Source:
 //! <https://modelcontextprotocol.io/specification/2024-11-05/basic/transports#http-with-sse>.
 
 use crate::streamable_http::{HTTP_REQUEST_TIMEOUT, SseParser};

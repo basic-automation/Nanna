@@ -112,6 +112,34 @@ fn validate_source(source: &str) -> Result<(), String> {
             "source must `export default` an object with `name` and `description`".to_string(),
         );
     }
+    // The same parse `UserToolManager::create_tool` runs. Without it an edit
+    // that broke the syntax was written, re-registered and advertised, and
+    // failed only when called — a working tool replaced by a broken one.
+    nanna_scripting::check_syntax(source).map_err(|e| {
+        format!("source does not parse ({e}); nothing was written, the tool is unchanged")
+    })
+}
+
+/// Whether `name` is a tool shipped in the binary.
+///
+/// Those are not the model's to rewrite: a bundled tool is part of what Nanna
+/// IS (the file tools, `exec`, memory), boot re-extracts newer shipped
+/// versions over it, and an edited one would run with the trust its shipped
+/// version earned. Authoring tools may add tools, never alter these.
+fn is_bundled(name: &str) -> bool {
+    nanna_tools::skills::defaults::DEFAULT_SKILLS
+        .iter()
+        .any(|entry| entry.skill_name == name)
+}
+
+/// The refusal for a bundled `name`, addressed to the model.
+fn refuse_bundled(name: &str) -> Result<(), String> {
+    if is_bundled(name) {
+        return Err(format!(
+            "'{name}' ships with Nanna and cannot be changed by tool authoring. \
+             Create a new tool under a different name instead."
+        ));
+    }
     Ok(())
 }
 
@@ -190,6 +218,10 @@ pub fn build_tool_authoring_services(
             let services = create_services.clone();
             Box::pin(async move {
                 let name = string_arg(&params, "name")?;
+                // A debug build loads bundled tools from the source tree, so
+                // the tools dir may not hold one yet — and a user tool of the
+                // same name would shadow it.
+                refuse_bundled(&name)?;
                 let source = string_arg(&params, "source")?;
                 validate_source(&source)?;
 
@@ -234,6 +266,7 @@ pub fn build_tool_authoring_services(
             let services = update_services.clone();
             Box::pin(async move {
                 let name = string_arg(&params, "name")?;
+                refuse_bundled(&name)?;
                 let dir = resolve_tool_dir(&tools_dir, &name)?;
                 let source_path = existing_source_path(&dir).ok_or_else(|| {
                     format!("no tool named '{name}' on disk; use tools.create to add one")
@@ -305,11 +338,6 @@ fn existing_source_path(dir: &Path) -> Option<PathBuf> {
 /// embedded catalogue is the right thing to subtract — a name-list comparison,
 /// not a guess from timestamps or a marker file that could go missing.
 fn list_user_tools(tools_dir: &Path) -> Value {
-    let bundled: std::collections::HashSet<&str> = nanna_tools::skills::defaults::DEFAULT_SKILLS
-        .iter()
-        .map(|entry| entry.skill_name)
-        .collect();
-
     let Ok(entries) = std::fs::read_dir(tools_dir) else {
         return json!([]);
     };
@@ -322,7 +350,7 @@ fn list_user_tools(tools_dir: &Path) -> Value {
         let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if bundled.contains(name) {
+        if is_bundled(name) {
             continue;
         }
         let Some(source_path) = existing_source_path(&dir) else {
@@ -366,6 +394,50 @@ mod tests {
   execute: function(input) { return "ok"; }
 };
 "#;
+
+    fn authoring(dir: &Path) -> ServiceMap {
+        build_tool_authoring_services(dir.to_path_buf(), Weak::new(), Arc::new(OnceLock::new()))
+    }
+
+    /// Shipped tools are not the model's to rewrite, through either verb.
+    #[tokio::test]
+    async fn a_bundled_tool_cannot_be_created_over_or_updated() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = authoring(dir.path());
+        let bundled = nanna_tools::skills::defaults::DEFAULT_SKILLS[0].skill_name;
+        let create = services["tools.create"](json!({ "name": bundled, "source": VALID_SOURCE }))
+            .await
+            .expect_err("create over a bundled tool");
+        assert!(create.contains("ships with Nanna"), "{create}");
+        let update = services["tools.update"](json!({ "name": bundled, "source": VALID_SOURCE }))
+            .await
+            .expect_err("update of a bundled tool");
+        assert!(update.contains("ships with Nanna"), "{update}");
+        assert!(!dir.path().join(bundled).exists(), "nothing reached disk");
+    }
+
+    /// An edit that breaks the syntax is refused, and the working tool stays.
+    /// It used to be written and re-registered, and fail only when called.
+    #[tokio::test]
+    async fn an_edit_that_breaks_the_syntax_leaves_the_working_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = authoring(dir.path());
+        services["tools.create"](json!({ "name": "probe", "source": VALID_SOURCE }))
+            .await
+            .expect("create");
+        let source_path = dir.path().join("probe").join("tool.ts");
+        let before = std::fs::read_to_string(&source_path).unwrap();
+        let broken = services["tools.update"](json!({
+            "name": "probe",
+            "old_string": "return \"ok\";",
+            "new_string": "return \"ok\"; }}}",
+        }))
+        .await
+        .expect_err("a syntax error is refused");
+        assert!(broken.contains("does not parse"), "{broken}");
+        let after = std::fs::read_to_string(&source_path).unwrap();
+        assert_eq!(after, before, "the working tool is unchanged");
+    }
 
     // --- name containment -------------------------------------------------
 

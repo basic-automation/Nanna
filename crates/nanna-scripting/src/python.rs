@@ -289,12 +289,13 @@ _nanna_json = _nj.dumps(_nanna_result)
                             }
                         }
 
-                // Fallback if extraction failed
+                // Extraction failed: the outcome is unknown, so it is not reported
+                // as a success (the caller would otherwise trust an empty result).
                 PythonResult {
                     stdout: String::new(),
                     stderr: String::new(),
-                    success: true,
-                    error: None,
+                    success: false,
+                    error: Some("the script ran but its result could not be read back".into()),
                     duration_ms: 0,
                 }
             }
@@ -371,8 +372,14 @@ _nanna_result = {{"stdout": "", "stderr": "", "success": True, "error": None}}
 try:
     _nanna_user_code = """{escaped_code}"""
     exec(compile(_nanna_user_code, '<python>', 'exec'))
-except SystemExit:
-    pass
+except SystemExit as _nanna_exit:
+    _nanna_status = _nanna_exit.code
+    if _nanna_status is not None and _nanna_status != 0:
+        _nanna_result["success"] = False
+        if isinstance(_nanna_status, int):
+            _nanna_result["error"] = "SystemExit: exited with status " + str(_nanna_status)
+        else:
+            _nanna_result["error"] = "SystemExit: " + str(_nanna_status)
 except:
     _nanna_result["success"] = False
     _nanna_result["error"] = traceback.format_exc()
@@ -577,6 +584,55 @@ print(sys.getrecursionlimit())",
             "100",
             "a limit under the cap passes through"
         );
+    }
+
+    /// `sys.exit(1)` is a failure, as it is to any shell; it used to be swallowed
+    /// and reported as success. `exit()`/`exit(0)`/`exit(None)` stay successes.
+    #[tokio::test]
+    async fn system_exit_carries_its_status() {
+        let _serialize = PYTHON_TEST_GUARD.lock().await;
+        let engine = PythonEngine::new();
+
+        let failed = engine
+            .execute("import sys\nprint('partial')\nsys.exit(3)", None, 30)
+            .await
+            .expect("runs");
+        assert!(!failed.success, "a non-zero exit is a failure");
+        assert_eq!(
+            failed.stdout.trim(),
+            "partial",
+            "output before the exit is kept"
+        );
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("status 3")),
+            "{failed:?}"
+        );
+
+        let message = engine
+            .execute("import sys\nsys.exit('bad input')", None, 30)
+            .await
+            .expect("runs");
+        assert!(!message.success);
+        assert!(
+            message
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("bad input")),
+            "{message:?}"
+        );
+
+        for clean in [
+            "import sys\nsys.exit()",
+            "import sys\nsys.exit(0)",
+            "import sys\nsys.exit(None)",
+        ] {
+            let ok = engine.execute(clean, None, 30).await.expect("runs");
+            assert!(ok.success, "{clean}: {ok:?}");
+            assert!(ok.error.is_none(), "{clean}: {ok:?}");
+        }
     }
 
     /// A single-threaded Tokio runtime is the worst case for the old design: there is

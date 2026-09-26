@@ -389,14 +389,21 @@ impl IpcServer {
     /// response cannot be serialized, or when its connection's outgoing
     /// channel is closed (the client went away mid-send).
     pub async fn send_response(&self, client_id: &str, response: Response) -> Result<(), String> {
-        let clients = self.clients.read().await;
-        if let Some(client) = clients.get(client_id) {
-            let msg = serde_json::to_string(&response).map_err(|e| e.to_string())?;
-            client.tx.send(Message::Text(msg.into())).await.map_err(|e| e.to_string())?;
-            Ok(())
-        } else {
-            Err(format!("Client not found: {client_id}"))
-        }
+        // The sender is cloned out and the guard released BEFORE the send. The
+        // channel is bounded, so a client that stops reading makes `send`
+        // wait — and a read guard held across that wait blocked every writer:
+        // no client could connect or disconnect until the slow one drained.
+        let tx = self
+            .clients
+            .read()
+            .await
+            .get(client_id)
+            .map(|client| client.tx.clone())
+            .ok_or_else(|| format!("Client not found: {client_id}"))?;
+        let msg = serde_json::to_string(&response).map_err(|e| e.to_string())?;
+        tx.send(Message::Text(msg.into()))
+            .await
+            .map_err(|e| e.to_string())
     }
     
     /// Broadcast an event to all subscribed clients

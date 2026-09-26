@@ -54,10 +54,7 @@ impl SignalListener {
     /// * `api_url` - Base URL of signal-cli-rest-api (e.g., "<http://localhost:8080>")
     /// * `phone_number` - Phone number of the registered account (e.g., "+1234567890")
     pub fn new(api_url: impl Into<String>, phone_number: impl Into<String>) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(120)) // Long timeout for SSE
-            .build()
-            .unwrap_or_else(|_| Client::new());
+        let client = super::sse::long_lived_client();
 
         Self {
             client,

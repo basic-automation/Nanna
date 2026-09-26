@@ -54,10 +54,10 @@ fn message_is_mission(message: &str) -> bool {
 /// and tool buffers are cleared at every attempt start; the timeline, token
 /// totals, clock and cancel token span the whole run.
 struct ChatRunBuffers {
-    accumulated: Arc<tokio::sync::RwLock<String>>,
-    accumulated_thinking: Arc<tokio::sync::RwLock<String>>,
-    active_tools: Arc<tokio::sync::RwLock<Vec<ActiveToolCallInfo>>>,
-    completed_tools: Arc<tokio::sync::RwLock<Vec<CompletedToolCallInfo>>>,
+    accumulated: Arc<std::sync::Mutex<String>>,
+    accumulated_thinking: Arc<std::sync::Mutex<String>>,
+    active_tools: Arc<std::sync::Mutex<Vec<ActiveToolCallInfo>>>,
+    completed_tools: Arc<std::sync::Mutex<Vec<CompletedToolCallInfo>>>,
     timeline: Arc<std::sync::Mutex<Vec<TimelineItem>>>,
     run_input_tokens: Arc<std::sync::atomic::AtomicU64>,
     run_output_tokens: Arc<std::sync::atomic::AtomicU64>,
@@ -74,10 +74,10 @@ struct ChatRunBuffers {
 impl ChatRunBuffers {
     fn new() -> Self {
         Self {
-            accumulated: Arc::new(tokio::sync::RwLock::new(String::new())),
-            accumulated_thinking: Arc::new(tokio::sync::RwLock::new(String::new())),
-            active_tools: Arc::new(tokio::sync::RwLock::new(Vec::<ActiveToolCallInfo>::new())),
-            completed_tools: Arc::new(tokio::sync::RwLock::new(Vec::<CompletedToolCallInfo>::new())),
+            accumulated: Arc::new(std::sync::Mutex::new(String::new())),
+            accumulated_thinking: Arc::new(std::sync::Mutex::new(String::new())),
+            active_tools: Arc::new(std::sync::Mutex::new(Vec::<ActiveToolCallInfo>::new())),
+            completed_tools: Arc::new(std::sync::Mutex::new(Vec::<CompletedToolCallInfo>::new())),
             timeline: Arc::new(std::sync::Mutex::new(Vec::<TimelineItem>::new())),
             run_input_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             run_output_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -337,13 +337,13 @@ struct ActiveChat {
     cancel: CancelToken,
     started_at: chrono::DateTime<chrono::Utc>,
     /// Accumulated streamed text (shared with `on_text` callback)
-    accumulated_text: Arc<tokio::sync::RwLock<String>>,
+    accumulated_text: Arc<std::sync::Mutex<String>>,
     /// Accumulated thinking/reasoning text (shared with `on_thinking` callback)
-    accumulated_thinking: Arc<tokio::sync::RwLock<String>>,
+    accumulated_thinking: Arc<std::sync::Mutex<String>>,
     /// Tool calls currently in progress
-    active_tool_calls: Arc<tokio::sync::RwLock<Vec<ActiveToolCallInfo>>>,
+    active_tool_calls: Arc<std::sync::Mutex<Vec<ActiveToolCallInfo>>>,
     /// Tool calls completed during this run (before final message)
-    completed_tool_calls: Arc<tokio::sync::RwLock<Vec<CompletedToolCallInfo>>>,
+    completed_tool_calls: Arc<std::sync::Mutex<Vec<CompletedToolCallInfo>>>,
     /// RUN-scoped chronological journal (thinking / text / tool / fault
     /// items, in order). Unlike the buffers above — which are cleared at
     /// every healing-attempt start — this survives attempt restarts, so a
@@ -366,6 +366,22 @@ struct ActiveChat {
     /// enforced context window (for the chat header's realtime indicator).
     context_used: Arc<std::sync::atomic::AtomicU64>,
     context_window: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Lock one of a run's recovery buffers (streamed text and thinking, active
+/// and completed tool calls).
+///
+/// They are `std::sync::Mutex`es for the reason the timeline is: the stream
+/// callbacks that append to them are synchronous, and the `try_write` they
+/// used on a tokio `RwLock` silently DROPPED the delta whenever a run-state
+/// snapshot held a read guard — so a client remounting mid-run was shown text
+/// with holes. Every critical section is a push, a clear or a clone; none
+/// awaits while holding the guard. A poisoned lock still holds valid data
+/// (a panic mid-push leaves a complete `String`/`Vec`), so it is recovered.
+pub(crate) fn lock_buf<T>(buffer: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    buffer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Journal outputs are capped at this many bytes. Derivation: tool results
@@ -677,10 +693,10 @@ pub struct CompletedToolCallInfo {
 #[derive(Clone)]
 pub struct ExternalRunHandle {
     pub cancel: CancelToken,
-    pub accumulated_text: Arc<tokio::sync::RwLock<String>>,
-    pub accumulated_thinking: Arc<tokio::sync::RwLock<String>>,
-    pub active_tool_calls: Arc<tokio::sync::RwLock<Vec<ActiveToolCallInfo>>>,
-    pub completed_tool_calls: Arc<tokio::sync::RwLock<Vec<CompletedToolCallInfo>>>,
+    pub accumulated_text: Arc<std::sync::Mutex<String>>,
+    pub accumulated_thinking: Arc<std::sync::Mutex<String>>,
+    pub active_tool_calls: Arc<std::sync::Mutex<Vec<ActiveToolCallInfo>>>,
+    pub completed_tool_calls: Arc<std::sync::Mutex<Vec<CompletedToolCallInfo>>>,
     pub timeline: Arc<std::sync::Mutex<Vec<crate::session::TimelineItem>>>,
 }
 
@@ -977,10 +993,10 @@ impl AgentService {
     pub async fn register_external_run(&self, session_id: &str) -> ExternalRunHandle {
         let handle = ExternalRunHandle {
             cancel: CancelToken::new(),
-            accumulated_text: Arc::new(tokio::sync::RwLock::new(String::new())),
-            accumulated_thinking: Arc::new(tokio::sync::RwLock::new(String::new())),
-            active_tool_calls: Arc::new(tokio::sync::RwLock::new(Vec::new())),
-            completed_tool_calls: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            accumulated_text: Arc::new(std::sync::Mutex::new(String::new())),
+            accumulated_thinking: Arc::new(std::sync::Mutex::new(String::new())),
+            active_tool_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            completed_tool_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             timeline: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         let mut active = self.active_chats.write().await;
@@ -1150,10 +1166,10 @@ impl AgentService {
             // retry, and — if every model fails — the all-exhausted path
             // persists the concatenation of all partial attempts as one
             // assistant message.
-            accumulated.write().await.clear();
-            accumulated_thinking.write().await.clear();
-            active_tools.write().await.clear();
-            completed_tools.write().await.clear();
+            lock_buf(accumulated).clear();
+            lock_buf(accumulated_thinking).clear();
+            lock_buf(active_tools).clear();
+            lock_buf(completed_tools).clear();
 
             // Notify clients which model we're using. Suppressed on
             // same-model retries: Event::Error{model_retry} already covers
@@ -1457,7 +1473,12 @@ impl AgentService {
 
     /// Wire the text, thinking and tool-start streams: each feeds the run's
     /// recovery buffers and journal, then the client event.
-    fn attach_stream_callbacks(&self, options: &mut RunOptions, session_id: &str, run: &ChatRunBuffers) {
+    fn attach_stream_callbacks(
+        &self,
+        options: &mut RunOptions,
+        session_id: &str,
+        run: &ChatRunBuffers,
+    ) {
         let ChatRunBuffers {
             accumulated,
             accumulated_thinking,
@@ -1483,7 +1504,8 @@ impl AgentService {
         let tokens_out_for_tool_start = run_output_tokens.clone();
         options.on_text = Some(Box::new(move |chunk: &str| {
             // Accumulate text for run state recovery
-            if let Ok(mut buf) = accumulated_for_cb.try_write() {
+            {
+                let mut buf = lock_buf(&accumulated_for_cb);
                 buf.push_str(chunk);
             }
             timeline_append_segment(&timeline_for_text, chunk, false);
@@ -1498,7 +1520,8 @@ impl AgentService {
             let timeline_for_thinking = timeline.clone();
             move |chunk: &str| {
                 // Accumulate thinking for run state recovery
-                if let Ok(mut buf) = accumulated_thinking.try_write() {
+                {
+                let mut buf = lock_buf(&accumulated_thinking);
                     buf.push_str(chunk);
                 }
                 timeline_append_segment(&timeline_for_thinking, chunk, true);
@@ -1510,7 +1533,8 @@ impl AgentService {
         }));
         options.on_tool_start = Some(Box::new(move |call_id: &str, name: &str, input: &serde_json::Value, model: Option<&str>| {
             // Track active tool calls for run state recovery
-            if let Ok(mut tools) = active_tools_for_cb.try_write() {
+            {
+                let mut tools = lock_buf(&active_tools_for_cb);
                 tools.push(ActiveToolCallInfo {
                     call_id: call_id.to_string(),
                     name: name.to_string(),
@@ -1537,7 +1561,12 @@ impl AgentService {
 
     /// Wire tool completion: move the call from active to completed, back-fill
     /// its journal entry, and emit the client event.
-    fn attach_tool_end_callback(&self, options: &mut RunOptions, session_id: &str, run: &ChatRunBuffers) {
+    fn attach_tool_end_callback(
+        &self,
+        options: &mut RunOptions,
+        session_id: &str,
+        run: &ChatRunBuffers,
+    ) {
         let ChatRunBuffers {
             active_tools,
             completed_tools,
@@ -1552,10 +1581,12 @@ impl AgentService {
             let timeline_for_tool_end = timeline.clone();
             Some(Box::new(move |call_id: &str, name: &str, output: &str, success: bool, duration_ms: u64, data: Option<&serde_json::Value>| {
                 // Move from active to completed
-                if let Ok(mut active) = active_tools_for_end.try_write() {
+                {
+                let mut active = lock_buf(&active_tools_for_end);
                     active.retain(|t| t.call_id != call_id);
                 }
-                if let Ok(mut completed) = completed_tools_for_end.try_write() {
+                {
+                let mut completed = lock_buf(&completed_tools_for_end);
                     completed.push(CompletedToolCallInfo {
                         call_id: call_id.to_string(),
                         name: name.to_string(),
@@ -1625,7 +1656,12 @@ impl AgentService {
     }
 
     /// Wire the per-iteration crash-recovery checkpoint.
-    fn attach_checkpoint_callback(&self, options: &mut RunOptions, session_id: &str, run: &ChatRunBuffers) {
+    fn attach_checkpoint_callback(
+        &self,
+        options: &mut RunOptions,
+        session_id: &str,
+        run: &ChatRunBuffers,
+    ) {
         let ChatRunBuffers {
             accumulated,
             completed_tools,
@@ -1641,12 +1677,10 @@ impl AgentService {
             Some(Box::new(move |messages: &[nanna_llm::AnthropicMessage], iteration: usize| {
                 // Snapshot accumulated text + tool calls to a checkpoint.
                 // This runs synchronously in the agent loop — keep it fast.
-                let text = checkpoint_accumulated.try_read()
-                    .map(|t| t.clone())
-                    .unwrap_or_default();
-                let tools: Vec<CompletedToolCallInfo> = checkpoint_completed.try_read()
-                    .map(|t| t.clone())
-                    .unwrap_or_default();
+                // (A `try_read` here used to checkpoint EMPTY text and tools
+                // whenever a writer held the lock.)
+                let text = lock_buf(&checkpoint_accumulated).clone();
+                let tools: Vec<CompletedToolCallInfo> = lock_buf(&checkpoint_completed).clone();
 
                 // Timeline snapshot with EVERYTHING bulky bounded:
                 // the checkpoint is rewritten every iteration, so
@@ -1878,7 +1912,7 @@ impl AgentService {
         // consecutive no-progress faults still climb the
         // unload→restart ladder and exhaust at the max.
         if walk.same_model_retries > 0 && crate::tasks::is_transient_llm_error(error_str) {
-            let attempt_tool_calls = completed_tools.read().await.len();
+            let attempt_tool_calls = lock_buf(completed_tools).len();
             if attempt_tool_calls > 0 {
                 info!(
                     "Attempt completed {attempt_tool_calls} tool calls before this fault — new transient burst, retry budget replenished"
@@ -2016,9 +2050,9 @@ impl AgentService {
         queue.depth.fetch_sub(1, Ordering::Relaxed);
 
         // Collect any accumulated text from the failed run
-        let partial_text = accumulated.read().await.clone();
-        let partial_thinking = accumulated_thinking.read().await.clone();
-        let completed = completed_tools.read().await.clone();
+        let partial_text = lock_buf(accumulated).clone();
+        let partial_thinking = lock_buf(accumulated_thinking).clone();
+        let completed = lock_buf(completed_tools).clone();
         let full_timeline = timeline_lock(timeline).clone();
 
         let error_msg = format!("All models exhausted. Tried: {tried_models:?}. Last error: {last_error}");
@@ -2305,10 +2339,10 @@ impl AgentService {
         match active.get(session_id) {
             Some(chat) => RunStateSnapshot {
                 is_running: true,
-                accumulated_text: chat.accumulated_text.read().await.clone(),
-                accumulated_thinking: chat.accumulated_thinking.read().await.clone(),
-                active_tool_calls: chat.active_tool_calls.read().await.clone(),
-                completed_tool_calls: chat.completed_tool_calls.read().await.clone(),
+                accumulated_text: lock_buf(&chat.accumulated_text).clone(),
+                accumulated_thinking: lock_buf(&chat.accumulated_thinking).clone(),
+                active_tool_calls: lock_buf(&chat.active_tool_calls).clone(),
+                completed_tool_calls: lock_buf(&chat.completed_tool_calls).clone(),
                 timeline: if include_timeline { timeline_lock(&chat.timeline).clone() } else { vec![] },
                 run_input_tokens: chat.run_input_tokens.load(Ordering::Relaxed),
                 run_output_tokens: chat.run_output_tokens.load(Ordering::Relaxed),
@@ -2477,6 +2511,37 @@ pub(crate) fn truncate(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A delta that meets a snapshot holding the buffer waits and lands; the
+    /// old `try_write` dropped it. A buffer poisoned by a panic mid-append is
+    /// still read, not lost.
+    #[test]
+    fn a_recovery_buffer_never_drops_a_delta() {
+        let buffer = Arc::new(std::sync::Mutex::new(String::from("a")));
+        let snapshot = lock_buf(&buffer);
+        let writer = {
+            let buffer = Arc::clone(&buffer);
+            std::thread::spawn(move || lock_buf(&buffer).push('b'))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(snapshot.as_str(), "a", "the snapshot is consistent");
+        drop(snapshot);
+        writer.join().expect("the writer finishes");
+        assert_eq!(lock_buf(&buffer).as_str(), "ab", "the delta landed");
+
+        let poisoner = Arc::clone(&buffer);
+        let _ = std::thread::spawn(move || {
+            let _guard = lock_buf(&poisoner);
+            panic!("mid-append");
+        })
+        .join();
+        assert!(buffer.is_poisoned());
+        assert_eq!(
+            lock_buf(&buffer).as_str(),
+            "ab",
+            "a poisoned buffer still reads"
+        );
+    }
 
     #[test]
     fn blank_model_names_are_not_models() {

@@ -417,8 +417,17 @@ impl ServiceManager {
     
     #[cfg(target_os = "linux")]
     fn generate_systemd_unit(&self) -> String {
-        let exe = self.config.executable.display();
-        let args = self.config.arguments.join(" ");
+        // Each word quoted: systemd splits `ExecStart=` on whitespace and
+        // expands `%` specifiers, so an install under a path with a space (or
+        // a `%`) started the wrong program, or none.
+        let exe = systemd_quote(&self.config.executable.to_string_lossy());
+        let args = self
+            .config
+            .arguments
+            .iter()
+            .map(|arg| systemd_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
         
         format!(r"[Unit]
 Description={}
@@ -436,9 +445,46 @@ WantedBy=default.target
     }
 }
 
+/// One `ExecStart=` word, quoted the way systemd reads it: double quotes
+/// around the whole word, `\` and `"` backslash-escaped inside them, and `%`
+/// doubled so no specifier is expanded (systemd.service(5), "Command lines").
+#[cfg(any(target_os = "linux", test))]
+fn systemd_quote(word: &str) -> String {
+    let mut quoted = String::with_capacity(word.len() + 2);
+    quoted.push('"');
+    for c in word.chars() {
+        match c {
+            '\\' | '"' => {
+                quoted.push('\\');
+                quoted.push(c);
+            }
+            '%' => quoted.push_str("%%"),
+            _ => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    debug_assert!(quoted.len() >= word.len() + 2, "quoting only ever adds");
+    quoted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_start_words_survive_spaces_quotes_and_specifiers() {
+        assert_eq!(
+            systemd_quote("/usr/bin/nanna-daemon"),
+            "\"/usr/bin/nanna-daemon\""
+        );
+        assert_eq!(
+            systemd_quote("/home/u/My Apps/nanna-daemon"),
+            "\"/home/u/My Apps/nanna-daemon\"",
+            "a space stays inside one word"
+        );
+        assert_eq!(systemd_quote(r#"a"b\c"#), r#""a\"b\\c""#);
+        assert_eq!(systemd_quote("100%"), "\"100%%\"", "no specifier expansion");
+    }
 
     /// The bug this guards: Windows needs the `service` subcommand (the SCM
     /// dispatcher), every other platform needs `run` (a supervised foreground
@@ -489,8 +535,8 @@ mod tests {
             "unit must define ExecStart, got:\n{unit}"
         );
         assert!(
-            unit.contains(" run"),
-            "ExecStart must pass the run subcommand, got:\n{unit}"
+            unit.contains(" \"run\""),
+            "ExecStart must pass the run subcommand as its own quoted word, got:\n{unit}"
         );
     }
 }

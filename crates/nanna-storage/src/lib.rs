@@ -24,7 +24,7 @@ pub use tasks::*;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 use turso::{Builder, Connection};
 
 #[derive(Error, Debug)]
@@ -127,32 +127,18 @@ impl Storage {
         )
         .await?;
 
-        // Run migrations
-        for (name, sql) in migrations::MIGRATIONS {
-            let mut rows = conn
-                .query("SELECT 1 FROM _migrations WHERE name = ?1", turso::params![*name])
-                .await?;
-
-            let applied = rows.next().await?.is_some();
-
-            if !applied {
-                info!("Running migration: {}", name);
-                // Execute each statement in the migration — split by a lexer
-                // that knows comments and quotes, not by every ';'.
-                for statement in migrations::split_statements(sql) {
-                    conn.execute(&statement, ()).await?;
-                }
-                conn.execute(
-                    "INSERT INTO _migrations (name, applied_at) VALUES (?1, datetime('now'))",
-                    turso::params![*name],
-                )
-                .await?;
-            }
-        }
+        // Boxed as `dyn Future + Send` so proving `Storage::new` is `Send` stops
+        // here. Unboxed, the proof walks every nested migration future and
+        // overruns the solver's depth limit (the future-incompatible
+        // `recursion_depth_exceeding_limit`, rust#159228) in every crate and
+        // test that holds a `Storage` future — one allocation per boot instead.
+        let run: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), StorageError>> + Send + '_>,
+        > = Box::pin(apply_migrations(&conn, migrations::MIGRATIONS));
+        let result = run.await;
         // Held across every migration and its `_migrations` record.
         drop(conn);
-
-        Ok(())
+        result
     }
 
     /// Get connection reference
@@ -248,7 +234,11 @@ impl Storage {
     /// Returns [`StorageError::Database`] if the insert or the read-back
     /// query fails, or [`StorageError::NotFound`] if the new row cannot be
     /// read back.
-    pub async fn create_gui_session_with_workspace(&self, name: &str, workspace_id: Option<&str>) -> Result<Session, StorageError> {
+    pub async fn create_gui_session_with_workspace(
+        &self,
+        name: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Session, StorageError> {
         let session_id = uuid::Uuid::new_v4().to_string();
         let conn = self.conn.lock().await;
 
@@ -256,10 +246,12 @@ impl Storage {
             "INSERT INTO sessions (session_id, channel, user_id, workspace_id, name, metadata) 
              VALUES (?1, 'gui', NULL, ?2, ?3, ?4)",
             turso::params![
-                session_id.as_str(), 
+                session_id.as_str(),
                 workspace_id,
                 name,
-                format!("{{\"name\":\"{name}\"}}").as_str()
+                // Serialized, never formatted: a name with a quote or a
+                // backslash produced metadata that was not JSON at all.
+                serde_json::json!({ "name": name }).to_string().as_str()
             ],
         )
         .await?;
@@ -445,6 +437,91 @@ impl Storage {
     }
 }
 
+/// Apply every migration in `migrations` that `_migrations` does not record,
+/// each inside its own transaction.
+///
+/// A migration and its `_migrations` row commit together or not at all. Before
+/// this, a failure between two statements left half a migration applied and
+/// unrecorded, so every later boot re-ran it from the top and died on the first
+/// statement that had already landed (`duplicate column name` is the usual
+/// one). Turso rolls DDL back (verified: a rolled-back `CREATE TABLE` and
+/// `ADD COLUMN` both vanish), so the transaction is the real fix; the
+/// `ADD COLUMN` probe covers databases that were half-migrated before it.
+///
+/// # Errors
+/// Returns the first failing statement's error, after rolling its migration back.
+pub(crate) async fn apply_migrations(
+    conn: &Connection,
+    migrations: &[(&str, &str)],
+) -> Result<(), StorageError> {
+    for (name, sql) in migrations {
+        debug_assert!(!name.is_empty(), "a migration has a name");
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM _migrations WHERE name = ?1",
+                turso::params![*name],
+            )
+            .await?;
+        let applied = rows.next().await?.is_some();
+        // An open cursor on this connection swallows later writes.
+        drop(rows);
+        if applied {
+            continue;
+        }
+        info!("Running migration: {}", name);
+        conn.execute("BEGIN", ()).await?;
+        match apply_one_migration(conn, name, sql).await {
+            Ok(()) => {
+                conn.execute("COMMIT", ()).await?;
+            }
+            Err(e) => {
+                if let Err(rollback) = conn.execute("ROLLBACK", ()).await {
+                    warn!("Rolling back migration {name} failed too: {rollback}");
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One migration's statements plus its `_migrations` row, inside the caller's
+/// transaction.
+async fn apply_one_migration(conn: &Connection, name: &str, sql: &str) -> Result<(), StorageError> {
+    // Split by a lexer that knows comments and quotes, not by every ';'.
+    for statement in migrations::split_statements(sql) {
+        if let Some((table, column)) = migrations::add_column_target(&statement)
+            && column_exists(conn, &table, &column).await?
+        {
+            warn!(
+                "Migration {name}: {table}.{column} already exists (a partial earlier run); skipping its ADD COLUMN"
+            );
+            continue;
+        }
+        conn.execute(&statement, ()).await?;
+    }
+    conn.execute(
+        "INSERT INTO _migrations (name, applied_at) VALUES (?1, datetime('now'))",
+        turso::params![name],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Whether `table` currently has a column named `column` (case-insensitive,
+/// as SQLite identifiers are).
+async fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, StorageError> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM pragma_table_info(?1) WHERE lower(name) = lower(?2)",
+            turso::params![table, column],
+        )
+        .await?;
+    let exists = rows.next().await?.is_some();
+    drop(rows);
+    Ok(exists)
+}
+
 /// Byte offset at or below `max_bytes` that a slice can end on.
 ///
 /// A session id is whatever the caller stored: `nanna chat --session <ID>` and
@@ -465,6 +542,185 @@ const fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cutoff is compared in `created_at`'s own format. An RFC 3339 cutoff
+    /// sorted `' '` below `'T'`, so a row one second inside the window, on the
+    /// cutoff DAY, was deleted with the rest of that day.
+    #[tokio::test]
+    async fn the_tool_log_prune_keeps_everything_inside_the_window() {
+        let storage = Storage::in_memory().await.expect("storage");
+        let conn = storage.conn().lock().await;
+        for (tool, age) in [
+            ("stale", "-31 days"),
+            ("edge", "-30 days"),
+            ("fresh", "-1 hours"),
+        ] {
+            conn.execute(
+                "INSERT INTO tool_call_log \
+                 (tool_name, success, duration_ms, error_message, session_id, created_at) \
+                 VALUES (?1, 1, 5, '', '', datetime('now', ?2, '+2 seconds'))",
+                turso::params![tool, age],
+            )
+            .await
+            .expect("insert");
+        }
+        drop(conn);
+
+        let deleted = storage.prune_tool_call_log(30).await.expect("prune");
+        let left: Vec<String> = storage
+            .get_tool_call_log(None, 10)
+            .await
+            .expect("log")
+            .into_iter()
+            .map(|e| e.tool_name)
+            .collect();
+        assert_eq!(deleted, 1, "the real count, not a placeholder 0");
+        assert!(
+            left.contains(&"edge".to_string()),
+            "inside the window by 2 s: {left:?}"
+        );
+        assert!(!left.contains(&"stale".to_string()), "{left:?}");
+    }
+
+    /// A short-circuited call never ran. The hourly aggregate knew that; the
+    /// daily one counted it as a success, so the two disagreed.
+    #[tokio::test]
+    async fn both_aggregates_agree_on_a_short_circuited_call() {
+        let storage = Storage::in_memory().await.expect("storage");
+        for short_circuited in [true, false] {
+            storage
+                .log_tool_call(&NewToolCall {
+                    tool_name: "exec",
+                    success: true,
+                    short_circuited,
+                    duration_ms: 3,
+                    output_size: 0,
+                    error_message: None,
+                    session_id: None,
+                })
+                .await
+                .expect("log");
+        }
+        let hourly = storage
+            .get_tool_stats_hourly(Some("exec"), 2)
+            .await
+            .expect("hourly");
+        let daily = storage
+            .get_tool_stats_daily(Some("exec"), 2)
+            .await
+            .expect("daily");
+        let counts = |b: &ToolStatsTimeBucket| (b.call_count, b.success_count, b.failure_count);
+        assert_eq!(counts(&hourly[0]), (2, 1, 0), "{hourly:?}");
+        assert_eq!(counts(&daily[0]), counts(&hourly[0]), "{daily:?}");
+    }
+
+    /// Session metadata is serialized, not formatted: a quote in the name used
+    /// to produce a string that was not JSON.
+    #[tokio::test]
+    async fn a_session_name_with_quotes_is_stored_as_json() {
+        let storage = Storage::in_memory().await.expect("storage");
+        let name = r#"the "big" plan \ v2"#;
+        let session = storage
+            .create_gui_session_with_workspace(name, None)
+            .await
+            .expect("create");
+        assert_eq!(
+            session.metadata.as_ref().and_then(|m| m["name"].as_str()),
+            Some(name),
+            "{session:?}"
+        );
+    }
+
+    async fn table_names(conn: &Connection) -> Vec<String> {
+        let mut rows = conn
+            .query(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name",
+                (),
+            )
+            .await
+            .expect("schema");
+        let mut names = Vec::new();
+        while let Some(row) = rows.next().await.expect("row") {
+            names.push(row.get::<String>(0).expect("name"));
+        }
+        names
+    }
+
+    async fn recorded(conn: &Connection, name: &str) -> bool {
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM _migrations WHERE name = ?1",
+                turso::params![name],
+            )
+            .await
+            .expect("query");
+        rows.next().await.expect("row").is_some()
+    }
+
+    /// A migration that fails part-way used to leave its first statements
+    /// applied and itself unrecorded, so every later boot re-ran it and died on
+    /// what had already landed. Now it commits whole or not at all.
+    #[tokio::test]
+    async fn a_failing_migration_leaves_no_trace() {
+        let storage = Storage::in_memory().await.expect("storage");
+        let conn = storage.conn().lock().await;
+        let broken: &[(&str, &str)] = &[(
+            "900_broken",
+            "CREATE TABLE half_done (id INTEGER); ALTER TABLE half_done ADD COLUMN x TEXT; \
+             INSERT INTO no_such_table VALUES (1);",
+        )];
+        assert!(apply_migrations(&conn, broken).await.is_err());
+        assert!(
+            !table_names(&conn).await.contains(&"half_done".to_string()),
+            "rolled back"
+        );
+        assert!(!recorded(&conn, "900_broken").await);
+
+        // The same name, fixed, applies cleanly on the next boot.
+        let fixed: &[(&str, &str)] = &[(
+            "900_broken",
+            "CREATE TABLE half_done (id INTEGER); ALTER TABLE half_done ADD COLUMN x TEXT;",
+        )];
+        apply_migrations(&conn, fixed)
+            .await
+            .expect("the fixed migration applies");
+        let is_recorded = recorded(&conn, "900_broken").await;
+        drop(conn);
+        assert!(is_recorded);
+    }
+
+    /// A database half-migrated before migrations ran in a transaction: the
+    /// column landed, the record did not. The ADD COLUMN probe lets the rerun
+    /// through instead of wedging every boot on `duplicate column name`.
+    #[tokio::test]
+    async fn a_half_applied_add_column_is_not_fatal() {
+        let storage = Storage::in_memory().await.expect("storage");
+        let conn = storage.conn().lock().await;
+        conn.execute("CREATE TABLE legacy (id INTEGER)", ())
+            .await
+            .expect("create");
+        conn.execute("ALTER TABLE legacy ADD COLUMN landed TEXT", ())
+            .await
+            .expect("the half that landed");
+        let rerun: &[(&str, &str)] = &[(
+            "901_partial",
+            "ALTER TABLE legacy ADD COLUMN landed TEXT; ALTER TABLE legacy ADD COLUMN missing TEXT;",
+        )];
+        apply_migrations(&conn, rerun)
+            .await
+            .expect("the rerun completes");
+        let is_recorded = recorded(&conn, "901_partial").await;
+        let missing_added = column_exists(&conn, "legacy", "missing")
+            .await
+            .expect("probe");
+        let landed_seen = column_exists(&conn, "LEGACY", "Landed")
+            .await
+            .expect("probe");
+        drop(conn);
+        assert!(is_recorded);
+        assert!(missing_added, "the half that had not landed is applied");
+        assert!(landed_seen, "the probe is case-insensitive");
+    }
 
     /// Usage rolls up per day and per month, prices from the 1-hour column, and
     /// ignores what falls outside the window.
@@ -1026,8 +1282,13 @@ impl Storage {
             ],
         ).await?;
 
-        // Also update hourly aggregate
-        let hour = chrono::Utc::now().format("%Y-%m-%dT%H:00:00").to_string();
+        // One instant for both aggregates, so a call at 23:59:59.999 cannot
+        // land in one day's hourly row and the next day's daily row.
+        let now = chrono::Utc::now();
+        let hour = now.format("%Y-%m-%dT%H:00:00").to_string();
+        // A short-circuited call never ran: it is neither a success nor a
+        // failure in EITHER aggregate. The daily one used to count it as
+        // `success`, so the two views disagreed about the same calls.
         let success_incr = i64::from(success && !short_circuited);
         let failure_incr = i64::from(!success && !short_circuited);
         conn.execute(
@@ -1049,8 +1310,7 @@ impl Storage {
             ],
         ).await?;
 
-        // Also update daily aggregate
-        let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let day = now.format("%Y-%m-%d").to_string();
         conn.execute(
             "INSERT INTO tool_stats_daily (tool_name, day, call_count, success_count, failure_count, total_duration_ms, avg_duration_ms, p95_duration_ms)
              VALUES (?1, ?2, 1, ?3, ?4, ?5, ?5, ?5)
@@ -1064,8 +1324,8 @@ impl Storage {
             turso::params![
                 tool_name,
                 day,
-                i64::from(success),
-                i64::from(!success),
+                success_incr,
+                failure_incr,
                 duration_ms.cast_signed()
             ],
         ).await?;
@@ -1251,21 +1511,27 @@ impl Storage {
         Ok(result)
     }
 
-    /// Prune old tool call logs (keep last N days).
+    /// Delete raw tool-call rows older than `keep_days`; returns how many.
+    ///
+    /// The cutoff is computed by the database, in the format `created_at` is
+    /// written in (`datetime('now')`, `YYYY-MM-DD HH:MM:SS`). It used to be an
+    /// RFC 3339 string, and `' '` sorts below `'T'`, so every row of the cutoff
+    /// DAY compared as older and the whole day was deleted at any hour. Only
+    /// the raw log is pruned — the hourly and daily aggregates keep history.
     ///
     /// # Errors
     /// Returns [`StorageError::Database`] if the delete fails.
     pub async fn prune_tool_call_log(&self, keep_days: u32) -> Result<u64, StorageError> {
+        let modifier = format!("-{keep_days} days");
         let conn = self.conn.lock().await;
-        let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(keep_days));
-        let cutoff_str = cutoff.to_rfc3339();
-        conn.execute(
-            "DELETE FROM tool_call_log WHERE created_at < ?1",
-            turso::params![cutoff_str],
-        ).await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM tool_call_log WHERE created_at < datetime('now', ?1)",
+                turso::params![modifier],
+            )
+            .await?;
         drop(conn);
-        // Return approximate count (turso doesn't give affected rows easily)
-        Ok(0)
+        Ok(deleted)
     }
 }
 
@@ -1600,6 +1866,26 @@ impl Storage {
             "DELETE FROM messages WHERE session_id = ?1",
             turso::params![session_id],
         ).await?;
+        drop(conn);
+        Ok(())
+    }
+
+    /// Delete one message of a daemon session, by its message id.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the delete fails.
+    pub async fn delete_daemon_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        // The message id is stored in `tool_use_id` (see `add_daemon_message`).
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ?1 AND tool_use_id = ?2",
+            turso::params![session_id, message_id],
+        )
+        .await?;
         drop(conn);
         Ok(())
     }

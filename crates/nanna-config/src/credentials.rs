@@ -233,6 +233,15 @@ impl SecureStore {
         match entry.set_password(value) {
             Ok(()) => {
                 info!("Stored credential '{}' in keyring", key);
+                // Drop any file-fallback copy, as `delete` does. Left behind, it
+                // is the OLD secret, and `get` reads it the moment the keyring
+                // next fails — a rotated key quietly comes back.
+                if self.allow_file_fallback {
+                    match self.delete_from_file(key) {
+                        Ok(()) | Err(CredentialError::NotFound) => {}
+                        Err(e) => warn!("Could not drop the stale file copy of '{key}': {e}"),
+                    }
+                }
                 Ok(())
             }
             Err(e) => {
@@ -486,7 +495,11 @@ impl SecureStore {
     /// or when the store cannot say whether one is already there — nothing is
     /// written then, so a record that exists is never overwritten.
     pub fn bind_unbound_ollama_token(&self, host: &str) -> Result<bool, CredentialError> {
-        if self.ollama_token().is_none() || self.ollama_token_host()?.is_some() {
+        // A blank host names no server; binding to it would retire the token.
+        if host.trim().is_empty()
+            || self.ollama_token().is_none()
+            || self.ollama_token_host()?.is_some()
+        {
             return Ok(false);
         }
         self.set(
@@ -593,7 +606,10 @@ impl SecureStore {
         decrypt_credentials(&bytes, &self.file_encryption_key()?)
     }
 
-    fn save_file_credentials(&self, creds: &HashMap<String, String>) -> Result<(), CredentialError> {
+    fn save_file_credentials(
+        &self,
+        creds: &HashMap<String, String>,
+    ) -> Result<(), CredentialError> {
         let path = self.credentials_file_path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -601,7 +617,16 @@ impl SecureStore {
         let bytes = encrypt_credentials(creds, &self.file_encryption_key()?)?;
         let tmp = path.with_extension("enc.tmp");
         {
-            let mut f = std::fs::File::create(&tmp)?;
+            // 0600 from the first byte, like the key file: the temp copy is
+            // the store's full contents until the rename.
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut f = options.open(&tmp)?;
             f.write_all(&bytes)?;
             f.sync_all()?;
         }
@@ -634,39 +659,48 @@ impl SecureStore {
         Ok(())
     }
 
-    /// Resolve the 32-byte AES-256 key.
-    /// Prefer OS keyring (`nanna/file-encryption-key`); else a 0600 key file.
+    /// Resolve the 32-byte AES-256 key for `credentials.enc`.
+    ///
+    /// Two places can hold it — the OS keyring (`nanna/file-encryption-key`)
+    /// and a 0600 `credentials.key` beside the store — and the old rule
+    /// ("keyring, else file") picked by *availability*, so the source flipped:
+    /// one keyring hiccup generated a new key file, the existing store stopped
+    /// decrypting, and the next `set` re-encrypted it under the new key,
+    /// orphaning every credential the old one held. The key is now the one
+    /// that already OPENS the store ([`choose_file_key`]); a new one is only
+    /// ever made for a store that does not exist yet.
     fn file_encryption_key(&self) -> Result<[u8; 32], CredentialError> {
-        // In file-only mode (tests/headless) never touch the OS keyring: the whole
-        // point is determinism. Always use the colocated key file.
-        if !self.file_only
-            && let Ok(entry) = Entry::new(KEYRING_SERVICE, "file-encryption-key") {
-                match entry.get_password() {
-                    Ok(b64) => {
-                        if let Ok(bytes) = base64_decode(&b64)
-                            && bytes.len() == 32 {
-                                let mut key = [0u8; 32];
-                                key.copy_from_slice(&bytes);
-                                return Ok(key);
-                            }
-                    }
-                    Err(keyring::Error::NoEntry) => {
-                        let key = random_key()?;
-                        if entry.set_password(&base64_encode(&key)).is_ok() {
-                            return Ok(key);
-                        }
-                    }
-                    Err(_) => {}
-                }
-            }
         let key_path = self
             .credentials_file_path()?
             .with_file_name("credentials.key");
-        if key_path.exists() {
-            let bytes = std::fs::read(&key_path)?;
-            if bytes.len() == 32 {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&bytes);
+        let file_key = match std::fs::read(&key_path) {
+            Ok(bytes) => <[u8; 32]>::try_from(bytes.as_slice()).ok(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        // In file-only mode (tests/headless) never touch the OS keyring: the
+        // whole point is determinism.
+        let keyring = if self.file_only {
+            KeyringKey::Absent
+        } else {
+            read_keyring_file_key()
+        };
+        let store_path = self.credentials_file_path()?;
+        let ciphertext = match std::fs::read(&store_path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        match choose_file_key(file_key, &keyring, ciphertext.as_deref()) {
+            KeyChoice::Use(key) => return Ok(key),
+            KeyChoice::Refuse(why) => return Err(CredentialError::Crypto(why)),
+            KeyChoice::Generate => {}
+        }
+        if !self.file_only
+            && let Ok(entry) = Entry::new(KEYRING_SERVICE, "file-encryption-key")
+        {
+            let key = random_key()?;
+            if entry.set_password(&base64_encode(&key)).is_ok() {
                 return Ok(key);
             }
         }
@@ -1403,6 +1437,85 @@ const NONCE_LEN: usize = 12;
 /// it. A getrandom failure is essentially never seen on a real system, and there
 /// is no safe weak fallback for a long-lived encryption key, so we refuse to mint
 /// one rather than mint a guessable one (matches [`random_nonce`]).
+/// What the OS keyring said about the file-encryption key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyringKey {
+    /// It holds a well-formed 32-byte key.
+    Found([u8; 32]),
+    /// It answered, and holds no usable key.
+    Absent,
+    /// It could not be asked (locked, no Secret Service, a D-Bus failure).
+    Unavailable,
+}
+
+/// Ask the keyring for the file-encryption key, without ever writing one.
+fn read_keyring_file_key() -> KeyringKey {
+    let Ok(entry) = Entry::new(KEYRING_SERVICE, "file-encryption-key") else {
+        return KeyringKey::Unavailable;
+    };
+    match entry.get_password() {
+        Ok(b64) => base64_decode(&b64)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+            .map_or(KeyringKey::Absent, KeyringKey::Found),
+        Err(keyring::Error::NoEntry) => KeyringKey::Absent,
+        Err(_) => KeyringKey::Unavailable,
+    }
+}
+
+/// Which file-encryption key to use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyChoice {
+    Use([u8; 32]),
+    /// No store exists yet, so a new key orphans nothing.
+    Generate,
+    /// A store exists and no key at hand opens it. Making a new one would
+    /// orphan every credential in it, so this is an error, not a fallback.
+    Refuse(String),
+}
+
+/// Choose the key for `credentials.enc`. Pure.
+///
+/// The key is the one that already opens the store, whichever of the two
+/// places holds it; with no store yet, an existing key is reused (the key
+/// file first — it is the one a keyring outage created, and the keyring may be
+/// back without ever having held it) and only with no key anywhere is one
+/// generated.
+fn choose_file_key(
+    file_key: Option<[u8; 32]>,
+    keyring: &KeyringKey,
+    ciphertext: Option<&[u8]>,
+) -> KeyChoice {
+    let keyring_key = match keyring {
+        KeyringKey::Found(key) => Some(*key),
+        KeyringKey::Absent | KeyringKey::Unavailable => None,
+    };
+    let candidates = [file_key, keyring_key];
+    let Some(ciphertext) = ciphertext else {
+        return candidates
+            .into_iter()
+            .flatten()
+            .next()
+            .map_or(KeyChoice::Generate, KeyChoice::Use);
+    };
+    if let Some(key) = candidates
+        .into_iter()
+        .flatten()
+        .find(|key| decrypt_credentials(ciphertext, key).is_ok())
+    {
+        return KeyChoice::Use(key);
+    }
+    KeyChoice::Refuse(if *keyring == KeyringKey::Unavailable {
+        "the OS keyring is unavailable and holds the key credentials.enc was written with; \
+         not generating a new one, which would orphan every stored credential"
+            .to_string()
+    } else {
+        "no key at hand opens credentials.enc; not generating a new one, which would orphan \
+         every stored credential"
+            .to_string()
+    })
+}
+
 fn random_key() -> Result<[u8; 32], CredentialError> {
     let mut key = [0u8; 32];
     getrandom::fill(&mut key)
@@ -1483,6 +1596,57 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The key-source flip: a store written under one key must keep being
+    /// opened by that key whichever place holds it, and a store no key opens is
+    /// refused rather than silently re-keyed — which would orphan it.
+    #[test]
+    fn the_file_key_is_the_one_that_opens_the_store() {
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let creds = HashMap::from([("anthropic".to_string(), "sk-live".to_string())]);
+        let under_a = encrypt_credentials(&creds, &a).expect("encrypt");
+        let under_b = encrypt_credentials(&creds, &b).expect("encrypt");
+
+        // A keyring outage once created a key file; the store is still under
+        // the keyring's key. The file key must not win just by existing.
+        assert_eq!(
+            choose_file_key(Some(b), &KeyringKey::Found(a), Some(&under_a)),
+            KeyChoice::Use(a)
+        );
+        // …and the other way round: the store moved to the file key.
+        assert_eq!(
+            choose_file_key(Some(b), &KeyringKey::Found(a), Some(&under_b)),
+            KeyChoice::Use(b)
+        );
+        // The keyring is back and never held the key: the file key opens it.
+        assert_eq!(
+            choose_file_key(Some(b), &KeyringKey::Absent, Some(&under_b)),
+            KeyChoice::Use(b)
+        );
+        // The keyring holds the only key and is locked right now: refuse,
+        // never generate (the old code minted a file key here).
+        assert!(matches!(
+            choose_file_key(None, &KeyringKey::Unavailable, Some(&under_a)),
+            KeyChoice::Refuse(why) if why.contains("unavailable")
+        ));
+        assert!(matches!(
+            choose_file_key(Some(b), &KeyringKey::Absent, Some(&under_a)),
+            KeyChoice::Refuse(_)
+        ));
+        // No store yet: reuse a key that exists, else make one.
+        assert_eq!(
+            choose_file_key(Some(b), &KeyringKey::Found(a), None),
+            KeyChoice::Use(b)
+        );
+        assert_eq!(
+            choose_file_key(None, &KeyringKey::Found(a), None),
+            KeyChoice::Use(a)
+        );
+        assert_eq!(
+            choose_file_key(None, &KeyringKey::Unavailable, None),
+            KeyChoice::Generate
+        );
+    }
 
     #[test]
     fn test_credential_expiry() {

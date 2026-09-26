@@ -120,6 +120,31 @@ pub async fn summarizer_context_window_tokens(router: &LlmRouter, models: &[Stri
     resolved
 }
 
+/// Waits between congested rounds when the provider does not say how long.
+const BACKOFF_SECS: [u64; 6] = [5, 15, 30, 60, 120, 240];
+
+/// Longest wait taken on a provider's own `retry_after`.
+///
+/// Bound justification: a dream cycle holds its cluster while it waits, and a
+/// provider asking for more than ten minutes is out for the night, not
+/// congested — the cycle is better off failing the cluster and letting the
+/// next cycle try.
+const RETRY_AFTER_MAX_SECS: u64 = 600;
+
+/// How long to wait after congested round `round`, or `None` when that was the
+/// last round and the walk should give up now.
+///
+/// One wait per round. The provider's `retry_after` replaces the schedule
+/// rather than adding to it: the loop used to sleep the provider's hint at the
+/// end of a round and then the schedule's step at the top of the next, and
+/// after the final round it announced a wait and gave up anyway.
+fn next_wait_secs(round: usize, provider_retry_after: Option<u64>) -> Option<u64> {
+    let scheduled = *BACKOFF_SECS.get(round)?;
+    let wait = provider_retry_after.map_or(scheduled, |secs| secs.min(RETRY_AFTER_MAX_SECS));
+    debug_assert!(wait <= RETRY_AFTER_MAX_SECS, "every wait is bounded");
+    Some(wait)
+}
+
 /// Build the `summarize_fn` a dream cycle calls, walking `models` in order and
 /// returning the first answer that has text.
 ///
@@ -160,15 +185,11 @@ pub fn summarize_with_failover(
             // Congestion is a throughput limit, not a failure. Waiting spreads
             // the cycle over a few minutes, which is the correct price. Only a
             // model that is genuinely broken gets failed over.
-            const BACKOFF_SECS: [u64; 6] = [5, 15, 30, 60, 120, 240];
-
             let mut last_error = String::from("no summarization models configured");
-            for (round, wait) in std::iter::once(0)
-                .chain(BACKOFF_SECS.iter().copied())
-                .enumerate()
-            {
-                if wait > 0 {
-                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            let mut wait_secs = 0u64;
+            for round in 0..=BACKOFF_SECS.len() {
+                if wait_secs > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
                 }
 
                 let mut soonest_retry: Option<u64> = None;
@@ -228,20 +249,15 @@ pub fn summarize_with_failover(
                 if congested == 0 {
                     break;
                 }
-
-                // The provider says when it will be ready; prefer that over the
-                // schedule, which only exists for providers that decline to say.
-                let next = soonest_retry.unwrap_or_else(|| {
-                    BACKOFF_SECS.get(round).copied().unwrap_or(240)
-                });
+                let Some(next) = next_wait_secs(round, soonest_retry) else {
+                    break;
+                };
                 tracing::info!(
                     "Dream summarization congested on all {} model(s) — waiting {}s",
                     models.len(),
                     next
                 );
-                if let Some(secs) = soonest_retry {
-                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-                }
+                wait_secs = next;
             }
 
             Err(format!(
@@ -255,6 +271,31 @@ pub fn summarize_with_failover(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_congested_round_waits_once_and_the_last_round_does_not_wait() {
+        assert_eq!(
+            next_wait_secs(0, None),
+            Some(5),
+            "the schedule when the provider is silent"
+        );
+        assert_eq!(
+            next_wait_secs(0, Some(42)),
+            Some(42),
+            "the provider's word replaces it"
+        );
+        assert_eq!(
+            next_wait_secs(1, Some(86_400)),
+            Some(RETRY_AFTER_MAX_SECS),
+            "bounded"
+        );
+        assert_eq!(next_wait_secs(BACKOFF_SECS.len() - 1, None), Some(240));
+        assert_eq!(
+            next_wait_secs(BACKOFF_SECS.len(), Some(1)),
+            None,
+            "after the final round there is nothing left to wait for"
+        );
+    }
 
     fn v(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_string()).collect()

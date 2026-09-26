@@ -436,9 +436,11 @@ fn version_comparison_orders_releases_and_respects_the_boundary() {
     assert!(version_is_at_most("0.2", "0.2.0"), "0.2 == 0.2.0");
 }
 
-/// The crates.io `tauri-build` release carried in `vendor/tauri-build` with the
-/// target-dir fix from tauri-apps/tauri#15831 applied on top.
-const TAURI_BUILD_VENDORED_VERSION: &str = "2.6.3";
+/// The first crates.io `tauri-build` carrying tauri-apps/tauri#15831. Below it,
+/// cargo's build-dir layout v2 sends the sidecar into `target/<profile>/build/`
+/// and panics the Linux GUI build (`IsADirectory`); until 2.7.0 shipped, a
+/// vendored 2.6.3 plus that diff stood in through `[patch.crates-io]`.
+const TAURI_BUILD_FIRST_FIXED_VERSION: &str = "2.7.0";
 
 /// Return the single `[[package]]` block for `name`, or `None` if it is absent.
 ///
@@ -467,52 +469,26 @@ fn block_version(block: &str) -> Option<&str> {
     version
 }
 
-/// A path `[patch]` is sticky: cargo keeps the vendored 2.6.3 even after a
-/// fixed release exists, so "is it still registry-sourced?" can never fire.
-/// `tauri-codegen` is the trigger instead — it ships in lockstep with
-/// `tauri-build` (both 2.6.3 today) and moves the moment `cargo update` takes
-/// the next tauri release, every one of which carries #15831.
+/// The vendored patch retired on 2026-09-26, when 2.7.0 reached crates.io. What
+/// must not come back: a lockfile walked below the fixed release (a pin-back or
+/// a `--precise` typo), or a path `[patch]` shadowing crates.io again.
 #[test]
-fn vendored_tauri_build_retires_with_the_next_tauri_release() {
+fn tauri_build_resolves_from_crates_io_at_the_fixed_release() {
     let lockfile = workspace_lockfile();
     let contents = std::fs::read_to_string(&lockfile)
         .unwrap_or_else(|e| panic!("cannot read {lockfile:?}: {e}"));
-    let retire = "delete vendor/tauri-build plus the [patch.crates-io] table and the \
-                  `exclude` entry in the root Cargo.toml, then confirm `cargo check -p \
-                  nanna-gui` on Linux";
 
     let build = package_block(&contents, "tauri-build")
-        .unwrap_or_else(|| panic!("`tauri-build` left the graph — {retire}, and this test"));
+        .unwrap_or_else(|| panic!("`tauri-build` left the graph — re-decide this guard"));
     assert!(
-        !build.contains("source = \"registry+"),
-        "tauri-build resolves from crates.io, so the vendored patch is not applied — {retire}"
+        build.contains("source = \"registry+"),
+        "tauri-build no longer resolves from crates.io — a `[patch]` is shadowing it"
     );
-    assert_eq!(
-        block_version(build),
-        Some(TAURI_BUILD_VENDORED_VERSION),
-        "the patched tauri-build is not the vendored release"
-    );
-
-    let codegen = package_block(&contents, "tauri-codegen")
-        .unwrap_or_else(|| panic!("`tauri-codegen` left the graph — re-decide this guard"));
-    assert_eq!(
-        block_version(codegen),
-        Some(TAURI_BUILD_VENDORED_VERSION),
-        "tauri released past the vendored tauri-build (tauri-codegen moved); the new \
-         tauri-build carries tauri-apps/tauri#15831 — {retire}"
-    );
-
-    // A re-vendor of plain 2.6.3 would pass everything above and bring back the
-    // `IsADirectory` panic, so the fix itself is part of the invariant.
-    let vendored_lib = lockfile
-        .parent()
-        .map(|root| root.join("vendor/tauri-build/src/lib.rs"))
-        .expect("the lockfile sits in the workspace root");
-    let source = std::fs::read_to_string(&vendored_lib)
-        .unwrap_or_else(|e| panic!("cannot read {vendored_lib:?}: {e}"));
+    let version = block_version(build).expect("a lockfile package block carries a version");
     assert!(
-        source.contains("fn target_dir_from_out_dir("),
-        "vendor/tauri-build lost the tauri-apps/tauri#15831 fix"
+        !version_is_at_most(version, "2.6.3"),
+        "tauri-build {version} predates {TAURI_BUILD_FIRST_FIXED_VERSION}, the first release \
+         with tauri-apps/tauri#15831 — the Linux GUI build panics below it"
     );
 }
 

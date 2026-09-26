@@ -1998,9 +1998,10 @@ impl ChatSink {
             delta: text.to_string(),
         });
         if let Some(run) = &self.run {
-            // try_write mirrors the in-service path: a snapshot clone briefly
-            // holding the lock must not block the stream thread.
-            if let Ok(mut acc) = run.accumulated_text.try_write() {
+            // Infallible, as in the service path (`agent_service::lock_buf`): a
+            // snapshot clone holds the lock only for the clone.
+            {
+                let mut acc = crate::agent_service::lock_buf(&run.accumulated_text);
                 acc.push_str(text);
             }
             // The journal lock is std::sync and infallible by design (see
@@ -2031,7 +2032,8 @@ impl ChatSink {
             delta: text.to_string(),
         });
         if let Some(run) = &self.run {
-            if let Ok(mut acc) = run.accumulated_thinking.try_write() {
+            {
+                let mut acc = crate::agent_service::lock_buf(&run.accumulated_thinking);
                 acc.push_str(text);
             }
             let mut journal = crate::agent_service::timeline_lock(&run.timeline);
@@ -2061,7 +2063,8 @@ impl ChatSink {
             total_tokens: None,
         });
         if let Some(run) = &self.run {
-            if let Ok(mut active) = run.active_tool_calls.try_write() {
+            {
+                let mut active = crate::agent_service::lock_buf(&run.active_tool_calls);
                 active.push(crate::agent_service::ActiveToolCallInfo {
                     call_id: call_id.to_string(),
                     name: name.to_string(),
@@ -2107,10 +2110,12 @@ impl ChatSink {
             data: data.cloned(),
         });
         if let Some(run) = &self.run {
-            if let Ok(mut active) = run.active_tool_calls.try_write() {
+            {
+                let mut active = crate::agent_service::lock_buf(&run.active_tool_calls);
                 active.retain(|t| t.call_id != call_id);
             }
-            if let Ok(mut done) = run.completed_tool_calls.try_write() {
+            {
+                let mut done = crate::agent_service::lock_buf(&run.completed_tool_calls);
                 done.push(crate::agent_service::CompletedToolCallInfo {
                     call_id: call_id.to_string(),
                     name: name.to_string(),
@@ -6933,10 +6938,10 @@ mod tests {
     fn external_run_handle() -> crate::agent_service::ExternalRunHandle {
         crate::agent_service::ExternalRunHandle {
             cancel: nanna_agent::CancelToken::new(),
-            accumulated_text: Arc::new(RwLock::new(String::new())),
-            accumulated_thinking: Arc::new(RwLock::new(String::new())),
-            active_tool_calls: Arc::new(RwLock::new(Vec::new())),
-            completed_tool_calls: Arc::new(RwLock::new(Vec::new())),
+            accumulated_text: Arc::new(std::sync::Mutex::new(String::new())),
+            accumulated_thinking: Arc::new(std::sync::Mutex::new(String::new())),
+            active_tool_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            completed_tool_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             timeline: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
@@ -6973,17 +6978,20 @@ mod tests {
         sink.delta("done");
 
         // What get_run_state serves after navigating away and back:
-        assert_eq!(run.accumulated_text.read().await.as_str(), "running ls done");
         assert_eq!(
-            run.accumulated_thinking.read().await.as_str(),
+            crate::agent_service::lock_buf(&run.accumulated_text).as_str(),
+            "running ls done"
+        );
+        assert_eq!(
+            crate::agent_service::lock_buf(&run.accumulated_thinking).as_str(),
             "what files exist?"
         );
         assert!(
-            run.active_tool_calls.read().await.is_empty(),
+            crate::agent_service::lock_buf(&run.active_tool_calls).is_empty(),
             "the call completed — it must not linger as active"
         );
         {
-            let done = run.completed_tool_calls.read().await;
+            let done = crate::agent_service::lock_buf(&run.completed_tool_calls);
             assert_eq!(done.len(), 1);
             assert_eq!(done[0].name, "exec");
             assert_eq!(done[0].output, "file.txt");
@@ -7082,7 +7090,7 @@ mod tests {
 
         sink.step_header(&request(7));
         assert!(
-            run.accumulated_text.read().await.is_empty(),
+            crate::agent_service::lock_buf(&run.accumulated_text).is_empty(),
             "conversational turn: no banner"
         );
 
@@ -7092,7 +7100,7 @@ mod tests {
         );
 
         sink.step_header(&request(9));
-        let streamed = run.accumulated_text.read().await.clone();
+        let streamed = crate::agent_service::lock_buf(&run.accumulated_text).clone();
         assert!(
             streamed.is_empty(),
             "run mechanics must NEVER be message text (got: {streamed:?})"
@@ -7141,7 +7149,7 @@ mod tests {
         sink.delta("It says hello.");
 
         assert_eq!(
-            run.accumulated_text.read().await.as_str(),
+            crate::agent_service::lock_buf(&run.accumulated_text).as_str(),
             "Let me check the file.\n\nIt says hello.",
             "one break at the step seam, none inside a step, none before the first text"
         );
@@ -7161,7 +7169,7 @@ mod tests {
         sink.text_join.lock().unwrap().end_steps();
         sink.delta("\n\n_2 steps_");
 
-        let reply = run.accumulated_text.read().await.clone();
+        let reply = crate::agent_service::lock_buf(&run.accumulated_text).clone();
         let (repeat, span) = sink
             .text_join
             .lock()
@@ -7209,7 +7217,7 @@ mod tests {
         sink.delta("Fourth.");
 
         assert_eq!(
-            run.accumulated_text.read().await.as_str(),
+            crate::agent_service::lock_buf(&run.accumulated_text).as_str(),
             "First.\nSecond.\nThird.\n\nFourth."
         );
     }

@@ -13,9 +13,9 @@
 
 use crate::{
     NewTask, StorageError, Task, TaskActivityEntry, TaskEvent, TaskEventKind, TaskEventSink,
-    TaskNote, TaskNoteKind, TaskPatch, task_filter,
+    TaskNote, TaskNoteKind, TaskPatch, VerdictTally, task_filter,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use turso::Connection;
@@ -47,6 +47,14 @@ pub const TASK_DEPS_MAX: usize = 100;
 /// recurse once per level; 32 levels is far beyond meaningful decomposition
 /// and keeps every walk trivially bounded.
 pub const TASK_DEPTH_MAX: usize = 32;
+
+/// Most verdicts [`TaskRepository::verdict_rollup`] will scan.
+///
+/// Bound justification: a verdict row is ~200 B decoded, so the cap holds a
+/// scan under ~20 MiB and a few hundred ms on this store, while being two
+/// orders of magnitude past the few hundred recent outcomes the router needs
+/// to tell members apart.
+pub const VERDICT_WINDOW_MAX: usize = 100_000;
 
 /// Maximum tasks per scope.
 ///
@@ -862,6 +870,70 @@ impl TaskRepository {
         Ok(notes)
     }
 
+    /// The `limit` most recently closed board cards (done or cancelled, any
+    /// scope but `session`), newest first — the dream fold's candidates.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a row does not
+    /// decode.
+    ///
+    /// # Panics
+    /// Panics if `limit` is 0.
+    pub async fn closed_board_cards(&self, limit: usize) -> Result<Vec<Task>, StorageError> {
+        assert!(
+            limit > 0,
+            "a scan for closed cards is bounded and non-empty"
+        );
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT {TASK_COLUMNS} FROM tasks \
+                     WHERE status IN ('done', 'cancelled') AND scope != 'session' \
+                     ORDER BY COALESCE(completed_at, updated_at) DESC, id DESC LIMIT ?1"
+                ),
+                turso::params![limit],
+            )
+            .await?;
+        let mut cards = Vec::new();
+        while let Some(row) = rows.next().await? {
+            cards.push(decode_task_row(&row)?);
+        }
+        drop(rows);
+        drop(conn);
+        debug_assert!(cards.iter().all(|t| is_closed_status(&t.status)));
+        Ok(cards)
+    }
+
+    /// One thread post by its id.
+    ///
+    /// Task events name a post by id rather than carrying it (the bus is not a
+    /// replication channel), so a consumer that needs the text reads it here.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::NotFound`] if no post has `note_id`, or
+    /// [`StorageError::Database`] if the query fails or the row does not decode.
+    pub async fn note(&self, note_id: i64) -> Result<TaskNote, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, task_id, author, content, created_at, author_member_id, kind \
+                 FROM task_notes WHERE id = ?1",
+                turso::params![note_id],
+            )
+            .await?;
+        let note = match rows.next().await? {
+            Some(row) => Some(decode_task_note(&row)?),
+            None => None,
+        };
+        drop(rows);
+        drop(conn);
+        let note = note.ok_or_else(|| StorageError::NotFound(format!("task note #{note_id}")))?;
+        debug_assert_eq!(note.id, note_id, "looked up by primary key");
+        Ok(note)
+    }
+
     /// Last `limit` activity entries for a task, oldest first.
     ///
     /// # Errors
@@ -875,8 +947,8 @@ impl TaskRepository {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, task_id, actor, action, detail, created_at FROM task_activity \
-                 WHERE task_id = ?1 ORDER BY id DESC LIMIT ?2",
+                "SELECT id, task_id, actor, action, detail, created_at, assignee \
+                 FROM task_activity WHERE task_id = ?1 ORDER BY id DESC LIMIT ?2",
                 turso::params![task_id, limit],
             )
             .await?;
@@ -890,6 +962,7 @@ impl TaskRepository {
                 action: row.get(3)?,
                 detail: detail_str.and_then(|s| serde_json::from_str(&s).ok()),
                 created_at: row.get(5)?,
+                assignee: row.get(6)?,
             });
         }
         // Held until the cursor is gone: an open `Rows` on the shared
@@ -916,13 +989,88 @@ impl TaskRepository {
     ) -> Result<(), StorageError> {
         let detail_json = detail.as_ref().map(std::string::ToString::to_string);
         let conn = self.conn.lock().await;
+        // The assignee is read inside the INSERT, so the row names whoever held
+        // the card at the instant it was written — no caller supplies it and
+        // no concurrent re-assignment can land between a read and the write.
         conn.execute(
-            "INSERT INTO task_activity (task_id, actor, action, detail) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO task_activity (task_id, actor, action, detail, assignee) \
+             VALUES (?1, ?2, ?3, ?4, (SELECT assignee FROM tasks WHERE id = ?1))",
             turso::params![task_id, actor, action, detail_json.as_deref()],
         )
         .await?;
         drop(conn);
         Ok(())
+    }
+
+    /// Each member's acceptance verdicts over the last `window` of them, per
+    /// label and overall — the router's evidence of what each member actually
+    /// passes (P25 decisions 4 and 15).
+    ///
+    /// A verdict is an `acceptance_checked` row, the one both the `tasks.complete`
+    /// tool and the harness write. It counts toward the member stamped on that
+    /// row — assigned when it was judged, not now (migration 021). Rows with no
+    /// stamped member (pre-021, or an unassigned card) and verdicts the check
+    /// itself marked `unknown` are left out: neither says anything about a
+    /// member. Labels are the card's current ones.
+    ///
+    /// `window` bounds the scan to the most recent verdicts: the history is
+    /// unbounded, and recent outcomes are the ones that predict.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a row does not
+    /// decode.
+    ///
+    /// # Panics
+    /// Panics if `window` is 0 or above [`VERDICT_WINDOW_MAX`].
+    pub async fn verdict_rollup(&self, window: usize) -> Result<Vec<VerdictTally>, StorageError> {
+        assert!(
+            window > 0 && window <= VERDICT_WINDOW_MAX,
+            "verdict window must be in 1..={VERDICT_WINDOW_MAX}, got {window}"
+        );
+        let window_i64 = i64::try_from(window).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT a.assignee, t.labels, a.detail FROM task_activity a \
+                 JOIN tasks t ON t.id = a.task_id \
+                 WHERE a.action = 'acceptance_checked' AND a.assignee IS NOT NULL \
+                 ORDER BY a.id DESC LIMIT ?1",
+                turso::params![window_i64],
+            )
+            .await?;
+        let mut tallies: BTreeMap<(String, Option<String>), (u64, u64)> = BTreeMap::new();
+        let mut scanned = 0usize;
+        while let Some(row) = rows.next().await? {
+            scanned += 1;
+            let member: String = row.get(0)?;
+            let labels: String = row.get(1)?;
+            let detail: Option<String> = row.get(2)?;
+            let Some(passed) = verdict_outcome(detail.as_deref()) else {
+                continue;
+            };
+            let labels: Vec<String> = serde_json::from_str(&labels)?;
+            let keys = std::iter::once(None).chain(labels.into_iter().map(Some));
+            for label in keys {
+                let tally = tallies.entry((member.clone(), label)).or_default();
+                if passed {
+                    tally.0 += 1;
+                } else {
+                    tally.1 += 1;
+                }
+            }
+        }
+        drop(rows);
+        drop(conn);
+        debug_assert!(scanned <= window, "the scan is bounded by the window");
+        Ok(tallies
+            .into_iter()
+            .map(|((member_id, label), (passed, failed))| VerdictTally {
+                member_id,
+                label,
+                passed,
+                failed,
+            })
+            .collect())
     }
 
     /// Query tasks in a scope with the filter language
@@ -1059,9 +1207,14 @@ impl TaskRepository {
                     continue;
                 }
             }
-            // The subtree may already be gone via an earlier parent delete.
-            if self.get_raw(target.id).await.is_ok() {
-                deleted += self.delete(target.id, None).await?;
+            // The subtree may already be gone via an earlier parent delete —
+            // that, and only that, is a skip. A read that FAILED is not
+            // evidence the row is gone; treating it as "already deleted" made
+            // a database error look like a smaller, successful clear.
+            match self.get_raw(target.id).await {
+                Ok(_) => deleted += self.delete(target.id, None).await?,
+                Err(StorageError::NotFound(_)) => {}
+                Err(e) => return Err(e),
             }
         }
         Ok(deleted)
@@ -1547,6 +1700,17 @@ fn apply_status_patch(
 /// What a `Created` event carries: enough for the router to place a new card
 /// without re-reading it, and nothing more — the event says what happened, and
 /// a full row on every mutation would make the bus a replication channel.
+/// What an `acceptance_checked` row says about the member: `Some(passed)`, or
+/// `None` when it says nothing — no detail, no boolean `passed`, or a check
+/// that marked its own verdict `unknown` (it could not tell).
+fn verdict_outcome(detail: Option<&str>) -> Option<bool> {
+    let detail: serde_json::Value = serde_json::from_str(detail?).ok()?;
+    if detail.get("unknown").and_then(serde_json::Value::as_bool) == Some(true) {
+        return None;
+    }
+    detail.get("passed").and_then(serde_json::Value::as_bool)
+}
+
 fn created_detail(task: &Task) -> serde_json::Value {
     serde_json::json!({
         "title": task.title,

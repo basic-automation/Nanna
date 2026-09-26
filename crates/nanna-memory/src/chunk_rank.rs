@@ -82,8 +82,10 @@ pub fn collapse_chunk_hits(
     for (memory_id, ordinal, similarity) in hits {
         // Chunks below the bar are not evidence of anything and must not
         // corroborate. Counting them would let a long memory accumulate rank
-        // from pieces that do not match at all.
-        if *similarity < min_score {
+        // from pieces that do not match at all. NaN (a zero vector) is checked
+        // by name: it compares false against the floor and would otherwise be
+        // admitted as a hit and poison the ordering downstream.
+        if !similarity.is_finite() || *similarity < min_score {
             continue;
         }
         collapsed
@@ -189,6 +191,22 @@ mod tests {
         let collapsed = collapse_chunk_hits(&hits, 0.40);
         assert_eq!(collapsed["m"].corroborating, 0);
         assert!((collapsed["m"].best - 0.80).abs() < 1e-6);
+    }
+
+    /// A NaN chunk (a zero vector) is not evidence: alone it admits nothing,
+    /// and beside a real hit it neither corroborates nor wins.
+    #[test]
+    fn a_nan_chunk_is_not_evidence() {
+        let alone = collapse_chunk_hits(&[("z".to_string(), 0, f32::NAN)], 0.40);
+        assert!(
+            alone.is_empty(),
+            "NaN must not clear the floor by comparing false"
+        );
+
+        let hits = vec![("m".to_string(), 0, 0.80), ("m".to_string(), 1, f32::NAN)];
+        let collapsed = collapse_chunk_hits(&hits, 0.40);
+        assert_eq!(collapsed["m"].corroborating, 0, "NaN never corroborates");
+        assert_eq!(collapsed["m"].best_ordinal, 0);
     }
 
     #[test]

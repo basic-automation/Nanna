@@ -2371,6 +2371,7 @@ impl<'a> HarnessRun<'a> {
                     .is_ok()
             {
                 self.reopened_once.insert(id);
+                self.forget_verified(id);
                 self.progress.remove(&id);
                 self.items_completed = self.items_completed.saturating_sub(1);
                 self.items_regressed_reopened += 1;
@@ -3569,6 +3570,25 @@ impl<'a> HarnessRun<'a> {
         }
     }
 
+    /// Drop item `id` from what the run calls verified, because its check
+    /// just failed again.
+    ///
+    /// `verified_outcomes` feeds the do-not-regress digest, which tells the
+    /// model that EDITS "#id … VERIFIED WORKING right now" — so a regressed
+    /// item left in it was asserted as working in the very prompt that sent the
+    /// model back to fix it, and a re-earned verdict was listed twice in the
+    /// report. `verified_this_run` feeds later sweeps; the item re-enters both
+    /// when its check passes again.
+    fn forget_verified(&mut self, id: i64) {
+        self.verified_outcomes.retain(|outcome| outcome.id != id);
+        self.verified_this_run
+            .retain(|(verified, _, _)| *verified != id);
+        debug_assert!(
+            self.verified_outcomes.iter().all(|o| o.id != id),
+            "a regressed item is no longer claimed verified"
+        );
+    }
+
     /// Mid-run: reopen verified items whose check fails again. Returns the
     /// regressions as `(id, title, detail)`.
     async fn recheck_verified_mid_run(
@@ -3623,6 +3643,7 @@ impl<'a> HarnessRun<'a> {
                 .is_ok()
             {
                 self.reopened_once.insert(id);
+                self.forget_verified(id);
                 self.progress.remove(&id);
                 self.items_completed = self.items_completed.saturating_sub(1);
                 self.items_regressed_reopened += 1;
@@ -5859,6 +5880,11 @@ mod tests {
         );
         assert!(requests[2].prompt.contains("Disk is truth"));
         assert!(
+            !requests[2].prompt.contains("- #1 build artifact:"),
+            "the prompt that sends the model back to #1 must not call #1 verified: {}",
+            requests[2].prompt
+        );
+        assert!(
             !requests[3].prompt.contains("un-did verified work"),
             "the notice is one-shot"
         );
@@ -5893,6 +5919,16 @@ mod tests {
         assert_eq!(report.items_regressed_reopened, 1, "{report:?}");
         assert_eq!(report.items_completed, 2);
         assert_eq!(report.steps_taken, 4);
+        assert_eq!(
+            report
+                .verified_outcomes
+                .iter()
+                .filter(|o| o.id == 1)
+                .count(),
+            1,
+            "a re-earned verdict is listed once: {:?}",
+            report.verified_outcomes
+        );
         assert_mid_run_regression_caught(&source, &runner).await;
     }
 

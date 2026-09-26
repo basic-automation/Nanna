@@ -202,8 +202,50 @@ pub struct LlmApiKeys {
     pub openrouter_key_set: bool,
 }
 
+/// Where the local Claude proxy is expected when nothing says otherwise.
+const CLAUDE_PROXY_DEFAULT_URL: &str = "http://localhost:3456";
+
+/// This GUI process's Claude proxy setting: enabled, and the URL, if one was set.
+///
+/// Seeded once from `CLAUDE_PROXY_ENABLED` / `CLAUDE_PROXY_URL` at first use, so
+/// a launch-time environment still configures it, and changed in memory after
+/// that. The commands used to write the process environment instead —
+/// `unsafe set_var` from a command on the multi-threaded runtime, which races
+/// every concurrent `getenv` (glibc's included) — only for this same process
+/// to read it back; nothing else ever saw those variables.
+static CLAUDE_PROXY: std::sync::LazyLock<std::sync::RwLock<(bool, Option<String>)>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::RwLock::new((
+            std::env::var_os("CLAUDE_PROXY_ENABLED").is_some(),
+            std::env::var("CLAUDE_PROXY_URL").ok(),
+        ))
+    });
+
+/// The current proxy setting as `(enabled, url)`, the URL defaulted.
+fn claude_proxy_setting() -> (bool, String) {
+    let (enabled, url) = CLAUDE_PROXY
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    (
+        enabled,
+        url.unwrap_or_else(|| CLAUDE_PROXY_DEFAULT_URL.to_string()),
+    )
+}
+
+/// Change the proxy setting; `url: None` keeps the current one.
+fn set_claude_proxy_setting(enabled: bool, url: Option<String>) {
+    let mut guard = CLAUDE_PROXY
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.0 = enabled;
+    if url.is_some() {
+        guard.1 = url;
+    }
+}
+
 /// The local Claude proxy: whether it is enabled, and the URL it is expected
-/// at (`CLAUDE_PROXY_ENABLED` / `CLAUDE_PROXY_URL`).
+/// at (see [`CLAUDE_PROXY`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeProxyStatus {
     pub claude_proxy_enabled: bool,
@@ -257,7 +299,6 @@ fn ollama_token_status(
 /// Memory consolidation and capture settings.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MemorySettings {
-    pub dreaming_enabled: bool,
     pub auto_remember_messages: bool,
     pub max_compression_ratio: f32,
     pub min_remaining_memories: usize,
@@ -343,10 +384,12 @@ fn build_extended_settings(
         },
         github_key_set: config.llm.github_token.is_some()
             || std::env::var("GITHUB_TOKEN").is_ok(),
-        claude_proxy: ClaudeProxyStatus {
-            claude_proxy_enabled: std::env::var("CLAUDE_PROXY_ENABLED").is_ok(),
-            claude_proxy_url: std::env::var("CLAUDE_PROXY_URL")
-                .unwrap_or_else(|_| "http://localhost:3456".to_string()),
+        claude_proxy: {
+            let (claude_proxy_enabled, claude_proxy_url) = claude_proxy_setting();
+            ClaudeProxyStatus {
+                claude_proxy_enabled,
+                claude_proxy_url,
+            }
         },
         brave_key_set: config.tools.brave_api_key.is_some()
             || std::env::var("BRAVE_API_KEY").is_ok(),
@@ -410,9 +453,6 @@ fn build_extended_settings(
         tools,
 
         memory: MemorySettings {
-            // Dreaming has no daemon control action yet; its setter is still a
-            // no-op, so report the enabled default.
-            dreaming_enabled: true,
             auto_remember_messages: config.memory.auto_remember_messages,
             max_compression_ratio: config.memory.max_compression_ratio,
             min_remaining_memories: config.memory.min_remaining_memories,
@@ -451,8 +491,11 @@ pub async fn set_extraction_model(
     if let Err(e) = state_guard.config.save() {
         warn!("Failed to save extraction model to config: {}", e);
     }
-    let _ = state_guard.backend.config_reload().await;
+    // Never hold AppState across a daemon round trip: every other
+    // command waits on this lock for as long as the reload takes.
+    let backend = Arc::clone(&state_guard.backend);
     drop(state_guard);
+    let _ = backend.config_reload().await;
 
     if model.is_empty() {
         info!("Extraction model set to: (use chat model)");
@@ -494,10 +537,7 @@ pub async fn set_provider_api_key(
         "github" => state_guard.config.llm.github_token = Some(api_key.clone()),
         "claude-proxy" => {
             // For claude-proxy, the "api_key" is actually the proxy URL
-            unsafe {
-                std::env::set_var("CLAUDE_PROXY_URL", &api_key);
-                std::env::set_var("CLAUDE_PROXY_ENABLED", "1");
-            }
+            set_claude_proxy_setting(true, Some(api_key.clone()));
         }
         _ => return Err(format!("Unknown provider: {provider}")),
     }
@@ -516,8 +556,11 @@ pub async fn set_provider_api_key(
         error!("Failed to save config: {}", e);
         // Non-fatal - key is hydrated in-process for this session
     }
-    let _ = state_guard.backend.config_reload().await;
+    // Never hold AppState across a daemon round trip: every other
+    // command waits on this lock for as long as the reload takes.
+    let backend = Arc::clone(&state_guard.backend);
     drop(state_guard);
+    let _ = backend.config_reload().await;
 
     info!("API key set for provider: {} (secure store)", provider);
     Ok(())
@@ -547,8 +590,11 @@ async fn persist_oauth_login(
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save config: {e}");
     }
-    let _ = state_guard.backend.config_reload().await;
+    // Never hold AppState across a daemon round trip: every other
+    // command waits on this lock for as long as the reload takes.
+    let backend = Arc::clone(&state_guard.backend);
     drop(state_guard);
+    let _ = backend.config_reload().await;
     Ok(())
 }
 
@@ -732,9 +778,7 @@ pub async fn save_anthropic_oauth_token(
 /// cannot be deleted; nothing else changes then. A failed `config.toml` save
 /// afterwards is only logged.
 #[tauri::command]
-pub async fn logout_anthropic_oauth(
-    state: State<'_, Arc<RwLock<AppState>>>,
-) -> Result<(), String> {
+pub async fn logout_anthropic_oauth(state: State<'_, Arc<RwLock<AppState>>>) -> Result<(), String> {
     // Remove the durable credential first — if this fails the user would be
     // silently logged back in at next launch, so surface it instead.
     nanna_config::SecureStore::new()
@@ -750,8 +794,11 @@ pub async fn logout_anthropic_oauth(
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save config after logout: {}", e);
     }
-    let _ = state_guard.backend.config_reload().await;
+    // Never hold AppState across a daemon round trip: every other
+    // command waits on this lock for as long as the reload takes.
+    let backend = Arc::clone(&state_guard.backend);
     drop(state_guard);
+    let _ = backend.config_reload().await;
 
     info!("Anthropic OAuth logout successful");
     Ok(())
@@ -870,9 +917,7 @@ pub async fn get_daemon_providers(
 pub async fn get_mcp_servers(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let state_guard = state.read().await;
-    let status = state_guard.backend.system_status().await?;
-    drop(state_guard);
+    let status = backend_handle(&state).await.system_status().await?;
     Ok(status
         .get("mcp_servers")
         .and_then(|v| v.as_array())
@@ -924,8 +969,11 @@ pub async fn refresh_oauth_token(
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save config: {}", e);
     }
-    let _ = state_guard.backend.config_reload().await;
+    // Never hold AppState across a daemon round trip: every other
+    // command waits on this lock for as long as the reload takes.
+    let backend = Arc::clone(&state_guard.backend);
     drop(state_guard);
+    let _ = backend.config_reload().await;
 
     let hours = refreshed.seconds_until_expiry().map_or(0, |s| s / 3600);
     info!("OAuth token refreshed, expires in {}h", hours);
@@ -983,8 +1031,11 @@ pub async fn set_provider(
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save config: {}", e);
     }
-    let _ = state_guard.backend.config_reload().await;
+    // Never hold AppState across a daemon round trip: every other
+    // command waits on this lock for as long as the reload takes.
+    let backend = Arc::clone(&state_guard.backend);
     drop(state_guard);
+    let _ = backend.config_reload().await;
 
     info!("Provider changed to: {}", provider);
     Ok(())
@@ -1170,8 +1221,11 @@ pub async fn set_ollama_api_key(
             return Err(err_msg);
         }
     }
-    let _ = state_guard.backend.config_reload().await;
+    // Never hold AppState across a daemon round trip: every other
+    // command waits on this lock for as long as the reload takes.
+    let backend = Arc::clone(&state_guard.backend);
     drop(state_guard);
+    let _ = backend.config_reload().await;
     Ok(if saved { "Ollama token saved" } else { "Ollama token removed" }.to_string())
 }
 
@@ -1929,16 +1983,8 @@ pub async fn get_claude_proxy_models(
 /// Never returns `Err`.
 #[tauri::command]
 pub async fn set_claude_proxy(enabled: bool, url: Option<String>) -> Result<(), String> {
-    unsafe {
-        if enabled {
-            std::env::set_var("CLAUDE_PROXY_ENABLED", "1");
-            if let Some(u) = url {
-                std::env::set_var("CLAUDE_PROXY_URL", u);
-            }
-        } else {
-            std::env::remove_var("CLAUDE_PROXY_ENABLED");
-        }
-    }
+    // Disabling keeps the URL, as clearing only the flag always did.
+    set_claude_proxy_setting(enabled, url.filter(|_| enabled));
     Ok(())
 }
 
@@ -1950,8 +1996,7 @@ pub async fn set_claude_proxy(enabled: bool, url: Option<String>) -> Result<(), 
 /// unreachable or unhealthy proxy is `Ok(false)`.
 #[tauri::command]
 pub async fn check_claude_proxy_health() -> Result<bool, String> {
-    let proxy_url = std::env::var("CLAUDE_PROXY_URL")
-        .unwrap_or_else(|_| "http://localhost:3456".to_string());
+    let (_, proxy_url) = claude_proxy_setting();
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -2184,26 +2229,57 @@ fn imported_config(
 
 /// Import config from TOML string
 ///
+/// The daemon performs the import (`config.import`): it files any secret the
+/// text brings in, keeps every stored one the text leaves out, saves, and
+/// applies the result live. This command used to only write `config.toml` —
+/// the running daemon never saw the import until a restart, and this process's
+/// cached copy lost every keychain secret, because an export carries none.
+/// The cached copy is then refilled from the store the daemon just settled.
+///
 /// # Errors
 ///
-/// Returns `Failed to parse config: …` when the text is not a valid config
-/// (nothing changes then), and `Failed to save config: …` when `config.toml`
-/// cannot be written (the cached config has already been replaced then).
+/// Returns `Failed to parse config: …` when the text is not a valid config,
+/// the daemon's refusal when it refuses, or the transport error when it cannot
+/// be reached; nothing changes in any of those cases.
 #[tauri::command]
 pub async fn import_config(
     state: State<'_, Arc<RwLock<AppState>>>,
     config: String,
 ) -> Result<(), String> {
-    let mut state_guard = state.write().await;
     let store = nanna_config::SecureStore::new();
-    let new_config = imported_config(&config, &state_guard.config, &store)?;
-    state_guard.config = new_config;
-    state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {e}"))?;
-    drop(state_guard);
+    let (running_host, mut new_config) = {
+        let state_guard = state.read().await;
+        let running_host = state_guard.config.memory.ollama_host.clone();
+        (
+            running_host,
+            imported_config(&config, &state_guard.config, &store)?,
+        )
+    };
+    // The daemon gets the text's own config — secrets it brings in included,
+    // for the daemon to file — not this copy, whose Ollama token is ours.
+    let as_written: nanna_config::Config =
+        toml::from_str(&config).map_err(|e| format!("Failed to parse config: {e}"))?;
+    let wire =
+        serde_json::to_value(&as_written).map_err(|e| format!("Failed to encode config: {e}"))?;
+    let reply = backend_handle(&state).await.config_import(wire).await?;
+    import_refusal(&reply)?;
 
+    new_config.refill_secrets_replacing(&running_host, &store);
+    state.write().await.config = new_config;
     info!("Config imported from TOML");
     Ok(())
+}
+
+/// The daemon's refusal in a `config.import` reply, if it refused.
+fn import_refusal(reply: &serde_json::Value) -> Result<(), String> {
+    let Some(error) = reply.get("error") else {
+        return Ok(());
+    };
+    let reason = reply
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| error.to_string(), str::to_string);
+    Err(format!("config import refused: {reason}"))
 }
 
 // =============================================================================
@@ -2254,11 +2330,14 @@ pub async fn set_chat_model_priority(
         .map_err(|e| format!("Failed to save config: {e}"))?;
 
     // Propagate to the daemon so changes take effect without restart
-    let _ = state_guard.backend.config_set(
+    // Clone the handle and release the lock before the round trip: the
+    // save above stays ordered under it, the daemon call does not need it.
+    let backend = state_guard.backend.clone();
+    drop(state_guard);
+    let _ = backend.config_set(
         "llm.model_priority",
         serde_json::to_value(&priority).unwrap_or_default(),
     ).await;
-    drop(state_guard);
 
     // Emit model-status event so the GUI badge updates
     let _ = app.emit("model-status", ModelStatusEvent {
@@ -2350,8 +2429,11 @@ pub async fn set_summarization_model_priority(
     // Tell the daemon now, as the other settings saves do. It would find the
     // change by itself — its file watcher polls every ~2 s — but a turn that
     // starts inside that window would summarize on the old list.
-    let _ = state_guard.backend.config_reload().await;
+    // Never hold AppState across a daemon round trip: every other
+    // command waits on this lock for as long as the reload takes.
+    let backend = Arc::clone(&state_guard.backend);
     drop(state_guard);
+    let _ = backend.config_reload().await;
 
     info!("Summarization model priority set: {:?}", priority);
     Ok(())
@@ -2472,11 +2554,14 @@ pub async fn set_model_routing(
         .map_err(|e| format!("Failed to save config: {e}"))?;
 
     // Propagate to the daemon
-    let _ = state_guard.backend.config_set(
+    // Clone the handle and release the lock before the round trip: the
+    // save above stays ordered under it, the daemon call does not need it.
+    let backend = state_guard.backend.clone();
+    drop(state_guard);
+    let _ = backend.config_set(
         "llm.model_routing",
         serde_json::to_value(&routes).unwrap_or_default(),
     ).await;
-    drop(state_guard);
 
     info!("Model routing set: {:?}", routes);
     Ok(())
@@ -2516,11 +2601,14 @@ pub async fn set_routing_first_turn_primary(
         .map_err(|e| format!("Failed to save config: {e}"))?;
 
     // Propagate to the daemon
-    let _ = state_guard.backend.config_set(
+    // Clone the handle and release the lock before the round trip: the
+    // save above stays ordered under it, the daemon call does not need it.
+    let backend = state_guard.backend.clone();
+    drop(state_guard);
+    let _ = backend.config_set(
         "llm.routing_first_turn_primary",
         serde_json::Value::Bool(enabled),
     ).await;
-    drop(state_guard);
 
     info!("Routing first turn primary set: {}", enabled);
     Ok(())
@@ -2572,17 +2660,20 @@ pub async fn set_sub_agent_models(
         .map_err(|e| format!("Failed to save config: {e}"))?;
 
     // Propagate to the daemon
-    let _ = state_guard.backend.config_set(
+    // Clone the handle and release the lock before the round trip: the
+    // save above stays ordered under it, the daemon call does not need it.
+    let backend = state_guard.backend.clone();
+    drop(state_guard);
+    let _ = backend.config_set(
         "llm.sub_agent_models",
         serde_json::json!(models),
     ).await;
-    let _ = state_guard.backend.config_set(
+    let _ = backend.config_set(
         "llm.sub_agent_model",
         serde_json::Value::Null,
     ).await;
 
-    info!("Sub-agent models set: {:?}", state_guard.config.llm.sub_agent_models);
-    drop(state_guard);
+    info!("Sub-agent models set: {:?}", models);
     Ok(())
 }
 
@@ -2711,6 +2802,50 @@ pub async fn save_config(
 mod tests {
     use super::*;
 
+    /// A refusal is surfaced with the daemon's message; an import is not.
+    #[test]
+    fn an_import_refusal_carries_the_daemons_message() {
+        assert_eq!(
+            import_refusal(&serde_json::json!({ "status": "imported" })),
+            Ok(())
+        );
+        let refused =
+            serde_json::json!({ "error": "secret_store_failed", "message": "keyring locked" });
+        assert_eq!(
+            import_refusal(&refused),
+            Err("config import refused: keyring locked".to_string())
+        );
+        let bare = serde_json::json!({ "error": "import_failed" });
+        assert!(import_refusal(&bare).is_err_and(|e| e.contains("import_failed")));
+    }
+
+    /// The proxy setting lives in memory, not the process environment, and
+    /// keeps the old command semantics: enabling may set a URL, disabling
+    /// keeps it, and no URL means the default. The only test touching the
+    /// process-wide setting, so it cannot race another.
+    #[tokio::test]
+    async fn the_claude_proxy_setting_is_in_memory() {
+        set_claude_proxy(true, Some("http://127.0.0.1:9".into()))
+            .await
+            .expect("never fails");
+        assert_eq!(
+            claude_proxy_setting(),
+            (true, "http://127.0.0.1:9".to_string())
+        );
+        set_claude_proxy(false, Some("http://ignored".into()))
+            .await
+            .expect("never fails");
+        assert_eq!(
+            claude_proxy_setting(),
+            (false, "http://127.0.0.1:9".to_string()),
+            "disabling keeps the URL"
+        );
+        assert!(
+            std::env::var_os("CLAUDE_PROXY_URL").is_none_or(|v| v != "http://127.0.0.1:9"),
+            "the environment is not written"
+        );
+    }
+
     fn sample_settings() -> ExtendedSettings {
         ExtendedSettings {
             llm_api_keys: LlmApiKeys {
@@ -2755,7 +2890,6 @@ mod tests {
                 is_user_tool: false,
             }],
             memory: MemorySettings {
-                dreaming_enabled: true,
                 auto_remember_messages: false,
                 max_compression_ratio: 0.5,
                 min_remaining_memories: 20,
@@ -2788,7 +2922,7 @@ mod tests {
             r#""ollama_token_host":"http://127.0.0.1:11434","ollama_token_from_env":false,"#,
             r#""temperature":1.0,"top_p":0.95,"#,
             r#""max_tokens":8192,"tools":[{"name":"exec","description":"run","enabled":true,"is_user_tool":false}],"#,
-            r#""dreaming_enabled":true,"auto_remember_messages":false,"max_compression_ratio":0.5,"#,
+            r#""auto_remember_messages":false,"max_compression_ratio":0.5,"#,
             r#""min_remaining_memories":20,"scheduler_enabled":false,"heartbeat_enabled":true,"#,
             r#""heartbeat_interval_seconds":1800,"agent_max_iterations":null,"#,
             r#""agent_nudge_after_iterations":40,"agent_nudge_interval_iterations":10}"#,

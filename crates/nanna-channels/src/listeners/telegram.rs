@@ -91,7 +91,8 @@ impl TelegramListener {
             ])
             .send()
             .await
-            .map_err(|e| ListenerError::Connection(e.to_string()))?;
+            // The URL embeds the bot token; reqwest's Display would print it.
+            .map_err(|e| ListenerError::Connection(e.without_url().to_string()))?;
 
         let status = response.status();
         if status == 401 {
@@ -101,7 +102,9 @@ impl TelegramListener {
         let body: TelegramApiResponse<Vec<TelegramUpdate>> = response
             .json()
             .await
-            .map_err(|e| ListenerError::Api(format!("Failed to parse response: {e}")))?;
+            .map_err(|e| {
+                ListenerError::Api(format!("Failed to parse response: {}", e.without_url()))
+            })?;
 
         if !body.ok {
             return Err(ListenerError::Api(

@@ -191,7 +191,6 @@ macro_rules! command_handler {
             commands::memory::trigger_consolidation,
             commands::memory::apply_memory_updates,
             // Memory & scheduling settings
-            commands::memory::set_dreaming_enabled,
             commands::memory::set_auto_remember_messages,
             commands::memory::set_max_compression_ratio,
             commands::memory::set_min_remaining_memories,
@@ -236,9 +235,6 @@ macro_rules! command_handler {
             commands::system::send_notification,
             commands::system::request_notification_permission,
             commands::system::check_notification_permission,
-            // Similarity threshold
-            commands::memory::get_similarity_threshold,
-            commands::memory::set_similarity_threshold,
             // System prompt & agent settings
             commands::settings::get_system_prompt,
             commands::settings::set_system_prompt,

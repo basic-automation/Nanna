@@ -194,7 +194,10 @@ pub fn fixture_vectors(count: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
 		.map(|_| {
 			(0..dim)
 				.map(|_| {
-					let unit = top_24_bits_as_f32(next()) / f32::from(1_u16 << 8) / 96.0;
+					// 24 bits over 2^24 is [0, 1). The old divisor, 2^8 × 96 =
+					// 24 576, gave [0, 683): nearly every component positive
+					// and large, so the "random" vectors were near-parallel.
+					let unit = top_24_bits_as_f32(next()) / 16_777_216.0;
 					unit.mul_add(2.0, -1.0)
 				})
 				.collect()
@@ -225,6 +228,17 @@ mod tests {
 		let len = ids.len();
 		ids.dedup();
 		assert_eq!(ids.len(), len);
+	}
+
+	#[test]
+	fn fixture_components_are_in_the_unit_interval() {
+		let vectors = fixture_vectors(64, 32, 7);
+		assert!(
+			vectors.iter().flatten().all(|x| (-1.0..1.0).contains(x)),
+			"components must lie in [-1, 1)"
+		);
+		let negative = vectors.iter().flatten().filter(|x| **x < 0.0).count();
+		assert!(negative > 64 * 32 / 4, "roughly half the components are negative: {negative}");
 	}
 
 	#[test]

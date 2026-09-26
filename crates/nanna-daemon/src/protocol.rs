@@ -82,10 +82,14 @@ pub enum Action {
 // Task Actions (P15 store + P14 long-horizon runs)
 // =============================================================================
 
+/// Verdicts `task.verdicts` scans when the caller names no window: enough
+/// recent history to tell members apart on the labels they share, small enough
+/// to answer from one indexed scan in well under a frame.
+pub const TASK_VERDICT_WINDOW_DEFAULT: usize = 500;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
-pub enum TaskAction {
-    /// List tasks in a scope
+pub enum TaskAction {    /// List tasks in a scope
     List {
         #[serde(default)]
         scope: Option<String>,
@@ -197,6 +201,13 @@ pub enum TaskAction {
         scope: Option<String>,
         #[serde(default)]
         session_id: Option<String>,
+    },
+    /// Each member's acceptance verdicts per label and overall, over the most
+    /// recent `window` of them (default [`TASK_VERDICT_WINDOW_DEFAULT`]) — the
+    /// history the P25 router reads to choose a member.
+    Verdicts {
+        #[serde(default)]
+        window: Option<usize>,
     },
 }
 
@@ -457,7 +468,67 @@ pub enum MemoryAction {
 // Config Actions
 // =============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A secret the user typed, carried in a request.
+///
+/// The wire form is the plain string (`serde(transparent)`), so no client
+/// changes; `Debug` never shows it. It exists because the IPC layer logs every
+/// request with `{:?}` at debug level — and a `String` field printed the key
+/// under validation in full, while the handler's comment said it was "never
+/// logged".
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretInput(String);
+
+impl SecretInput {
+    #[must_use]
+    pub fn new(secret: impl Into<String>) -> Self {
+        Self(secret.into())
+    }
+
+    /// The secret itself — for the one call that needs it, never a log.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[redacted {} bytes]", self.0.len())
+    }
+}
+
+/// `value` with every string at a secret config path (as `nanna-config`
+/// defines them: the fields a save strips) replaced by `"[redacted]"`.
+/// `prefix` is the dotted path `value` sits at; `""` for a whole config.
+fn redact_config_secrets(prefix: &str, value: &Value) -> Value {
+    match value {
+        Value::String(text) if nanna_config::Config::names_a_secret(prefix) && !text.is_empty() => {
+            Value::String("[redacted]".to_string())
+        }
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, child)| {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    (key.clone(), redact_config_secrets(&path, child))
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| redact_config_secrets(prefix, item))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ConfigAction {
     /// Get full config or specific path
@@ -472,6 +543,30 @@ pub enum ConfigAction {
     Export,
     /// Import config
     Import { config: Value },
+}
+
+/// Written by hand so a secret never reaches a log: `config.set` of
+/// `llm.api_key`, or a whole imported config, printed every key in full through
+/// the IPC layer's debug line. Values at secret paths are redacted; everything
+/// else prints as before.
+impl std::fmt::Debug for ConfigAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Get { path } => f.debug_struct("Get").field("path", path).finish(),
+            Self::Set { path, value } => f
+                .debug_struct("Set")
+                .field("path", path)
+                .field("value", &redact_config_secrets(path, value))
+                .finish(),
+            Self::Reset { path } => f.debug_struct("Reset").field("path", path).finish(),
+            Self::Reload => f.write_str("Reload"),
+            Self::Export => f.write_str("Export"),
+            Self::Import { config } => f
+                .debug_struct("Import")
+                .field("config", &redact_config_secrets("", config))
+                .finish(),
+        }
+    }
 }
 
 // =============================================================================
@@ -633,8 +728,7 @@ pub enum WorkspaceAction {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
-pub enum SystemAction {
-    /// Get system status
+pub enum SystemAction {    /// Get system status
     Status,
     /// Restart the daemon
     Restart,
@@ -715,8 +809,9 @@ pub enum SystemAction {
     ValidateApiKey {
         /// `anthropic` | `openai` | `openrouter` | `github` (GitHub Models).
         provider: String,
-        /// The key as typed. Blank is refused before any network.
-        key: String,
+        /// The key as typed. Blank is refused before any network. Redacted in
+        /// `Debug`, which the IPC layer logs every request through.
+        key: SecretInput,
     },
 }
 
@@ -1221,6 +1316,56 @@ impl From<ControlAction> for Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The IPC layer logs every request as `{:?}`. A key under validation, a
+    /// `config.set` of a key, and an imported config all printed their secrets
+    /// in full there; the wire form must stay exactly what clients send.
+    #[test]
+    fn secrets_never_reach_a_requests_debug_line() {
+        let validate = serde_json::json!({
+            "type": "system", "action": "validate_api_key",
+            "provider": "anthropic", "key": "sk-ant-SECRET-1",
+        });
+        let set_key = serde_json::json!({
+            "type": "config", "action": "set", "path": "llm.api_key", "value": "sk-SECRET-2",
+        });
+        let set_section = serde_json::json!({
+            "type": "config", "action": "set", "path": "llm",
+            "value": { "api_key": "sk-SECRET-3", "model": "claude-fable-5" },
+        });
+        let import = serde_json::json!({
+            "type": "config", "action": "import",
+            "config": { "llm": { "api_key": "sk-SECRET-4", "model": "qwen" } },
+        });
+        for raw in [validate, set_key, set_section, import] {
+            let action: Action = serde_json::from_value(raw.clone()).expect("parses");
+            let line = format!("{action:?}");
+            assert!(
+                !line.contains("SECRET"),
+                "a secret reached the log line: {line}"
+            );
+            assert_eq!(
+                serde_json::to_value(&action).expect("serializes"),
+                raw,
+                "the wire form is unchanged"
+            );
+        }
+        // What is not a secret still prints, or the log line is useless.
+        let set_model: Action = serde_json::from_value(serde_json::json!({
+            "type": "config", "action": "set", "path": "llm.model", "value": "qwen3.5:9b",
+        }))
+        .expect("parses");
+        assert!(format!("{set_model:?}").contains("qwen3.5:9b"));
+        let Action::System(SystemAction::ValidateApiKey { key, .. }) =
+            serde_json::from_value(serde_json::json!({
+                "type": "system", "action": "validate_api_key", "provider": "openai", "key": "k",
+            }))
+            .expect("parses")
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(key.expose(), "k", "the handler still gets the key itself");
+    }
 
     /// Every client hand-writes this envelope as JSON (the GUI's
     /// `daemon_client.rs`, the CLI, anything on the socket), so the tag

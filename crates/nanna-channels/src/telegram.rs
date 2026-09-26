@@ -135,13 +135,18 @@ impl TelegramChannel {
             .json(&params)
             .send()
             .await
-            .map_err(|e| ChannelError::Send(e.to_string()))?;
+            // `without_url`: the request URL embeds the bot token
+            // (`/bot<token>/…`), and reqwest's Display prints it — every
+            // connection error put the token in logs and channel status.
+            .map_err(|e| ChannelError::Send(e.without_url().to_string()))?;
 
         let status = response.status();
         let body: TelegramApiResponse<T> = response
             .json()
             .await
-            .map_err(|e| ChannelError::Send(format!("Failed to parse response: {e}")))?;
+            .map_err(|e| {
+                ChannelError::Send(format!("Failed to parse response: {}", e.without_url()))
+            })?;
 
         if body.ok {
             body.result
@@ -686,8 +691,8 @@ impl Channel for TelegramChannel {
 
         let reply_to: Option<i64> = message
             .reply_to
-            .as_ref()
-            .and_then(|r| r.parse().ok());
+            .as_deref()
+            .and_then(|r| crate::native_reply_id(r).parse().ok());
 
         let result = match message.content {
             MessageContent::Text { text } => {
@@ -897,6 +902,19 @@ impl Channel for TelegramChannel {
 
 #[cfg(test)]
 mod tests {
+    /// A failed request names what failed, never the token in its URL.
+    #[tokio::test]
+    async fn a_connection_error_does_not_carry_the_token() {
+        let token = "123456:SECRET-token-value";
+        let channel = super::TelegramChannel::new(token).with_api_base("http://127.0.0.1:9");
+        let err = channel
+            .send_message_draft(1, 1, "hi")
+            .await
+            .expect_err("nothing listens on port 9");
+        let shown = format!("{err} {err:?}");
+        assert!(!shown.contains("SECRET"), "{shown}");
+    }
+
     use super::*;
 
     #[test]

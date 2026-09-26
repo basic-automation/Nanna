@@ -292,6 +292,19 @@ impl MessageQueue {
         }
     }
 
+    /// Publish a queue event without ever waiting.
+    ///
+    /// Events are advisory, and the channel is bounded (1000) with nobody
+    /// obliged to read it. Emitting used to `.await` a `send` while holding
+    /// the queues' write lock, so once 1000 events went unread the next
+    /// enqueue blocked forever — and with it every other queue operation. A
+    /// full channel now drops the event instead (and says so at debug level).
+    fn emit(&self, event: QueueEvent) {
+        if let Err(mpsc::error::TrySendError::Full(dropped)) = self.event_tx.try_send(event) {
+            debug!("Queue event channel full; dropped {:?}", dropped);
+        }
+    }
+
     /// Get the event receiver
     #[must_use]
     pub fn events(&self) -> Arc<RwLock<mpsc::Receiver<QueueEvent>>> {
@@ -304,7 +317,11 @@ impl MessageQueue {
     }
 
     /// Enqueue a message with specific priority
-    pub async fn enqueue_with_priority(&self, message: OutgoingMessage, priority: MessagePriority) -> u64 {
+    pub async fn enqueue_with_priority(
+        &self,
+        message: OutgoingMessage,
+        priority: MessagePriority,
+    ) -> u64 {
         let provider = message.channel.provider.clone();
         let mut queues = self.queues.write().await;
 
@@ -337,14 +354,14 @@ impl MessageQueue {
         queue.messages.push(entry);
         queue.stats.queued = queue.messages.len();
 
-        let _ = self.event_tx.send(QueueEvent::Queued { 
+        self.emit(QueueEvent::Queued { 
             provider: provider.clone(), 
             message_id: id,
-        }).await;
+        });
 
         debug!("Enqueued message {} for {} (priority: {:?})", id, provider, priority);
-        // Held across the event send: concurrent enqueues emit their `Queued`
-        // events in the same order they assigned message ids.
+        // Held across the (synchronous) emit: concurrent enqueues emit their
+        // `Queued` events in the same order they assigned message ids.
         drop(queues);
         id
     }
@@ -389,13 +406,13 @@ impl MessageQueue {
                         queue.stats.queued = queue.messages.len();
                     }
 
-                    let _ = self.event_tx.send(QueueEvent::Sent {
+                    self.emit(QueueEvent::Sent {
                         provider: provider.to_string(),
                         message_id: msg.id,
                         result_id,
-                    }).await;
-                    // Held across the event send so the `Sent` event is ordered
-                    // with the stats change it reports.
+                    });
+                    // Held across the (synchronous) emit so the `Sent` event is
+                    // ordered with the stats change it reports.
                     drop(queues);
                 }
                 Err(ChannelError::RateLimited) => {
@@ -414,10 +431,10 @@ impl MessageQueue {
 
                     results.push(SendResult::RateLimited(cooldown));
 
-                    let _ = self.event_tx.send(QueueEvent::RateLimited {
+                    self.emit(QueueEvent::RateLimited {
                         provider: provider.to_string(),
                         cooldown,
-                    }).await;
+                    });
 
                     warn!("Rate limited on {}, cooling down for {:?}", provider, cooldown);
                     break;
@@ -431,12 +448,12 @@ impl MessageQueue {
 
                         results.push(SendResult::RetryLater(delay, e.to_string()));
 
-                        let _ = self.event_tx.send(QueueEvent::RetryScheduled {
+                        self.emit(QueueEvent::RetryScheduled {
                             provider: provider.to_string(),
                             message_id: msg.id,
                             attempt: msg.attempts,
                             retry_in: delay,
-                        }).await;
+                        });
 
                         debug!("Will retry message {} in {:?} (attempt {})", msg.id, delay, msg.attempts);
                     } else {
@@ -449,15 +466,15 @@ impl MessageQueue {
                             queue.stats.queued = queue.messages.len();
                         }
 
-                        let _ = self.event_tx.send(QueueEvent::Failed {
+                        self.emit(QueueEvent::Failed {
                             provider: provider.to_string(),
                             message_id: msg.id,
                             error: e.to_string(),
-                        }).await;
+                        });
 
                         error!("Message {} failed after {} attempts: {}", msg.id, msg.attempts, e);
-                        // Held across the event send so the `Failed` event is
-                        // ordered with the stats change it reports.
+                        // Held across the (synchronous) emit so the `Failed` event
+                        // is ordered with the stats change it reports.
                         drop(queues);
                     }
                 }
@@ -609,5 +626,31 @@ mod tests {
         let id = queue.enqueue(msg).await;
         assert_eq!(id, 0);
         assert_eq!(queue.len("test").await, 1);
+    }
+
+    /// Nobody reads the events: enqueueing past the event channel's 1000
+    /// still returns. It used to block forever on the 1001st, holding the
+    /// queues' write lock.
+    #[tokio::test]
+    async fn unread_events_never_block_the_queue() {
+        let queue = MessageQueue::default();
+        let enqueue_all = async {
+            let mut last = 0;
+            for n in 0..1_100 {
+                last = queue
+                    .enqueue(OutgoingMessage {
+                        channel: ChannelId::new("test", "123"),
+                        content: crate::MessageContent::text(format!("m{n}")),
+                        reply_to: None,
+                    })
+                    .await;
+            }
+            last
+        };
+        let last = tokio::time::timeout(std::time::Duration::from_secs(10), enqueue_all)
+            .await
+            .expect("enqueue never blocks on unread events");
+        assert_eq!(last, 1_099);
+        assert!(queue.len("test").await > 0);
     }
 }

@@ -447,24 +447,70 @@ pub async fn create_skill(
     })
 }
 
+/// The name of an existing skill, trimmed, or why it cannot name one.
+///
+/// One rule for every command that addresses an existing skill directory by
+/// name: non-empty, no path separator, no `..`, and only ASCII letters,
+/// digits, `-`, `_` and `.`. `Path::join` does the rest of the damage without
+/// it — `../x` walks out of the skills directory, and an absolute name
+/// REPLACES the base path outright.
+///
+/// # Errors
+///
+/// Returns the reason `name` is refused.
+fn validate_existing_skill_name(name: &str) -> Result<&str, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Skill name must be non-empty".into());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(format!(
+            "Invalid skill name '{name}': path separators and '..' are not allowed"
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(format!(
+            "Invalid skill name '{name}': only alphanumeric, '-', '_', '.' are allowed"
+        ));
+    }
+    debug_assert!(!name.starts_with('/'), "a separator-free name is relative");
+    Ok(name)
+}
+
 /// Update an existing skill's code.
 ///
 /// # Errors
 ///
-/// Fails when no skill directory named `name` exists, when it holds none of
-/// `tool.ts`, `tool.js`, `tool.yaml` and `tool.yml`, and when that file cannot
-/// be written.
+/// Fails when `name` is refused by [`validate_existing_skill_name`], when no
+/// skill directory named `name` exists or it resolves outside the skills
+/// directory (a symlink), when it holds none of `tool.ts`, `tool.js`,
+/// `tool.yaml` and `tool.yml`, and when that file cannot be written.
 #[tauri::command]
 pub async fn update_skill(
     state: State<'_, Arc<RwLock<AppState>>>,
     name: String,
     code: String,
 ) -> Result<SkillInfo, String> {
+    let name = validate_existing_skill_name(&name)?.to_string();
     let skills_path = get_skills_path(&*state.read().await).await;
 
     let skill_dir = skills_path.join(&name);
     if !skill_dir.exists() {
         return Err(format!("Skill '{name}' not found"));
+    }
+    // A skill directory that is a symlink resolves wherever it points; the
+    // write below must still land inside the skills directory.
+    let root = std::fs::canonicalize(&skills_path)
+        .map_err(|e| format!("Failed to resolve skills directory: {e}"))?;
+    let resolved = std::fs::canonicalize(&skill_dir)
+        .map_err(|e| format!("Failed to resolve skill '{name}': {e}"))?;
+    if !resolved.starts_with(&root) {
+        return Err(format!(
+            "Skill '{name}' resolves outside the skills directory"
+        ));
     }
 
     let code_files = ["tool.ts", "tool.js", "tool.yaml", "tool.yml"];
@@ -513,20 +559,7 @@ pub async fn delete_skill(
     state: State<'_, Arc<RwLock<AppState>>>,
     name: String,
 ) -> Result<(), String> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err("Skill name must be non-empty".into());
-    }
-    if name.contains('/') || name.contains('\\') || name.contains("..") {
-        return Err(format!(
-            "Invalid skill name '{name}': path separators and '..' are not allowed"
-        ));
-    }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
-        return Err(format!(
-            "Invalid skill name '{name}': only alphanumeric, '-', '_', '.' are allowed"
-        ));
-    }
+    let name = validate_existing_skill_name(&name)?;
 
     let skills_path = get_skills_path(&*state.read().await).await;
     let skills_root = if skills_path.exists() {
@@ -608,5 +641,38 @@ pub async fn test_skill(
             Err(e) => Err(format!("Invalid YAML: {e}")),
         },
         _ => Err(format!("Unknown skill type: {skill_type}")),
+    }
+}
+
+#[cfg(test)]
+mod skill_name_tests {
+    /// The name reaches `Path::join`: `../x` walks out of the skills
+    /// directory and an absolute name replaces it. `update_skill` joined
+    /// whatever it was given.
+    #[test]
+    fn a_skill_name_can_only_name_a_directory_inside_the_skills_dir() {
+        for bad in [
+            "",
+            "   ",
+            "../escape",
+            "a/b",
+            "a\\b",
+            "/etc/passwd",
+            "..",
+            "x y",
+        ] {
+            assert!(
+                super::validate_existing_skill_name(bad).is_err(),
+                "{bad:?} accepted"
+            );
+        }
+        assert_eq!(
+            super::validate_existing_skill_name(" web_search ").unwrap(),
+            "web_search"
+        );
+        assert_eq!(
+            super::validate_existing_skill_name("My-Tool.v2").unwrap(),
+            "My-Tool.v2"
+        );
     }
 }

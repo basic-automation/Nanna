@@ -382,15 +382,7 @@ Be concise and direct.",
 /// List recent sessions
 pub async fn list_sessions(config: &Config, limit: i64) -> anyhow::Result<()> {
     // Initialize storage only (no LLM needed)
-    let storage_path = config
-        .memory
-        .storage_path
-        .clone()
-        .unwrap_or_else(|| {
-            Config::default_data_dir()
-                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
-                .join("nanna.db")
-        });
+    let storage_path = crate::setup::cli_storage_path(config);
 
     let storage_config = StorageConfig {
         path: storage_path.to_string_lossy().to_string(),

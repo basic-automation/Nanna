@@ -24,10 +24,6 @@ pub struct ClientConfig {
     pub connect_timeout: Duration,
     /// Request timeout
     pub request_timeout: Duration,
-    /// Auto-reconnect on disconnect
-    pub auto_reconnect: bool,
-    /// Maximum reconnection attempts
-    pub max_reconnect_attempts: u32,
     /// Client identifier (for logging)
     pub client_id: Option<String>,
 }
@@ -38,8 +34,6 @@ impl Default for ClientConfig {
             url: nanna_daemon::ipc::default_daemon_ws_url(),
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(30),
-            auto_reconnect: true,
-            max_reconnect_attempts: 10,
             client_id: None,
         }
     }
@@ -60,7 +54,6 @@ pub enum ConnectionState {
     Disconnected,
     Connecting,
     Connected,
-    Reconnecting,
 }
 
 /// Pending request waiting for response
@@ -327,9 +320,13 @@ impl Client {
             pending.insert(id.clone(), PendingRequest { tx });
         }
         
-        // Send request
-        self.msg_tx.send(Message::Text(json.into())).await
-            .map_err(|e| ClientError::Request(e.to_string()))?;
+        // Send request. A send that fails leaves nothing that will ever answer
+        // the entry just registered, so it goes too — it used to stay in
+        // `pending` for the life of the client.
+        if let Err(e) = self.msg_tx.send(Message::Text(json.into())).await {
+            self.pending.write().await.remove(&id);
+            return Err(ClientError::Request(e.to_string()));
+        }
         
         // Wait for response with timeout
         match tokio::time::timeout(self.config.request_timeout, rx).await {

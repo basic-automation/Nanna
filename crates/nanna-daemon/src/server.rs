@@ -393,8 +393,8 @@ fn tags_with_provenance(
 /// of a 42-case test run and being told nothing was missing will report on what
 /// it saw. Reassemble, rather than keep a promise the retrieval path was not
 /// keeping.
-async fn assemble_handle_content(
-    memory: &Arc<MemoryService>,
+fn assemble_handle_content(
+    all: &[nanna_memory::MemoryListEntry],
     entry: &nanna_memory::MemoryListEntry,
 ) -> String {
     let Some(source_id) = entry.metadata.get("source_id") else {
@@ -402,10 +402,8 @@ async fn assemble_handle_content(
     };
     // `chunk` is `"i/N"`: the position, and the count the stub promised.
     let mut expected_count = 0_usize;
-    let mut chunks: Vec<(usize, String)> = memory
-        .list_all()
-        .await
-        .into_iter()
+    let mut chunks: Vec<(usize, &str)> = all
+        .iter()
         .filter(|e| e.metadata.get("source_id").is_some_and(|s| s == source_id))
         .map(|e| {
             let mark = e.metadata.get("chunk");
@@ -415,7 +413,7 @@ async fn assemble_handle_content(
             if let Some(total) = mark.and_then(|c| c.split('/').nth(1)?.parse::<usize>().ok()) {
                 expected_count = expected_count.max(total);
             }
-            (idx, e.content)
+            (idx, e.content.as_str())
         })
         .collect();
     if chunks.len() <= 1 {
@@ -507,19 +505,17 @@ fn recall_feedback(
 }
 
 /// The ids of the rows a handle's content was assembled from.
-async fn served_row_ids(
-    memory: &Arc<MemoryService>,
+fn served_row_ids(
+    all: &[nanna_memory::MemoryListEntry],
     entry: &nanna_memory::MemoryListEntry,
 ) -> Vec<String> {
     let Some(source_id) = entry.metadata.get("source_id") else {
         return vec![entry.id.clone()];
     };
-    let ids: Vec<String> = memory
-        .list_all()
-        .await
-        .into_iter()
+    let ids: Vec<String> = all
+        .iter()
         .filter(|e| e.metadata.get("source_id").is_some_and(|s| s == source_id))
-        .map(|e| e.id)
+        .map(|e| e.id.clone())
         .collect();
     if ids.is_empty() {
         vec![entry.id.clone()]
@@ -547,9 +543,19 @@ async fn resolve_memory_handle(
     memory: &Arc<MemoryService>,
     handle: &str,
 ) -> Result<nanna_memory::MemoryListEntry, String> {
+    resolve_memory_handle_in(&memory.list_all().await, handle)
+}
+
+/// [`resolve_memory_handle`] over a snapshot the caller already holds, so a
+/// caller that also assembles content reads ONE state of the store — not a
+/// resolve from one snapshot and a reassembly from a later one, with a dream
+/// cycle free to land in between.
+fn resolve_memory_handle_in(
+    all: &[nanna_memory::MemoryListEntry],
+    handle: &str,
+) -> Result<nanna_memory::MemoryListEntry, String> {
     const MAX_FORWARD_HOPS: usize = 8;
 
-    let all = memory.list_all().await;
     let direct = |needle: &str| -> Option<nanna_memory::MemoryListEntry> {
         all.iter()
             .find(|e| e.id == needle)
@@ -913,12 +919,10 @@ fn memory_search_services(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let limit = crate::numeric::usize_saturating(
-                    params
-                        .get("limit")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(10),
-                );
+                // Lenient: a JS number arrives as a float (`10.0`), which a
+                // strict `as_u64` read as absent and silently replaced with
+                // the default. `opt_count` takes it, and names a bad value.
+                let limit = opt_count(&params, "limit")?.unwrap_or(10);
                 // Per-result page budget. Storage is unbounded now, so a
                 // recall that returned whole memories would put an
                 // arbitrarily large payload into a fixed context window —
@@ -926,19 +930,9 @@ fn memory_search_services(
                 // worth of text: the same unit the memory was indexed in,
                 // so a page corresponds to something the retrieval actually
                 // reasoned about rather than to a round number of bytes.
-                let page_chars = params
-                    .get("page_chars")
-                    .and_then(serde_json::Value::as_u64)
-                    .map_or(
-                        nanna_memory::MEMORY_CHUNK_TARGET_CHARS,
-                        crate::numeric::usize_saturating,
-                    );
-                let offset = crate::numeric::usize_saturating(
-                    params
-                        .get("offset")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0),
-                );
+                let page_chars = opt_count(&params, "page_chars")?
+                    .unwrap_or(nanna_memory::MEMORY_CHUNK_TARGET_CHARS);
+                let offset = opt_count(&params, "offset")?.unwrap_or(0);
                 let workspace = ws.read().await;
                 match mem
                     .recall_scoped_with_coverage(&query, workspace.as_deref())
@@ -1159,10 +1153,13 @@ fn memory_read_services(
                 // the context the stub existed to protect.
                 let limit = opt_count(&params, "limit")?.unwrap_or(4_000);
 
-                let entry = resolve_memory_handle(&mem, &id).await?;
-                let content = assemble_handle_content(&mem, &entry).await;
+                // One snapshot for the resolve, the reassembly and the
+                // feedback: it used to be three full `list_all()` clones.
+                let all = mem.list_all().await;
+                let entry = resolve_memory_handle_in(&all, &id)?;
+                let content = assemble_handle_content(&all, &entry);
                 if let Some(dreaming) = feedback.as_ref().and_then(|slot| slot.get()) {
-                    let served = served_row_ids(&mem, &entry).await;
+                    let served = served_row_ids(&all, &entry);
                     for (memory_id, signal) in recall_feedback(offset, &served) {
                         dreaming.record_feedback(&memory_id, signal).await;
                     }
@@ -1347,10 +1344,7 @@ fn agent_spawn_services(
                     .and_then(|v| v.as_str())
                     .unwrap_or("sub-task")
                     .to_string();
-                let max_iterations = params
-                    .get("max_iterations")
-                    .and_then(serde_json::Value::as_u64)
-                    .map(crate::numeric::usize_saturating);
+                let max_iterations = opt_count(&params, "max_iterations")?;
                 match spawner.spawn(&prompt, &description, max_iterations).await {
                     Ok(result) => Ok(json!({
                         "text": result.text,
@@ -1366,6 +1360,14 @@ fn agent_spawn_services(
 
     services
 }
+
+/// Longest `python.exec` run a caller may ask for.
+///
+/// Bound justification: five minutes covers a real computation (a data
+/// transform, a small simulation) while a model that asks for hours cannot
+/// hold the call — and, until the engine's timeout kills, the interpreter —
+/// for that long.
+const PYTHON_EXEC_TIMEOUT_MAX_SECS: u64 = 300;
 
 /// `python.exec`: the embedded interpreter (no system Python required).
 fn python_exec_services() -> HashMap<String, ServiceFn> {
@@ -1385,10 +1387,11 @@ fn python_exec_services() -> HashMap<String, ServiceFn> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let timeout = params
-                    .get("timeout")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(30);
+                // Model-supplied, so bounded: an uncapped value held the call
+                // (and its interpreter) for as long as the model asked.
+                let timeout = opt_count(&params, "timeout")?
+                    .map_or(30, |secs| u64::try_from(secs).unwrap_or(u64::MAX))
+                    .min(PYTHON_EXEC_TIMEOUT_MAX_SECS);
                 let workdir = params
                     .get("workdir")
                     .and_then(|v| v.as_str())
@@ -1425,12 +1428,7 @@ fn session_history_services(session_history: SharedSessionHistory) -> HashMap<St
         Arc::new(move |params: Value| {
             let history = history.clone();
             Box::pin(async move {
-                let limit = crate::numeric::usize_saturating(
-                    params
-                        .get("limit")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(20),
-                );
+                let limit = opt_count(&params, "limit")?.unwrap_or(20);
                 let history = history.read().await;
                 let start = if history.len() > limit {
                     history.len() - limit
@@ -2583,6 +2581,36 @@ async fn run_scheduled_consolidation(
     outcome
 }
 
+/// The board fold (P25 DSP step 3), run right after each scheduled dream.
+///
+/// It writes memories, so it takes the same guards the dream does: skipped
+/// while a harness run is live, and only with the dream latch claimed.
+/// Deterministic and model-free, so it runs whether or not the model-driven
+/// cycle found anything to consolidate.
+async fn run_board_fold(
+    dreaming: Option<&Arc<nanna_memory::DreamingService>>,
+    storage: Option<&Arc<nanna_storage::Storage>>,
+    chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
+    dream_in_flight: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    let (Some(dreaming), Some(storage)) = (dreaming, storage) else {
+        return;
+    };
+    if chat_runs.any_active().await
+        || dream_in_flight.swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
+    let folded =
+        crate::memory_write_through::fold_closed_cards(storage, &dreaming.memory_arc()).await;
+    dream_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+    match folded {
+        Ok(0) => {}
+        Ok(count) => info!("Dream fold: {count} closed cards folded into memory"),
+        Err(e) => warn!("Dream fold failed: {e}"),
+    }
+}
+
 /// One dream cycle, with the latch already claimed by the caller.
 ///
 /// The idle gate AND the full cycle (feedback flush -> FSRS testing-effect
@@ -3018,6 +3046,65 @@ async fn run_recurrence_sweep(
     )
 }
 
+/// Name of the scheduled task that prunes the raw tool-call log.
+pub const TOOL_CALL_LOG_PRUNE_TASK: &str = "tool_call_log_prune";
+
+/// Name of the P15 recurrence sweep (which also announces due/overdue cards).
+pub const TASK_RECURRENCE_SWEEP_TASK: &str = "task_recurrence_sweep";
+
+/// Scheduled tasks that are the daemon's own machinery, not prompts.
+///
+/// They live in the same persisted `cron_jobs` table as the user's jobs, so any
+/// other scheduler over that table — `nanna serve` runs one — must recognise
+/// them and leave them alone. Unrecognised, a scheduler that runs payloads as
+/// agent prompts hands "Reopen recurring tasks…" (or a reminder's text) to the
+/// model, and one that fakes success consumes a one-shot reminder unsent.
+pub const DAEMON_SYSTEM_TASKS: &[&str] = &[
+    TASK_RECURRENCE_SWEEP_TASK,
+    TOOL_CALL_LOG_PRUNE_TASK,
+    crate::reminder_service::REMINDER_TASK_NAME,
+];
+
+/// Days of raw `tool_call_log` rows kept.
+///
+/// Bound justification: raw rows back only the "recent calls" view (the last
+/// 50 by default); per-hour and per-day history lives in the aggregate tables,
+/// which this does not touch. A month covers any debugging look-back, and at a
+/// heavy few thousand calls a day holds the table near 100k rows instead of
+/// growing for the daemon's whole life — which it did, because
+/// `prune_tool_call_log` had never had a caller.
+const TOOL_CALL_LOG_KEEP_DAYS: u32 = 30;
+
+/// The daily `tool_call_log_prune` scheduled task.
+///
+/// Returns the scheduler's `(success, output, error)` triple.
+async fn run_tool_call_log_prune(
+    storage: Option<&Arc<nanna_storage::Storage>>,
+) -> (bool, Option<String>, Option<String>) {
+    let Some(storage) = storage else {
+        return (true, Some("Skipped (no storage)".to_string()), None);
+    };
+    match storage.prune_tool_call_log(TOOL_CALL_LOG_KEEP_DAYS).await {
+        Ok(deleted) => {
+            if deleted > 0 {
+                info!(
+                    "Pruned {deleted} tool-call log rows older than {TOOL_CALL_LOG_KEEP_DAYS} days"
+                );
+            }
+            (
+                true,
+                Some(format!("Pruned {deleted} tool-call log rows")),
+                None,
+            )
+        }
+        Err(e) => (
+            false,
+            None,
+            Some(format!("tool-call log prune failed: {e}")),
+        ),
+    }
+}
+
 /// A reminder: delivered as a message, never run as a prompt.
 ///
 /// A reminder needs no model, and must not wait for one (see
@@ -3097,6 +3184,11 @@ pub struct DaemonServer {
     /// store WAS repaired and does persist. Surfaced on status so the state is
     /// observable rather than inferred from a log line at boot.
     storage_error: Option<String>,
+    /// The board memory write-through queue's receiving end, created with the
+    /// task event sink when storage opens and taken by `init_services` once the
+    /// memory service exists (P25 Stage 1). Left `None` — and so dropped —
+    /// when memory is disabled, which the sink reads as "no copies owed".
+    board_copies: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<nanna_storage::TaskEvent>>>,
     /// Terminal reason file: a durable record of WHY this process stopped, so
     /// the next boot can tell a clean shutdown from a hard death whose only
     /// other evidence is a log that simply ends (2026-08-10 ministral leg).
@@ -3252,6 +3344,7 @@ impl DaemonServer {
             storage: None,
             memory_recovery: None,
             storage_error: None,
+            board_copies: std::sync::Mutex::new(None),
             exit_reason,
         }
     }
@@ -3314,9 +3407,18 @@ impl DaemonServer {
                 // which is the only place that sees every writer — including
                 // the cascades (subtree cancel, ancestor auto-complete) that
                 // no caller ever names.
-                if !storage.set_task_events(Arc::new(
-                    crate::task_event_bridge::TaskEventBridge::new(self.ipc.event_sender()),
+                let (copies_tx, copies_rx) = tokio::sync::mpsc::channel(
+                    crate::memory_write_through::WRITE_THROUGH_QUEUE_MAX,
+                );
+                if storage.set_task_events(Arc::new(
+                    crate::task_event_bridge::TaskEventBridge::new(self.ipc.event_sender())
+                        .with_memory_write_through(copies_tx),
                 )) {
+                    *self
+                        .board_copies
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(copies_rx);
+                } else {
                     warn!("task event sink was already attached; keeping the existing one");
                 }
                 self.set_storage(storage);
@@ -3437,19 +3539,38 @@ impl DaemonServer {
         // engine — recurring todo items are reopened here, not by a second
         // clock inside the task store.
         if self.storage.is_some() {
-            let deduped = scheduler.deduplicate_by_name("task_recurrence_sweep").await;
+            let deduped = scheduler.deduplicate_by_name(TASK_RECURRENCE_SWEEP_TASK).await;
             if deduped > 0 {
                 info!("Removed {deduped} duplicate recurrence sweep tasks");
             }
-            if !scheduler.has_task_named("task_recurrence_sweep").await {
+            if !scheduler.has_task_named(TASK_RECURRENCE_SWEEP_TASK).await {
                 scheduler
                     .add_task(nanna_core::recurring_task(
-                        "task_recurrence_sweep",
+                        TASK_RECURRENCE_SWEEP_TASK,
                         std::time::Duration::from_secs(300),
                         "Reopen recurring tasks whose next occurrence has arrived.",
                     ))
                     .await;
                 info!("Scheduled task recurrence sweep (every 5 minutes)");
+            }
+
+            let deduped = scheduler.deduplicate_by_name(TOOL_CALL_LOG_PRUNE_TASK).await;
+            if deduped > 0 {
+                info!("Removed {deduped} duplicate tool-call log prune tasks");
+            }
+            if !scheduler.has_task_named(TOOL_CALL_LOG_PRUNE_TASK).await {
+                scheduler
+                    // Empty payload on purpose: the executor runs any task name
+                    // it does not recognise as an AGENT PROMPT, so a binary older
+                    // than this one (a rollback) would hand a prose payload to the
+                    // model — "delete … rows" included. An empty one it skips.
+                    .add_task(nanna_core::recurring_task(
+                        TOOL_CALL_LOG_PRUNE_TASK,
+                        std::time::Duration::from_hours(24),
+                        "",
+                    ))
+                    .await;
+                info!("Scheduled tool-call log prune (daily, keeping {TOOL_CALL_LOG_KEEP_DAYS} days)");
             }
         }
 
@@ -3533,7 +3654,7 @@ impl DaemonServer {
                 let started_at = chrono::Utc::now();
                 let (success, output, error) = match task.name.as_str() {
                     "memory_consolidation" => {
-                        run_scheduled_consolidation(
+                        let outcome = run_scheduled_consolidation(
                             dreaming.as_ref(),
                             &agent,
                             &router,
@@ -3542,11 +3663,18 @@ impl DaemonServer {
                             &dream_in_flight,
                             dream,
                         )
-                        .await
+                        .await;
+                        run_board_fold(
+                            dreaming.as_ref(),
+                            storage.as_ref(),
+                            &chat_runs,
+                            &dream_in_flight,
+                        )
+                        .await;
+                        outcome
                     }
-                    "task_recurrence_sweep" => {
-                        run_recurrence_sweep(storage.as_ref()).await
-                    }
+                    TASK_RECURRENCE_SWEEP_TASK => run_recurrence_sweep(storage.as_ref()).await,
+                    TOOL_CALL_LOG_PRUNE_TASK => run_tool_call_log_prune(storage.as_ref()).await,
                     crate::reminder_service::REMINDER_TASK_NAME => {
                         deliver_scheduled_reminder(&sessions, &events, &task, reminder_tick).await
                     }
@@ -3910,6 +4038,40 @@ impl DaemonServer {
         }
     }
 
+    /// Append a crashed run's recovered output to its session. `false` when
+    /// the session does not exist, so the caller keeps the checkpoint.
+    async fn repost_recovered(
+        &self,
+        session_id: &str,
+        partial: crate::agent_service::ChatResult,
+    ) -> bool {
+        let reasoning = partial.reasoning.clone();
+        let posted = self
+            .sessions
+            .add_full_message(
+                session_id,
+                crate::session::MessageRole::Assistant,
+                &partial.content,
+                crate::session::MessageDetails {
+                    tool_calls: partial.tool_calls,
+                    reasoning,
+                    timeline: partial.timeline,
+                    usage: partial.usage,
+                },
+            )
+            .await
+            .is_some();
+        if posted {
+            info!("Recovered crashed run for session {}", session_id);
+        } else {
+            warn!(
+                "Crashed run's checkpoint names session {} which does not exist — keeping the checkpoint",
+                session_id
+            );
+        }
+        posted
+    }
+
     /// Re-post the partial output of any run that crashed mid-turn.
     ///
     /// A checkpoint is deleted only after a SUCCESSFUL recovery (or when it
@@ -3929,22 +4091,10 @@ impl DaemonServer {
                         let mut recovered = false;
                         if let Ok(Some(data)) = storage.load_checkpoint(&session_id).await {
                             if let Some(partial) = agent.recover_checkpoint_from_data(&data) {
-                                let reasoning = partial.reasoning.clone();
-                                self.sessions
-                                    .add_full_message(
-                                        &session_id,
-                                        crate::session::MessageRole::Assistant,
-                                        &partial.content,
-                                        crate::session::MessageDetails {
-                                            tool_calls: partial.tool_calls,
-                                            reasoning,
-                                            timeline: partial.timeline,
-                                            usage: partial.usage,
-                                        },
-                                    )
-                                    .await;
-                                info!("Recovered crashed run for session {}", session_id);
-                                recovered = true;
+                                // `None` = no such session: the output had nowhere
+                                // to go. It used to be reported recovered and its
+                                // checkpoint deleted — the output lost for good.
+                                recovered = self.repost_recovered(&session_id, partial).await;
                             } else if serde_json::from_str::<serde_json::Value>(&data).is_ok() {
                                 // Parsed fine but held nothing recoverable —
                                 // an empty checkpoint is safe to clean up.
@@ -3983,28 +4133,15 @@ impl DaemonServer {
                             .and_then(|s| s.strip_suffix(".json"))
                             .unwrap_or("");
                         if !session_id.is_empty() {
-                            if let Some(partial) = agent.recover_checkpoint(session_id) {
-                                let reasoning = partial.reasoning.clone();
-                                self.sessions
-                                    .add_full_message(
-                                        session_id,
-                                        crate::session::MessageRole::Assistant,
-                                        &partial.content,
-                                        crate::session::MessageDetails {
-                                            tool_calls: partial.tool_calls,
-                                            reasoning,
-                                            timeline: partial.timeline,
-                                            usage: partial.usage,
-                                        },
-                                    )
-                                    .await;
-                                info!(
-                                    "Recovered crashed run from legacy checkpoint for session {}",
-                                    session_id
-                                );
+                            let reposted = match agent.recover_checkpoint(session_id) {
+                                Some(partial) => self.repost_recovered(session_id, partial).await,
+                                None => true,
+                            };
+                            // Remove the legacy file — unless its output found no
+                            // session to go to, as for the stored checkpoints.
+                            if reposted {
+                                let _ = std::fs::remove_file(entry.path());
                             }
-                            // Remove the legacy file
-                            let _ = std::fs::remove_file(entry.path());
                         }
                     }
                 }
@@ -4742,6 +4879,7 @@ impl DaemonServer {
         let tools_dir = self.resolve_tools_directory();
 
         let memory = self.init_memory_service(chat_runs, degradations).await;
+        self.start_board_write_through(memory.as_ref());
 
         // ONE config for every long-lived collaborator below. The sub-agent
         // spawner and the script summarizer are constructed BEFORE the agent
@@ -5059,6 +5197,31 @@ impl DaemonServer {
             Some(resolved)
         } else {
             None
+        }
+    }
+
+    /// Start draining the board write-through queue (P25 Stage 1): memory
+    /// copies when memory is enabled, timeline episodes whenever storage is.
+    ///
+    /// Runs at most once: the receiver is taken. Without storage the receiver
+    /// is dropped here, and the sink reads the closed queue as "nothing owed"
+    /// instead of filling it.
+    fn start_board_write_through(&self, memory: Option<&Arc<MemoryService>>) {
+        let queue = self
+            .board_copies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let (Some(queue), Some(storage)) = (queue, self.storage.as_ref()) {
+            tokio::spawn(crate::memory_write_through::run(
+                queue,
+                Arc::clone(storage),
+                memory.cloned(),
+            ));
+            info!(
+                memory_copies = memory.is_some(),
+                "Board write-through running: cards and posts feed the timeline and memory"
+            );
         }
     }
 
@@ -6422,6 +6585,37 @@ fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsC
 mod tests {
     use super::*;
 
+    /// A JS number reaches a service as a float (`2.0`). A strict `as_u64`
+    /// read it as absent and silently used the default instead; the model's
+    /// `limit` had no effect at all.
+    #[tokio::test]
+    async fn a_float_count_from_script_is_the_count_it_says() {
+        let history: SharedSessionHistory = Arc::new(tokio::sync::RwLock::new(
+            (0..5)
+                .map(|n| crate::session::SessionMessage {
+                    id: n.to_string(),
+                    role: crate::session::MessageRole::User,
+                    content: format!("message {n}"),
+                    timestamp: chrono::Utc::now(),
+                    tool_calls: Vec::new(),
+                    attachments: Vec::new(),
+                    reasoning: None,
+                    timeline: Vec::new(),
+                    usage: None,
+                })
+                .collect(),
+        ));
+        let services = session_history_services(history);
+        let two = services["session.history"](serde_json::json!({ "limit": 2.0 }))
+            .await
+            .expect("a float count is read");
+        assert_eq!(two.as_array().map(Vec::len), Some(2), "{two}");
+        let refused = services["session.history"](serde_json::json!({ "limit": "lots" }))
+            .await
+            .expect_err("a count that is not a number is named, not defaulted");
+        assert!(refused.contains("limit"), "{refused}");
+    }
+
     /// With no Settings summarization list, `memory.summarize` walks the chat
     /// models in their configured order — the rule every memory consumer
     /// shares. It used to take the single chat model, so a first chat model
@@ -6648,7 +6842,7 @@ mod tests {
         let service = seeded_chunk_store(3, 3).await;
         let entry = first_entry(&service).await;
 
-        let assembled = assemble_handle_content(&service, &entry).await;
+        let assembled = assemble_handle_content(&service.list_all().await, &entry);
 
         assert_eq!(assembled, "part 1\npart 2\npart 3");
         assert!(!assembled.contains("[SYSTEM:"));
@@ -6664,7 +6858,7 @@ mod tests {
         let service = seeded_chunk_store(2, 17).await;
         let entry = first_entry(&service).await;
 
-        let assembled = assemble_handle_content(&service, &entry).await;
+        let assembled = assemble_handle_content(&service.list_all().await, &entry);
 
         assert!(assembled.starts_with("part 1\npart 2"), "content still comes first");
         assert!(assembled.contains("2 of 17 stored chunks"), "{assembled}");
@@ -6687,7 +6881,7 @@ mod tests {
             assert!(stored.metadata.contains_key("source_id"));
         }
 
-        let assembled = assemble_handle_content(&service, &entry).await;
+        let assembled = assemble_handle_content(&service.list_all().await, &entry);
         assert!(!assembled.contains("[SYSTEM:"), "{assembled}");
     }
 
@@ -7467,5 +7661,4 @@ mod tests {
         doc.save_to(&mut bytes).expect("document saves");
         bytes
     }
-
 }

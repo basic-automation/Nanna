@@ -3777,6 +3777,81 @@ async fn race_stream_cancel<F: std::future::Future>(
     }
 }
 
+/// Tools that only read: a batch made only of these may run in parallel.
+///
+/// An allowlist, so an unknown tool — a new skill, an MCP tool — counts as
+/// one that may change something, and the batch it is in runs in order.
+/// Canonical names plus the Claude Code aliases models send.
+const READ_ONLY_TOOLS: &[&str] = &[
+    "read_file",
+    "read_pdf",
+    "list_dir",
+    "find_files",
+    "search_file",
+    "code_search",
+    "code_outline",
+    "project_structure",
+    "file_history",
+    "web_search",
+    "web_search_batch",
+    "web_fetch",
+    "recall",
+    "recall_messages",
+    "status",
+    "discover_tools",
+    "list_reminders",
+    "list_user_tools",
+    "describe_image",
+    "analyze_image",
+    "ocr",
+    "echo",
+    "Read",
+    "Glob",
+    "Grep",
+    "LS",
+    "WebFetch",
+    "WebSearch",
+];
+
+/// Whether `name` is a tool that cannot change anything.
+fn is_read_only_tool(name: &str) -> bool {
+    READ_ONLY_TOOLS.contains(&name)
+}
+
+/// Run one turn's tool calls: all at once when `parallel`, else one after
+/// another in the order given.
+///
+/// A turn's calls used to run concurrently while their results were presented
+/// in order, as if sequential: `write_file` then `exec cargo test` in one turn
+/// could test the OLD file, and the model — reading "wrote it, then the test
+/// failed" — would chase a bug that was only a race. Parallelism is kept for
+/// batches that only read, where order cannot change an answer.
+async fn run_tool_batch<F: std::future::Future>(futures: Vec<F>, parallel: bool) -> Vec<F::Output> {
+    if parallel {
+        return futures::future::join_all(futures).await;
+    }
+    let mut outputs = Vec::with_capacity(futures.len());
+    for future in futures {
+        outputs.push(future.await);
+    }
+    outputs
+}
+
+/// A provider error mid-stream as the `Err` it is; every other event passes./// A provider error mid-stream as the `Err` it is; every other event passes.
+///
+/// Both error events used to fall into the stream loop's `_ => {}`: an
+/// overload, a 429 or a dropped connection ended the loop as though the model
+/// had finished, and the truncated text became the answer — no retry, no
+/// fallback model. As `Err` they reach `call_llm`'s backoff and the caller's
+/// escalation like any failed call.
+fn stream_failure(event: StreamEvent) -> Result<StreamEvent, AgentError> {
+    match event {
+        StreamEvent::RecoverableError { error, .. } => Err(error.into()),
+        StreamEvent::Error { message } => Err(nanna_llm::LlmError::Stream(message).into()),
+        other => Ok(other),
+    }
+}
+
 /// The error for a stream that stayed silent past the `watchdog`, logged
 /// loudly as it is built.
 fn stream_watchdog_error(model: &str, watchdog: std::time::Duration) -> AgentError {
@@ -4584,7 +4659,6 @@ impl Agent {
         )
         .await;
         self.post_hoc_spiral_nudge(state, &result).await?;
-        Self::enforce_token_budget(state, options)?;
 
         let salvage = self.salvage_prose_calls(state, &mut result).await;
 
@@ -4601,11 +4675,16 @@ impl Agent {
         if !result.text.is_empty() {
             state.final_text = result.text;
         }
-        // Mid-stream cancel closes the LLM call with partial text; fold it and exit.
-        if options.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
-            // Content blocks may already be stored above — finish_cancelled
-            // de-dupes the cancel marker message.
-            return ControlFlow::Break(RunExit::Cancelled);
+        if let Some(exit) = self
+            .stop_after_stored_reply(
+                state,
+                options,
+                &result.tool_uses,
+                &result.error_tool_results,
+            )
+            .await
+        {
+            return ControlFlow::Break(exit);
         }
 
         // If no tool calls, check for narration loop before exiting.
@@ -5770,6 +5849,78 @@ impl Agent {
         ControlFlow::Continue(())
     }
 
+    /// The exits taken once a reply is stored, before any of its calls run:
+    /// a mid-stream cancel, then a spent token budget. Each pairs the reply's
+    /// calls with "skipped" results first, so the stored turn stays valid.
+    ///
+    /// The budget check runs HERE, after the reply is stored and taken as the
+    /// final text. It used to run first, so the reply just paid for was thrown
+    /// away and the run ended on the previous round's text.
+    async fn stop_after_stored_reply(
+        &self,
+        state: &mut RunState,
+        options: &RunOptions,
+        tool_uses: &[(String, String, Value)],
+        error_tool_results: &[ContentBlock],
+    ) -> Option<RunExit> {
+        // Mid-stream cancel closes the LLM call with partial text; fold it and
+        // exit. finish_cancelled de-dupes the cancel marker message.
+        let (exit, why) = if options
+            .cancel
+            .as_ref()
+            .is_some_and(CancelToken::is_cancelled)
+        {
+            (
+                RunExit::Cancelled,
+                "the user cancelled the run before this tool started",
+            )
+        } else if let ControlFlow::Break(exit) = Self::enforce_token_budget(state, options) {
+            (
+                exit,
+                "the run's token budget ran out before this tool started",
+            )
+        } else {
+            return None;
+        };
+        self.pair_unrun_calls(tool_uses, error_tool_results, why)
+            .await;
+        Some(exit)
+    }
+
+    /// Pair every call in a stored reply that will never run with a result
+    /// saying so, before the loop exits without reaching `execute_tools`.
+    ///
+    /// The stored assistant turn carries its `tool_use` blocks; left unpaired,
+    /// the NEXT request is one Anthropic rejects outright (every `tool_use`
+    /// needs its `tool_result`), so a Stop or a spent budget broke the
+    /// conversation's following turn. Malformed calls already carry their
+    /// synthesized error results, which are stored the same way.
+    async fn pair_unrun_calls(
+        &self,
+        tool_uses: &[(String, String, Value)],
+        error_tool_results: &[ContentBlock],
+        why: &str,
+    ) {
+        if tool_uses.is_empty() && error_tool_results.is_empty() {
+            return;
+        }
+        let mut blocks: Vec<ContentBlock> = tool_uses
+            .iter()
+            .map(|(id, _, _)| ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content: format!("[Skipped: {why}. Nothing was executed.]"),
+                is_error: Some(true),
+            })
+            .collect();
+        blocks.extend(error_tool_results.iter().cloned());
+        debug_assert!(!blocks.is_empty(), "only called with calls to pair");
+        self.context
+            .write()
+            .await
+            .messages
+            .push(AnthropicMessage::user(blocks));
+    }
+
     /// End the run once the token budget is spent; warn as it nears.
     fn enforce_token_budget(state: &mut RunState, options: &RunOptions) -> Pass {
         // Token budget enforcement
@@ -6705,6 +6856,16 @@ impl Agent {
             }
             ctx.messages.push(AnthropicMessage::user(blocks));
         }
+        // This message IS the live request. `pin_live_request` existed with no
+        // caller, so every cut path fell back to index 0 — the OLDEST message
+        // of a long session — and compression could cut away the very
+        // question the run was answering while protecting a stale one.
+        ctx.pin_live_request();
+        debug_assert_eq!(
+            ctx.pinned_index() + 1,
+            ctx.messages.len(),
+            "the pin names the message just pushed"
+        );
     }
 
     /// Cooperative cancel: preserve unfinished text in the response AND in the
@@ -6887,7 +7048,7 @@ impl Agent {
                 Err(_elapsed) => return Err(stream_watchdog_error(&request.model, watchdog)),
             };
             let Some(event) = event else { break };
-            match event? {
+            match stream_failure(event?)? {
                 StreamEvent::TextDelta { text, .. } => {
                     on_text(&text);
                     asm.on_text(&text);
@@ -7434,10 +7595,14 @@ impl Agent {
         tool_calls_with_meta: &[(String, String, Value, ToolCall)],
         breaker_notices: &[Option<String>],
     ) -> ControlFlow<Vec<ContentBlock>, Vec<(ToolResponse, u64)>> {
-        // Phase 2: Execute all tools in parallel
+        // Phase 2: execute the batch — in parallel only when every call is
+        // read-only; otherwise one at a time, in the order the model wrote.
+        let parallel = tool_calls_with_meta
+            .iter()
+            .all(|(_, name, _, _)| is_read_only_tool(name));
         info!(
-            "🚀 Executing {} tools in parallel",
-            tool_calls_with_meta.len()
+            count = tool_calls_with_meta.len(),
+            parallel, "🚀 Executing tool batch"
         );
         let tool_futures: Vec<_> = tool_calls_with_meta
             .iter()
@@ -7504,7 +7669,7 @@ impl Agent {
         let results = if let Some(token) = options.cancel.as_ref() {
             tokio::select! {
                 biased;
-                joined = futures::future::join_all(tool_futures) => joined,
+                joined = run_tool_batch(tool_futures, parallel) => joined,
                 () = token.cancelled() => {
                     const INTERRUPTED: &str =
                         "[Interrupted: the user cancelled the run while this tool was \
@@ -7531,7 +7696,7 @@ impl Agent {
                 }
             }
         } else {
-            futures::future::join_all(tool_futures).await
+            run_tool_batch(tool_futures, parallel).await
         };
         ControlFlow::Continue(results)
     }
@@ -8121,13 +8286,32 @@ impl Agent {
     /// - `OpenAI`: "maximum context length" / "reduce the length"
     /// - Anthropic: "prompt is too long"
     fn is_context_length_error(error: &str) -> bool {
+        const INPUT_TOO_LONG: [&str; 8] = [
+            "context_length_exceeded",
+            "maximum context length",
+            "reduce the length",
+            "prompt is too long",
+            "too many tokens",
+            "exceeds the context length",
+            "exceeds the context window",
+            "input is too long",
+        ];
         let lower = error.to_lowercase();
-        lower.contains("context_length_exceeded")
-            || lower.contains("maximum context length")
-            || lower.contains("reduce the length")
-            || lower.contains("prompt is too long")
-            || lower.contains("too many tokens")
-            || (lower.contains("400") && lower.contains("token"))
+        // A refusal of the OUTPUT budget is not a context overflow. Anthropic's
+        // "max_tokens: N > M, which is the maximum allowed number of output
+        // tokens" is a 400 that mentions tokens, and the old catch-all
+        // `400 && "token"` matched it — so the loop halved the conversation, a
+        // remedy that destroys context and cannot fix a `max_tokens` setting.
+        // Same for a per-minute token RATE limit ("tokens per min", "TPM"):
+        // waiting fixes it, shrinking the conversation does not.
+        if lower.contains("max_tokens")
+            || lower.contains("output tokens")
+            || lower.contains("rate limit")
+            || lower.contains("per min")
+        {
+            return false;
+        }
+        INPUT_TOO_LONG.iter().any(|phrase| lower.contains(phrase))
     }
 
     /// Compress large tool results in older messages using the summarization-model
@@ -8303,6 +8487,21 @@ impl Agent {
                         );
                         continue;
                     }
+
+                if !provider_serves(self.llm.provider(), &tier_entry.model) {
+                    // Once per process: the config does not change between
+                    // iterations, so repeating this is noise.
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        warn!(
+                            model = %tier_entry.model,
+                            provider = ?self.llm.provider(),
+                            "Model routing: skipping an entry this agent's provider cannot serve"
+                        );
+                    }
+                    continue;
+                }
 
                 if tier_entry.model != self.config.model {
                     info!(
@@ -9413,6 +9612,33 @@ Example: [{{"content": "User prefers dark mode", "category": "preference", "prov
     )
 }
 
+/// Whether a client for `provider` can serve the routing entry `model`.
+///
+/// Routing rewrites only the request's model name — the request still goes to
+/// this agent's one client — so an entry whose explicit prefix names ANOTHER
+/// provider (`openai/gpt-4o` on an Anthropic client) is a guaranteed 4xx. That
+/// failure was then escalated to the primary: every such routed step paid a
+/// wasted round trip plus a false failure against the routed model. Only the
+/// explicit prefixes are judged; a bare name is left to the client, as before.
+fn provider_serves(provider: nanna_llm::Provider, model: &str) -> bool {
+    use nanna_llm::Provider as P;
+    const PREFIXES: [(&str, &[P]); 5] = [
+        ("openrouter/", &[P::OpenRouter]),
+        ("github/", &[P::GitHubModels]),
+        ("ollama/", &[P::Ollama]),
+        ("anthropic/", &[P::Anthropic, P::ClaudeProxy]),
+        ("openai/", &[P::OpenAI]),
+    ];
+    PREFIXES
+        .iter()
+        .find(|(prefix, _)| {
+            model
+                .get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        })
+        .is_none_or(|(_, served_by)| served_by.contains(&provider))
+}
+
 /// The structural complexity heuristic behind `Agent::classify_complexity`,
 /// over the context's messages and the run's iteration count.
 fn classify_messages(messages: &[AnthropicMessage], iterations: usize) -> TaskComplexity {
@@ -10251,7 +10477,225 @@ fn parse_exit_code_prefix(text: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    /// A routing entry is judged by its explicit prefix only; a bare name is
+    /// the client's to resolve, as it always was.
+    #[test]
+    fn routing_skips_entries_another_provider_serves() {
+        use super::provider_serves;
+        use nanna_llm::Provider;
+        assert!(!provider_serves(Provider::Anthropic, "openai/gpt-4o"));
+        assert!(!provider_serves(
+            Provider::Anthropic,
+            "OpenRouter/anthropic/claude-haiku-4.5"
+        ));
+        assert!(!provider_serves(
+            Provider::Ollama,
+            "anthropic/claude-haiku-4-5"
+        ));
+        assert!(provider_serves(
+            Provider::OpenRouter,
+            "openrouter/anthropic/claude-haiku-4.5"
+        ));
+        assert!(provider_serves(
+            Provider::ClaudeProxy,
+            "anthropic/claude-sonnet-5"
+        ));
+        assert!(provider_serves(Provider::Ollama, "ollama/qwen3.5:9b"));
+        assert!(
+            provider_serves(Provider::Anthropic, "claude-haiku-4-5"),
+            "bare names pass"
+        );
+        assert!(provider_serves(Provider::Ollama, "qwen3.5:9b"));
+    }
+
     use super::*;
+
+    fn tool_result_ids(message: &AnthropicMessage) -> Vec<String> {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A Stop, or a spent budget, after a reply with calls is stored: every
+    /// call gets a "skipped" result, or the next request carries an unpaired
+    /// `tool_use` that Anthropic rejects outright. And the budget exit keeps
+    /// the reply it just paid for as the answer.
+    #[tokio::test]
+    async fn a_stopped_round_pairs_its_calls_and_keeps_its_reply() {
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        let agent = Agent::new(AgentConfig::default(), llm, Arc::new(ToolRegistry::new()));
+        let calls = vec![
+            (
+                "call-1".to_string(),
+                "read".to_string(),
+                serde_json::json!({}),
+            ),
+            (
+                "call-2".to_string(),
+                "write".to_string(),
+                serde_json::json!({}),
+            ),
+        ];
+
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let options = RunOptions {
+            cancel: Some(cancel),
+            ..RunOptions::default()
+        };
+        let mut state = RunState::new();
+        let exit = agent
+            .stop_after_stored_reply(&mut state, &options, &calls, &[])
+            .await;
+        assert!(matches!(exit, Some(RunExit::Cancelled)));
+        let last = agent
+            .context()
+            .await
+            .messages
+            .last()
+            .cloned()
+            .expect("a message");
+        assert_eq!(tool_result_ids(&last), ["call-1", "call-2"]);
+
+        let options = RunOptions {
+            token_budget: Some(100),
+            ..RunOptions::default()
+        };
+        let mut state = RunState::new();
+        state.input_tokens = 150;
+        state.final_text = "the reply just paid for".to_string();
+        let exit = agent
+            .stop_after_stored_reply(&mut state, &options, &calls, &[])
+            .await;
+        assert!(matches!(exit, Some(RunExit::Respond { truncated: true })));
+        assert!(
+            state.final_text.starts_with("the reply just paid for"),
+            "{}",
+            state.final_text
+        );
+        let last = agent
+            .context()
+            .await
+            .messages
+            .last()
+            .cloned()
+            .expect("a message");
+        assert_eq!(tool_result_ids(&last), ["call-1", "call-2"]);
+
+        let mut state = RunState::new();
+        assert!(
+            agent
+                .stop_after_stored_reply(&mut state, &RunOptions::default(), &calls, &[])
+                .await
+                .is_none(),
+            "a round that is not stopping pairs nothing"
+        );
+    }
+
+    /// A batch with a call that can change something runs in the model's
+    /// order: a slow first call finishes before the second starts. A batch that
+    /// only reads keeps its parallelism.
+    #[tokio::test]
+    async fn a_mutating_batch_runs_in_order_and_a_read_only_one_in_parallel() {
+        async fn batch(parallel: bool) -> Vec<&'static str> {
+            let finished = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let make = |label: &'static str, delay_ms: u64| {
+                let finished = Arc::clone(&finished);
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    finished.lock().expect("lock").push(label);
+                }
+            };
+            let futures = vec![
+                Box::pin(make("write", 40))
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+                Box::pin(make("test", 0)),
+            ];
+            run_tool_batch(futures, parallel).await;
+            finished.lock().expect("lock").clone()
+        }
+        assert_eq!(
+            batch(false).await,
+            ["write", "test"],
+            "the test sees the write"
+        );
+        assert_eq!(batch(true).await, ["test", "write"], "reads still overlap");
+
+        assert!(is_read_only_tool("read_file") && is_read_only_tool("Grep"));
+        for mutating in [
+            "exec",
+            "write_file",
+            "edit_file",
+            "python",
+            "mcp__github__create_issue",
+        ] {
+            assert!(!is_read_only_tool(mutating), "{mutating}");
+        }
+    }
+
+    /// Only an INPUT overflow halves the conversation. The old catch-all
+    /// (`400` and `token`) also matched Anthropic's output-budget refusal and
+    /// per-minute token rate limits, and destroyed context for both.
+    #[test]
+    fn only_an_input_overflow_reads_as_a_context_length_error() {
+        for overflow in [
+            "API error: 400 - prompt is too long: 210000 tokens > 200000 maximum",
+            "This model's maximum context length is 128000 tokens (context_length_exceeded)",
+            "the input length exceeds the context length",
+            "Please reduce the length of the messages.",
+        ] {
+            assert!(Agent::is_context_length_error(overflow), "{overflow}");
+        }
+        for not_overflow in [
+            "API error: 400 - max_tokens: 100000 > 64000, which is the maximum allowed number \
+             of output tokens for claude-sonnet-5",
+            "Rate limit reached for gpt-5 on tokens per min (TPM): too many tokens",
+            "API error: 400 - invalid token in request body",
+            "API error: 401 - invalid x-api-key",
+        ] {
+            assert!(
+                !Agent::is_context_length_error(not_overflow),
+                "{not_overflow}"
+            );
+        }
+    }
+
+    /// Mid-stream provider errors end the call as a failure — the retry and
+    /// escalation machinery only ever sees an `Err` — while ordinary events
+    /// pass through untouched.
+    #[test]
+    fn a_mid_stream_provider_error_is_a_failed_call() {
+        let overloaded = StreamEvent::RecoverableError {
+            error: nanna_llm::LlmError::Api {
+                status: 529,
+                message: "overloaded_error: Overloaded".to_string(),
+            },
+            partial_text: "half an ans".to_string(),
+            partial_tool_calls: Vec::new(),
+        };
+        match stream_failure(overloaded) {
+            Err(AgentError::Llm(e)) => assert!(e.should_fallback(), "{e}"),
+            other => panic!("an overload must fail the call, got {other:?}"),
+        }
+        assert!(matches!(
+            stream_failure(StreamEvent::Error {
+                message: "bad".to_string()
+            }),
+            Err(AgentError::Llm(nanna_llm::LlmError::Stream(_)))
+        ));
+        assert!(matches!(
+            stream_failure(StreamEvent::TextDelta {
+                index: 0,
+                text: "hi".to_string()
+            }),
+            Ok(StreamEvent::TextDelta { .. })
+        ));
+    }
 
     /// A write that lands and breaks the file is not landed work. The guardrail
     /// matters as much as the finding: only a verdict that actually RAN and
@@ -11960,6 +12404,37 @@ mod repeat_failure_breaker_tests {
                 Ok(ToolResult::success("ok"))
             }
         }
+    }
+
+    /// The run's request is pinned by the one path that pushes it. The pin had
+    /// no caller at all, so every cut path fell back to index 0 — in a long
+    /// session, the OLDEST message — and `the_live_request_survives_every_cut_path`
+    /// only held because that test pins by hand.
+    #[tokio::test]
+    async fn the_runs_request_is_pinned_where_it_is_pushed() {
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        let agent = Agent::new(AgentConfig::default(), llm, Arc::new(ToolRegistry::new()));
+        {
+            let mut ctx = agent.context.write().await;
+            for turn in ["an old question", "an old answer", "another old question"] {
+                ctx.messages.push(AnthropicMessage::user_text(turn));
+            }
+        }
+        agent
+            .add_user_message_with_budget("the live question", &RunOptions::default())
+            .await;
+
+        let ctx = agent.context().await;
+        assert_eq!(
+            ctx.pinned_index(),
+            3,
+            "the pin names the new request, not index 0"
+        );
+        let pinned = &ctx.messages[ctx.pinned_index()];
+        assert!(
+            format!("{pinned:?}").contains("the live question"),
+            "{pinned:?}"
+        );
     }
 
     async fn flaky_agent(fail: Arc<AtomicBool>, executions: Arc<AtomicUsize>) -> Agent {

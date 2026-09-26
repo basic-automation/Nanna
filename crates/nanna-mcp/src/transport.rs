@@ -419,6 +419,21 @@ pub mod stdio {
                     }
                 }
             }
+            // Nothing will answer the calls still waiting: drop their senders
+            // so each fails now as `ConnectionClosed`, instead of every one of
+            // them sitting out the full request timeout against a dead server.
+            let orphaned = {
+                let mut waiting = pending.lock().await;
+                let orphaned = waiting.len();
+                waiting.clear();
+                orphaned
+            };
+            if orphaned > 0 {
+                warn!(
+                    orphaned,
+                    "MCP server stream ended with calls in flight; failing them now"
+                );
+            }
         }
 
         /// Deliver one server line to where its shape says it belongs.
@@ -477,7 +492,7 @@ pub mod stdio {
             }
 
             // Wait for response with timeout
-            match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+            match tokio::time::timeout(crate::MCP_REQUEST_TIMEOUT, rx).await {
                 Ok(Ok(response)) => Ok(response),
                 Ok(Err(_)) => Err(McpError::ConnectionClosed),
                 Err(_) => {
@@ -596,6 +611,44 @@ pub mod stdio {
             assert!(
                 status.is_some_and(|s| !s.success()),
                 "killed, not exited: {status:?}"
+            );
+        }
+
+        /// A server that reads the request and dies without answering. Its
+        /// waiter used to stay in `pending` and sit out the whole request
+        /// timeout; the reader now fails it the moment stdout ends.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_server_that_dies_mid_call_fails_the_call_at_once() {
+            let transport =
+                super::StdioTransport::spawn("sh", &["-c", "read line; exit 0"]).unwrap();
+            let started = std::time::Instant::now();
+            let answer = transport
+                .request(super::JsonRpcRequest::new(1_i64, "tools/list", None))
+                .await;
+            assert!(
+                matches!(answer, Err(super::McpError::ConnectionClosed)),
+                "{answer:?}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "failed on EOF, not after the {:?} timeout: {:?}",
+                crate::MCP_REQUEST_TIMEOUT,
+                started.elapsed()
+            );
+        }
+
+        #[test]
+        fn the_registry_deadline_sits_past_the_transport_timeout() {
+            let transport = crate::MCP_REQUEST_TIMEOUT.as_secs();
+            let registry = transport + crate::MCP_DEADLINE_MARGIN_SECS;
+            assert!(
+                registry > transport,
+                "the transport's own timeout must fire first"
+            );
+            assert_eq!(
+                crate::streamable_http::HTTP_REQUEST_TIMEOUT.as_secs(),
+                transport
             );
         }
 
@@ -762,403 +815,6 @@ pub mod stdio {
 
 #[cfg(feature = "stdio")]
 pub use stdio::{MCP_EXIT_GRACE, StdioTransport};
-
-// ============================================================================
-// HTTP Transport
-// ============================================================================
-
-#[cfg(feature = "http")]
-/// Split the first complete SSE event (terminated by a blank line) off the
-/// front of `buffer`, without the terminator. `None` until one is complete.
-fn take_sse_event(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
-    const TERMINATOR: &[u8] = b"\n\n";
-    let at = buffer
-        .windows(TERMINATOR.len())
-        .position(|window| window == TERMINATOR)?;
-    let mut event: Vec<u8> = buffer.drain(..at + TERMINATOR.len()).collect();
-    event.truncate(at);
-    debug_assert!(
-        !event.ends_with(TERMINATOR),
-        "the terminator is not part of the event"
-    );
-    Some(event)
-}
-
-#[cfg(test)]
-mod sse_event_tests {
-    use super::take_sse_event;
-
-    /// A multibyte character split across network chunks reaches the event
-    /// whole; the old per-chunk decode dropped the chunk and the event.
-    #[test]
-    fn an_event_split_mid_character_arrives_whole() {
-        let wire = "data: {\"result\":\"月 🌙\"}\n\n".as_bytes();
-        for split in 0..wire.len() {
-            let mut buffer = Vec::new();
-            buffer.extend_from_slice(&wire[..split]);
-            let early = take_sse_event(&mut buffer);
-            buffer.extend_from_slice(&wire[split..]);
-            let event = early
-                .or_else(|| take_sse_event(&mut buffer))
-                .expect("one event");
-            assert_eq!(
-                String::from_utf8(event).expect("whole characters"),
-                "data: {\"result\":\"月 🌙\"}",
-                "split at byte {split}"
-            );
-            assert!(buffer.is_empty(), "nothing left over");
-        }
-    }
-
-    #[test]
-    fn events_are_taken_one_at_a_time() {
-        let mut buffer = b"a\n\nb\n\nc".to_vec();
-        assert_eq!(take_sse_event(&mut buffer).as_deref(), Some(&b"a"[..]));
-        assert_eq!(take_sse_event(&mut buffer).as_deref(), Some(&b"b"[..]));
-        assert_eq!(take_sse_event(&mut buffer), None, "c is incomplete");
-        assert_eq!(buffer, b"c");
-    }
-}
-
-pub mod http {
-    use super::{async_trait, Arc, Mutex, JsonRpcResponse, Result, McpError, Transport, JsonRpcRequest, JsonRpcNotification};
-    use futures::StreamExt;
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio::sync::{mpsc, oneshot};
-    use tracing::{debug, error, trace, warn};
-
-    /// HTTP transport - connects to an MCP server over HTTP with SSE
-    pub struct HttpTransport {
-        /// Base URL of the server
-        base_url: String,
-        /// HTTP client
-        client: reqwest::Client,
-        /// Pending requests
-        pending: Arc<Mutex<HashMap<String, oneshot::Sender<JsonRpcResponse>>>>,
-        /// SSE connection active. Shared with the SSE task, which outlives
-        /// `connect`'s stack frame — see `connect`.
-        connected: Arc<AtomicBool>,
-        /// Message endpoint (typically /message or from SSE endpoint)
-        message_endpoint: Arc<Mutex<Option<String>>>,
-        /// Shutdown signal
-        shutdown_tx: mpsc::Sender<()>,
-    }
-
-    impl HttpTransport {
-        /// Connect to an HTTP MCP server
-        ///
-        /// # Errors
-        ///
-        /// Returns error if connection fails
-        pub async fn connect(base_url: impl Into<String>) -> Result<Self> {
-            let base_url = base_url.into();
-            debug!(url = %base_url, "Connecting to MCP HTTP server");
-
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .map_err(|e| McpError::Transport(e.to_string()))?;
-
-            let pending = Arc::new(Mutex::new(HashMap::new()));
-            let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
-            let message_endpoint = Arc::new(Mutex::new(None));
-
-            // Start SSE listener
-            let transport = Self {
-                base_url: base_url.clone(),
-                client,
-                pending,
-                connected: Arc::new(AtomicBool::new(false)),
-                message_endpoint,
-                shutdown_tx,
-            };
-
-            // Spawn SSE connection task
-            let pending_clone = transport.pending.clone();
-            let client_clone = transport.client.clone();
-            let base_url_clone = base_url.clone();
-            let message_endpoint_clone = transport.message_endpoint.clone();
-            // The task used to get a raw pointer to `transport.connected` —
-            // a field of a local that is moved out by `Ok(transport)` below, so
-            // every store the task made wrote through a dangling pointer. Its
-            // "safety" note (the shutdown channel) never held either: dropping
-            // the transport ends the task only between connections, not while
-            // a stream is open. The task owns a share now.
-            let connected_clone = Arc::clone(&transport.connected);
-
-            tokio::spawn(async move {
-                Self::sse_task(
-                    client_clone,
-                    base_url_clone,
-                    pending_clone,
-                    message_endpoint_clone,
-                    &connected_clone,
-                    shutdown_rx,
-                ).await;
-            });
-
-            // Wait for connection
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-            Ok(transport)
-        }
-
-        /// SSE listener task
-        async fn sse_task(
-            client: reqwest::Client,
-            base_url: String,
-            pending: Arc<Mutex<HashMap<String, oneshot::Sender<JsonRpcResponse>>>>,
-            message_endpoint: Arc<Mutex<Option<String>>>,
-            connected: &AtomicBool,
-            mut shutdown_rx: mpsc::Receiver<()>,
-        ) {
-            let sse_url = format!("{base_url}/sse");
-            debug!(url = %sse_url, "Connecting to SSE endpoint");
-
-            loop {
-                tokio::select! {
-                    _ = shutdown_rx.recv() => {
-                        debug!("SSE task shutting down");
-                        break;
-                    }
-                    result = client.get(&sse_url).send() => {
-                        match result {
-                            Ok(response) => {
-                                if !response.status().is_success() {
-                                    error!(status = %response.status(), "SSE connection failed");
-                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                                    continue;
-                                }
-
-                                connected.store(true, Ordering::SeqCst);
-                                debug!("SSE connection established");
-
-                                // Process SSE events
-                                let mut stream = response.bytes_stream();
-                                
-                                // Raw bytes, decoded one COMPLETE event at a
-                                // time. Decoding each network chunk on its own
-                                // silently DROPPED any chunk that split a
-                                // multibyte character (`if let Ok(text)` with
-                                // no else) — and the event it belonged to with
-                                // it, leaving that request's caller waiting.
-                                // The delimiter is ASCII, so a complete event
-                                // is always whole characters.
-                                let mut buffer: Vec<u8> = Vec::new();
-                                while let Some(chunk) = stream.next().await {
-                                    match chunk {
-                                        Ok(bytes) => {
-                                            buffer.extend_from_slice(&bytes);
-                                            while let Some(event) = super::take_sse_event(&mut buffer) {
-                                                match String::from_utf8(event) {
-                                                    Ok(event) => {
-                                                        Self::process_sse_event(
-                                                            &event,
-                                                            &pending,
-                                                            &message_endpoint,
-                                                        )
-                                                        .await;
-                                                    }
-                                                    Err(e) => {
-                                                        warn!(error = %e, "SSE event is not UTF-8 — skipped");
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!(error = %e, "SSE stream error");
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                connected.store(false, Ordering::SeqCst);
-                                warn!("SSE connection closed, reconnecting...");
-                            }
-                            Err(e) => {
-                                error!(error = %e, "Failed to connect to SSE endpoint");
-                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        /// Process an SSE event
-        async fn process_sse_event(
-            event: &str,
-            pending: &Arc<Mutex<HashMap<String, oneshot::Sender<JsonRpcResponse>>>>,
-            message_endpoint: &Arc<Mutex<Option<String>>>,
-        ) {
-            let mut event_type = "message";
-            let mut data = String::new();
-
-            for line in event.lines() {
-                if let Some(value) = line.strip_prefix("event: ") {
-                    event_type = value.trim();
-                } else if let Some(value) = line.strip_prefix("data: ") {
-                    data = value.to_string();
-                }
-            }
-
-            match event_type {
-                "endpoint" => {
-                    // Server is telling us where to POST messages
-                    debug!(endpoint = %data, "Received message endpoint");
-                    let mut ep = message_endpoint.lock().await;
-                    *ep = Some(data);
-                }
-                "message" => {
-                    // JSON-RPC response
-                    trace!(data, "Received SSE message");
-                    if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&data) {
-                        let id = response.id.to_string();
-                        let mut pending = pending.lock().await;
-                        if let Some(tx) = pending.remove(&id) {
-                            let _ = tx.send(response);
-                        }
-                    }
-                }
-                _ => {
-                    trace!(event_type, "Unknown SSE event type");
-                }
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Transport for HttpTransport {
-        async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
-            let id = request.id.to_string();
-
-            // Get message endpoint
-            let endpoint = {
-                let ep = self.message_endpoint.lock().await;
-                ep.clone().unwrap_or_else(|| format!("{}/message", self.base_url))
-            };
-
-            // Register pending request
-            let (tx, rx) = oneshot::channel();
-            {
-                let mut pending = self.pending.lock().await;
-                pending.insert(id.clone(), tx);
-            }
-
-            // Send request
-            trace!(endpoint, "Sending HTTP request");
-            let response = self
-                .client
-                .post(&endpoint)
-                .json(&request)
-                .send()
-                .await
-                .map_err(|e| McpError::Transport(e.to_string()))?;
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let text = response.text().await.unwrap_or_default();
-                return Err(McpError::Transport(format!("{status}: {text}")));
-            }
-
-            // For HTTP, we might get the response directly or via SSE
-            // Try to get from response body first
-            if let Ok(text) = response.text().await
-                && !text.is_empty()
-                    && let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(&text) {
-                        // Clean up pending
-                        self.pending.lock().await.remove(&id);
-                        return Ok(resp);
-                    }
-
-            // Wait for response via SSE
-            match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-                Ok(Ok(response)) => Ok(response),
-                Ok(Err(_)) => Err(McpError::ConnectionClosed),
-                Err(_) => {
-                    self.pending.lock().await.remove(&id);
-                    Err(McpError::Timeout)
-                }
-            }
-        }
-
-        async fn notify(&self, notification: JsonRpcNotification) -> Result<()> {
-            let endpoint = {
-                let ep = self.message_endpoint.lock().await;
-                ep.clone().unwrap_or_else(|| format!("{}/message", self.base_url))
-            };
-
-            self.client
-                .post(&endpoint)
-                .json(&notification)
-                .send()
-                .await
-                .map_err(|e| McpError::Transport(e.to_string()))?;
-
-            Ok(())
-        }
-
-        async fn close(&self) -> Result<()> {
-            let _ = self.shutdown_tx.send(()).await;
-            self.connected.store(false, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        /// The SSE task's view of the connection must reach the transport
-        /// `connect` returned. With the old raw pointer, a connection that
-        /// completed after `connect`'s 100 ms wait wrote into the moved-from
-        /// slot, so the returned transport never saw `true` — hence the server
-        /// here answers only after `connect` has returned.
-        #[tokio::test]
-        async fn the_returned_transport_sees_the_sse_task_connect() {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind");
-            let addr = listener.local_addr().expect("addr");
-            let server = tokio::spawn(async move {
-                let (mut socket, _) = listener.accept().await.expect("accept");
-                let mut request = [0u8; 1024];
-                let _ = socket.read(&mut request).await;
-                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                socket
-                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
-                    .await
-                    .expect("head");
-                // Hold the stream open until the test ends.
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            });
-
-            let transport = HttpTransport::connect(format!("http://{addr}"))
-                .await
-                .expect("connect");
-            let mut seen = false;
-            for _ in 0..100 {
-                if transport.connected.load(Ordering::SeqCst) {
-                    seen = true;
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            assert!(
-                seen,
-                "the SSE task connected but the transport never saw it"
-            );
-            transport.close().await.expect("close");
-            assert!(!transport.connected.load(Ordering::SeqCst));
-            server.abort();
-        }
-    }
-}
-
-#[cfg(feature = "http")]
-pub use http::HttpTransport;
 
 /// Either transport the daemon starts servers over, so one manager can hold
 /// stdio and Streamable HTTP servers side by side.

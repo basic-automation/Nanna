@@ -36,7 +36,7 @@ pub async fn execute(
     let timeout_ms = tool.timeout_ms;
 
     let result = tokio::task::spawn_blocking(move || {
-        execute_sync(&source_clone, &input_clone, &bridge_clone)
+        execute_sync(&source_clone, &input_clone, &bridge_clone, timeout_ms)
     });
 
     // Apply timeout
@@ -45,6 +45,33 @@ pub async fn execute(
         Ok(Err(e)) => Err(ScriptError::Execution(format!("Task panicked: {e}"))),
         Err(_) => Err(ScriptError::Timeout(timeout_ms)),
     }
+}
+
+/// Loop iterations per second no Boa loop can exceed on the reference machine.
+///
+/// Bound justification: the simplest possible loop body (`s += i % 7; i++`)
+/// measured 10.0 M iterations/s on the reference AMD Zen 4 in a release build
+/// (2026-09-26); twice that is a ceiling no real loop body reaches.
+const LOOP_ITERATIONS_PER_SEC_CEILING: u64 = 20_000_000;
+
+/// The per-loop iteration limit for a script allowed `timeout_ms`.
+///
+/// Boa cannot be interrupted, so when the caller's timeout fires the blocking
+/// thread keeps running — a `while (true)` in a tool used to spin a core for
+/// the life of the process. This limit makes such a loop THROW. It is sized so
+/// that a loop able to finish within the timeout can never reach it (no loop
+/// runs faster than [`LOOP_ITERATIONS_PER_SEC_CEILING`]), while a runaway loop
+/// stops within about twice the timeout.
+fn loop_iteration_limit(timeout_ms: u64) -> u64 {
+    let limit = timeout_ms
+        .max(1)
+        .saturating_mul(LOOP_ITERATIONS_PER_SEC_CEILING)
+        / 1000;
+    debug_assert!(
+        limit >= LOOP_ITERATIONS_PER_SEC_CEILING / 1000,
+        "at least 1 ms of loop"
+    );
+    limit
 }
 
 /// The exact text Boa is asked to evaluate for a tool.
@@ -126,11 +153,15 @@ fn execute_sync(
     source: &str,
     input: &Value,
     bridge: &Arc<NannaBridge>,
+    timeout_ms: u64,
 ) -> Result<Value> {
     // Store bridge in thread-local for native function access
     BRIDGE.with(|b| *b.borrow_mut() = Some(bridge.clone()));
-    
+
     let mut context = Context::default();
+    context
+        .runtime_limits_mut()
+        .set_loop_iteration_limit(loop_iteration_limit(timeout_ms));
 
     // Register console.log
     register_console(&mut context)?;
@@ -775,11 +806,52 @@ fn json_to_js(value: &Value, context: &mut Context) -> Result<JsValue> {
     }
 }
 
+/// Deepest nesting a script's value may have on its way to JSON.
+///
+/// Bound justification: `serde_json` itself refuses to parse past 128 levels,
+/// and a real tool result is a few levels deep; 64 is generous for data and
+/// small enough that the recursion can never approach the thread's stack.
+const JS_TO_JSON_DEPTH_MAX: usize = 64;
+
+/// Most values one conversion may visit.
+///
+/// Bound justification: a depth bound alone does not stop a DAG whose levels
+/// share one sub-object (`a.x = a.y = b`), which converts 2^depth times. A
+/// million values is far past any tool result and a few hundred ms of work.
+const JS_TO_JSON_NODES_MAX: usize = 1_000_000;
+
 /// Convert Boa `JsValue` to JSON Value
+///
+/// Bounded in depth and in total values. Unbounded, a tool returning a cyclic
+/// object (`o.self = o`) recursed until the stack overflowed — which aborts the
+/// whole daemon, not just the call.
 fn js_to_json(value: &JsValue, context: &mut Context) -> Result<Value> {
+    let mut visited = 0usize;
+    js_to_json_bounded(value, context, 0, &mut visited)
+}
+
+fn js_to_json_bounded(
+    value: &JsValue,
+    context: &mut Context,
+    depth: usize,
+    visited: &mut usize,
+) -> Result<Value> {
     // Use Boa's variant enum for pattern matching
     use boa_engine::value::JsVariant;
-    
+
+    if depth > JS_TO_JSON_DEPTH_MAX {
+        return Err(ScriptError::Execution(format!(
+            "result nests deeper than {JS_TO_JSON_DEPTH_MAX} levels — a cyclic object? \
+             Return plain data"
+        )));
+    }
+    *visited += 1;
+    if *visited > JS_TO_JSON_NODES_MAX {
+        return Err(ScriptError::Execution(format!(
+            "result has more than {JS_TO_JSON_NODES_MAX} values — a shared or cyclic \
+             object? Return plain data"
+        )));
+    }
     match value.variant() {
         // BigInt and Symbol have no JSON representation either.
         JsVariant::Undefined | JsVariant::Null | JsVariant::BigInt(_) | JsVariant::Symbol(_) => {
@@ -807,7 +879,7 @@ fn js_to_json(value: &JsValue, context: &mut Context) -> Result<Value> {
                     let item = obj
                         .get(i, context)
                         .map_err(|e| ScriptError::Execution(format!("Array get failed: {e}")))?;
-                    arr.push(js_to_json(&item, context)?);
+                    arr.push(js_to_json_bounded(&item, context, depth + 1, visited)?);
                 }
                 Ok(Value::Array(arr))
             } else {
@@ -831,7 +903,10 @@ fn js_to_json(value: &JsValue, context: &mut Context) -> Result<Value> {
                     
                     // Skip functions
                     if !val.is_callable() {
-                        map.insert(key_str, js_to_json(&val, context)?);
+                        map.insert(
+                            key_str,
+                            js_to_json_bounded(&val, context, depth + 1, visited)?,
+                        );
                     }
                 }
                 Ok(Value::Object(map))
@@ -851,6 +926,63 @@ fn transpile_typescript(source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cyclic or explosively shared result used to recurse until the stack
+    /// overflowed, aborting the daemon. Both are refused as errors now.
+    #[test]
+    fn a_cyclic_or_exploding_result_is_an_error_not_a_crash() {
+        let bridge = Arc::new(crate::bridge::NannaBridge::new(
+            crate::ToolPermissions::none(),
+        ));
+        let cyclic = "export default { name: 'c', description: 'c', \
+                      execute: function(input) { var o = {}; o.self = o; return o; } };";
+        let err = execute_sync(cyclic, &serde_json::json!({}), &bridge, 1000)
+            .expect_err("a cycle is refused");
+        assert!(err.to_string().contains("cyclic"), "{err}");
+
+        // 40 levels, each pointing twice at the next: 2^40 visits unbounded.
+        let dag = "export default { name: 'd', description: 'd', \
+                   execute: function(input) { var n = {v: 1}; \
+                   for (var i = 0; i < 40; i++) { n = {a: n, b: n}; } return n; } };";
+        let err = execute_sync(dag, &serde_json::json!({}), &bridge, 1000)
+            .expect_err("an exploding DAG is refused");
+        assert!(err.to_string().contains("values"), "{err}");
+
+        let fine = "export default { name: 'f', description: 'f', \
+                    execute: function(input) { return {a: [1, {b: 2}]}; } };";
+        let ok = execute_sync(fine, &serde_json::json!({}), &bridge, 1000).expect("plain data");
+        assert_eq!(ok, serde_json::json!({"a": [1, {"b": 2}]}));
+    }
+
+/// Boa cannot be interrupted, so a runaway loop used to outlive its
+    /// timeout forever. The iteration limit makes it throw; a loop that fits
+    /// its budget still completes.
+    #[test]
+    fn a_runaway_loop_ends_and_a_bounded_one_completes() {
+        let bridge = Arc::new(crate::bridge::NannaBridge::new(
+            crate::ToolPermissions::none(),
+        ));
+        let runaway = "export default { name: 'spin', description: 'spin', \
+                       execute: function(input) { while (true) {} } };";
+        let started = std::time::Instant::now();
+        let ended = execute_sync(runaway, &serde_json::json!({}), &bridge, 10);
+        assert!(
+            ended.is_err(),
+            "a while(true) must throw, not spin: {ended:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "bounded by the limit: {:?}",
+            started.elapsed()
+        );
+
+        let bounded = "export default { name: 'count', description: 'count', \
+                       execute: function(input) { let s = 0; \
+                       for (let i = 0; i < 1000; i++) { s += i; } return s; } };";
+        let done = execute_sync(bounded, &serde_json::json!({}), &bridge, 10).expect("fits");
+        assert_eq!(done.as_f64(), Some(499_500.0));
+        assert_eq!(loop_iteration_limit(30_000), 600_000_000);
+    }
 
     #[test]
     fn test_json_roundtrip() {

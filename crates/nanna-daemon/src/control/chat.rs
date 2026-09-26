@@ -143,7 +143,9 @@ impl ControlPlane {
                         "message": "No user message to regenerate from"
                     });
                 };
-                self.sessions.update(session).await;
+                // `replace`, not `update`: the dropped turn must leave the
+                // store too, or it returns on the next restart.
+                self.sessions.replace(session).await;
                 Box::pin(self.handle_chat(
                     client_id,
                     ChatAction::Send {

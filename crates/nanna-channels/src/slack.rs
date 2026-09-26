@@ -628,7 +628,7 @@ impl Channel for SlackChannel {
 
     async fn send(&self, message: OutgoingMessage) -> Result<String, ChannelError> {
         let channel = &message.channel.id;
-        let thread_ts = message.reply_to.as_deref();
+        let thread_ts = message.reply_to.as_deref().map(crate::native_reply_id);
 
         let result = match message.content {
             MessageContent::Text { text } => {

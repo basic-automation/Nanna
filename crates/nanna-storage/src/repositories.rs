@@ -1,6 +1,10 @@
 //! Repository implementations using Turso
 
-use crate::{CronJob, JobRun, Memory, MemoryChunk, MemoryEventRow, MemoryFsrsUpdate, Message, NewCronJob, NewJobRun, NewMemory, NewMemoryChunk, NewMemoryEvent, NewMessage, Session, StorageError, WorkspaceRecord};
+use crate::{
+    CronJob, JobRun, Memory, MemoryChunk, MemoryEventRow, MemoryFsrsUpdate, Message, NewCronJob,
+    NewJobRun, NewMemory, NewMemoryChunk, NewMemoryEvent, NewMessage, QueuedChunk, Session,
+    StorageError, WorkspaceRecord,
+};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use turso::Connection;
@@ -1149,11 +1153,6 @@ impl MemoryRepository {
     /// rebuild: the text is already stored and chunked, so only the vectors
     /// need recomputing — incrementally, and restartably after a crash.
     ///
-    /// # Errors
-    /// Returns [`StorageError`] if the query fails.
-    ///
-    /// # Panics
-    /// Panics if `limit` is 0.
     /// Chunk work for `model`, taken from the durable queue.
     ///
     /// Seeds the queue first so an existing database — whose chunks predate the
@@ -1171,7 +1170,7 @@ impl MemoryRepository {
         model: &str,
         limit: usize,
         seed: bool,
-    ) -> Result<Vec<MemoryChunk>, StorageError> {
+    ) -> Result<Vec<QueuedChunk>, StorageError> {
         assert!(!model.is_empty(), "chunk work must name the model it is for");
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let conn = self.conn.lock().await;
@@ -1204,20 +1203,11 @@ impl MemoryRepository {
             .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
-            out.push(MemoryChunk {
+            out.push(QueuedChunk {
                 id: row.get(0)?,
                 memory_id: row.get(1)?,
                 ordinal: row.get(2)?,
                 content: row.get(3)?,
-                char_start: 0,
-                char_end: 0,
-                embedding: None,
-                embedding_model: None,
-                chunk_max_chars: 0,
-                chunker_version: 0,
-                workspace_id: None,
-                created_at: String::new(),
-                updated_at: String::new(),
             });
         }
         // Held from the seeding through the drained cursor: seeding and
@@ -2966,6 +2956,44 @@ impl MemoryEventRepository {
         debug_assert!(out.len() <= limit, "the page cap must hold");
         Ok(out)
     }
+
+    /// Up to `limit` events whose lineage names `source_id`, oldest first —
+    /// one card's series (`task:<id>`) for the dream fold.
+    ///
+    /// Matched against the stored JSON array with the id's own quotes, so
+    /// `task:12` never matches `task:120`.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if `limit` exceeds [`MAX_EVENT_PAGE`] or the
+    /// query fails.
+    pub async fn for_source(
+        &self,
+        source_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryEventRow>, StorageError> {
+        check_page(limit)?;
+        if source_id.is_empty() || source_id.contains('"') {
+            return Err(StorageError::Invalid(format!(
+                "a source id to match must be non-empty and unquoted, got {source_id:?}"
+            )));
+        }
+        let pattern = format!("%\"{source_id}\"%");
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                MEMORY_EVENTS_FOR_SOURCE,
+                turso::params![pattern, i64::try_from(limit).unwrap_or(i64::MAX)],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row_to_memory_event(&row)?);
+        }
+        drop(rows);
+        drop(conn);
+        debug_assert!(out.len() <= limit, "the page cap must hold");
+        Ok(out)
+    }
 }
 
 /// Reject a backwards window rather than returning an empty page for it: an
@@ -3033,6 +3061,14 @@ FROM memory_events
 WHERE ts_unix_ms >= ?1 AND ts_unix_ms < ?2 AND workspace_id = ?3
 ORDER BY ts_unix_ms ASC, id ASC
 LIMIT ?4";
+
+const MEMORY_EVENTS_FOR_SOURCE: &str = "
+SELECT id, event_id, ts_unix_ms, kind, workspace_id, content,
+       content_len_chars, embedding, embedding_model, salience, created_at, source_ids
+FROM memory_events
+WHERE source_ids LIKE ?1
+ORDER BY ts_unix_ms ASC, id ASC
+LIMIT ?2";
 
 const RECENT_MEMORY_EVENTS: &str = "
 SELECT id, event_id, ts_unix_ms, kind, workspace_id, content,

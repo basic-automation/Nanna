@@ -50,6 +50,10 @@ pub enum ReceiveMode {
     Poll,
 }
 
+/// Deadline for one poll request (poll mode). Generous next to a bridge's
+/// normal sub-second answer; it exists so a hung bridge cannot stall polling.
+const POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl WhatsAppWebListener {
     /// Create a new `WhatsApp` Web listener
     ///
@@ -57,10 +61,7 @@ impl WhatsAppWebListener {
     /// * `api_url` - Base URL of the bridge server
     /// * `session_id` - Session identifier (use "default" if bridge doesn't support multi-session)
     pub fn new(api_url: impl Into<String>, session_id: impl Into<String>) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .unwrap_or_else(|_| Client::new());
+        let client = super::sse::long_lived_client();
 
         Self {
             client,
@@ -391,8 +392,10 @@ impl WhatsAppWebListener {
                 }
                 () = tokio::time::sleep(poll_interval) => {
                     let poll_url = format!("{url}?since={last_timestamp}");
-                    
-                    match self.client.get(&poll_url).send().await {
+
+                    // The client has no whole-request timeout (it also serves the
+                    // SSE stream), so a poll bounds itself.
+                    match self.client.get(&poll_url).timeout(POLL_REQUEST_TIMEOUT).send().await {
                         Ok(response) => {
                             if response.status().is_success() {
                                 cb.record_success().await;
@@ -402,7 +405,7 @@ impl WhatsAppWebListener {
                                             && ts > last_timestamp {
                                                 last_timestamp = ts;
                                             }
-                                        
+
                                         if let Some(incoming) = self.parse_message(msg) {
                                             debug!(msg_id = %incoming.id, "Received WhatsApp message");
                                             if sender.send(incoming).await.is_err() {

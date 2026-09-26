@@ -68,13 +68,6 @@ mod lossy {
     }
 }
 
-/// At most the first 40 bytes of `content`, cut back to a char boundary, for
-/// log lines. A raw `&content[..40]` panics when byte 40 lands inside a
-/// multi-byte character — the same crash class that once wedged a chat turn.
-fn preview(content: &str) -> &str {
-    &content[..content.floor_char_boundary(40)]
-}
-
 pub use activity::ActivityClock;
 
 pub use chunk_rank::{collapse_chunk_hits, ChunkHit};
@@ -186,6 +179,71 @@ pub struct MemoryStoreHealth {
     pub corrupt_rows: usize,
     pub loaded: usize,
     pub expected: usize,
+}
+
+/// What a durable batch removal did. See [`VectorStore::remove_many_durable`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DurableRemoval {
+    /// Entries whose row the backend confirmed gone, and which left RAM.
+    pub removed: usize,
+    /// Ids the backend refused to delete. They are still in RAM and on disk.
+    pub failed: usize,
+    /// The first backend error among `failed`, for the caller to report.
+    pub first_error: Option<String>,
+}
+
+/// Which memories a recall may return.
+///
+/// One definition for every recall path, and the only place the rule lives.
+/// A second, narrower copy used to sit in the chunk-only pass and silently
+/// dropped a global memory that only its chunks matched (2026-09-22 review);
+/// and the daemon's `memory.search` could not express "global only" at all, so
+/// it answered `scope:"global"` with every memory while `list` and `export`
+/// answered it with the global ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecallScope<'a> {
+    /// Every memory, whatever its workspace.
+    Everything,
+    /// Only memories that belong to no workspace.
+    GlobalOnly,
+    /// That workspace's memories plus the global ones — what a workspace sees.
+    Workspace(&'a str),
+}
+
+impl<'a> RecallScope<'a> {
+    /// The historical `Option<&str>` scope: `None` = everything, `Some(id)` =
+    /// that workspace plus the globals.
+    #[must_use]
+    pub const fn from_workspace(workspace_id: Option<&'a str>) -> Self {
+        match workspace_id {
+            None => Self::Everything,
+            Some(ws) => Self::Workspace(ws),
+        }
+    }
+
+    /// Whether a memory owned by `memory_workspace` is visible in this scope.
+    #[must_use]
+    pub fn admits(self, memory_workspace: Option<&str>) -> bool {
+        debug_assert!(
+            !matches!(self, Self::Workspace("")),
+            "a workspace scope names a workspace"
+        );
+        match self {
+            Self::Everything => true,
+            Self::GlobalOnly => memory_workspace.is_none(),
+            Self::Workspace(ws) => memory_workspace.is_none_or(|owner| owner == ws),
+        }
+    }
+
+    /// The workspace a SQL-side prefilter may narrow to. `GlobalOnly` has no
+    /// SQL form, so it scans unscoped and [`Self::admits`] does the cut.
+    #[must_use]
+    pub const fn sql_workspace(self) -> Option<&'a str> {
+        match self {
+            Self::Workspace(ws) => Some(ws),
+            Self::Everything | Self::GlobalOnly => None,
+        }
+    }
 }
 
 /// What a search could actually COMPARE, measured during the scan it describes.
@@ -1132,22 +1190,34 @@ impl VectorStore {
         top_k: usize,
         workspace_id: Option<&str>,
     ) -> (Vec<(MemoryEntry, f32)>, SearchCoverage) {
+        self.search_in_scope_with_coverage(
+            query_embedding,
+            top_k,
+            RecallScope::from_workspace(workspace_id),
+        )
+        .await
+    }
+
+    /// [`Self::search_scoped_with_coverage`] over any [`RecallScope`].
+    pub async fn search_in_scope_with_coverage(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        scope: RecallScope<'_>,
+    ) -> (Vec<(MemoryEntry, f32)>, SearchCoverage) {
         // Get more to filter
         let (all_results, coverage) = self.search_with_coverage(query_embedding, top_k * 3).await;
 
-        let filtered: Vec<(MemoryEntry, f32)> = match workspace_id {
-            // Workspace scope: global + this workspace only
-            Some(ws_id) => all_results
-                .into_iter()
-                .filter(|(entry, _)| {
-                    entry.workspace_id.is_none() || entry.workspace_id.as_deref() == Some(ws_id)
-                })
-                .take(top_k)
-                .collect(),
-            // Global scope: all memories
-            None => all_results.into_iter().take(top_k).collect(),
-        };
+        let filtered: Vec<(MemoryEntry, f32)> = all_results
+            .into_iter()
+            .filter(|(entry, _)| scope.admits(entry.workspace_id.as_deref()))
+            .take(top_k)
+            .collect();
 
+        debug_assert!(
+            filtered.len() <= top_k,
+            "the scoped answer is bounded by top_k"
+        );
         (filtered, coverage)
     }
 
@@ -1159,26 +1229,85 @@ impl VectorStore {
 
     /// Remove entry by ID.
     ///
+    /// Durable or refused: the persistence backend is written **first**, and a
+    /// failure there leaves the entry in RAM and returns the error. The old
+    /// order (RAM, then a logged-and-ignored backend error) reported a delete
+    /// that a restart undid — the memory came back from disk.
+    ///
     /// # Errors
     ///
-    /// Returns `MemoryError::NotFound` if no entry with the given ID exists.
+    /// Returns `MemoryError::NotFound` if no entry with the given ID exists,
+    /// and the backend's error if it could not delete the row.
     pub async fn remove(&self, id: &str) -> Result<(), MemoryError> {
+        if !self.entries.read().await.iter().any(|e| e.id == id) {
+            return Err(MemoryError::NotFound(id.to_string()));
+        }
+        if let Some(ref db) = self.db {
+            db.remove_entry(id).await?;
+        }
         let mut entries = self.entries.write().await;
-        let idx = entries
-            .iter()
-            .position(|e| e.id == id)
-            .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
-        entries.remove(idx);
+        let before = entries.len();
+        entries.retain(|e| e.id != id);
+        debug_assert!(before - entries.len() <= 1, "memory ids are unique");
         drop(entries);
-
-        // Write-through: remove from persistence backend
-        if let Some(ref db) = self.db
-            && let Err(e) = db.remove_entry(id).await {
-                warn!("Failed to remove memory entry {} from persistence: {}", id, e);
-                // Non-fatal
-            }
-
         Ok(())
+    }
+
+    /// Remove many entries, durably: an entry leaves RAM only once the backend
+    /// has confirmed its row is gone.
+    ///
+    /// The fast path is the one batched [`MemoryPersistence::remove_entries`]
+    /// call. That batch is not one transaction, so when it fails it may have
+    /// stopped part-way; the fallback then deletes one id at a time (deleting
+    /// an already-deleted row is a no-op) to learn exactly which rows are gone,
+    /// and only those leave RAM. So the result can be trusted row by row:
+    /// what it reports removed will not come back on a restart, and what it
+    /// reports failed is still visible.
+    pub async fn remove_many_durable(&self, ids: &[&str]) -> DurableRemoval {
+        if ids.is_empty() {
+            return DurableRemoval::default();
+        }
+        let mut failed = 0usize;
+        let mut first_error = None;
+        let confirmed: Vec<&str> = match self.db {
+            None => ids.to_vec(),
+            Some(ref db) => match db.remove_entries(ids).await {
+                Ok(()) => ids.to_vec(),
+                Err(batch_error) => {
+                    warn!(
+                        "Batch removal of {} memories failed ({batch_error}); retrying one by one",
+                        ids.len()
+                    );
+                    let mut confirmed = Vec::with_capacity(ids.len());
+                    for id in ids {
+                        match db.remove_entry(id).await {
+                            Ok(()) => confirmed.push(*id),
+                            Err(e) => {
+                                failed += 1;
+                                first_error.get_or_insert_with(|| e.to_string());
+                            }
+                        }
+                    }
+                    confirmed
+                }
+            },
+        };
+        let gone: std::collections::HashSet<&str> = confirmed.iter().copied().collect();
+        let mut entries = self.entries.write().await;
+        let before = entries.len();
+        entries.retain(|e| !gone.contains(e.id.as_str()));
+        let removed = before - entries.len();
+        drop(entries);
+        debug_assert!(
+            removed <= ids.len(),
+            "removed more entries than ids requested"
+        );
+        debug_assert!(failed <= ids.len(), "more failures than ids");
+        DurableRemoval {
+            removed,
+            failed,
+            first_error,
+        }
     }
 
     /// Remove many entries by ID in one batch.
@@ -1756,83 +1885,6 @@ impl VectorStore {
         Ok(())
     }
 
-    pub async fn re_embed_mismatched<F, Fut>(
-        &self,
-        expected_dim: usize,
-        embed_fn: F,
-    ) -> usize
-    where
-        F: Fn(String) -> Fut,
-        Fut: std::future::Future<Output = Result<Vec<f32>, String>>,
-    {
-        let mut entries = self.entries.write().await;
-        let total = entries.len();
-        let mismatched_count = entries.iter()
-            .filter(|e| e.embedding.len() != expected_dim)
-            .count();
-
-        if mismatched_count == 0 {
-            return 0;
-        }
-
-        info!(
-            "Re-embedding {} of {} entries ({} dims → {} dims)...",
-            mismatched_count, total,
-            entries.iter().find(|e| e.embedding.len() != expected_dim)
-                .map_or(0, |e| e.embedding.len()),
-            expected_dim
-        );
-
-        let mut re_embedded = 0usize;
-        let mut failed = 0usize;
-
-        for entry in entries.iter_mut() {
-            if entry.embedding.len() == expected_dim {
-                continue;
-            }
-
-            match (embed_fn)(entry.content.clone()).await {
-                Ok(mut new_embedding) => {
-                    if new_embedding.len() == expected_dim {
-                        normalize_f32(&mut new_embedding);
-                        entry.embedding = new_embedding;
-                        re_embedded += 1;
-                    } else {
-                        warn!(
-                            "Re-embed returned wrong dimension for '{}': expected {}, got {}",
-                            preview(&entry.content),
-                            expected_dim, new_embedding.len()
-                        );
-                        failed += 1;
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to re-embed '{}': {}",
-                        preview(&entry.content), e
-                    );
-                    failed += 1;
-                }
-            }
-        }
-
-        // Remove entries that failed to re-embed
-        if failed > 0 {
-            entries.retain(|e| e.embedding.len() == expected_dim);
-            warn!("Dropped {} entries that failed to re-embed", failed);
-        }
-
-        info!(
-            "Re-embedding complete: {} succeeded, {} failed, {} total entries",
-            re_embedded, failed, entries.len()
-        );
-        // Held across every re-embed and the retain, so no reader sees the
-        // store half re-embedded.
-        drop(entries);
-
-        re_embedded
-    }
-
     /// Get the current configured dimension
     #[must_use]
     pub fn dimension(&self) -> usize {
@@ -2193,6 +2245,29 @@ fn chrono_timestamp() -> i64 {
 mod tests {
     use super::*;
 
+    /// The one scope rule every recall path shares.
+    #[test]
+    fn a_workspace_scope_sees_its_own_and_the_global_memories() {
+        let ws = RecallScope::Workspace("a");
+        assert!(ws.admits(None), "global is visible in a workspace");
+        assert!(ws.admits(Some("a")), "own workspace");
+        assert!(!ws.admits(Some("b")), "never another workspace");
+
+        assert!(RecallScope::Everything.admits(Some("b")));
+        assert!(RecallScope::Everything.admits(None));
+
+        assert!(RecallScope::GlobalOnly.admits(None));
+        assert!(
+            !RecallScope::GlobalOnly.admits(Some("a")),
+            "global-only means no workspace's memories"
+        );
+
+        assert_eq!(RecallScope::from_workspace(None), RecallScope::Everything);
+        assert_eq!(RecallScope::from_workspace(Some("a")), ws);
+        assert_eq!(RecallScope::GlobalOnly.sql_workspace(), None);
+        assert_eq!(ws.sql_workspace(), Some("a"));
+    }
+
     /// What the ranking did before `rank_top_k`: a STABLE sort of all N on
     /// similarity alone, then `truncate`. Kept verbatim as the oracle, so the
     /// equivalence claim is checked against the real previous behaviour rather
@@ -2276,15 +2351,6 @@ mod tests {
             all.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
             vec![2, 4, 1, 0, 3]
         );
-    }
-
-    #[test]
-    fn preview_never_splits_a_character() {
-        // 39 ASCII bytes then a 3-byte char straddling byte 40.
-        let text = format!("{}€ tail", "a".repeat(39));
-        assert_eq!(preview(&text), "a".repeat(39));
-        assert_eq!(preview("short"), "short");
-        assert_eq!(preview(&"b".repeat(50)), "b".repeat(40));
     }
 
     fn store_of_width(width: usize) -> VectorStore {
@@ -2718,6 +2784,108 @@ mod tests {
             fsrs: FsrsState::default(),
             workspace_id: None,
         }
+    }
+
+    /// A backend that refuses to delete one named row, and whose batch delete
+    /// always fails part-way — the shape of a real `bulk_delete`, which is not
+    /// one transaction.
+    struct RefusingDb {
+        refuse: &'static str,
+    }
+    #[async_trait]
+    impl MemoryPersistence for RefusingDb {
+        async fn save_entry(&self, _e: &MemoryEntry) -> Result<(), MemoryError> {
+            Ok(())
+        }
+        async fn remove_entry(&self, id: &str) -> Result<(), MemoryError> {
+            if id == self.refuse {
+                return Err(MemoryError::Persistence("database is locked".into()));
+            }
+            Ok(())
+        }
+        async fn remove_entries(&self, _ids: &[&str]) -> Result<(), MemoryError> {
+            Err(MemoryError::Persistence("batch stopped part-way".into()))
+        }
+        async fn update_entry_fsrs(&self, _id: &str, _f: &FsrsState) -> Result<(), MemoryError> {
+            Ok(())
+        }
+        async fn update_entry_content(&self, _id: &str, _c: &str) -> Result<(), MemoryError> {
+            Ok(())
+        }
+        async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
+            Ok(vec![])
+        }
+    }
+
+    fn refusing_store(refuse: &'static str) -> VectorStore {
+        VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        })
+        .with_persistence(Arc::new(RefusingDb { refuse }))
+    }
+
+    /// A delete the backend refused used to leave RAM first and log the
+    /// failure, so the caller was told "deleted" and a restart brought the
+    /// memory back. Now it is refused, and RAM still matches disk.
+    #[tokio::test]
+    async fn a_delete_the_backend_refuses_is_refused() {
+        let store = refusing_store("stuck");
+        store.add(entry_dim8("stuck")).await.unwrap();
+        store.add(entry_dim8("free")).await.unwrap();
+
+        let refused = store.remove("stuck").await;
+        assert!(
+            matches!(refused, Err(MemoryError::Persistence(_))),
+            "the backend's error is returned: {refused:?}"
+        );
+        assert!(
+            store.get("stuck").await.is_some(),
+            "kept, because disk kept it"
+        );
+
+        store
+            .remove("free")
+            .await
+            .expect("an ordinary delete still works");
+        assert!(store.get("free").await.is_none());
+        assert!(matches!(
+            store.remove("free").await,
+            Err(MemoryError::NotFound(_))
+        ));
+    }
+
+    /// The batch is not one transaction, so its failure says nothing about
+    /// which rows went. The durable path finds out one id at a time and removes
+    /// from RAM exactly the rows the backend confirmed gone.
+    #[tokio::test]
+    async fn a_failed_batch_removes_exactly_what_the_backend_confirmed() {
+        let store = refusing_store("m1");
+        for i in 0..3 {
+            store.add(entry_dim8(&format!("m{i}"))).await.unwrap();
+        }
+
+        let outcome = store.remove_many_durable(&["m0", "m1", "m2"]).await;
+
+        assert_eq!(outcome.removed, 2);
+        assert_eq!(outcome.failed, 1);
+        assert!(
+            outcome
+                .first_error
+                .as_deref()
+                .is_some_and(|e| e.contains("locked")),
+            "the refused row's own error is reported: {outcome:?}"
+        );
+        assert!(
+            store.get("m1").await.is_some(),
+            "the refused row stays visible"
+        );
+        assert_eq!(store.len().await, 1);
+        assert_eq!(
+            store.remove_many_durable(&[]).await,
+            DurableRemoval::default()
+        );
     }
 
     #[tokio::test]

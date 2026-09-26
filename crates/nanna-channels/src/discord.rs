@@ -622,7 +622,7 @@ impl Channel for DiscordChannel {
             MessageContent::Text { text } => {
                 // Discord has 2000 char limit - split if needed
                 if text.len() <= 2000 {
-                    self.send_message(channel_id, &text, message.reply_to.as_deref())
+                    self.send_message(channel_id, &text, message.reply_to.as_deref().map(crate::native_reply_id))
                         .await?
                 } else {
                     // Send first chunk, then rest as followups
@@ -633,7 +633,7 @@ impl Channel for DiscordChannel {
                         .collect();
 
                     let mut last_msg = self
-                        .send_message(channel_id, chunks[0], message.reply_to.as_deref())
+                        .send_message(channel_id, chunks[0], message.reply_to.as_deref().map(crate::native_reply_id))
                         .await?;
 
                     for chunk in &chunks[1..] {
@@ -653,7 +653,7 @@ impl Channel for DiscordChannel {
             _ => {
                 // For other content types, send as text description
                 let text = "[Unsupported content type]".to_string();
-                self.send_message(channel_id, &text, message.reply_to.as_deref())
+                self.send_message(channel_id, &text, message.reply_to.as_deref().map(crate::native_reply_id))
                     .await?
             }
         };

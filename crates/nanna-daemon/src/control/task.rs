@@ -126,6 +126,26 @@ impl ControlPlane {
             TaskAction::RunStatus { scope, session_id } => self.task_run_status(scope, session_id).await,
 
             TaskAction::CancelRun { scope, session_id } => self.cancel_task_run(scope, session_id).await,
+
+            TaskAction::Verdicts { window } => Self::task_verdicts(&repo, window).await,
+        }
+    }
+
+    /// `TaskAction::Verdicts`: the per-member, per-label verdict rollup.
+    async fn task_verdicts(repo: &TaskRepository, window: Option<usize>) -> Value {
+        let window = window.unwrap_or(crate::protocol::TASK_VERDICT_WINDOW_DEFAULT);
+        if window == 0 || window > nanna_storage::VERDICT_WINDOW_MAX {
+            return json!({
+                "error": "bad_window",
+                "message": format!(
+                    "window must be in 1..={}, got {window}",
+                    nanna_storage::VERDICT_WINDOW_MAX
+                ),
+            });
+        }
+        match repo.verdict_rollup(window).await {
+            Ok(tallies) => json!({ "window": window, "verdicts": tallies }),
+            Err(e) => json!({"error": "task_verdicts_failed", "message": e.to_string()}),
         }
     }
 

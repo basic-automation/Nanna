@@ -27,6 +27,56 @@ pub struct MemorySearchResult {
 /// A count from a daemon reply; 0 when the key is absent or not an unsigned
 /// integer. Lossless on the 64-bit targets this ships for; it saturates where
 /// the former `as usize` would have wrapped.
+/// Characters of context shown on each side of a search match.
+const SNIPPET_CONTEXT_CHARS: usize = 50;
+
+/// The first case-insensitive match of `query_lower` in `content`, with up to
+/// `context_chars` characters either side and `...` where the text continues, or
+/// `None` when there is no match.
+///
+/// Char-safe in both directions. The old code sliced `content` at byte offsets
+/// ±50 from a match, which panics inside a multi-byte character (an em dash
+/// within 50 bytes of a match was enough to abort the GUI), and it found the
+/// match in the LOWERCASED copy and applied that offset to the original —
+/// but lowercasing can change a character's byte length (`İ` is 2 bytes, its
+/// lowercase 3), so the offset could point anywhere. Here every byte of the
+/// lowered copy remembers the original character it came from.
+fn match_snippet(content: &str, query_lower: &str, context_chars: usize) -> Option<String> {
+    if query_lower.is_empty() {
+        return None;
+    }
+    let mut lowered = String::with_capacity(content.len());
+    let mut origin: Vec<usize> = Vec::with_capacity(content.len());
+    for (byte, ch) in content.char_indices() {
+        let before = lowered.len();
+        lowered.extend(ch.to_lowercase());
+        origin.resize(lowered.len(), byte);
+        debug_assert!(
+            lowered.len() > before,
+            "every char lowers to at least one char"
+        );
+    }
+    let found = lowered.find(query_lower)?;
+    let match_start = origin[found];
+    let match_end = origin
+        .get(found + query_lower.len())
+        .copied()
+        .unwrap_or(content.len());
+    let start = content[..match_start]
+        .char_indices()
+        .rev()
+        .nth(context_chars.saturating_sub(1))
+        .map_or(0, |(i, _)| i);
+    let end = content[match_end..]
+        .char_indices()
+        .nth(context_chars)
+        .map_or(content.len(), |(i, _)| match_end + i);
+    debug_assert!(content.is_char_boundary(start) && content.is_char_boundary(end));
+    let prefix = if start > 0 { "..." } else { "" };
+    let suffix = if end < content.len() { "..." } else { "" };
+    Some(format!("{prefix}{}{suffix}", &content[start..end]))
+}
+
 fn count_field(reply: &serde_json::Value, key: &str) -> usize {
     reply
         .get(key)
@@ -120,18 +170,7 @@ pub async fn search_memory(
 
         for (msg_id, role, content, timestamp) in messages {
             let content_lower = content.to_lowercase();
-            if content_lower.contains(&query_lower) {
-                let pos = content_lower.find(&query_lower).unwrap_or(0);
-                let start = pos.saturating_sub(50);
-                let end = (pos + query.len() + 50).min(content.len());
-                let snippet = if start > 0 || end < content.len() {
-                    let prefix = if start > 0 { "..." } else { "" };
-                    let suffix = if end < content.len() { "..." } else { "" };
-                    format!("{}{}{}", prefix, &content[start..end], suffix)
-                } else {
-                    content.clone()
-                };
-
+            if let Some(snippet) = match_snippet(&content, &query_lower, SNIPPET_CONTEXT_CHARS) {
                 let matches = content_lower.matches(&query_lower).count();
                 let relevance = match_density(matches, content.len());
 
@@ -205,24 +244,6 @@ pub async fn get_memory_stats(
         oldest_session: timestamps.first().cloned(),
         newest_session: timestamps.last().cloned(),
     })
-}
-
-/// Set dreaming (memory consolidation) enabled.
-///
-/// The daemon runs consolidation on its own schedule; there is no runtime toggle
-/// for it over IPC yet, so this is a no-op accepted for UI compatibility.
-///
-/// # Errors
-///
-/// Never returns `Err`; the `Result` is what Tauri requires of an async command
-/// that borrows `State`.
-#[tauri::command]
-pub async fn set_dreaming_enabled(
-    _state: State<'_, Arc<RwLock<AppState>>>,
-    enabled: bool,
-) -> Result<(), String> {
-    info!("set_dreaming_enabled({enabled}) is a no-op in daemon-only mode (daemon manages consolidation scheduling)");
-    Ok(())
 }
 
 /// Set whether messages are automatically remembered (persisted to config +
@@ -578,7 +599,8 @@ pub async fn update_memory(
 /// # Errors
 ///
 /// Returns `Failed to clear memories: …` when the daemon cannot be reached or
-/// the `memory.clear` request is dropped or times out.
+/// the `memory.clear` request is dropped or times out, and the daemon's own
+/// message when it kept memories it could not delete from storage.
 #[tauri::command]
 pub async fn clear_memories(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -586,11 +608,19 @@ pub async fn clear_memories(
     workspace_id: Option<String>,
 ) -> Result<(), String> {
     let effective = resolve_memory_scope(scope, workspace_id);
-    backend_handle(&state)
+    let reply = backend_handle(&state)
         .await
         .memory_clear(effective.as_deref())
         .await
         .map_err(|e| format!("Failed to clear memories: {e}"))?;
+    // A refused or partial clear arrives inside the `Ok` reply. Dropping it
+    // here toasted "All memories cleared" over memories that were kept.
+    if reply.get("error").is_some() {
+        return Err(reply["message"]
+            .as_str()
+            .unwrap_or("The daemon refused to clear memories")
+            .to_string());
+    }
     info!("Cleared memories (scope: {:?}, via daemon)", effective);
     Ok(())
 }
@@ -599,39 +629,30 @@ pub async fn clear_memories(
 // Similarity Threshold Configuration
 // =============================================================================
 
-/// Get the current similarity threshold.
-///
-/// The daemon owns the memory service and does not expose this over IPC yet, so
-/// the client reports the neutral default.
-///
-/// # Errors
-///
-/// Never returns `Err`; the `Result` is what Tauri requires of an async command
-/// that borrows `State`.
-#[tauri::command]
-pub async fn get_similarity_threshold(
-    _state: State<'_, Arc<RwLock<AppState>>>,
-) -> Result<f32, String> {
-    Ok(0.0)
-}
+#[cfg(test)]
+mod snippet_tests {
+    use super::match_snippet;
 
-/// Set the similarity threshold for memory recall.
-///
-/// No daemon control action exists for this yet; accepted for UI compatibility
-/// (validates the range) but does not change daemon behavior.
-///
-/// # Errors
-///
-/// Returns `Threshold must be between 0.0 and 1.0` for a value outside that
-/// range, NaN included.
-#[tauri::command]
-pub async fn set_similarity_threshold(
-    _state: State<'_, Arc<RwLock<AppState>>>,
-    threshold: f32,
-) -> Result<String, String> {
-    if !(0.0..=1.0).contains(&threshold) {
-        return Err("Threshold must be between 0.0 and 1.0".to_string());
+    /// Both ways the old byte slicing aborted the GUI: a multi-byte character
+    /// inside the context window, and a lowercase whose byte length differs
+    /// from the original's.
+    #[test]
+    fn a_snippet_never_splits_a_character() {
+        let dashes = format!("{}needle{}", "—".repeat(60), "—".repeat(60));
+        let snippet = match_snippet(&dashes, "needle", 5).expect("found");
+        assert_eq!(snippet, "...—————needle—————...");
+
+        // `İ` is 2 bytes; its lowercase is 3. Offsets from the lowered copy
+        // would have pointed into the wrong place in the original.
+        let turkish = format!("{}Needle tail", "İ".repeat(40));
+        let snippet = match_snippet(&turkish, "needle", 3).expect("found");
+        assert_eq!(snippet, "...İİİNeedle ta...");
+
+        assert_eq!(
+            match_snippet("short", "short", 50).as_deref(),
+            Some("short")
+        );
+        assert!(match_snippet("nothing here", "needle", 50).is_none());
+        assert!(match_snippet("anything", "", 50).is_none());
     }
-    info!("set_similarity_threshold({threshold}) is a no-op in daemon-only mode");
-    Ok(format!("Similarity threshold set to {threshold:.2}"))
 }

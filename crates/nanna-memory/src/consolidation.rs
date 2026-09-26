@@ -1024,10 +1024,10 @@ pub fn create_consolidated_entry(
     
     // Provenance is MONOTONE across a merge: if any source was a user
     // assertion, the entry that replaces it still contains a user assertion and
-    // must still read as one. The metadata merge above is first-writer-wins, so
-    // without this the result's `fact_type` would be whichever source happened
-    // to be ordered first — a rule that depends on iteration order is not a
-    // rule. The verbatim pin makes this unreachable today (a stated memory is
+    // must still read as one. The metadata merge above keeps a key only when
+    // every source agrees, so a cluster mixing a stated and an observed memory
+    // would carry NO `fact_type` at all — and a missing `fact_type` reads as
+    // "unknown", demoting the user's assertion. The verbatim pin makes this unreachable today (a stated memory is
     // partitioned out before it can join a cluster), so this is the invariant
     // stated explicitly rather than left to hold by reachability.
     if cluster.memories.iter().any(|m| is_verbatim_pinned(&m.metadata)) {
@@ -1853,8 +1853,9 @@ mod tests {
 
     /// Provenance must be monotone across a merge: an entry that replaces a
     /// user assertion still contains one, so it must still read as one. The
-    /// metadata merge is first-writer-wins, so before this the answer depended
-    /// on cluster order — hence both orders are asserted here.
+    /// metadata merge keeps only unanimous keys, so a mixed cluster would lose
+    /// `fact_type` entirely; both orders are asserted so no ordering can
+    /// sneak back in.
     #[test]
     fn a_consolidated_entry_inherits_stated_provenance_from_any_source() {
         for stated_first in [true, false] {

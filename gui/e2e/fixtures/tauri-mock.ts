@@ -501,10 +501,6 @@ function installInPage(options = {}) {
         return true;
       case 'get_cognitive_memory_stats':
         return { total: state.memories.length, by_category: {}, avg_importance: 0.5 };
-      case 'get_similarity_threshold':
-        return 0.85;
-      case 'set_similarity_threshold':
-      case 'set_dreaming_enabled':
       case 'set_max_compression_ratio':
       case 'set_min_remaining_memories':
       case 'trigger_consolidation':

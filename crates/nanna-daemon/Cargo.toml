@@ -29,6 +29,7 @@ nanna-config = { path = "../nanna-config" }
 nanna-storage = { path = "../nanna-storage" }
 nanna-llm = { path = "../nanna-llm" }
 nanna-memory = { path = "../nanna-memory" }
+nanna-timeline = { path = "../nanna-timeline" }
 nanna-mcp = { path = "../nanna-mcp" }
 # Kill-on-close Job Object adoption (job.rs re-export; implementation shared
 # with the exec tool's and acceptance runner's per-child containment).

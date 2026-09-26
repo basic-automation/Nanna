@@ -196,7 +196,6 @@ impl TestDaemon {
     async fn connect_client(&self) -> Client {
         Client::connect(ClientConfig {
             url: self.url(),
-            auto_reconnect: false,
             connect_timeout: READY_HANG_CEILING,
             request_timeout: READY_HANG_CEILING,
             ..Default::default()
@@ -2970,4 +2969,323 @@ async fn a_request_longer_than_the_window_says_so() {
 
     client.disconnect().await;
     daemon.stop();
+}
+
+/// A sub-session that overruns its timeout is cancelled and wound down, not
+/// dropped mid-flight. Dropped, its chat's `active_chats` entry was never
+/// released: the daemon kept reporting the long-dead run as live — `chat.cancel`
+/// on it answered `cancelled` forever — and the agent service read as busy.
+#[tokio::test]
+async fn a_timed_out_sub_session_leaves_no_live_run_behind() {
+    use nanna_daemon::protocol::{Action, SessionAction};
+
+    // Every model reply is held back far past the sub-session's 1 s timeout.
+    let ollama =
+        ScriptedOllama::start(vec!["WAIT 20000 Too late.\nTASK COMPLETE".to_string()]).await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let spawned = client
+        .request(Action::Session(SessionAction::SpawnSubSession {
+            task: "take your time".to_string(),
+            label: Some("slow".to_string()),
+            parent_id: None,
+            model: None,
+            max_iterations: None,
+            timeout_secs: Some(1),
+            system_prompt: None,
+        }))
+        .await
+        .expect("sessions.spawn_sub_session answers");
+    assert!(spawned.get("error").is_none(), "{spawned}");
+
+    let status = tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            let status = client
+                .request(Action::Session(SessionAction::GetSubSessionStatus {
+                    target: "slow".to_string(),
+                }))
+                .await
+                .expect("status answers");
+            if status["error"].is_string() {
+                return status;
+            }
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the sub-session times out");
+    assert!(
+        status["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("timed out")),
+        "{status}"
+    );
+    let sub = status["session_id"].as_str().expect("an id").to_string();
+
+    let cancel = client
+        .chat()
+        .cancel(&sub)
+        .await
+        .expect("chat.cancel answers");
+    assert_eq!(
+        cancel["status"], "not_active",
+        "the timed-out run is gone: {cancel}"
+    );
+}
+
+/// Killing a sub-session stops its run, and it stays killed. Kill used to set
+/// a flag nothing read: the sub-agent ran on to the end, and its finish then
+/// overwrote `killed` with `completed`.
+#[tokio::test]
+async fn a_killed_sub_session_stops_and_stays_killed() {
+    use nanna_daemon::protocol::{Action, SessionAction};
+
+    let ollama = ScriptedOllama::start(vec![
+        "WAIT 20000 Finished anyway.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    client
+        .request(Action::Session(SessionAction::SpawnSubSession {
+            task: "work slowly".to_string(),
+            label: Some("doomed".to_string()),
+            parent_id: None,
+            model: None,
+            max_iterations: None,
+            timeout_secs: None,
+            system_prompt: None,
+        }))
+        .await
+        .expect("spawn answers");
+    // Kill once the run is really in flight: the stub has seen its request.
+    tokio::time::timeout(READY_HANG_CEILING, async {
+        while ollama.chat_bodies.lock().await.is_empty() {
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the sub-agent reaches the model");
+    let killed = client
+        .request(Action::Session(SessionAction::KillSubSession {
+            target: "doomed".to_string(),
+        }))
+        .await
+        .expect("kill answers");
+    assert_eq!(killed["status"], "killed", "{killed}");
+
+    // Without touching the run otherwise, it winds down well before the
+    // stub's 20 s reply: the kill itself stopped it.
+    let after = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = doomed_status(&client).await;
+            if status["result"].is_string() || status["error"].is_string() {
+                return status;
+            }
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the killed run stopped instead of running on");
+    assert!(
+        !after.to_string().contains("Finished anyway"),
+        "the run did not finish its work: {after}"
+    );
+    assert_eq!(
+        after["state"], "killed",
+        "still killed after the run ended: {after}"
+    );
+}
+
+/// `sessions.get_sub_session_status` for the sub-session labelled `doomed`.
+async fn doomed_status(client: &Client) -> serde_json::Value {
+    client
+        .request(nanna_daemon::protocol::Action::Session(
+            nanna_daemon::protocol::SessionAction::GetSubSessionStatus {
+                target: "doomed".to_string(),
+            },
+        ))
+        .await
+        .expect("status answers")
+}
+
+/// A fork's copied conversation is stored like any other: it survives a
+/// restart, and the original keeps its own. The fork used to be written through
+/// `update`, which stores only the session row — its messages existed in memory
+/// alone and came back empty after a restart.
+#[tokio::test]
+async fn a_forked_conversation_survives_a_restart() {
+    use nanna_daemon::protocol::{Action, SessionAction};
+
+    let ollama =
+        ScriptedOllama::start(vec!["The original answer.\nTASK COMPLETE".to_string()]).await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), {
+        let host = host.clone();
+        move |b| {
+            b.with_model(STUB_MODEL)
+                .with_ollama_host(host)
+                .with_scheduler(false)
+        }
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let original = session_id_of(
+        &client
+            .sessions()
+            .create(Some("original".to_string()))
+            .await
+            .expect("create"),
+    );
+    converse(&client, &original, "ask something").await;
+    let count = |history: &serde_json::Value| history["messages"].as_array().map_or(0, Vec::len);
+    let before = count(
+        &client
+            .sessions()
+            .history(&original, None)
+            .await
+            .expect("history"),
+    );
+    assert!(before >= 2, "a question and an answer");
+
+    let forked = client
+        .request(Action::Session(SessionAction::Fork {
+            id: original.clone(),
+            name: Some("the fork".to_string()),
+        }))
+        .await
+        .expect("fork answers");
+    let fork_id = forked["session"]["id"]
+        .as_str()
+        .expect("the fork's id")
+        .to_string();
+
+    client.disconnect().await;
+    let restarted = TestDaemon::start_with(daemon.stop(), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = restarted.connect_client().await;
+    let fork_after = count(
+        &client
+            .sessions()
+            .history(&fork_id, None)
+            .await
+            .expect("history"),
+    );
+    let original_after = count(
+        &client
+            .sessions()
+            .history(&original, None)
+            .await
+            .expect("history"),
+    );
+    assert_eq!(fork_after, before, "the fork's messages were stored");
+    assert_eq!(original_after, before, "the original is untouched");
+    client.disconnect().await;
+    restarted.stop();
+}
+
+/// Regenerate's dropped reply leaves the store too: after a restart the
+/// conversation holds the question and the NEW answer only. It was dropped
+/// through `update`, which never deleted the old rows, so the stale answer
+/// came back from the store on the next start.
+#[tokio::test]
+async fn a_regenerated_reply_stays_replaced_after_a_restart() {
+    use nanna_daemon::protocol::{Action, ChatAction};
+
+    let ollama = ScriptedOllama::start(vec![
+        "The first answer.\nTASK COMPLETE".to_string(),
+        "The second answer.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), {
+        let host = host.clone();
+        move |b| {
+            b.with_model(STUB_MODEL)
+                .with_ollama_host(host)
+                .with_scheduler(false)
+        }
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("regen".to_string()))
+            .await
+            .expect("create"),
+    );
+    converse(&client, &session, "ask once").await;
+    let mut events = client.subscribe_session(session.clone());
+    client
+        .request(Action::Chat(ChatAction::Regenerate {
+            session_id: session.clone(),
+        }))
+        .await
+        .expect("regenerate answers");
+    tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            if let Ok(nanna_client::Event::MessageEnd { .. }) = events.recv().await {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the regenerated turn ends");
+    let live = client
+        .sessions()
+        .history(&session, None)
+        .await
+        .expect("history");
+
+    client.disconnect().await;
+    let restarted = TestDaemon::start_with(daemon.stop(), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = restarted.connect_client().await;
+    let stored = client
+        .sessions()
+        .history(&session, None)
+        .await
+        .expect("history");
+    let texts = |h: &serde_json::Value| -> Vec<String> {
+        h["messages"]
+            .as_array()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|m| m["content"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        texts(&stored),
+        texts(&live),
+        "the store matches what the client saw"
+    );
+    assert!(
+        !texts(&stored).iter().any(|t| t.contains("first answer")),
+        "the replaced reply stayed gone: {stored}"
+    );
+    client.disconnect().await;
+    restarted.stop();
 }

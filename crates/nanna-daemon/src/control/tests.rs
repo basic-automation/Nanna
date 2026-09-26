@@ -2035,3 +2035,274 @@ async fn a_null_set_of_no_secret_leaves_the_store_alone() {
     assert_eq!(resp["status"], "updated", "{resp}");
     assert_eq!(cp.config.read().await.llm.sub_agent_model, None);
 }
+
+/// `memory.search` and `memory.list` must mean the same thing by a scope. They
+/// did not: `search` read `scope:"global"` as *every* memory while `list` and
+/// `export` read it as the global ones, so the board's memory page showed one
+/// set under "Global" and searched another.
+#[tokio::test]
+async fn memory_search_and_list_agree_on_the_global_scope() {
+    let embed: nanna_memory::EmbedFn =
+        Arc::new(|_text: &str| Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0, 0.0]) }));
+    let memory = Arc::new(
+        nanna_memory::MemoryService::new(nanna_memory::MemoryServiceConfig {
+            dimension: 4,
+            min_score: 0.4,
+            ..Default::default()
+        })
+        .with_embed_fn(embed),
+    );
+    for (id, workspace) in [("global", None), ("scoped", Some("ws-a"))] {
+        memory
+            .add_entry(nanna_memory::MemoryEntry {
+                id: id.to_string(),
+                content: format!("memory {id}"),
+                embeddings: std::collections::HashMap::new(),
+                embedding_model: None,
+                embedding: vec![1.0, 0.0, 0.0, 0.0],
+                metadata: std::collections::HashMap::new(),
+                timestamp: 0,
+                fsrs: nanna_memory::FsrsState::default(),
+                workspace_id: workspace.map(str::to_string),
+            })
+            .await
+            .expect("add");
+    }
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.memory = Some(memory);
+    let cp = Arc::new(cp);
+
+    let ids = |resp: &Value| -> Vec<String> {
+        let mut ids: Vec<String> = resp["memories"]
+            .as_array()
+            .expect("a memories array")
+            .iter()
+            .filter_map(|m| m["id"].as_str().map(str::to_string))
+            .collect();
+        ids.sort();
+        ids
+    };
+    let global = Some("global".to_string());
+    let listed = cp
+        .handle(
+            "test",
+            Action::Memory(MemoryAction::List {
+                scope: global.clone(),
+            }),
+        )
+        .await;
+    let search = MemoryAction::Search {
+        query: "memory".to_string(),
+        limit: None,
+        scope: global,
+    };
+    let searched = cp.handle("test", Action::Memory(search)).await;
+    assert_eq!(ids(&listed), ["global"], "{listed}");
+    assert_eq!(
+        ids(&searched),
+        ids(&listed),
+        "search must scope like list: {searched}"
+    );
+
+    // And a workspace scope is that workspace plus the globals, in both.
+    let ws = Some("ws-a".to_string());
+    let search = MemoryAction::Search {
+        query: "memory".to_string(),
+        limit: None,
+        scope: ws,
+    };
+    let searched = cp.handle("test", Action::Memory(search)).await;
+    assert_eq!(ids(&searched), ["global", "scoped"], "{searched}");
+}
+
+/// Records every row the daemon asks storage to delete, and refuses one.
+struct RecordingDeletes {
+    refuse: Option<&'static str>,
+    deleted: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl nanna_memory::MemoryPersistence for RecordingDeletes {
+    async fn save_entry(
+        &self,
+        _entry: &nanna_memory::MemoryEntry,
+    ) -> Result<(), nanna_memory::MemoryError> {
+        Ok(())
+    }
+    async fn remove_entry(&self, id: &str) -> Result<(), nanna_memory::MemoryError> {
+        if self.refuse == Some(id) {
+            return Err(nanna_memory::MemoryError::Persistence(
+                "disk I/O error".into(),
+            ));
+        }
+        self.deleted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(id.to_string());
+        Ok(())
+    }
+    async fn update_entry_fsrs(
+        &self,
+        _id: &str,
+        _fsrs: &nanna_memory::FsrsState,
+    ) -> Result<(), nanna_memory::MemoryError> {
+        Ok(())
+    }
+    async fn update_entry_content(
+        &self,
+        _id: &str,
+        _content: &str,
+    ) -> Result<(), nanna_memory::MemoryError> {
+        Ok(())
+    }
+    async fn load_all(&self) -> Result<Vec<nanna_memory::MemoryEntry>, nanna_memory::MemoryError> {
+        Ok(Vec::new())
+    }
+}
+
+async fn clear_all_against(db: Arc<RecordingDeletes>) -> (Value, usize) {
+    let memory = Arc::new(
+        nanna_memory::MemoryService::new(nanna_memory::MemoryServiceConfig {
+            dimension: 4,
+            ..Default::default()
+        })
+        .with_persistence(db),
+    );
+    for (id, workspace) in [("a", None), ("b", Some("ws")), ("c", None)] {
+        memory
+            .add_entry(nanna_memory::MemoryEntry {
+                id: id.to_string(),
+                content: format!("memory {id}"),
+                embeddings: std::collections::HashMap::new(),
+                embedding_model: None,
+                embedding: vec![1.0, 0.0, 0.0, 0.0],
+                metadata: std::collections::HashMap::new(),
+                timestamp: 0,
+                fsrs: nanna_memory::FsrsState::default(),
+                workspace_id: workspace.map(str::to_string),
+            })
+            .await
+            .expect("add");
+    }
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.memory = Some(Arc::clone(&memory));
+    let resp = Arc::new(cp)
+        .handle("test", Action::Memory(MemoryAction::Clear { scope: None }))
+        .await;
+    (resp, memory.count().await)
+}
+
+/// "Delete All Memories" used to empty RAM only and answer `cleared`: the rows
+/// stayed in Turso and the next restart loaded every one of them back.
+#[tokio::test]
+async fn clearing_every_memory_deletes_the_rows() {
+    let db = Arc::new(RecordingDeletes {
+        refuse: None,
+        deleted: std::sync::Mutex::new(Vec::new()),
+    });
+    let (resp, left) = clear_all_against(Arc::clone(&db)).await;
+    assert_eq!(resp["status"], "cleared", "{resp}");
+    assert_eq!(resp["removed"], 3, "{resp}");
+    assert_eq!(left, 0);
+    let mut deleted = db.deleted.lock().expect("lock").clone();
+    deleted.sort();
+    assert_eq!(deleted, ["a", "b", "c"], "every row reached storage");
+}
+
+/// A row storage refused is kept, and the reply says so instead of `cleared`.
+#[tokio::test]
+async fn a_clear_storage_refused_is_reported_not_claimed() {
+    let db = Arc::new(RecordingDeletes {
+        refuse: Some("b"),
+        deleted: std::sync::Mutex::new(Vec::new()),
+    });
+    let (resp, left) = clear_all_against(db).await;
+    assert_eq!(resp["error"], "clear_incomplete", "{resp}");
+    assert_eq!(resp["removed"], 2, "{resp}");
+    assert_eq!(resp["failed"], 1, "{resp}");
+    assert!(
+        resp["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("disk I/O")),
+        "{resp}"
+    );
+    assert_eq!(
+        left, 1,
+        "the refused memory is still visible, as it is still on disk"
+    );
+}
+
+/// `task.verdicts` reaches the rollup from the wire, and a window outside the
+/// store's bound is refused as a reply rather than tripping its assert.
+#[tokio::test]
+async fn task_verdicts_answers_the_rollup_over_ipc() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    storage
+        .members()
+        .create(nanna_storage::NewMember {
+            id: "agent-a".to_string(),
+            name: "Agent A".to_string(),
+            avatar: None,
+            kind: nanna_storage::MemberKind::Agent,
+            owner_kind: nanna_storage::MemberOwner::Workspace,
+            owner_id: None,
+            status: nanna_storage::MemberStatus::Idle,
+            profile: serde_json::json!({}),
+        })
+        .await
+        .expect("member");
+    let id = storage
+        .tasks()
+        .create(nanna_storage::NewTask {
+            scope: "workspace".to_string(),
+            scope_id: Some("ws1".to_string()),
+            title: "card".to_string(),
+            priority: 3,
+            labels: vec!["rust".to_string()],
+            assignee: Some("agent-a".to_string()),
+            ..nanna_storage::NewTask::default()
+        })
+        .await
+        .expect("card")
+        .id;
+    storage
+        .tasks()
+        .log_activity(
+            id,
+            Some("harness"),
+            "acceptance_checked",
+            Some(serde_json::json!({ "passed": true })),
+        )
+        .await
+        .expect("verdict");
+
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(storage);
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+
+    let resp = ask(serde_json::json!({ "type": "task", "action": "verdicts" })).await;
+    assert_eq!(
+        resp["window"],
+        crate::protocol::TASK_VERDICT_WINDOW_DEFAULT,
+        "{resp}"
+    );
+    let verdicts = resp["verdicts"].as_array().expect("verdicts array");
+    assert_eq!(verdicts.len(), 2, "overall + the one label: {resp}");
+    assert!(
+        verdicts
+            .iter()
+            .any(|v| v["member_id"] == "agent-a" && v["label"] == "rust" && v["passed"] == 1),
+        "{resp}"
+    );
+
+    let refused =
+        ask(serde_json::json!({ "type": "task", "action": "verdicts", "window": 0 })).await;
+    assert_eq!(refused["error"], "bad_window", "{refused}");
+}

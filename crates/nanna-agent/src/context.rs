@@ -473,6 +473,22 @@ impl AgentContext {
             .min(self.messages.len() - 1)
     }
 
+    /// Forget which content the summary covers. Called when the summary loses
+    /// text (elided, re-condensed): the hashes would otherwise go on claiming
+    /// that a message's content is "already included in previous context
+    /// summary" after that part of the summary is gone. Deduplicating less is
+    /// the safe direction; a placeholder pointing at nothing is not.
+    fn forget_summarized_hashes(&mut self) {
+        let forgotten = self.summarized_content_hashes.len();
+        self.summarized_content_hashes.clear();
+        if forgotten > 0 {
+            debug!(
+                forgotten,
+                "Summary lost content; dropped its dedup chunk hashes"
+            );
+        }
+    }
+
     /// Shift the pin after `removed` messages were taken from positions
     /// strictly before it. Removal paths call this instead of touching the
     /// field, so the pin cannot silently drift onto a different message.
@@ -780,8 +796,20 @@ impl AgentContext {
         let mut dedup_count = 0;
         let mut bytes_saved = 0;
         let mut deduped = Vec::with_capacity(self.messages.len());
+        // Never placeholdered: the newest message (it carries the tool results
+        // the model is about to answer) and the pinned live request. A fresh
+        // re-read of a file whose earlier read was summarised used to be
+        // replaced by "already included in previous context summary" — but the
+        // summary is lossy, so the model lost the very text it had just asked
+        // for, and asked again.
+        let newest = self.messages.len().saturating_sub(1);
+        let pinned = self.pinned_index();
 
-        for msg in &self.messages {
+        for (index, msg) in self.messages.iter().enumerate() {
+            if index == newest || index == pinned {
+                deduped.push(msg.clone());
+                continue;
+            }
             let mut new_content = Vec::with_capacity(msg.content.len());
 
             for block in &msg.content {
@@ -1027,6 +1055,7 @@ impl AgentContext {
             return false;
         }
         self.consolidated_summary = Some(replacement);
+        self.forget_summarized_hashes();
         info!(
             original_chars = summary.len(),
             elided_chars = elided,
@@ -1080,6 +1109,7 @@ impl AgentContext {
                     "[This summary has itself been re-condensed to make room for current \
                      work. Earlier wording is gone; nothing it described was undone.]\n{condensed}"
                 ));
+                self.forget_summarized_hashes();
                 info!(
                     original_chars = summary.len(),
                     condensed_chars = condensed.len(),
@@ -3548,6 +3578,7 @@ mod tests {
         ctx.growth.rebaseline(100);
         ctx.growth.observe(600);
         ctx.consolidated_summary = Some("earlier summary. ".repeat(1_000));
+        ctx.summarized_content_hashes.insert(42);
 
         assert!(ctx.preamble_starved());
         let before = ctx.messages.len();
@@ -3563,6 +3594,51 @@ mod tests {
         assert!(
             !ctx.exceeds_hard_limit(),
             "eliding the preamble is what brings the request under the limit"
+        );
+        assert!(
+            ctx.summarized_content_hashes.is_empty(),
+            "an elided summary no longer vouches for the content it used to cover"
+        );
+    }
+
+    /// The newest message carries the tool results the model is about to
+    /// answer. A re-read of a file whose first read was summarised came back
+    /// as "already included in previous context summary" — from a LOSSY
+    /// summary — so the model lost the text it had just asked for.
+    #[test]
+    fn the_newest_tool_result_is_never_deduplicated() {
+        let file = "fn main() { println!(\"a line of a real file\"); }\n".repeat(200);
+        assert!(file.len() >= DEDUP_MIN_SIZE);
+        let mut ctx = AgentContext::new("s1");
+        ctx.summarized_content_hashes.extend(chunk_and_hash(&file));
+        let result = |id: &str| {
+            AnthropicMessage::user(vec![ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content: file.clone(),
+                is_error: None,
+            }])
+        };
+        ctx.messages
+            .push(AnthropicMessage::user_text("read main.rs"));
+        ctx.pin_live_request();
+        ctx.messages.push(result("older-read"));
+        ctx.messages
+            .push(AnthropicMessage::assistant_text("reading it again"));
+        ctx.messages.push(result("fresh-read"));
+
+        let deduped = ctx.deduplicate_messages();
+        let content = |m: &AnthropicMessage| match &m.content[0] {
+            ContentBlock::ToolResult { content, .. } => content.clone(),
+            other => panic!("expected a tool result, got {other:?}"),
+        };
+        assert!(
+            content(&deduped[1]).contains("already included"),
+            "older copies still fold"
+        );
+        assert_eq!(
+            content(&deduped[3]),
+            file,
+            "the newest result is sent whole"
         );
     }
 

@@ -197,29 +197,45 @@ impl MemoryPersistence for TursoMemoryPersistence {
                 // vector never survived a restart: `set_embedding_for_model`
                 // saved the entry, the save fell into this branch, and the one
                 // field it had just computed was the one field not written.
-                let _ = self.repo.update_content(&entry.id, &entry.content).await;
+                //
+                // Each write's error is returned, not discarded: the three
+                // `let _ =` here reported a save that had not happened, so the
+                // caller kept the RAM copy and a restart silently rolled it back.
+                // The order leaves any failure in the safe state — content first
+                // (which clears the stored vector), so a failure after it leaves
+                // the row queued for re-embedding rather than wrongly searchable.
+                let failed = |what: &str, e: nanna_storage::StorageError| {
+                    MemoryError::Persistence(format!("updating the {what} of {}: {e}", entry.id))
+                };
+                self.repo
+                    .update_content(&entry.id, &entry.content)
+                    .await
+                    .map_err(|e| failed("content", e))?;
                 if !entry.embedding.is_empty() {
-                    let _ = self
-                        .repo
+                    self.repo
                         .update_embedding(
                             &entry.id,
                             &entry.embedding,
                             entry.embedding_model.as_deref(),
                         )
-                        .await;
+                        .await
+                        .map_err(|e| failed("embedding", e))?;
                 }
-                let _ = self.repo.update_fsrs(
-                    &entry.id,
-                    &MemoryFsrsUpdate {
-                        stability: entry.fsrs.stability,
-                        difficulty: entry.fsrs.difficulty,
-                        last_access: entry.fsrs.last_access,
-                        access_count: i64::from(entry.fsrs.access_count),
-                        importance: entry.fsrs.importance,
-                        storage_strength: entry.fsrs.storage_strength,
-                        generation: i64::from(entry.fsrs.generation),
-                    },
-                ).await;
+                self.repo
+                    .update_fsrs(
+                        &entry.id,
+                        &MemoryFsrsUpdate {
+                            stability: entry.fsrs.stability,
+                            difficulty: entry.fsrs.difficulty,
+                            last_access: entry.fsrs.last_access,
+                            access_count: i64::from(entry.fsrs.access_count),
+                            importance: entry.fsrs.importance,
+                            storage_strength: entry.fsrs.storage_strength,
+                            generation: i64::from(entry.fsrs.generation),
+                        },
+                    )
+                    .await
+                    .map_err(|e| failed("FSRS state", e))?;
                 Ok(())
             }
             Err(e) => Err(MemoryError::Persistence(e.to_string())),

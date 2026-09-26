@@ -300,12 +300,80 @@ pub struct CallToolResult {
 }
 
 /// Content returned by tool
+///
+/// `rename_all` on a tagged enum renames the VARIANTS (the `type` tag) and
+/// not their fields, so every camelCase field is renamed by hand. `Image`'s
+/// `mimeType` was not: every image block failed to deserialize, and with it
+/// the whole `tools/call` result — text blocks included.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ToolContent {
-    Text { text: String },
-    Image { data: String, mime_type: String },
-    Resource { resource: ResourceContents },
+pub enum ToolContent {    Text {
+        text: String,
+    },
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    Audio {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    Resource {
+        resource: ResourceContents,
+    },
+    /// A link to a resource the server did not inline (MCP 2025-06-18).
+    ResourceLink {
+        uri: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(default, rename = "mimeType", skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+    },
+    /// A content type newer than this client. Kept as a marker rather than
+    /// failing the result: one unknown block used to discard every other block
+    /// the server sent with it.
+    #[serde(other)]
+    Unknown,
+}
+
+impl ToolContent {
+    /// The block as the text an agent reads: text verbatim, binary content
+    /// described by its type and size, a link by where it points.
+    #[must_use]
+    pub fn to_text(&self) -> Option<String> {
+        match self {
+            Self::Text { text } => Some(text.clone()),
+            Self::Image { data, mime_type } => {
+                Some(format!("[Image: {mime_type}, {} bytes]", data.len()))
+            }
+            Self::Audio { data, mime_type } => {
+                Some(format!("[Audio: {mime_type}, {} bytes]", data.len()))
+            }
+            Self::Resource { resource } => resource.text.clone().or_else(|| {
+                resource
+                    .blob
+                    .as_ref()
+                    .map(|b| format!("[Blob: {} bytes]", b.len()))
+            }),
+            Self::ResourceLink {
+                uri,
+                name,
+                description,
+                ..
+            } => {
+                let label = name.as_deref().unwrap_or(uri);
+                Some(description.as_deref().map_or_else(
+                    || format!("[Resource link: {label} <{uri}>]"),
+                    |d| format!("[Resource link: {label} <{uri}> — {d}]"),
+                ))
+            }
+            Self::Unknown => Some("[Content of a type this client does not know]".to_string()),
+        }
+    }
 }
 
 // ============================================================================
@@ -425,10 +493,17 @@ pub enum PromptRole {
 /// Prompt content
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum PromptContent {
-    Text { text: String },
-    Image { data: String, mime_type: String },
-    Resource { resource: ResourceContents },
+pub enum PromptContent {    Text {
+        text: String,
+    },
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    Resource {
+        resource: ResourceContents,
+    },
 }
 
 // ============================================================================
@@ -471,12 +546,48 @@ pub struct PaginationParams {
 
 #[cfg(test)]
 mod tests {
-    use super::CallToolResult;
+    use super::{CallToolResult, ToolContent};
+
     use super::error_codes::{
         HEADER_MISMATCH, INVALID_PARAMS, LEGACY_RESOURCE_NOT_FOUND,
         MISSING_REQUIRED_CLIENT_CAPABILITY, UNSUPPORTED_PROTOCOL_VERSION, is_resource_missing,
     };
     use serde_json::json;
+
+    /// A `tools/call` result as MCP servers send it. Image blocks carried
+    /// `mimeType` and failed to parse as `mime_type`, discarding the whole
+    /// result; `audio`, `resource_link` and anything newer did the same.
+    #[test]
+    fn every_content_block_type_parses_and_reads_as_text() {
+        let raw = serde_json::json!({
+            "content": [
+                { "type": "text", "text": "done" },
+                { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" },
+                { "type": "audio", "data": "AAAA", "mimeType": "audio/wav" },
+                {
+                    "type": "resource_link", "uri": "file:///r.md", "name": "r.md",
+                    "description": "the report", "mimeType": "text/markdown"
+                },
+                { "type": "something_from_2027", "whatever": 1 }
+            ],
+            "isError": false
+        });
+        let result: CallToolResult = serde_json::from_value(raw).expect("a spec result parses");
+        let text: Vec<String> = result
+            .content
+            .iter()
+            .filter_map(ToolContent::to_text)
+            .collect();
+        assert_eq!(text[0], "done");
+        assert_eq!(text[1], "[Image: image/png, 8 bytes]");
+        assert_eq!(text[2], "[Audio: audio/wav, 4 bytes]");
+        assert_eq!(text[3], "[Resource link: r.md <file:///r.md> — the report]");
+        assert!(matches!(result.content[4], ToolContent::Unknown));
+
+        // And it round-trips in the spec's field names.
+        let image = serde_json::to_value(&result.content[1]).expect("serializes");
+        assert_eq!(image["mimeType"], "image/png");
+    }
 
     /// Deserialize a `tools/call` result body.
     fn parse(body: serde_json::Value) -> CallToolResult {

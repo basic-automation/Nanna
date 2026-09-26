@@ -117,8 +117,9 @@ impl ControlPlane {
             }
             SystemAction::ValidateApiKey { provider, key } => {
                 // The key is used for this one request and dropped; it is
-                // never logged and never written anywhere.
-                crate::validate_api_key::handle_validate_api_key(&provider, &key).await
+                // never written anywhere, and `SecretInput` keeps it out of
+                // the IPC layer's request log.
+                crate::validate_api_key::handle_validate_api_key(&provider, key.expose()).await
             }
         }
     }

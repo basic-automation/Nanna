@@ -334,6 +334,41 @@ pub struct TaskActivityEntry {
     pub action: String,
     pub detail: Option<serde_json::Value>,
     pub created_at: String,
+    /// The card's assignee when this row was written — stamped by the store,
+    /// never a caller. `None` for rows older than migration 021, and for a
+    /// card that had no assignee.
+    #[serde(default)]
+    pub assignee: Option<String>,
+}
+
+/// One member's acceptance verdicts, for one label or overall.
+///
+/// Read by the router when it picks a member for a card (P25 decision 4) and
+/// when it adjusts capability tags at verdict time (decision 15). Attributed to
+/// the member assigned when each verdict was judged, not the card's current
+/// assignee — see migration 021.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerdictTally {
+    pub member_id: String,
+    /// `None` is the member's total across every card, labelled or not; a card
+    /// with several labels counts once toward each of them.
+    pub label: Option<String>,
+    pub passed: u64,
+    pub failed: u64,
+}
+
+/// One chunk waiting for a vector under some model: exactly what the
+/// embedding queue knows, and nothing more.
+///
+/// The queue used to hand back a whole [`MemoryChunk`] with nine fields filled
+/// by invention (`char_end: 0`, `created_at: ""`, …) — values a caller could
+/// not tell from real ones. A narrow type makes the absence visible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedChunk {
+    pub id: i64,
+    pub memory_id: String,
+    pub ordinal: i64,
+    pub content: String,
 }
 
 /// One embedded slice of a memory's content.

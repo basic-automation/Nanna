@@ -55,6 +55,11 @@ jobs:
       - name: Suite 3 — memory retention budgets
         run: cargo test -p nanna-memory --lib retention --locked -- --nocapture
 
+      # Suite 3 — the timeline fold (bench/budgets.toml dreaming.timeline_*)
+      # Source: nanna_timeline::compress::tests::budget_gate_timeline_fold
+      - name: Suite 3 — timeline fold budgets
+        run: cargo test -p nanna-timeline --lib compress --locked -- --nocapture
+
       # Suite 4 — Long-horizon harness, deterministic half
       # (bench/budgets.toml agent_loop.*)
       # Sources: nanna_agent::harness::tests::*

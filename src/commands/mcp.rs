@@ -73,8 +73,7 @@ pub async fn serve(
 }
 
 async fn connect_daemon(url: &str) -> anyhow::Result<Client> {
-    let mut client_config = ClientConfig::new(url);
-    client_config.auto_reconnect = false;
+    let client_config = ClientConfig::new(url);
     match tokio::time::timeout(DAEMON_CONNECT_TIMEOUT, Client::connect(client_config)).await {
         Ok(Ok(client)) => Ok(client),
         Ok(Err(e)) => Err(anyhow::anyhow!(e)).context("the daemon refused the connection"),

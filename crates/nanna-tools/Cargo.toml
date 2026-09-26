@@ -24,6 +24,7 @@ rust-stemmers.workspace = true
 
 nanna-storage = { path = "../nanna-storage" }
 nanna-simd = { path = "../nanna-simd" }
+nanna-proc = { path = "../nanna-proc" }
 nanna-browser = { path = "../nanna-browser", optional = true }
 nanna-llm = { path = "../nanna-llm", optional = true }
 

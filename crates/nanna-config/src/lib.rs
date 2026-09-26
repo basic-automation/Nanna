@@ -972,7 +972,12 @@ impl Config {
         let mut disk = self.clone();
         disk.strip_secrets_for_disk();
         let contents = toml::to_string_pretty(&disk)?;
-        fs::write(path, contents)?;
+        // Temp file + rename, never an in-place write: the daemon watches this
+        // file and applies what it reads, so a truncate-then-write could be
+        // read half-written — a config missing everything past the cut.
+        let tmp = path.with_extension("toml.tmp");
+        fs::write(&tmp, contents)?;
+        fs::rename(&tmp, path)?;
         Ok(())
     }
 
@@ -1190,6 +1195,14 @@ impl Config {
             (Ok(Some(bound)), _) => bound,
             (Ok(None), UnboundOllamaToken::Configured) => {
                 self.llm.ollama_api_key = Some(token);
+                return;
+            }
+            (Ok(None), UnboundOllamaToken::RunningServer(running)) if running.trim().is_empty() => {
+                // No server is running to attribute it to. A blank record is
+                // still a record — it names no server and matches none — so
+                // writing one here bound the token to nothing, forever: it was
+                // never sent again, even after a real Server URL was set. Left
+                // unbound, it goes to the first real server instead.
                 return;
             }
             (Ok(None), UnboundOllamaToken::RunningServer(running)) => {
@@ -1536,7 +1549,6 @@ pub fn validate_data_dir(path: &Path) -> Result<(), DataDirError> {
 }
 
 impl Config {
-
     /// Copy config.toml from the legacy `bot/clawd/Nanna` tree into the
     /// canonical `com/nanna/nanna` tree when the latter does not yet exist.
     /// Best-effort and silent on failure — a failed migrate leaves the user on
@@ -1582,8 +1594,17 @@ impl Config {
         }
     }
 
-    /// Override config with environment variables
-    #[must_use] 
+    /// Override config with environment variables.
+    ///
+    /// **Secret precedence, end to end.** At load, each secret is filled only
+    /// if `config.toml` left it blank, from the environment first and then the
+    /// secure store (`fill_secrets`). Every entry point (the daemon, the
+    /// control plane, the CLI) then calls this, where a non-blank environment
+    /// variable replaces whatever was loaded. So the effective order is
+    /// **environment > `config.toml` > secure store**, and a blank variable
+    /// counts as unset everywhere. The one exception is the Ollama token from
+    /// the store, which is only ever used for the server it was saved for.
+    #[must_use]
     pub fn with_env_overrides(self) -> Self {
         self.with_env_overrides_from(process_env)
     }
@@ -2912,6 +2933,42 @@ mod ollama_token_binding_tests {
         assert_eq!(recorded_server(&store), None);
         assert!(!store.exists(keys::OLLAMA_API_KEY));
         assert!(!store.exists(keys::OLLAMA_API_KEY_HOST));
+    }
+
+    /// With no server address to attribute it to, a legacy token must stay
+    /// unbound. Recorded against a blank address it matched no server ever
+    /// again — the token was silently retired.
+    #[test]
+    fn a_blank_running_address_never_binds_the_token() {
+        let (dir, store) = store();
+        store
+            .set(keys::OLLAMA_API_KEY, "legacy-token")
+            .expect("set");
+        // A scratch config file: a test must never read the owner's.
+        let path = dir.path().join("config.toml");
+        Config::default().save_to(&path).expect("save");
+        let cfg = Config::load_from_replacing_with(&path, "  ", &store, no_env).expect("load");
+        assert_eq!(
+            recorded_server(&store),
+            None,
+            "nothing recorded for no server"
+        );
+        assert_eq!(cfg.llm.ollama_api_key, None);
+        assert!(
+            !store.bind_unbound_ollama_token("").expect("bind"),
+            "refused at the store too"
+        );
+
+        // The first real server then gets it.
+        assert!(
+            store
+                .bind_unbound_ollama_token("https://a.example/ollama")
+                .expect("bind")
+        );
+        assert_eq!(
+            recorded_server(&store).as_deref(),
+            Some("https://a.example/ollama")
+        );
     }
 
     #[test]

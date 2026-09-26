@@ -1519,6 +1519,23 @@ impl MemoryService {
         query: &str,
         workspace_id: Option<&str>,
     ) -> Result<RecallReport, MemoryError> {
+        self.recall_in_scope_with_report(query, crate::RecallScope::from_workspace(workspace_id))
+            .await
+    }
+
+    /// [`Self::recall_scoped_with_report`] over any [`crate::RecallScope`] —
+    /// including [`crate::RecallScope::GlobalOnly`], which the `Option<&str>`
+    /// form cannot express.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if no embedding function is configured, or if
+    /// embedding the query fails.
+    pub async fn recall_in_scope_with_report(
+        &self,
+        query: &str,
+        scope: crate::RecallScope<'_>,
+    ) -> Result<RecallReport, MemoryError> {
         let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
 
         let embed_started = std::time::Instant::now();
@@ -1533,11 +1550,7 @@ impl MemoryService {
         // Scoped search
         let (results, coverage) = self
             .store
-            .search_scoped_with_coverage(
-                &query_embedding,
-                self.config.max_results * 2,
-                workspace_id,
-            )
+            .search_in_scope_with_coverage(&query_embedding, self.config.max_results * 2, scope)
             .await;
         let min_score = self.get_min_score();
 
@@ -1558,13 +1571,13 @@ impl MemoryService {
                 &query_embedding,
                 &active_model,
                 self.config.max_results * 2,
-                workspace_id,
+                scope.sql_workspace(),
                 min_score,
             )
             .await;
 
         let filtered = self
-            .rank_and_assemble(results, &chunk_hits, workspace_id, min_score)
+            .rank_and_assemble(results, &chunk_hits, scope, min_score)
             .await;
 
         let timings = RecallTimings {
@@ -1576,7 +1589,7 @@ impl MemoryService {
         // without ever saying how long either half took.
         info!(
             "Recall (scoped {:?}) '{}': embed {} ms, search {} ms, {} results from {} memories",
-            workspace_id,
+            scope,
             truncate(query, 30),
             timings.embed_ms(),
             timings.search_ms(),
@@ -1615,7 +1628,7 @@ impl MemoryService {
         &self,
         results: Vec<(MemoryEntry, f32)>,
         chunk_hits: &HashMap<String, crate::chunk_rank::ChunkHit>,
-        workspace_id: Option<&str>,
+        scope: crate::RecallScope<'_>,
         min_score: f32,
     ) -> Vec<RecallResult> {
         debug_assert!(min_score.is_finite(), "a similarity floor is a number");
@@ -1626,19 +1639,26 @@ impl MemoryService {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for (entry, score) in results {
+            // A non-finite similarity is no evidence at all (a zero vector
+            // yields NaN), and NaN slips through `<`: it compares false against
+            // the floor and would be admitted. It is also why the sort below
+            // can use a total order.
+            let row = score.is_finite().then_some(score);
             let hit = chunk_hits.get(&entry.id);
             // Admitted on the better of the two TRUE similarities. Neither is
             // inflated for the test: `rank` carries the corroboration bonus and
             // is used only for ordering, so the threshold keeps the exact
             // meaning it was calibrated with.
-            let best = hit.map_or(score, |h| h.best.max(score));
+            let Some(best) = best_similarity(row, hit) else { continue };
             if best < min_score {
                 continue;
             }
-            let rank = hit.map_or(score, |h| h.rank().max(score));
+            let rank = hit.map_or(best, |h| h.rank().max(best));
             // Only name a chunk when the chunk is what actually won; a row-level
             // hit has no "part that matched" to point at.
-            let best_chunk = hit.filter(|h| h.best >= score).map(|h| h.best_ordinal);
+            let best_chunk = hit
+                .filter(|h| row.is_none_or(|r| h.best >= r))
+                .map(|h| h.best_ordinal);
             seen.insert(entry.id.clone());
             scored.push((entry, best, rank, best_chunk));
         }
@@ -1651,15 +1671,22 @@ impl MemoryService {
             if seen.contains(id) {
                 continue;
             }
+            debug_assert!(hit.best >= min_score, "collapse_chunk_hits admits on the floor");
             if let Some(entry) = self.store.get(id).await {
-                if workspace_id.is_some() && entry.workspace_id.as_deref() != workspace_id {
+                // The same rule the row scan applied. The chunk SQL narrows
+                // only to `sql_workspace`, so `GlobalOnly` is cut here.
+                if !scope.admits(entry.workspace_id.as_deref()) {
                     continue;
                 }
                 scored.push((entry, hit.best, hit.rank(), Some(hit.best_ordinal)));
             }
         }
 
-        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        debug_assert!(
+            scored.iter().all(|s| s.1.is_finite() && s.2.is_finite()),
+            "only finite scores reach the ordering"
+        );
+        scored.sort_by(|a, b| b.2.total_cmp(&a.2));
 
         for (entry, score, _rank, best_chunk) in scored {
             let weight = entry.fsrs.weight(&self.config.fsrs);
@@ -1958,10 +1985,19 @@ impl MemoryService {
         Ok(())
     }
 
-    /// Clear all memories
-    pub async fn clear(&self) {
-        self.store.clear().await;
-        info!("Cleared all memories");
+    /// Forget every memory in `ids`, durably. See
+    /// [`crate::VectorStore::remove_many_durable`]: a memory reported removed
+    /// is gone from disk too, and one reported failed is still there.
+    ///
+    /// Replaces a `clear()` that emptied RAM only — the daemon reported
+    /// "cleared" and the next restart loaded every memory back.
+    pub async fn forget_many(&self, ids: &[&str]) -> crate::DurableRemoval {
+        let outcome = self.store.remove_many_durable(ids).await;
+        info!(
+            "Forgot {} memories ({} refused by the backend)",
+            outcome.removed, outcome.failed
+        );
+        outcome
     }
 
     /// Save memories to file.
@@ -2897,6 +2933,30 @@ impl RecallResult {
         let start = start.min(total);
         let text: String = self.content.chars().skip(start).take(budget.max(1)).collect();
         (text, start, total)
+    }
+}
+
+/// The better of a memory's row and chunk similarity, or `None` when neither
+/// is evidence.
+///
+/// `row` is already `None` for a non-finite score; a chunk hit is finite by
+/// construction (`collapse_chunk_hits` drops NaN). Returning `None` rather
+/// than a sentinel keeps a memory with no usable score from being compared
+/// against the floor at all.
+fn best_similarity(row: Option<f32>, hit: Option<&crate::chunk_rank::ChunkHit>) -> Option<f32> {
+    debug_assert!(
+        row.is_none_or(f32::is_finite),
+        "a row score reaching here is finite"
+    );
+    debug_assert!(
+        hit.is_none_or(|h| h.best.is_finite()),
+        "a chunk hit is finite"
+    );
+    match (row, hit) {
+        (Some(r), Some(h)) => Some(r.max(h.best)),
+        (Some(r), None) => Some(r),
+        (None, Some(h)) => Some(h.best),
+        (None, None) => None,
     }
 }
 
@@ -4707,6 +4767,140 @@ mod tests {
         assert!(
             service.recall_scoped("the query", None).await.unwrap().is_empty(),
             "thirty near-misses must not clear a threshold none of them clears"
+        );
+    }
+
+    fn scoped_entry(id: &str, workspace_id: Option<&str>) -> MemoryEntry {
+        MemoryEntry {
+            id: id.to_string(),
+            content: format!("memory {id}"),
+            embeddings: HashMap::new(),
+            // No row vector yet (queued for backfill), so the row scan cannot
+            // reach it and only the chunk-only pass can admit it — the path
+            // under test. An orthogonal vector would not do: a small store's
+            // row scan returns every row, sub-floor scores included, and chunk
+            // evidence would admit them through the row loop instead.
+            embedding_model: None,
+            embedding: Vec::new(),
+            metadata: HashMap::new(),
+            timestamp: 0,
+            fsrs: crate::FsrsState::default(),
+            workspace_id: workspace_id.map(str::to_string),
+        }
+    }
+
+    /// A workspace-scoped recall sees that workspace AND the global memories —
+    /// the chunk SQL applies exactly that rule. The chunk-only pass used to
+    /// re-filter with a narrower one (`owner == scope`), so a global memory that
+    /// only a chunk matched was found by the index and then thrown away.
+    #[tokio::test]
+    async fn a_global_memory_found_only_by_a_chunk_survives_a_workspace_scope() {
+        let embed: EmbedFn =
+            Arc::new(|_text: &str| Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0, 0.0]) }));
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 4,
+            min_score: 0.4,
+            max_results: 2,
+            ..Default::default()
+        })
+        .with_embed_fn(embed)
+        .with_persistence(Arc::new(StubChunkSearch {
+            hits: vec![
+                ("global".to_string(), 0, 0.9),
+                ("mine".to_string(), 0, 0.8),
+                ("theirs".to_string(), 0, 0.95),
+            ],
+            model: "prov:a".to_string(),
+        }));
+        service.rebind_embeddings("prov:a", 4, None).await;
+        for entry in [
+            scoped_entry("global", None),
+            scoped_entry("mine", Some("ws-a")),
+            scoped_entry("theirs", Some("ws-b")),
+        ] {
+            service.store.add(entry).await.expect("add");
+        }
+        // Another workspace's perfect row matches fill the row scan's whole
+        // over-fetch (max_results * 2 * 3 = 12) and are then scoped away, so no
+        // memory above reaches the row loop: the chunk-only pass is the only
+        // way in.
+        for i in 0..12 {
+            let mut crowd = scoped_entry(&format!("crowd-{i}"), Some("ws-b"));
+            crowd.embedding = vec![1.0, 0.0, 0.0, 0.0];
+            crowd.embedding_model = Some("prov:a".to_string());
+            service.store.add(crowd).await.expect("add");
+        }
+
+        let found = service
+            .recall_scoped("the query", Some("ws-a"))
+            .await
+            .unwrap();
+        let ids: Vec<&str> = found.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["global", "mine"],
+            "global + this workspace, ranked; another workspace's memory stays out"
+        );
+
+        // `GlobalOnly` has no SQL form (the chunk scan runs unscoped), so the
+        // cut is `admits` alone — and it must hold on the chunk-only pass too.
+        let global = service
+            .recall_in_scope_with_report("the query", crate::RecallScope::GlobalOnly)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = global.results.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["global"], "global-only admits no workspace's memory");
+    }
+
+    /// NaN compares false against every floor, so `best < min_score` let a
+    /// NaN-scored row through — and then `partial_cmp` fell back to `Equal`,
+    /// leaving the order of the whole answer to wherever the NaN happened to
+    /// sit. A non-finite score is no evidence and never reaches the ordering.
+    #[tokio::test]
+    async fn a_nan_score_is_not_evidence() {
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 4,
+            min_score: 0.4,
+            ..Default::default()
+        });
+        let results = vec![
+            (scoped_entry("nan", None), f32::NAN),
+            (scoped_entry("real", None), 0.7),
+            (scoped_entry("weak", None), 0.2),
+        ];
+        let out = service
+            .rank_and_assemble(results, &HashMap::new(), crate::RecallScope::Everything, 0.4)
+            .await;
+        let ids: Vec<&str> = out.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["real"], "NaN is rejected like any sub-floor score");
+
+        // A NaN row beside a real chunk hit is admitted on the chunk, and the
+        // chunk is named as what matched.
+        let hits = crate::chunk_rank::collapse_chunk_hits(
+            &[
+                ("nan".to_string(), 3, 0.8),
+                ("nan".to_string(), 4, f32::NAN),
+            ],
+            0.4,
+        );
+        let out = service
+            .rank_and_assemble(
+                vec![(scoped_entry("nan", None), f32::NAN)],
+                &hits,
+                crate::RecallScope::Everything,
+                0.4,
+            )
+            .await;
+        assert_eq!(out.len(), 1, "the chunk evidence stands on its own");
+        assert!(
+            (out[0].score - 0.8).abs() < 1e-6,
+            "scored on the chunk: {}",
+            out[0].score
+        );
+        assert_eq!(
+            out[0].best_chunk,
+            Some(3),
+            "the NaN chunk never corroborated or won"
         );
     }
 

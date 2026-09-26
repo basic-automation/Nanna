@@ -109,7 +109,7 @@ mod dispatch {
         }
     }
 
-    /// NEON is mandatory on AArch64 — no runtime probing needed.
+    /// NEON is mandatory on `AArch64` — no runtime probing needed.
     #[inline]
     pub const fn detect() -> SimdTier {
         SimdTier::Neon
@@ -138,9 +138,19 @@ mod dispatch {
 pub use dispatch::SimdTier;
 
 /// Returns the SIMD tier in use on this machine.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 #[must_use]
 pub fn simd_tier() -> SimdTier {
+    dispatch::detect()
+}
+
+/// Returns the SIMD tier in use on this machine: fixed at compile time off
+/// `x86_64`, so it can be `const` there.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+#[must_use]
+pub const fn simd_tier() -> SimdTier {
     dispatch::detect()
 }
 
@@ -173,7 +183,7 @@ pub fn dot_product_f32(a: &[f32], b: &[f32]) -> f32 {
 
     #[cfg(target_arch = "aarch64")]
     {
-        unsafe { neon::dot_product_f32_neon(a, b) };
+        unsafe { neon::dot_product_f32_neon(a, b) }
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -203,7 +213,7 @@ pub fn cosine_similarity_f32(a: &[f32], b: &[f32]) -> f32 {
 
     #[cfg(target_arch = "aarch64")]
     {
-        unsafe { neon::cosine_similarity_f32_neon(a, b) };
+        unsafe { neon::cosine_similarity_f32_neon(a, b) }
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -231,7 +241,6 @@ pub fn normalize_f32(v: &mut [f32]) {
     #[cfg(target_arch = "aarch64")]
     {
         unsafe { neon::normalize_f32_neon(v) };
-        return;
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -265,7 +274,6 @@ pub fn add_f32(a: &mut [f32], b: &[f32]) {
     #[cfg(target_arch = "aarch64")]
     {
         unsafe { neon::add_f32_neon(a, b) };
-        return;
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

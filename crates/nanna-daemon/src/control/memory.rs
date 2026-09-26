@@ -7,15 +7,17 @@ impl ControlPlane {
     // Memory Handlers
     // =========================================================================
     
-    /// Does a memory in `workspace_id` belong to `scope`? `None` = every
+    /// The wire `scope` as a [`nanna_memory::RecallScope`]: `None` = every
     /// memory, `"global"` = global memories only, a workspace id = global
-    /// memories plus that workspace's. One rule for `list` and `export`, so the
-    /// two can never disagree about what a scope contains.
-    fn memory_in_scope(scope: Option<&str>, workspace_id: Option<&str>) -> bool {
+    /// memories plus that workspace's. One parse for `search`, `list` and
+    /// `export`, so they can never disagree about what a scope contains —
+    /// `search` used to read `"global"` as *every* memory while the other two
+    /// read it as the global ones.
+    fn memory_scope(scope: Option<&str>) -> nanna_memory::RecallScope<'_> {
         match scope {
-            None => true,
-            Some("global") => workspace_id.is_none(),
-            Some(workspace) => workspace_id.is_none() || workspace_id == Some(workspace),
+            None => nanna_memory::RecallScope::Everything,
+            Some("global") => nanna_memory::RecallScope::GlobalOnly,
+            Some(workspace) => nanna_memory::RecallScope::Workspace(workspace),
         }
     }
 
@@ -120,15 +122,14 @@ impl ControlPlane {
     }
 
     /// `MemoryAction::Search`: scoped recall, saying how much of the store was searchable.
-    async fn memory_search(memory: &MemoryService, query: String, limit: Option<usize>, scope: Option<String>) -> Value {
-        // Use scoped recall: None = all, Some("global") = global only, Some(ws_id) = global + workspace
-        let scope_filter = match &scope {
-            Some(ws_id) if ws_id != "global" => Some(ws_id.as_str()),
-            // "global" or None → all
-            _ => None,
-        };
+    async fn memory_search(
+        memory: &MemoryService,
+        query: String,
+        limit: Option<usize>,
+        scope: Option<String>,
+    ) -> Value {
         let result = memory
-            .recall_scoped_with_report(&query, scope_filter)
+            .recall_in_scope_with_report(&query, Self::memory_scope(scope.as_deref()))
             .await;
         match result {
             Ok(nanna_memory::RecallReport {
@@ -189,42 +190,50 @@ impl ControlPlane {
         }
     }
 
-    /// `MemoryAction::Clear`: all memories (in-memory only), or one scope's durably.
+    /// `MemoryAction::Clear`: every memory, or one scope's — durably either way.
+    ///
+    /// `None` used to empty RAM only and answer `"cleared"`, so the next restart
+    /// loaded every memory back from Turso. Both arms now go through
+    /// [`MemoryService::forget_many`], which removes a memory from RAM only once
+    /// its row is gone; a partial failure is reported as one, never as success.
+    ///
+    /// Destructive scopes stay narrow, unlike `list`'s: `"global"` clears only
+    /// unscoped memories, and a workspace id clears ONLY that workspace's —
+    /// never the globals its tab also displays.
     async fn memory_clear(memory: &MemoryService, scope: Option<String>) -> Value {
-        match scope.as_deref() {
-            None => {
-                memory.clear().await;
-                // Note: clear() removes all in-memory entries. Individual removes
-                // write-through to Turso, but bulk clear would require a separate
-                // DB call. For now we log a warning.
-                warn!("Memory cleared in-memory. Turso entries are NOT cleared — restart will reload them.");
-                info!("Cleared all memories (in-memory only)");
-                json!({ "status": "cleared", "scope": "all" })
-            }
-            Some(s) => {
-                // Scoped clear removes each matching entry via
-                // forget(), which write-throughs to Turso — durable,
-                // unlike the legacy all-clear above. "global" clears
-                // only unscoped entries; a workspace id clears ONLY
-                // that workspace's entries (never the globals its
-                // tab also displays — destructive ops stay narrow).
-                let target_global = s == "global";
-                let entries = memory.list_all().await;
-                let mut removed = 0usize;
-                for m in entries {
-                    let matches = if target_global {
-                        m.workspace_id.is_none()
-                    } else {
-                        m.workspace_id.as_deref() == Some(s)
-                    };
-                    if matches && memory.forget(&m.id).await.is_ok() {
-                        removed += 1;
-                    }
-                }
-                info!("Cleared {} memories in scope {}", removed, s);
-                json!({ "status": "cleared", "scope": s, "removed": removed })
-            }
+        let entries = memory.list_all().await;
+        let ids: Vec<&str> = entries
+            .iter()
+            .filter(|m| match scope.as_deref() {
+                None => true,
+                Some("global") => m.workspace_id.is_none(),
+                Some(ws) => m.workspace_id.as_deref() == Some(ws),
+            })
+            .map(|m| m.id.as_str())
+            .collect();
+        let outcome = memory.forget_many(&ids).await;
+        let scope_name = scope.as_deref().unwrap_or("all");
+        info!(
+            "Cleared {} of {} memories in scope {} ({} refused)",
+            outcome.removed,
+            ids.len(),
+            scope_name,
+            outcome.failed
+        );
+        if outcome.failed > 0 {
+            return json!({
+                "error": "clear_incomplete",
+                "scope": scope_name,
+                "removed": outcome.removed,
+                "failed": outcome.failed,
+                "message": format!(
+                    "{} memories could not be deleted from storage and were kept: {}",
+                    outcome.failed,
+                    outcome.first_error.unwrap_or_default()
+                ),
+            });
         }
+        json!({ "status": "cleared", "scope": scope_name, "removed": outcome.removed })
     }
 
     /// `MemoryAction::Consolidate`: one explicit, non-idle-gated dream cycle.
@@ -349,7 +358,7 @@ impl ControlPlane {
     async fn memory_list(memory: &MemoryService, scope: Option<String>) -> Value {
         let all_memories = memory.list_all().await;
         let memories: Vec<_> = all_memories.into_iter()
-            .filter(|m| Self::memory_in_scope(scope.as_deref(), m.workspace_id.as_deref()))
+            .filter(|m| Self::memory_scope(scope.as_deref()).admits(m.workspace_id.as_deref()))
             .map(|m| {
                 // Absent provenance is "unknown" — NOT "stated". A legacy
                 // memory stored before provenance was captured must not be
@@ -378,7 +387,11 @@ impl ControlPlane {
     }
 
     /// `MemoryAction::Export`: render the scope's memories as a document.
-    async fn memory_export(memory: &MemoryService, scope: Option<String>, format: crate::protocol::ExportFormat) -> Value {
+    async fn memory_export(
+        memory: &MemoryService,
+        scope: Option<String>,
+        format: crate::protocol::ExportFormat,
+    ) -> Value {
         // Rendered here for the same reason as `session.export`: the
         // store's owner renders once and every client gets that
         // document. Filtered by the same rule `list` uses.
@@ -386,7 +399,7 @@ impl ControlPlane {
             .export_records()
             .await
             .into_iter()
-            .filter(|m| Self::memory_in_scope(scope.as_deref(), m.workspace_id.as_deref()))
+            .filter(|m| Self::memory_scope(scope.as_deref()).admits(m.workspace_id.as_deref()))
             .collect();
         match crate::export::export_memories(
             &records,

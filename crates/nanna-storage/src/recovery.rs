@@ -60,6 +60,9 @@ const SALVAGE_TABLES: &[&str] = &[
     "memory_chunk_vectors",
     "embedding_queue",
     "memory_tags",
+    // The episodic stream beneath memories; append-only history nothing else
+    // can rebuild.
+    "memory_events",
     "config",
     "cron_jobs",
     "job_runs",
@@ -72,6 +75,9 @@ const SALVAGE_TABLES: &[&str] = &[
     "tool_stats_daily",
     "workspaces",
     "checkpoints",
+    // Before `tasks`: a card's assignee must resolve to a member, and the fresh
+    // store seeds only `human` and the routers — every custom agent lives here.
+    "members",
     "tasks",
     "task_notes",
     "task_activity",
@@ -383,31 +389,33 @@ async fn salvage_table(src: &turso::Connection, fresh: &Storage, table: &str) ->
     let expected = count_rows(src, table).await;
 
     let select = format!("SELECT rowid, * FROM {table} ORDER BY rowid ASC");
-    let (mut rows, forward_complete) = read_prefix(src, &select).await;
+    let (mut rows, forward_complete, source_columns) = read_prefix(src, &select).await;
 
     if !forward_complete {
         let select_desc = format!("SELECT rowid, * FROM {table} ORDER BY rowid DESC");
         let seen: HashSet<i64> = rows.iter().map(|(rid, _)| *rid).collect();
-        let (tail_rows, _) = read_prefix(src, &select_desc).await;
+        let (tail_rows, _, _) = read_prefix(src, &select_desc).await;
         rows.extend(tail_rows.into_iter().filter(|(rid, _)| !seen.contains(rid)));
     }
 
     let mut recovered = 0usize;
     if !rows.is_empty() {
-        // One INSERT shape per table: `SELECT rowid, *` yields rowid plus the
-        // schema columns, and we insert only the schema columns positionally
-        // (both files share the same migration-defined column order).
-        let column_count = rows[0].1.len();
-        let placeholders = (1..=column_count)
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let insert = format!("INSERT INTO {table} VALUES ({placeholders})");
-
+        let Some(insert) = salvage_insert(fresh, table, &source_columns).await else {
+            return TableSalvage {
+                table: table.to_string(),
+                recovered: 0,
+                expected,
+            };
+        };
         let conn = fresh.conn().lock().await;
         for (_rid, values) in rows {
-            debug_assert_eq!(values.len(), column_count, "row width changed mid-table");
-            match conn.execute(&insert, values).await {
+            debug_assert_eq!(values.len(), source_columns.len(), "row width changed mid-table");
+            let values: Vec<Value> = insert
+                .source_indices
+                .iter()
+                .filter_map(|&i| values.get(i).cloned())
+                .collect();
+            match conn.execute(&insert.sql, values).await {
                 Ok(_) => recovered += 1,
                 Err(e) => {
                     warn!("Skipping unrestorable {table} row during salvage: {e}");
@@ -439,30 +447,109 @@ async fn count_rows(conn: &turso::Connection, table: &str) -> Option<usize> {
 /// whether the scan reached the end without error. The cursor is dropped
 /// before returning (an open cursor on a shared turso connection swallows
 /// later statements).
-async fn read_prefix(conn: &turso::Connection, sql: &str) -> (Vec<(i64, Vec<Value>)>, bool) {
+async fn read_prefix(
+    conn: &turso::Connection,
+    sql: &str,
+) -> (Vec<(i64, Vec<Value>)>, bool, Vec<String>) {
     let mut out = Vec::new();
     let Ok(mut rows) = conn.query(sql, ()).await else {
-        return (out, false);
+        return (out, false, Vec::new());
     };
+    // The schema columns, in the SOURCE file's order (`rowid` is column 0 of
+    // `SELECT rowid, *` and is not one of them).
+    let columns: Vec<String> = rows.column_names().into_iter().skip(1).collect();
     loop {
         match rows.next().await {
             Ok(Some(row)) => {
                 let Ok(rid) = row.get::<i64>(0) else {
-                    return (out, false);
+                    return (out, false, columns);
                 };
                 let mut values = Vec::with_capacity(row.column_count().saturating_sub(1));
                 for i in 1..row.column_count() {
                     match row.get_value(i) {
                         Ok(v) => values.push(v),
-                        Err(_) => return (out, false),
+                        Err(_) => return (out, false, columns),
                     }
                 }
                 out.push((rid, values));
             }
-            Ok(None) => return (out, true),
-            Err(_) => return (out, false),
+            Ok(None) => return (out, true, columns),
+            Err(_) => return (out, false, columns),
         }
     }
+}
+
+/// The statement that restores one salvaged row, matched by column NAME.
+struct SalvageInsert {
+    sql: String,
+    /// For each placeholder, the index of its value in a source row.
+    source_indices: Vec<usize>,
+}
+
+/// Build the salvage INSERT for `table` from the columns the source file has
+/// and the fresh store has.
+///
+/// By name, not position: the quarantined file can predate a migration (it is
+/// corrupt, so its own migration run may never have finished), and a column
+/// appended since then made every positional INSERT fail on width — the whole
+/// table lost, row by row. Columns only the fresh store has take their
+/// defaults; columns only the source has are dropped, loudly.
+///
+/// `OR REPLACE`, because a fresh store is not empty: migrations seed rows
+/// (`human`, the routers), and the user's own version of a seeded row — a
+/// renamed human — must win over the default rather than be skipped as a
+/// duplicate.
+async fn salvage_insert(
+    fresh: &Storage,
+    table: &str,
+    source_columns: &[String],
+) -> Option<SalvageInsert> {
+    let fresh_columns = {
+        let conn = fresh.conn().lock().await;
+        let rows = conn
+            .query(&format!("SELECT * FROM {table} LIMIT 0"), ())
+            .await;
+        let names = rows
+            .as_ref()
+            .map(turso::Rows::column_names)
+            .map_err(ToString::to_string);
+        drop(rows);
+        drop(conn);
+        match names {
+            Ok(names) => names,
+            Err(e) => {
+                error!("Fresh store has no readable {table} ({e}); nothing salvaged into it");
+                return None;
+            }
+        }
+    };
+    let mut columns = Vec::new();
+    let mut source_indices = Vec::new();
+    for (i, name) in source_columns.iter().enumerate() {
+        if fresh_columns.iter().any(|f| f.eq_ignore_ascii_case(name)) {
+            columns.push(name.as_str());
+            source_indices.push(i);
+        } else {
+            warn!("Salvage of {table}: column {name} no longer exists; its values are dropped");
+        }
+    }
+    if columns.is_empty() {
+        error!("Salvage of {table}: no column in common with the fresh store");
+        return None;
+    }
+    let placeholders = (1..=columns.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "INSERT OR REPLACE INTO {table} ({}) VALUES ({placeholders})",
+        columns.join(", ")
+    );
+    debug_assert_eq!(columns.len(), source_indices.len(), "one index per column");
+    Some(SalvageInsert {
+        sql,
+        source_indices,
+    })
 }
 
 #[cfg(test)]
@@ -560,6 +647,143 @@ mod tests {
         assert!(page > 0, "refusing to zero page 1 (schema root)");
         bytes[page * PAGE_SIZE..(page + 1) * PAGE_SIZE].fill(0);
         std::fs::write(db_path, bytes).unwrap();
+    }
+
+    /// Every table a migration creates must be salvaged, or a page-level
+    /// recovery silently drops it. `members` and `memory_events` were missing:
+    /// the recovered board lost every custom agent, and its cards were left
+    /// assigned to ids that no longer resolve.
+    #[test]
+    fn every_migrated_table_is_salvaged() {
+        let mut missing = Vec::new();
+        for (_, sql) in crate::migrations::MIGRATIONS {
+            for statement in crate::migrations::split_statements(sql) {
+                let words: Vec<&str> = statement.split_whitespace().collect();
+                let name = match words.as_slice() {
+                    [create, table, if_, not, exists, name, ..]
+                        if create.eq_ignore_ascii_case("create")
+                            && table.eq_ignore_ascii_case("table")
+                            && if_.eq_ignore_ascii_case("if")
+                            && not.eq_ignore_ascii_case("not")
+                            && exists.eq_ignore_ascii_case("exists") =>
+                    {
+                        *name
+                    }
+                    [create, table, name, ..]
+                        if create.eq_ignore_ascii_case("create")
+                            && table.eq_ignore_ascii_case("table") =>
+                    {
+                        *name
+                    }
+                    _ => continue,
+                };
+                let name = name.trim_end_matches('(');
+                if !SALVAGE_TABLES.contains(&name) {
+                    missing.push(name.to_string());
+                }
+            }
+        }
+        assert!(missing.is_empty(), "tables no salvage copies: {missing:?}");
+    }
+
+    /// A quarantined file can predate a migration. Positional salvage failed
+    /// every row of a table whose column count had since grown — here
+    /// `task_activity` before migration 021 added `assignee`.
+    #[tokio::test]
+    async fn salvage_matches_columns_by_name_across_a_schema_change() {
+        let dir = test_dir("by_name");
+        let src_path = dir.join("old.db");
+        let src = turso::Builder::new_local(&src_path.to_string_lossy())
+            .build()
+            .await
+            .and_then(|db| db.connect())
+            .unwrap();
+        src.execute(
+            "CREATE TABLE task_activity (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             task_id INTEGER NOT NULL, actor TEXT, action TEXT NOT NULL, detail TEXT, \
+             created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+            (),
+        )
+        .await
+        .unwrap();
+        src.execute(
+            "INSERT INTO task_activity (task_id, actor, action) VALUES (7, 'gui', 'created')",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let fresh = Storage::in_memory().await.unwrap();
+        let salvage = salvage_table(&src, &fresh, "task_activity").await;
+        assert_eq!(salvage.recovered, 1, "{salvage:?}");
+        let history = fresh.tasks().activity(7, 10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].action, "created");
+        assert_eq!(
+            history[0].assignee, None,
+            "a column the source lacked takes its default"
+        );
+
+        drop(src);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fresh store is not empty: migrations seed `human`. The user's own
+    /// version of that row must win over the seed, not be skipped as a
+    /// duplicate — and a custom agent must come back at all.
+    #[tokio::test]
+    async fn salvaged_members_replace_the_seeds_and_custom_agents_return() {
+        let dir = test_dir("members");
+        let config = StorageConfig {
+            path: dir.join("old.db").to_string_lossy().to_string(),
+        };
+        let old = Storage::new(&config).await.unwrap();
+        old.members()
+            .update(
+                crate::HUMAN_MEMBER_ID,
+                crate::MemberPatch {
+                    name: Some("Justin".to_string()),
+                    ..crate::MemberPatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        old.members()
+            .create(crate::NewMember {
+                id: "reviewer".to_string(),
+                name: "Reviewer".to_string(),
+                avatar: None,
+                kind: crate::MemberKind::Agent,
+                owner_kind: crate::MemberOwner::Workspace,
+                owner_id: None,
+                status: crate::MemberStatus::Idle,
+                profile: serde_json::json!({ "model": "qwen" }),
+            })
+            .await
+            .unwrap();
+        let src = old.conn().lock().await.clone();
+
+        let fresh = Storage::in_memory().await.unwrap();
+        let salvage = salvage_table(&src, &fresh, "members").await;
+        assert_eq!(salvage.expected, Some(3), "{salvage:?}");
+        assert_eq!(salvage.recovered, 3, "{salvage:?}");
+        assert_eq!(
+            fresh
+                .members()
+                .get(crate::HUMAN_MEMBER_ID)
+                .await
+                .unwrap()
+                .name,
+            "Justin"
+        );
+        assert_eq!(
+            fresh.members().get("reviewer").await.unwrap().name,
+            "Reviewer"
+        );
+
+        drop(src);
+        drop(old);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

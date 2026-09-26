@@ -100,8 +100,91 @@ impl ExecutableTool {
         // Capture output
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        
+
+        // Contain the process. `spawn` would otherwise inherit the daemon's stdin
+        // (`output()` used to null it implicitly), a dropped call would leave the
+        // child running, and a grandchild (`sh -c`, a script's own subprocesses)
+        // would escape a kill aimed at the shell alone. On Unix the process group
+        // IS the subtree; on Windows `run_contained` adds a kill-on-close job.
+        if !matches!(self.manifest.execution, ExecutionMethod::Binary(_)) {
+            cmd.stdin(Stdio::null());
+        }
+        cmd.kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
+
         Ok(cmd)
+    }
+
+    /// Spawn `cmd`, feed a binary its JSON on stdin, and collect its output
+    /// under the manifest's own deadline.
+    ///
+    /// `None` means the deadline passed and the whole process tree was killed.
+    /// The deadline covers the stdin write too: a binary that never reads would
+    /// otherwise block a large write forever. The manifest timeout used to be
+    /// enforced only by the registry dropping this future, which killed nothing
+    /// — the process ran on, orphaned, for as long as it liked.
+    ///
+    /// # Errors
+    ///
+    /// [`ToolError::ExecutionFailed`] if the process cannot be spawned, written
+    /// to, or waited on.
+    async fn run_contained(
+        &self,
+        mut cmd: Command,
+        params: &HashMap<String, Value>,
+    ) -> Result<Option<std::process::Output>, ToolError> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to spawn process: {e}")))?;
+        let pid = child.id();
+        let mut job = nanna_proc::ChildJob::assign(&child);
+        let stdin_json = match child.stdin.take() {
+            Some(stdin) => Some((
+                stdin,
+                serde_json::to_vec(params).map_err(|e| {
+                    ToolError::InvalidParams(format!("Failed to serialize params: {e}"))
+                })?,
+            )),
+            None => None,
+        };
+        let run = async move {
+            if let Some((mut stdin, json)) = stdin_json {
+                stdin.write_all(&json).await.map_err(|e| {
+                    ToolError::ExecutionFailed(format!("Failed to write to stdin: {e}"))
+                })?;
+                // Dropping stdin closes it, so a binary reading to EOF proceeds.
+            }
+            child
+                .wait_with_output()
+                .await
+                .map_err(|e| ToolError::ExecutionFailed(format!("Failed to wait for process: {e}")))
+        };
+        tokio::pin!(run);
+        let deadline = std::time::Duration::from_secs(self.manifest.timeout);
+        tokio::select! {
+            output = &mut run => {
+                // Finished and its pipes closed: anything still alive was
+                // deliberately detached. Spare it (the daemon-wide job bounds it).
+                if let Some(job) = job.take() {
+                    job.disarm();
+                }
+                output.map(Some)
+            }
+            () = tokio::time::sleep(deadline) => {
+                warn!(tool = %self.manifest.name, "Executable tool timed out; killing its tree");
+                // Walk while `run` still owns the child, then sweep the job.
+                if let Some(pid) = pid {
+                    nanna_proc::kill_process_tree(pid).await;
+                }
+                if let Some(job) = job.take() {
+                    job.terminate();
+                }
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -125,37 +208,16 @@ impl Tool for ExecutableTool {
 
     async fn execute(&self, params: HashMap<String, Value>) -> Result<ToolResult, ToolError> {
         debug!(tool = %self.manifest.name, "Executing executable tool");
-        
-        let mut cmd = self.build_command(&params)?;
-        
-        // For binary execution, we need to write to stdin
-        let is_binary = matches!(self.manifest.execution, ExecutionMethod::Binary(_));
-        
-        let output = if is_binary {
-            let mut child = cmd.spawn().map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to spawn process: {e}"))
-            })?;
-            
-            // Write JSON to stdin
-            if let Some(mut stdin) = child.stdin.take() {
-                use tokio::io::AsyncWriteExt;
-                let json = serde_json::to_vec(&params).map_err(|e| {
-                    ToolError::InvalidParams(format!("Failed to serialize params: {e}"))
-                })?;
-                stdin.write_all(&json).await.map_err(|e| {
-                    ToolError::ExecutionFailed(format!("Failed to write to stdin: {e}"))
-                })?;
-            }
-            
-            child.wait_with_output().await.map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to wait for process: {e}"))
-            })?
-        } else {
-            cmd.output().await.map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to execute: {e}"))
-            })?
+
+        let cmd = self.build_command(&params)?;
+        let Some(output) = self.run_contained(cmd, &params).await? else {
+            return Ok(ToolResult::error(format!(
+                "`{}` ran past its {}s timeout and was killed with everything it started; \
+                 any partial work it did is on disk",
+                self.manifest.name, self.manifest.timeout
+            )));
         };
-        
+
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         
@@ -285,5 +347,79 @@ mod tests {
         assert!(result.contains("test.jpg"));
         assert!(result.contains("800x600"));
         assert!(result.contains("out.jpg"));
+    }
+
+    /// Dead or a zombie awaiting its reaper: either way, no longer running.
+    #[cfg(target_os = "linux")]
+    fn is_running(pid: &str) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit(')')
+                    .next()
+                    .map(|rest| rest.trim_start().to_owned())
+            })
+            .is_some_and(|rest| !rest.starts_with('Z') && !rest.starts_with('X'))
+    }
+
+    /// The manifest timeout is enforced here, and it kills the whole tree: the
+    /// registry used to drop the future, which killed nothing, so a `sleep`
+    /// grandchild (and the shell) ran on orphaned.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_timed_out_skill_is_killed_with_its_grandchildren() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("tool.yaml"),
+            "name: sleeper\ndescription: sleeps\ncommand: \"sleep 30 & echo $! > child.pid; wait\"\ntimeout: 1\n",
+        )
+        .expect("manifest");
+        let tool = ExecutableTool::from_manifest(&dir.path().join("tool.yaml")).expect("loads");
+
+        let started = std::time::Instant::now();
+        let result = tool
+            .execute(HashMap::new())
+            .await
+            .expect("a result, not an error");
+        assert!(!result.success, "{result:?}");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("timeout")),
+            "{result:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the deadline held"
+        );
+
+        let pid = std::fs::read_to_string(dir.path().join("child.pid")).expect("pid written");
+        let pid = pid.trim();
+        let gone = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while is_running(pid) && std::time::Instant::now() < gone {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            !is_running(pid),
+            "the grandchild {pid} outlived the timeout"
+        );
+    }
+
+    /// A skill that finishes in time is untouched by the containment.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_quick_skill_still_returns_its_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("tool.yaml"),
+            "name: echoer\ndescription: echoes\ncommand: \"echo {{word}}\"\ntimeout: 5\n",
+        )
+        .expect("manifest");
+        let tool = ExecutableTool::from_manifest(&dir.path().join("tool.yaml")).expect("loads");
+        let params = HashMap::from([("word".to_owned(), Value::String("hello".to_owned()))]);
+        let result = tool.execute(params).await.expect("runs");
+        assert!(result.success, "{result:?}");
+        assert_eq!(result.content, "hello");
     }
 }

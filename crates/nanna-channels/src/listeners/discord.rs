@@ -119,8 +119,15 @@ impl DiscordListener {
             return None;
         }
 
-        // Skip bot messages
-        if data.get("author")?.get("bot")?.as_bool().unwrap_or(false) {
+        // Skip bot messages. Discord OMITS `bot` for a human author, so a
+        // missing field is "not a bot" — the `?` this used to put on it made
+        // every human message return `None`, i.e. dropped them all.
+        if data
+            .get("author")?
+            .get("bot")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
             return None;
         }
 
@@ -220,8 +227,18 @@ impl DiscordListener {
 
             info!("Discord Gateway connected");
 
+            // Set by op 10 Hello; until then there is nothing to beat.
+            let mut heartbeat: Option<tokio::time::Interval> = None;
+            let mut awaiting_ack = false;
+
             'connection: loop {
                 tokio::select! {
+                    () = next_beat(&mut heartbeat) => {
+                        if !self.beat(&mut write, &mut awaiting_ack).await {
+                            should_resume = true;
+                            break 'connection;
+                        }
+                    }
                     _ = shutdown_rx.recv() => {
                         info!("Discord Gateway listener shutting down");
                         // Send close frame
@@ -268,6 +285,8 @@ impl DiscordListener {
                             sender: &sender,
                             cb: &mut cb,
                             should_resume: &mut should_resume,
+                            heartbeat: &mut heartbeat,
+                            awaiting_ack: &mut awaiting_ack,
                         };
                         match self.handle_payload(&payload, &mut conn).await {
                             PayloadFlow::Continue => {}
@@ -283,6 +302,28 @@ impl DiscordListener {
         }
 
         info!("Discord Gateway listener stopped");
+    }
+
+    /// Send one heartbeat. `false` means leave the connection (and resume): the
+    /// previous beat was never acknowledged — a zombie connection, by Discord's
+    /// own rule — or the send failed.
+    async fn beat(&self, write: &mut GatewaySink, awaiting_ack: &mut bool) -> bool {
+        if *awaiting_ack {
+            warn!("Discord Gateway missed a heartbeat ACK; reconnecting");
+            return false;
+        }
+        let seq = self.sequence.load(Ordering::SeqCst);
+        let hb = json!({ "op": 1, "d": seq });
+        if write
+            .send(WsMessage::Text(hb.to_string().into()))
+            .await
+            .is_err()
+        {
+            warn!("Failed to send heartbeat");
+            return false;
+        }
+        *awaiting_ack = true;
+        true
     }
 
     /// Act on one decoded gateway payload (its sequence number is already stored).
@@ -330,6 +371,7 @@ impl DiscordListener {
             // Heartbeat ACK
             11 => {
                 debug!("Heartbeat ACK");
+                *conn.awaiting_ack = false;
                 PayloadFlow::Continue
             }
             _ => {
@@ -397,6 +439,10 @@ impl DiscordListener {
         if let Some(d) = &payload.d
             && let Some(interval) = d.get("heartbeat_interval").and_then(serde_json::Value::as_u64) {
                 debug!("Heartbeat interval: {}ms", interval);
+                let period = heartbeat_period(interval);
+                *conn.heartbeat =
+                    Some(tokio::time::interval_at(tokio::time::Instant::now() + period, period));
+                *conn.awaiting_ack = false;
             }
 
         // Send identify or resume
@@ -414,11 +460,10 @@ impl DiscordListener {
         }
 
         *conn.should_resume = false;
-
-        // Start heartbeat task
-        // Note: heartbeat sending is handled inline when we receive op:1
-        // In a full implementation, we'd spawn a task that sends heartbeats on interval
-        // and coordinate with the main loop. For now, we rely on Discord's heartbeat requests.
+        // The heartbeat itself runs in the connection loop (`next_beat`),
+        // armed above. Discord only ASKS for a beat (op 1) occasionally; a
+        // client that beats only when asked is dropped as dead within about
+        // one interval (~41 s), which is how this listener used to behave.
         PayloadFlow::Continue
     }
 }
@@ -432,6 +477,32 @@ struct GatewayConnection<'a> {
     sender: &'a mpsc::Sender<IncomingMessage>,
     cb: &'a mut CircuitBreaker,
     should_resume: &'a mut bool,
+    /// The heartbeat timer, armed by op 10 Hello.
+    heartbeat: &'a mut Option<tokio::time::Interval>,
+    /// A beat was sent and its op 11 ACK has not arrived.
+    awaiting_ack: &'a mut bool,
+}
+
+/// Shortest heartbeat period accepted from the gateway.
+///
+/// Discord sends ~41 250 ms. The floor is not a tuning knob: a zero period
+/// makes `tokio::time::interval` panic, and a tiny one would spin the loop,
+/// so a malformed Hello must not be able to do either.
+const HEARTBEAT_PERIOD_MIN_MS: u64 = 1_000;
+
+/// The period to beat at for the Hello's `heartbeat_interval`.
+fn heartbeat_period(interval_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(interval_ms.max(HEARTBEAT_PERIOD_MIN_MS))
+}
+
+/// The next heartbeat tick, or never while no Hello has armed the timer.
+async fn next_beat(heartbeat: &mut Option<tokio::time::Interval>) {
+    match heartbeat {
+        Some(timer) => {
+            timer.tick().await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 /// What the connection loop does after handling one gateway payload.
@@ -484,5 +555,58 @@ mod tests {
         let payload = listener.identify_payload();
         assert_eq!(payload["op"], 2);
         assert_eq!(payload["d"]["token"], "test_token");
+    }
+
+    /// The heartbeat beats on its own once armed, never at a zero period,
+    /// and waits forever before a Hello.
+    #[tokio::test(start_paused = true)]
+    async fn the_heartbeat_beats_on_its_own_once_armed() {
+        assert_eq!(heartbeat_period(0), std::time::Duration::from_secs(1));
+        assert_eq!(
+            heartbeat_period(41_250),
+            std::time::Duration::from_millis(41_250)
+        );
+
+        let mut unarmed = None;
+        let idle = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            next_beat(&mut unarmed),
+        );
+        assert!(idle.await.is_err(), "no beat before Hello");
+
+        let period = heartbeat_period(41_250);
+        let mut armed = Some(tokio::time::interval_at(
+            tokio::time::Instant::now() + period,
+            period,
+        ));
+        let start = tokio::time::Instant::now();
+        next_beat(&mut armed).await;
+        next_beat(&mut armed).await;
+        assert_eq!(start.elapsed(), period * 2, "two beats, one period apart");
+    }
+
+    /// A human's message — whose author has no `bot` field at all — is
+    /// delivered; a bot's and our own are not.
+    #[test]
+    fn a_human_message_is_delivered_and_a_bots_is_not() {
+        let listener = DiscordListener::new("t");
+        let message = |author: Value| {
+            json!({
+                "id": "1100000000000000000",
+                "channel_id": "42",
+                "content": "hello",
+                "author": author,
+            })
+        };
+        let human = message(json!({ "id": "7", "username": "ada" }));
+        let delivered = listener
+            .convert_message(&human, Some("99"))
+            .expect("a human message is delivered");
+        assert_eq!(delivered.sender.id, "7");
+
+        let bot = message(json!({ "id": "8", "username": "hook", "bot": true }));
+        assert!(listener.convert_message(&bot, Some("99")).is_none());
+        let own = message(json!({ "id": "99", "username": "nanna" }));
+        assert!(listener.convert_message(&own, Some("99")).is_none());
     }
 }

@@ -10,11 +10,12 @@ name: Dependency audit
 #   of the 16 is fixable from this tree (they sit under rustpython, turso's
 #   exact pin, and the Tauri/GTK stack). Failing on them would make the job
 #   permanently red and therefore ignored. They stay visible in the log.
-# - npm: an advisory of `high` or `critical` severity in the GUI's production
-#   dependencies. On 2026-09-21 the only findings were 4 low/moderate
-#   DOMPurify advisories, all inside `monaco-editor`'s *vendored* copy
-#   (esm/vs/base/browser/dompurify/) — a pnpm override would silence the
-#   audit without changing any code that runs, so there is none.
+# - npm: an advisory of `moderate` severity or worse in the GUI's production
+#   dependencies. Until 2026-09-26 the bar was `high`, because the only
+#   findings were 4 low/moderate DOMPurify advisories inside `monaco-editor`'s
+#   *vendored* copy (esm/vs/base/browser/dompurify/), which no pnpm override
+#   could reach. `monaco-editor 0.57.0` vendors DOMPurify 3.4.15 and the audit
+#   is clean at every level, so the exemption that justified `high` is gone.
 #
 # Triggered by the files that can change the answer, plus weekly: an advisory
 # can be published against a lockfile nobody touched.
@@ -63,4 +64,4 @@ jobs:
         with:
           version: 9
       # Reads pnpm-lock.yaml only — verified to need no install.
-      - run: pnpm audit --prod --audit-level=high
+      - run: pnpm audit --prod --audit-level=moderate

@@ -129,6 +129,37 @@ impl ModelHealth {
     }
 }
 
+/// Consecutive failures at which a model enters cooldown.
+const COOLDOWN_FAILURES: u32 = 5;
+
+/// When a model with `consecutive_failures` may be tried again: the last
+/// failure plus an exponential backoff (30 s doubling per further failure,
+/// capped at 10 min). `None` below the cooldown threshold.
+///
+/// Anchored to the failure, not to the moment of asking. It used to be
+/// `now + backoff`, recomputed on every call, so the deadline moved with the
+/// clock and never arrived — and because a model in cooldown is skipped, no
+/// request could ever succeed and reset the streak. Five failures in a row
+/// retired a model until the daemon restarted.
+#[must_use]
+pub fn cooldown_retry_after_ms(
+    consecutive_failures: u32,
+    last_failure_epoch_ms: u64,
+) -> Option<u64> {
+    if consecutive_failures < COOLDOWN_FAILURES {
+        return None;
+    }
+    let exponent = consecutive_failures
+        .saturating_sub(COOLDOWN_FAILURES)
+        .min(8);
+    let backoff_ms = 30_000u64.saturating_mul(1u64 << exponent).min(600_000);
+    debug_assert!(
+        (30_000..=600_000).contains(&backoff_ms),
+        "backoff stays in its band"
+    );
+    Some(last_failure_epoch_ms.saturating_add(backoff_ms))
+}
+
 /// Multi-provider LLM router
 pub struct LlmRouter {
     /// Available providers and their clients.
@@ -505,16 +536,9 @@ impl LlmRouter {
         );
 
         // Check for consecutive failures (unhealthy → cooldown)
-        if summary.consecutive_failures >= 5 {
-            // Exponential cooldown: 30s * 2^(consecutive-5), capped at 10 min
-            let exponent = (summary.consecutive_failures.saturating_sub(5)).min(8);
-            let backoff_secs = (30u64).saturating_mul(1u64 << exponent).min(600);
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, crate::numeric::millis_u64);
-            // Estimate: cooldown started ~now (conservative; we don't have exact last-error time)
-            let retry_after_ms = now_ms + (backoff_secs * 1000);
-
+        if let Some(retry_after_ms) =
+            cooldown_retry_after_ms(summary.consecutive_failures, summary.last_failure_epoch_ms)
+        {
             return ModelHealth::Cooldown {
                 reason: format!("{} consecutive failures", summary.consecutive_failures),
                 retry_after_ms,
@@ -814,7 +838,70 @@ impl ProviderCredentials {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnthropicCredential, LlmRouter, ProviderCredentials, ProviderId};
+    use super::{
+        AnthropicCredential, LlmRouter, ModelHealth, ProviderCredentials, ProviderId,
+        cooldown_retry_after_ms,
+    };
+
+    #[test]
+    fn a_cooldown_is_measured_from_the_last_failure() {
+        assert_eq!(
+            cooldown_retry_after_ms(4, 1_000),
+            None,
+            "below the threshold"
+        );
+        assert_eq!(cooldown_retry_after_ms(5, 1_000), Some(31_000));
+        assert_eq!(cooldown_retry_after_ms(6, 1_000), Some(61_000), "doubles");
+        assert_eq!(
+            cooldown_retry_after_ms(40, 1_000),
+            Some(601_000),
+            "capped at 10 min"
+        );
+        // A failure long enough ago is a cooldown that has ended.
+        let ended = ModelHealth::Cooldown {
+            reason: "old".to_string(),
+            retry_after_ms: cooldown_retry_after_ms(5, 1_000).expect("in cooldown"),
+        };
+        assert!(
+            ended.is_usable(),
+            "the model is tried again once the backoff has passed"
+        );
+    }
+
+    /// The live bug: `retry_after` was `now + backoff`, recomputed on every
+    /// call, so asking twice gave two different deadlines and neither ever
+    /// arrived. Five failures retired a model until restart.
+    #[tokio::test]
+    async fn a_cooldown_deadline_does_not_move_between_calls() {
+        let tracker = nanna_agent::ModelStatsTracker::new();
+        for _ in 0..5 {
+            tracker
+                .record(nanna_agent::RequestObservation {
+                    model: "flaky".to_string(),
+                    success: false,
+                    latency: std::time::Duration::from_millis(5),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    cache_creation_1h_tokens: 0,
+                    tier: None,
+                    escalated: false,
+                })
+                .await;
+        }
+        let router = LlmRouter::new();
+        router.set_stats(tracker).await;
+
+        let deadline = |health: ModelHealth| match health {
+            ModelHealth::Cooldown { retry_after_ms, .. } => retry_after_ms,
+            other => panic!("five failures must be a cooldown, got {other:?}"),
+        };
+        let first = deadline(router.model_health("flaky").await);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let second = deadline(router.model_health("flaky").await);
+        assert_eq!(first, second, "the deadline is a fixed point in time");
+    }
 
     /// The live failure this guards: a provider authenticated after boot must
     /// register on rebuild (no daemon restart), and one whose credential goes

@@ -29,8 +29,12 @@ offline, fixed-seed — these are exact, reproducible values, not timing samples
 | w20 aged-recall (FSRS-6 `0.0658`) | **6/6 topics** | `retention::tests::w20_experiment_aged_recall` | 800-day-aged corpus, FSRS-gated recall |
 | w20 aged-recall (FSRS-5 `0.5`, the old default) | **0/6 topics** | same test | evidence the shipped constant was wrong; default flipped 2026-07-17 |
 
+| Timeline fold compression (P25 DSP step 2) | **0.76** (24 of 100 events kept) | `nanna_timeline::compress::tests::budget_gate_timeline_fold` | *(2026-09-26)* fixed-seed `SplitMix64` card series at `DREAM_FOLD_BUDGET` (24); model-free, so exact |
+| Timeline fold transition retention | **1.0** (10/10 outcomes kept) | same test | a transition is never decimated while the budget can hold it |
+
 Budget: consolidation must not regress **recall retention below 1.0** on this fixed corpus,
-and must hold **compression ≥ 0.90**. The w20 rows are a correctness fixture (they assert the
+and must hold **compression ≥ 0.90**. The timeline fold must hold **compression ≥ 0.75** and
+**keep every transition** on its corpus. The w20 rows are a correctness fixture (they assert the
 FSRS-6 exponent strictly out-recalls the old FSRS-5 one on aged memories), not a tunable budget.
 
 ### Summarization drift (content fidelity, not recall)

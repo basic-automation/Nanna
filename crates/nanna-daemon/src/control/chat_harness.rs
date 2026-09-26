@@ -2263,7 +2263,7 @@ impl ChatTurn {
             }
         }
 
-        self.state_a_silent_finish(turn_stop_kind).await;
+        self.state_a_silent_finish(turn_stop_kind);
         self.persist_reply().await;
 
         // The turn's workdir binding is turn-scoped and dies with the turn.
@@ -2299,14 +2299,17 @@ impl ChatTurn {
     /// completion…_`); an empty *claimed* completion gets the same honesty.
     /// Never on a cancel: an empty stopped turn is exactly what Stop asked
     /// for.
-    async fn state_a_silent_finish(&self, turn_stop_kind: &str) {
+    fn state_a_silent_finish(&self, turn_stop_kind: &str) {
         if turn_stop_kind != "all_tasks_done" || self.run_handle.cancel.is_cancelled() {
             return;
         }
-        let said_nothing = strip_harness_markers(&self.run_handle.accumulated_text.read().await)
-            .trim()
-            .is_empty();
-        let did_nothing = self.run_handle.completed_tool_calls.read().await.is_empty();
+        let said_nothing = strip_harness_markers(&crate::agent_service::lock_buf(
+            &self.run_handle.accumulated_text,
+        ))
+        .trim()
+        .is_empty();
+        let did_nothing =
+            crate::agent_service::lock_buf(&self.run_handle.completed_tool_calls).is_empty();
         if said_nothing && did_nothing {
             tracing::warn!(
                 session_id = %self.session_id,
@@ -2324,7 +2327,8 @@ impl ChatTurn {
         // and the timeline journal carries the interleaved record.
         // Harness plumbing (the TASK COMPLETE claim marker) is stripped
         // from both — it is a verdict signal, not conversation.
-        let mut full_text = self.run_handle.accumulated_text.read().await.clone();
+        let mut full_text =
+            crate::agent_service::lock_buf(&self.run_handle.accumulated_text).clone();
         let repeated = self
             .final_sink
             .text_join

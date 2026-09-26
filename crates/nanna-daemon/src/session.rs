@@ -660,9 +660,6 @@ pub struct SubSessionInfo {
     pub result: Option<String>,
     /// Error message (on failure)
     pub error: Option<String>,
-    /// Cancellation flag for cooperative shutdown
-    #[serde(skip)]
-    pub cancellation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// A message in the sub-session mailbox
@@ -974,7 +971,35 @@ impl SessionManager {
             Err(e) => warn!("Failed to persist message {} in session {}: {}", msg.id, session_id, e),
         }
     }
-    
+
+    /// Fork session `id`: a new session in the same workspace, with the same
+    /// settings (`metadata`: pinned model, tools, …) and a copy of every
+    /// message under a fresh id, stored like any other. `None` if `id` does
+    /// not exist.
+    ///
+    /// The control plane used to copy only the messages — dropping the
+    /// workspace and settings — through [`Self::update`], which never stored
+    /// them: the fork came back empty after a restart.
+    pub async fn fork(&self, id: &str, name: Option<String>) -> Option<Session> {
+        let original = self.get(id).await?;
+        let name = name.or_else(|| original.name.as_ref().map(|n| format!("{n} (copy)")));
+        let mut forked = self
+            .create_in_workspace(name, original.workspace_id.clone())
+            .await;
+        forked.metadata = original.metadata.clone();
+        forked.messages = original
+            .messages
+            .iter()
+            .map(|m| SessionMessage {
+                id: uuid::Uuid::new_v4().to_string(),
+                ..m.clone()
+            })
+            .collect();
+        debug_assert_eq!(forked.messages.len(), original.messages.len());
+        self.replace(forked.clone()).await;
+        Some(forked)
+    }
+
     /// Create a session and return it
     pub async fn create(&self, name: Option<String>) -> Session {
         self.create_in_workspace(name, None).await
@@ -1231,6 +1256,49 @@ impl SessionManager {
     /// the live value wins and `update` stays pin-neutral — it can neither set
     /// nor clear a pin. A session the map has never seen has no live value to
     /// reconcile against, so its snapshot carries through as-is.
+    /// Replace a session wholesale: its row AND its messages, in memory and in
+    /// the store.
+    ///
+    /// [`Self::update`] persists only the row, so a caller that changed the
+    /// message list through it changed memory alone: Regenerate's dropped
+    /// reply came back from the store on the next restart, and a fork's copied
+    /// messages were never stored at all. Messages are matched by id: the ones
+    /// no longer present are deleted, the new ones written; unchanged ones are
+    /// left as they are.
+    pub async fn replace(&self, session: Session) {
+        let before: HashSet<String> = self
+            .sessions
+            .read()
+            .await
+            .get(&session.id)
+            .map(|live| live.messages.iter().map(|m| m.id.clone()).collect())
+            .unwrap_or_default();
+        let after: HashSet<&str> = session.messages.iter().map(|m| m.id.as_str()).collect();
+        let removed: Vec<String> = before
+            .iter()
+            .filter(|id| !after.contains(id.as_str()))
+            .cloned()
+            .collect();
+        let added: Vec<SessionMessage> = session
+            .messages
+            .iter()
+            .filter(|m| !before.contains(&m.id))
+            .cloned()
+            .collect();
+        let id = session.id.clone();
+        self.update(session).await;
+        if let Some(ref storage) = self.storage {
+            for message_id in &removed {
+                if let Err(e) = storage.delete_daemon_message(&id, message_id).await {
+                    warn!("Failed to delete message {message_id} in session {id}: {e}");
+                }
+            }
+        }
+        for message in &added {
+            self.persist_message(&id, message).await;
+        }
+    }
+
     pub async fn update(&self, mut session: Session) {
         let row = {
             let mut sessions = self.sessions.write().await;
@@ -1345,19 +1413,23 @@ impl SessionManager {
     }
     
     /// Add a message to a session (with write-through to DB)
-    pub async fn add_message(&self, session_id: &str, role: MessageRole, content: impl Into<String>) -> Option<String> {
+    pub async fn add_message(
+        &self,
+        session_id: &str,
+        role: MessageRole,
+        content: impl Into<String>,
+    ) -> Option<String> {
         let content = content.into();
         let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.get_mut(session_id) {
-            let msg_id = session.add_message(role, content);
-            // Persist the new message synchronously
-            if let Some(msg) = session.messages.last() {
-                self.persist_message(session_id, msg).await;
-            }
-            Some(msg_id)
-        } else {
-            None
+        let session = sessions.get_mut(session_id)?;
+        let msg_id = session.add_message(role, content);
+        let msg = session.messages.last().cloned();
+        // Persist after releasing the lock (see `add_full_message`).
+        drop(sessions);
+        if let Some(msg) = msg {
+            self.persist_message(session_id, &msg).await;
         }
+        Some(msg_id)
     }
 
     /// Append an assistant message outside any streamed turn and announce it
@@ -1402,16 +1474,19 @@ impl SessionManager {
     ) -> Option<String> {
         let content = content.into();
         let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.get_mut(session_id) {
-            let msg_id = session.add_full_message(role, content, details);
-            // Persist the new message synchronously
-            if let Some(msg) = session.messages.last() {
-                self.persist_message(session_id, msg).await;
-            }
-            Some(msg_id)
-        } else {
-            None
+        let session = sessions.get_mut(session_id)?;
+        let msg_id = session.add_full_message(role, content, details);
+        let msg = session.messages.last().cloned();
+        // Persisted after releasing the lock. The write guard over EVERY
+        // session used to be held across this database write, so each
+        // appended message stalled every session read and write in the daemon
+        // for the length of a disk write. Order is safe: the timestamp the
+        // store sorts by (`created_at`) was assigned above, under the lock.
+        drop(sessions);
+        if let Some(msg) = msg {
+            self.persist_message(session_id, &msg).await;
         }
+        Some(msg_id)
     }
     
     /// Whether a session exists, without loading it.
@@ -1534,9 +1609,15 @@ impl SessionManager {
     }
 
     /// Update sub-session state
+    ///
+    /// A killed sub-session stays killed: the run it belonged to may still
+    /// report in as it winds down, and that must not revive it.
     pub async fn set_sub_session_state(&self, session_id: &str, state: SubSessionState) {
         let mut subs = self.sub_sessions.write().await;
         if let Some(info) = subs.get_mut(session_id) {
+            if info.state == SubSessionState::Killed {
+                return;
+            }
             info.state = state;
             if matches!(state, SubSessionState::Completed | SubSessionState::Failed | SubSessionState::Killed) {
                 info.finished_at = Some(Utc::now());
@@ -1549,8 +1630,11 @@ impl SessionManager {
         let mut subs = self.sub_sessions.write().await;
         if let Some(info) = subs.get_mut(session_id) {
             info.result = Some(result);
-            info.state = SubSessionState::Completed;
-            info.finished_at = Some(Utc::now());
+            // Kept as what the run wrote, but a killed run did not complete.
+            if info.state != SubSessionState::Killed {
+                info.state = SubSessionState::Completed;
+                info.finished_at = Some(Utc::now());
+            }
         }
     }
 
@@ -1559,8 +1643,10 @@ impl SessionManager {
         let mut subs = self.sub_sessions.write().await;
         if let Some(info) = subs.get_mut(session_id) {
             info.error = Some(error);
-            info.state = SubSessionState::Failed;
-            info.finished_at = Some(Utc::now());
+            if info.state != SubSessionState::Killed {
+                info.state = SubSessionState::Failed;
+                info.finished_at = Some(Utc::now());
+            }
         }
     }
 
@@ -1596,14 +1682,11 @@ impl SessionManager {
             .collect()
     }
 
-    /// Kill a sub-session (set cancellation flag + state)
+    /// Mark a sub-session killed. Stopping its run is the caller's (the
+    /// control plane cancels the agent's chat for this session).
     pub async fn kill_sub_session(&self, session_id: &str) -> bool {
         let mut subs = self.sub_sessions.write().await;
         if let Some(info) = subs.get_mut(session_id) {
-            // Signal cancellation
-            if let Some(ref flag) = info.cancellation_flag {
-                flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
             info.state = SubSessionState::Killed;
             info.finished_at = Some(Utc::now());
             info!("Killed sub-session: {}", session_id);
@@ -2309,7 +2392,6 @@ mod tests {
             model: None,
             result: None,
             error: None,
-            cancellation_flag: None,
         };
         manager.register_sub_session(info).await;
 
