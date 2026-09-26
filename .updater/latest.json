@@ -1,15 +1,15 @@
 {
-  "version": "0.3.30",
-  "notes": "The task store announces itself: nine card events, and a memory edit no longer keeps its old search vector.",
-  "pub_date": "2026-09-24T19:48:32.408Z",
+  "version": "0.3.31",
+  "notes": "The board remembers: cards and threads become memories, closed cards fold into one; Discord delivers people's messages again; stopped and timed-out runs really stop.",
+  "pub_date": "2026-09-26T23:57:47.196Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXI3d0dDbGYxbE9zV2F2Qk85TGdENzV6c29BVnpIc3VMa1RQZnJETXNRaTJNUTFoV0lUbnFzM2lDcGlMckdvVzRpaVZmcjdoWk9BUkRiaklucTJWK1FrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMjc5MTY5CWZpbGU6TmFubmFfMC4zLjMwX3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMzAKQzlXUXl2andpclgxRzJTeVZEdnhOOEhaL1VWcFR6dU83MTY3ZzkzTXBoMFBEMUx4Q3pUVlhQcHl4VkY2NDloV2xQKytEdGY5OVorOGNGRXZieUtIQnc9PQo=",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.30-beta.39/Nanna_0.3.30_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXFhbEZOZStjUnNMOUtzWkl3a251VDlDTXYyb0VYdHBIWXZvM3dUb2NrcmF5aDhhWWlocS9sRks1UDVrRVRrZ2ZaYkoxRkoyd2FBR2k3cW53M0NqcEE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwNDY2OTA1CWZpbGU6TmFubmFfMC4zLjMxX3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMzEKRVJqcDR6eHhQMGRaalU4a1Z5MTdjRm1qZGRad0lqY3FDNHh5c2ZMNVJhRTNmYmlQMzQ2aGJ4YXlHNHA1SFpwUEQzLzE0TGF2SkpvUHl2NExlZmlCRHc9PQo=",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.31-beta.40/Nanna_0.3.31_x64-setup.exe"
     },
     "linux-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXFRTEJ2T0hSZnA2WTFjbFJFZE9iU3EveVoxaFMvdU9MSEZZNXhDZ3crWkVLOTNlUURIVnFlY1ZGY2dkR20zV2M3TWlUTWtNQ0hUdGNpLzdNa240VUFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMjc3NDk0CWZpbGU6TmFubmFfMC4zLjMwX2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjMwCnlLOCtGekZHQTBGOEo1NndUR1I4cVMzL3FvQ1VNR1NINkNCZ3NMZExuTjJ6VitWU3J3NUYxRWNSSzdvNEU0MmI5Zkg0U1pKS1Q0MmZZcGY0SklLL0JBPT0K",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.30-beta.39/Nanna_0.3.30_amd64.AppImage"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXZHWCtLR2tUd3lPMlZWYmRMQU5oM1BNWGp5cjdUb0Q3ZTlibVFyZEtvTTFRTEowVk9MMS8zK3ZackdOTjNKV2dqcWFVak1hSlM2QjVDOWZwV05yZ3cwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwNDY1MTA3CWZpbGU6TmFubmFfMC4zLjMxX2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjMxCm5zdUtZdDdNVjNtb240RG5TRDlCanVsc3JwZDdYUTNhUzNxMDB1NkkrUXk3bkxYNGprbUxTSXIwWG90b1U2aXpGN2RjUENIM3ZWY3NuWC80Yk1IeEJnPT0K",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.31-beta.40/Nanna_0.3.31_amd64.AppImage"
     }
   }
 }
