@@ -8,7 +8,7 @@ description = "Workspace management for Nanna - directory-based agent context"
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["fs", "process", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "process", "time"] }
 tracing = { workspace = true }
 toml = { workspace = true }
 

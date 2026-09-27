@@ -78,10 +78,7 @@ impl ScriptedToolWrapper {
             )
         })?;
 
-        // Apply timeout from manifest if specified
-        if let Some(timeout_secs) = manifest.timeout_secs {
-            tool.timeout_ms = timeout_secs * 1000;
-        }
+        apply_manifest_timeout(&mut tool, &manifest);
 
         // The script engine identifies a tool by `ScriptedTool::name`, which
         // `from_file` can only derive from the file stem — and every skill's
@@ -119,6 +116,10 @@ impl ScriptedToolWrapper {
         // Same reason as `from_file`: the caller's label is for the caller, the
         // manifest name is what everything downstream calls this tool.
         tool.name.clone_from(&manifest.name);
+        // And the same deadline: this constructor used to skip the manifest's
+        // `timeout`, so a tool built from source ran under the default however
+        // long it declared it needed.
+        apply_manifest_timeout(&mut tool, &manifest);
 
         Ok(Self {
             tool,
@@ -339,6 +340,18 @@ impl Tool for ScriptedToolWrapper {
     }
 }
 
+/// Give `tool` the deadline its manifest declares, if it declares one.
+///
+/// Saturating: the number is whatever the tool file says, and a `timeout` of
+/// 18446744073709552 seconds wrapped to a few milliseconds in a release build
+/// (and panicked in a debug one).
+fn apply_manifest_timeout(tool: &mut ScriptedTool, manifest: &ToolManifest) {
+    if let Some(timeout_secs) = manifest.timeout_secs {
+        tool.timeout_ms = timeout_secs.saturating_mul(1000);
+        debug_assert!(tool.timeout_ms >= timeout_secs, "never shorter than declared");
+    }
+}
+
 /// Parse parameters from a JSON Schema value
 /// Convert a JSON Schema `enum` entry to its string form. Preserves non-string
 /// scalars (numbers, booleans, null) that the previous `as_str`-only path silently
@@ -417,6 +430,23 @@ mod tests {
 
         assert_eq!(def.name, "greet");
         assert_eq!(def.description, "Greet someone");
+    }
+
+    /// Both constructors honour the manifest's `timeout`, and an absurd one
+    /// saturates instead of wrapping to a near-zero deadline.
+    #[test]
+    fn the_manifest_timeout_applies_and_saturates() {
+        let source = |timeout: &str| {
+            format!(
+                "export default {{ name: \"slow\", description: \"Slow\", timeout: {timeout}, execute() {{ return 1; }} }}"
+            )
+        };
+        let tool = ScriptedToolWrapper::from_source("slow", source("90")).unwrap();
+        assert_eq!(tool.tool.timeout_ms, 90_000, "from_source applies the declared timeout");
+        assert_eq!(tool.timeout_secs(), Some(90));
+
+        let tool = ScriptedToolWrapper::from_source("slow", source("18446744073709552")).unwrap();
+        assert_eq!(tool.tool.timeout_ms, u64::MAX, "an absurd timeout saturates");
     }
 
     #[tokio::test]

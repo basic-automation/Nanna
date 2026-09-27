@@ -2368,11 +2368,21 @@ pub(crate) fn is_transient_llm_error(message: &str) -> bool {
         || message.contains("stream watchdog:")
 }
 
-/// Forensics: append the exact prompt of an empty-completion step to a temp
-/// file so the deterministic trigger can be replayed and minimized offline.
+/// Forensics: append the exact prompt of an empty-completion step to a file
+/// beside the daemon's logs, so the deterministic trigger can be replayed and
+/// minimized offline.
+///
+/// It used to append to `nanna_empty_step_prompts.log` in the temp directory:
+/// unbounded (a degraded provider can produce hundreds of these an hour, each
+/// a whole prompt), world-readable under `/tmp`, and written synchronously on
+/// the runtime thread. Now it is bounded by [`crate::log_file::append_bounded`],
+/// owner-only, written off the runtime, and skipped when no log directory was
+/// resolved.
 fn dump_empty_step(request: &StepRequest, attempt: usize) {
-    use std::io::Write;
-    let path = std::env::temp_dir().join("nanna_empty_step_prompts.log");
+    let Some(dir) = crate::log_file::forensics_dir() else {
+        return;
+    };
+    let path = dir.join("empty_step_prompts.log");
     let entry = format!(
         "==== {} item#{} kind={:?} attempt={attempt} ====\n{}\n\n",
         chrono::Utc::now().to_rfc3339(),
@@ -2380,11 +2390,13 @@ fn dump_empty_step(request: &StepRequest, attempt: usize) {
         request.step_kind,
         request.prompt,
     );
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut f| f.write_all(entry.as_bytes()));
+    drop(tokio::task::spawn_blocking(move || {
+        if let Err(e) =
+            crate::log_file::append_bounded(&path, &entry, crate::log_file::FORENSIC_LOG_BYTES_MAX)
+        {
+            tracing::debug!(error = %e, path = %path.display(), "empty-step dump not written");
+        }
+    }));
 }
 
 /// An "empty completion": HTTP success but no text, no tool calls, and ~no

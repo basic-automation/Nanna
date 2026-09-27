@@ -164,7 +164,7 @@ impl PythonEngine {
             Ok(Err(_)) => Err(ScriptError::Execution(
                 "Python interpreter thread terminated without returning a result".to_string(),
             )),
-            Err(_) => Err(ScriptError::Timeout(timeout_secs * 1000)),
+            Err(_) => Err(ScriptError::Timeout(timeout_secs.saturating_mul(1000))),
         }
     }
 }
