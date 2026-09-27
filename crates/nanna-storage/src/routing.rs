@@ -332,6 +332,7 @@ async fn apply_split(
                 description: sub.description.clone(),
                 priority: task.priority,
                 assignee: sub.assignee.clone(),
+                created_by: Some(router_id.to_string()),
                 ..NewTask::default()
             })
             .await?;
@@ -377,6 +378,7 @@ async fn apply_clarify(
             priority: task.priority,
             labels: vec![CLARIFICATION_LABEL.to_string()],
             assignee: Some(HUMAN_MEMBER_ID.to_string()),
+            created_by: Some(router_id.to_string()),
             ..NewTask::default()
         })
         .await?;

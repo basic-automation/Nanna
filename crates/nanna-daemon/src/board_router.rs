@@ -11,10 +11,10 @@
 //! walks a model list with failover exactly as every other one-shot caller
 //! does, and tests drive it with a scripted reply.
 //!
-//! Not yet wired to the bus. The trigger it needs — "a card was created, and
-//! not by the router" — is not expressible from today's `created` event, whose
-//! `actor` is the card's assignee rather than its creator (see ROADMAP P25
-//! Stage 2).
+//! Not yet wired to the bus, on purpose: while the chat harness lives, its
+//! own workspace-scoped todos are board cards too, and routing them (a
+//! `clarify` blocks the harness's work on a human card) would fight it. The
+//! trigger lands with the board client's create (ROADMAP P25 Stage 2).
 
 use std::fmt::Write as _;
 use std::future::Future;

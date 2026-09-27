@@ -240,6 +240,10 @@ pub struct NewTask {
     pub acceptance: Option<serde_json::Value>,
     pub assignee: Option<String>,
     pub sort_order: i64,
+    /// Who created the card, as activity actors are recorded — the `created`
+    /// row's actor and the `created` event's. `None` when the caller does not
+    /// know. Not a column: the activity log is where a card's history lives.
+    pub created_by: Option<String>,
 }
 
 /// Partial task update; `None` fields are left untouched.

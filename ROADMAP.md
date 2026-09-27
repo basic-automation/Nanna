@@ -8024,15 +8024,24 @@ as its turn (`TurnAdmission`, scope default `session`).
             one-shot caller — and re-asks **once** with the parse error appended; a second
             unusable reply leaves the card untouched. Session-scoped cards are refused before any
             model call. 5 tests on a scripted model.
-      - [ ] **Wire the trigger — blocked on who created a card.** A `created` event's `actor`
-            is the card's **assignee**, not its creator: `TaskRepository::create` passes
-            `new.assignee` both to `log_activity` and to `emit`. So "wake on `created`, skip
-            cards the router itself created" cannot be told from the event — a router split
-            with unassigned children would re-wake the router on each child. Add a creator to
-            `NewTask` (and the activity row), carry it as the `created` actor, then subscribe:
-            a bounded queue fed from `TaskEventBridge` like the memory write-through (drops
-            counted), board scopes only, `route_card` per event, the router member's model list
-            from its profile else the agent's `model_priority`.
+      - [x] *(2026-09-27)* **A card knows who created it.** A `created` event's `actor` was
+            the card's **assignee** (`create` passed `new.assignee` to both `log_activity` and
+            `emit`), which the activity row already stamps in its own column since migration
+            021 — so the creator was recorded nowhere, and "skip cards the router itself
+            created" could not be told from the event. `NewTask::created_by` is now the
+            `created` actor (`None` when unknown, never guessed from the assignee). Writers:
+            the router's splits and clarifications stamp the router id; IPC create records
+            `gui` (as IPC update/complete do); `seed_plan` records `harness`; `tasks.add`
+            takes the caller's `actor` param, as `tasks.update` does. 1 test.
+      - [ ] **Wire the trigger — deliberately not yet.** Everything it needs now exists:
+            wake on `created` in a board scope whose actor is not a router (and on a failed
+            `verdict`), via a bounded queue fed from `TaskEventBridge` like the memory
+            write-through (drops counted), then `route_card`, the router member's model list
+            from its profile else the agent's `model_priority`. **Held back because the chat
+            harness still exists:** the chat model's own `tasks.add` cards in workspace scope
+            would be routed too, and a `clarify` would block the harness's work on a human card
+            mid-mission. Land it with the board client's create (Stage 4) or restricted to
+            `created_by = gui` until then — never on every board-scoped card while chat lives.
 - [ ] Triggers: `created` (skip cards the router itself created), clarification `done`, `verdict`
       failed (bounded retries, then a clarification to the human), recurring reopen, `stalled`
       (`in_progress` with no live run past threshold), heartbeat.

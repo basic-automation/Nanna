@@ -268,6 +268,8 @@ impl ControlPlane {
             acceptance,
             assignee,
             sort_order,
+            // IPC writers are recorded as `gui`, as its update and complete are.
+            created_by: Some("gui".to_string()),
         };
         // No `created` event is emitted here. `TaskRepository::create` emits
         // `Event::TaskEvent{ kind: Created }` for every writer, not just this

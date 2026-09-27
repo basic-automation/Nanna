@@ -673,6 +673,8 @@ fn task_add_service(
                 acceptance: canonical_acceptance(&params)?.or(parent_acceptance),
                 assignee: opt_string(&params, "assignee"),
                 sort_order,
+                // The same caller-named actor `tasks.update` records.
+                created_by: opt_string(&params, "actor"),
             };
             // Decomposition damping — a returned note, never a
             // refusal. The item is created regardless; the note rides
@@ -3935,6 +3937,7 @@ pub async fn seed_plan(
             acceptance: task.acceptance.clone(),
             assignee: None,
             sort_order: base_sort + crate::numeric::i64_saturating(index),
+            created_by: Some("harness".to_string()),
         };
         match repo.create(new).await {
             Ok(created) => ids.push(created.id),
@@ -7701,6 +7704,7 @@ mod acceptance_canonicalization_tests {
             acceptance: Some(canonical),
             assignee: None,
             sort_order: 0,
+            created_by: None,
         };
         let created = storage.tasks().create(new.clone()).await.expect("create");
         assert!(created.acceptance.expect("stored").is_object());
