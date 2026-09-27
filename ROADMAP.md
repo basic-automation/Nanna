@@ -7996,6 +7996,26 @@ as its turn (`TurnAdmission`, scope default `session`).
 - [ ] `RouterService` per workspace subscribed to the bus; decisions are small structured outputs
       (assign / split / clarify / park), each mirrored as a thread post. It runs on the router
       member's `ModelChain`.
+      - [x] *(2026-09-27)* **The model-free half: the decision contract and its application.**
+            `nanna_storage::routing` — `RouterDecision` (serde-tagged `{"decision": "assign" |
+            "split" | "clarify" | "park", …}`, the structured output the router model will be
+            asked for), `parse_decision` (bounded to 64 KiB, takes the outermost `{…}` so a fenced
+            block or a sentence around it is fine, validates, and returns an error worded to
+            re-ask the model with), and `apply_decision`, which performs each as store writes plus
+            the router's thread post: **assign** sets the assignee (must be a board member, never
+            a router — decision 4); **split** creates up to `SPLIT_SUBTASKS_MAX` = 30 children
+            under the card, inheriting scope and priority (30 = how many maximal titles one
+            16 KiB post can name); **clarify** creates a `clarification`-labelled card for the
+            human and adds it to the work card's `depends_on`, so the work is derived-`blocked`
+            (decision 6); **park** labels `parked` once and posts every time. A card with a live
+            run can only be parked (decision 7 — the caller says whether a run is live, since only
+            the daemon's run registry knows); closed cards are refused. Writes run created-cards →
+            this card → post, so a post never names a card that does not exist. `nanna-storage`
+            took `#![recursion_limit = "256"]` like the daemon/server/core/memory roots: proving
+            the nested repository future `Send` overran the default. 8 tests.
+            **Next:** the service half — subscribe to the bus, build the prompt from the card +
+            `list_for_workspace` profiles + `verdict_rollup`, call the router member's
+            `ModelChain`, re-ask once on a `parse_decision` error, then `apply_decision`.
 - [ ] Triggers: `created` (skip cards the router itself created), clarification `done`, `verdict`
       failed (bounded retries, then a clarification to the human), recurring reopen, `stalled`
       (`in_progress` with no live run past threshold), heartbeat.

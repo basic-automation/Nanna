@@ -1,5 +1,10 @@
 #![warn(clippy::all)]
 #![warn(clippy::pedantic, clippy::nursery)]
+// `routing::apply_decision` awaits repository futures one level deeper than
+// anything else here, and proving it `Send` (clippy's `future_not_send`)
+// exceeds the default depth — the same answer the daemon, server, core and
+// memory roots already carry (rust#159228).
+#![recursion_limit = "256"]
 
 //! Persistent storage for Nanna using Turso
 //!
@@ -10,6 +15,7 @@ mod migrations;
 mod models;
 mod recovery;
 mod repositories;
+pub mod routing;
 mod task_events;
 pub mod task_filter;
 mod tasks;
