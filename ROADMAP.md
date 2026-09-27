@@ -8013,9 +8013,26 @@ as its turn (`TurnAdmission`, scope default `session`).
             this card → post, so a post never names a card that does not exist. `nanna-storage`
             took `#![recursion_limit = "256"]` like the daemon/server/core/memory roots: proving
             the nested repository future `Send` overran the default. 8 tests.
-            **Next:** the service half — subscribe to the bus, build the prompt from the card +
-            `list_for_workspace` profiles + `verdict_rollup`, call the router member's
-            `ModelChain`, re-ask once on a `parse_decision` error, then `apply_decision`.
+      - [x] *(2026-09-27, later)* **The model half: `nanna_daemon::board_router::route_card`.**
+            Gathers what the router reads (the card, its last 8 posts oldest-first, the board's
+            roster from `list_for_workspace` minus every router, and `verdict_rollup` over the
+            last 500 verdicts), builds the prompt within `ROUTER_PROMPT_BYTES_MAX` = 9 216 bytes
+            (half the 4 608-token minimum window at ~4 B/token; posts previewed at 480 B so the
+            fixed sections can never crowd the roster below ~1.8 KB; members that do not fit are
+            counted and announced), asks the injected completion function — the
+            `summarize_with_failover` shape, so the model list fails over like every other
+            one-shot caller — and re-asks **once** with the parse error appended; a second
+            unusable reply leaves the card untouched. Session-scoped cards are refused before any
+            model call. 5 tests on a scripted model.
+      - [ ] **Wire the trigger — blocked on who created a card.** A `created` event's `actor`
+            is the card's **assignee**, not its creator: `TaskRepository::create` passes
+            `new.assignee` both to `log_activity` and to `emit`. So "wake on `created`, skip
+            cards the router itself created" cannot be told from the event — a router split
+            with unassigned children would re-wake the router on each child. Add a creator to
+            `NewTask` (and the activity row), carry it as the `created` actor, then subscribe:
+            a bounded queue fed from `TaskEventBridge` like the memory write-through (drops
+            counted), board scopes only, `route_card` per event, the router member's model list
+            from its profile else the agent's `model_priority`.
 - [ ] Triggers: `created` (skip cards the router itself created), clarification `done`, `verdict`
       failed (bounded retries, then a clarification to the human), recurring reopen, `stalled`
       (`in_progress` with no live run past threshold), heartbeat.
