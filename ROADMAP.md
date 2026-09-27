@@ -8619,6 +8619,22 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       VM's `signal_handlers` are initialised, and user code's bare `except:` catches the raised
       exception. A correct fix re-sends until the thread reports back and is tested with two
       interpreters running at once.
+      *(2026-09-27 — the Python engine; only regex backtracking is left on this line.)* A
+      timed-out `python.exec` is now **stopped**: each interpreter gets a user signal channel
+      (`init_hook` → `set_user_signal_channel`), and on timeout a reaper sends a
+      `KeyboardInterrupt` (a `BaseException`, so `except Exception:` cannot swallow it) every
+      50 ms until the thread reports back, bounded by a 5 s grace after which it warns that the
+      thread is abandoned (blocked outside bytecode, or a bare `except:`). The re-send is the
+      answer to the global `ANY_TRIGGERED` race: every `send` re-arms the flag, so another
+      interpreter consuming it only delays the interrupt. Nothing is sent until the thread
+      reports it has entered the user's code — set-up runs frozen-stdlib bytecode, and an
+      exception there under the release profile's `panic = "abort"` is not a risk worth taking.
+      **Found on the way:** interpreters ran with `install_signal_handlers: true`, so any
+      `python.exec` that imported `signal` — which `subprocess` does — installed RustPython's
+      libc SIGINT handler **process-wide**, taking Ctrl-C and `kill -INT` away from the daemon's
+      graceful shutdown for the rest of its life. Off now. 3 tests, each red without its fix
+      (a loop and two concurrent loops observed to stop; `SigCgt` in `/proc/self/status`
+      unchanged across `import signal, subprocess`).
       *(2026-09-26, later)* Manifest (`tool.yaml`) skills enforce their own timeout and kill the
       whole tree. The timeout used to exist only as the registry dropping the future, which
       killed nothing: the shell and anything it started ran on, orphaned. `run_contained` now

@@ -141,10 +141,10 @@ impl PythonEngine {
         // RustPython is synchronous and !Send, and needs far more native stack than a
         // Tokio blocking thread provides (see PYTHON_STACK_BYTES), so it gets its own
         // explicitly-sized thread rather than the runtime's ambient one.
-        let receiver = spawn_interpreter_thread(code, workdir)?;
+        let (mut receiver, interrupt, running) = spawn_interpreter_thread(code, workdir)?;
 
         let result =
-            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), receiver).await;
+            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), &mut receiver).await;
 
         let duration_ms = crate::elapsed_ms(start);
 
@@ -164,7 +164,91 @@ impl PythonEngine {
             Ok(Err(_)) => Err(ScriptError::Execution(
                 "Python interpreter thread terminated without returning a result".to_string(),
             )),
-            Err(_) => Err(ScriptError::Timeout(timeout_secs.saturating_mul(1000))),
+            Err(_) => {
+                // The caller gets its answer now; stopping the thread is the
+                // reaper's job, off this call's clock.
+                tokio::spawn(stop_abandoned_interpreter(interrupt, running, receiver));
+                Err(ScriptError::Timeout(timeout_secs.saturating_mul(1000)))
+            }
+        }
+    }
+}
+
+/// How often a timed-out interpreter is re-sent its interrupt.
+const INTERRUPT_RESEND: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How long the reaper keeps interrupting before it reports the thread lost.
+///
+/// An interrupt lands at the interpreter's next bytecode boundary, which a
+/// running loop reaches within microseconds; what outlasts this is code that
+/// is not running bytecode (a blocking read, a long native call) or code that
+/// catches `BaseException` and carries on — neither of which more waiting fixes.
+const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Stop an interpreter whose caller timed out.
+///
+/// `RustPython` cannot be pre-empted from outside, so a timed-out thread used to
+/// run to completion — forever, for a `while True` — spinning a core for the
+/// life of the process. The interpreter polls a user signal channel at every
+/// bytecode boundary; this sends it a `KeyboardInterrupt` through that channel.
+///
+/// It re-sends until the thread reports back, because the channel is gated by a
+/// process-global "a signal is pending" flag that ANY running interpreter
+/// clears when it checks: a second `python.exec` running at the same moment
+/// can consume the flag meant for this one, and a single send would then sit
+/// in the queue unread. Each send re-arms the flag. A `BaseException` is used
+/// so user code's `except Exception:` cannot swallow it (a bare `except:` still
+/// can — the grace bound is for that).
+///
+/// Nothing is sent until the thread reports `running` — that it has finished
+/// building the interpreter and entered the user's code. Interpreter set-up runs
+/// frozen-stdlib bytecode too, and an exception raised inside it is not the
+/// user's to catch; in a `panic = "abort"` release build a set-up that treated
+/// it as fatal would take the daemon down with it. Before `running`, the reaper
+/// only waits; the grace clock starts once it is set.
+async fn stop_abandoned_interpreter(
+    interrupt: rustpython_vm::signal::UserSignalSender,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mut done: tokio::sync::oneshot::Receiver<PythonResult>,
+) {
+    while !running.load(std::sync::atomic::Ordering::Acquire) {
+        if tokio::time::timeout(INTERRUPT_RESEND, &mut done)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+    }
+    let deadline = tokio::time::Instant::now() + INTERRUPT_GRACE;
+    let mut sends = 0u32;
+    loop {
+        let signal: rustpython_vm::signal::UserSignal = Box::new(|vm| {
+            Err(vm.new_exception(
+                vm.ctx.exceptions.keyboard_interrupt.to_owned(),
+                vec![vm.ctx.new_str("python.exec timed out").into()],
+            ))
+        });
+        // A closed channel means the interpreter is already gone.
+        if interrupt.send(signal).is_err() {
+            return;
+        }
+        sends = sends.saturating_add(1);
+        match tokio::time::timeout(INTERRUPT_RESEND, &mut done).await {
+            Ok(_) => {
+                debug!(sends, "timed-out Python interpreter stopped");
+                return;
+            }
+            Err(_) if tokio::time::Instant::now() >= deadline => {
+                tracing::warn!(
+                    sends,
+                    "a timed-out Python interpreter did not stop within {}s of being \
+                     interrupted (blocked outside bytecode, or catching BaseException); \
+                     its thread is abandoned",
+                    INTERRUPT_GRACE.as_secs()
+                );
+                return;
+            }
+            Err(_) => {}
         }
     }
 }
@@ -178,14 +262,19 @@ impl Default for PythonEngine {
 /// Run one isolated interpreter on a dedicated thread with a stack large enough for
 /// `RustPython`, returning a receiver for its result.
 ///
-/// A timed-out caller simply stops awaiting the receiver; the thread runs to
-/// completion and its result is dropped. That matches the previous `spawn_blocking`
-/// behavior — a synchronous interpreter cannot be pre-empted mid-execution — and the
-/// thread is bounded by the caller's timeout in practice.
+/// Also returns the sender half of the interpreter's user signal channel, and a flag
+/// the thread sets once the interpreter is built and running the user's code: a caller
+/// that times out hands it to [`stop_abandoned_interpreter`], which interrupts the
+/// thread at its next bytecode boundary. (It used to run to completion — forever,
+/// for a runaway loop — because a synchronous interpreter cannot be pre-empted.)
 fn spawn_interpreter_thread(
     code: String,
     workdir: Option<String>,
-) -> Result<tokio::sync::oneshot::Receiver<PythonResult>> {
+) -> Result<(
+    tokio::sync::oneshot::Receiver<PythonResult>,
+    rustpython_vm::signal::UserSignalSender,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+)> {
     // The stack invariant is enforced at compile time by the `const _` assert on
     // PYTHON_STACK_BYTES — stronger than a debug_assert here, and free.
     //
@@ -193,12 +282,15 @@ fn spawn_interpreter_thread(
     // so it is handled by the interpreter rather than asserted on, and a failed spawn
     // is an operational error returned as Err below. Hence no runtime assertion.
     let (sender, receiver) = tokio::sync::oneshot::channel();
+    let (interrupt, interrupts) = rustpython_vm::signal::user_signal_channel();
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let running_flag = std::sync::Arc::clone(&running);
 
     std::thread::Builder::new()
         .name("nanna-python".to_string())
         .stack_size(PYTHON_STACK_BYTES)
         .spawn(move || {
-            let result = execute_isolated(&code, workdir.as_deref());
+            let result = execute_isolated(&code, workdir.as_deref(), interrupts, &running_flag);
             // A dropped receiver means the caller timed out — expected, not an error.
             drop(sender.send(result));
         })
@@ -206,7 +298,7 @@ fn spawn_interpreter_thread(
             ScriptError::Execution(format!("failed to spawn Python interpreter thread: {e}"))
         })?;
 
-    Ok(receiver)
+    Ok((receiver, interrupt, running))
 }
 
 /// Execute code in a fresh, isolated interpreter.
@@ -216,7 +308,12 @@ fn spawn_interpreter_thread(
 /// 2. Write results to temp files that we read back from Rust
 ///
 /// This avoids needing to extract Python objects from the VM directly.
-fn execute_isolated(code: &str, workdir: Option<&str>) -> PythonResult {
+fn execute_isolated(
+    code: &str,
+    workdir: Option<&str>,
+    interrupts: rustpython_vm::signal::UserSignalReceiver,
+    running: &std::sync::atomic::AtomicBool,
+) -> PythonResult {
     use rustpython_vm as vm;
     use rustpython_vm::compiler::Mode;
 
@@ -224,11 +321,21 @@ fn execute_isolated(code: &str, workdir: Option<&str>) -> PythonResult {
     // Python bytecode). rustpython 0.5 replaced `Interpreter::with_init` with a
     // builder: stdlib module defs come from `stdlib_module_defs(&ctx)` and frozen
     // modules are added on the builder itself.
-    let builder = vm::Interpreter::builder(vm::Settings::default());
+    //
+    // `install_signal_handlers` is off: with it on, the interpreter's `_signal`
+    // module — imported by `signal`, and so by `subprocess` — installs its own
+    // libc SIGINT handler, process-wide. One `python.exec` would take Ctrl-C
+    // (and `kill -INT`) away from the daemon's graceful shutdown for the rest of
+    // the process's life. Timeouts reach the interpreter through its user signal
+    // channel instead (`stop_abandoned_interpreter`), which needs no OS handler.
+    let mut settings = vm::Settings::default();
+    settings.install_signal_handlers = false;
+    let builder = vm::Interpreter::builder(settings);
     let stdlib_defs = rustpython_stdlib::stdlib_module_defs(&builder.ctx);
     let interp = builder
         .add_native_modules(&stdlib_defs)
         .add_frozen_modules(rustpython_pylib::FROZEN_STDLIB)
+        .init_hook(move |vm| vm.set_user_signal_channel(interrupts))
         .build();
 
     // Build wrapper code that captures everything
@@ -236,6 +343,9 @@ fn execute_isolated(code: &str, workdir: Option<&str>) -> PythonResult {
 
     interp.enter(|vm| {
         let scope = vm.new_scope_with_builtins();
+        // Set-up is over: from here an interrupt lands in the wrapper, whose
+        // `except:` turns it into this call's result.
+        running.store(true, std::sync::atomic::Ordering::Release);
 
         match vm
             .compile(&wrapper, Mode::Exec, "<nanna>".to_owned())
@@ -759,5 +869,99 @@ print(msg)
         let result = engine.execute(code, None, 10).await.unwrap();
         assert!(result.success, "error: {:?}", result.error);
         assert!(result.stdout.contains("hello\nworld"));
+    }
+
+    /// Python that rewrites `path` with a growing counter forever.
+    fn runaway_writer(path: &std::path::Path) -> String {
+        format!(
+            "p = {}\nn = 0\nwhile True:\n    n += 1\n    if n % 2000 == 0:\n        open(p, 'w').write(str(n))\n",
+            python_string_literal(&path.to_string_lossy())
+        )
+    }
+
+    /// Wait until the file a runaway writer rewrites exists and then stops
+    /// changing — i.e. the loop really ended. Bounded well past the reaper's
+    /// grace plus a debug-build interpreter start-up.
+    async fn wait_until_still(path: &std::path::Path) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+        let mut last: Option<String> = None;
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            let now = std::fs::read_to_string(path).ok();
+            if now.is_some() && now == last {
+                return true;
+            }
+            last = now;
+        }
+        false
+    }
+
+    /// A timed-out `while True` is stopped, not abandoned: it used to spin a
+    /// core for the life of the process, since `RustPython` cannot be
+    /// pre-empted and the caller merely stopped waiting for it.
+    #[tokio::test]
+    async fn a_timed_out_loop_is_stopped_not_abandoned() {
+        let _serialize = PYTHON_TEST_GUARD.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("counter.txt");
+        let err = PythonEngine::new()
+            .execute(&runaway_writer(&path), None, 1)
+            .await
+            .expect_err("a runaway loop times out");
+        assert!(matches!(err, ScriptError::Timeout(1000)), "{err:?}");
+        assert!(
+            wait_until_still(&path).await,
+            "the loop kept running after its timeout"
+        );
+    }
+
+    /// Two interpreters timing out at once are both stopped. The user signal
+    /// channel is gated by a process-GLOBAL pending flag that any running
+    /// interpreter clears, so one interrupt could be consumed by the other
+    /// interpreter; the reaper re-sends until each thread reports back.
+    #[tokio::test]
+    async fn concurrent_timed_out_interpreters_are_all_stopped() {
+        let _serialize = PYTHON_TEST_GUARD.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
+        let engine = PythonEngine::new();
+        let (code_a, code_b) = (runaway_writer(&a), runaway_writer(&b));
+        let (ra, rb) = tokio::join!(
+            engine.execute(&code_a, None, 1),
+            engine.execute(&code_b, None, 1),
+        );
+        assert!(ra.is_err() && rb.is_err(), "both time out");
+        let (still_a, still_b) = tokio::join!(wait_until_still(&a), wait_until_still(&b));
+        assert!(still_a && still_b, "a: {still_a}, b: {still_b}");
+    }
+
+    /// Importing `signal` (as `subprocess` does) must not install the
+    /// interpreter's SIGINT handler into the daemon process: it would take
+    /// Ctrl-C and `kill -INT` away from graceful shutdown for good. Read from
+    /// the kernel's own record of which signals this process catches.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn importing_signal_leaves_the_process_sigint_handler_alone() {
+        fn catches_sigint() -> bool {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            let mask = status
+                .lines()
+                .find_map(|l| l.strip_prefix("SigCgt:"))
+                .map(str::trim)
+                .unwrap();
+            u64::from_str_radix(mask, 16).unwrap() & (1 << (2 - 1)) != 0
+        }
+        let _serialize = PYTHON_TEST_GUARD.lock().await;
+        let before = catches_sigint();
+        let result = PythonEngine::new()
+            .execute("import signal\nimport subprocess\nprint('ok')", None, 30)
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            catches_sigint(),
+            before,
+            "python.exec changed the process's SIGINT handling"
+        );
     }
 }
