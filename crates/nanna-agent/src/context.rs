@@ -210,6 +210,138 @@ fn verified_subject_preview(subject: &str) -> String {
     }
 }
 
+/// Bytes the verified-outcome LINES may occupy in one rendered slot.
+///
+/// The slot is the one preamble section no compression tier can shrink, so it
+/// must fit the smallest window the agent runs in beside everything else:
+/// `nanna_llm::DEFAULT_MIN_VIABLE_NUM_CTX` (4 608 tokens) is that floor, and
+/// the slot gets an eighth of it — 576 tokens, at ~4 bytes a token 2 304
+/// bytes, a dozen full-width lines or two dozen typical ones.
+pub const VERIFIED_SLOT_BYTES_MAX: usize = 2_304;
+
+/// Programs whose successful run proves nothing about work — they read state
+/// and change none. Matched on each pipeline segment's first word.
+const INSPECTION_PROGRAMS: &[&str] = &[
+    "cat", "cd", "date", "df", "du", "echo", "file", "find", "grep", "head", "ls", "printf",
+    "pwd", "rg", "sort", "stat", "tail", "tree", "uniq", "wc", "which", "whoami",
+];
+
+/// `git` subcommands that only read the repository.
+const INSPECTION_GIT_SUBCOMMANDS: &[&str] = &[
+    "blame", "branch", "diff", "log", "ls-files", "rev-parse", "show", "status",
+];
+
+/// Whether `command` only inspects: every segment of it (split on `|`, `&&`,
+/// `||`, `;`) starts with a read-only program, and nothing redirects output
+/// into a file or asks `find` to act. Conservative — anything it does not
+/// recognise is treated as work, so a real verdict is never folded away.
+fn is_inspection_command(command: &str) -> bool {
+    if command.contains('>') || command.contains('\n') {
+        return false;
+    }
+    let segments = command
+        .split("&&")
+        .flat_map(|s| s.split("||"))
+        .flat_map(|s| s.split(['|', ';']));
+    let mut any = false;
+    for segment in segments {
+        let mut words = segment.split_whitespace();
+        let Some(program) = words.next() else {
+            continue;
+        };
+        any = true;
+        let read_only = if program == "git" {
+            words
+                .find(|w| !w.starts_with('-'))
+                .is_some_and(|sub| INSPECTION_GIT_SUBCOMMANDS.contains(&sub))
+        } else if program == "find" {
+            !segment.contains("-delete") && !segment.contains("-exec") && !segment.contains("-ok")
+        } else {
+            INSPECTION_PROGRAMS.contains(&program)
+        };
+        if !read_only {
+            return false;
+        }
+    }
+    any
+}
+
+/// Render the slot's lines within `budget_bytes` (see
+/// [`AgentContext::verified_outcomes_block`] for the two reductions).
+///
+/// Lines appear in recording order; when they do not all fit, the ones kept
+/// are the most recently verified.
+fn render_verified_lines(outcomes: &[VerifiedOutcome], budget_bytes: usize) -> String {
+    let line_for = |outcome: &VerifiedOutcome| {
+        let when = if outcome.verified_at <= 0 {
+            "time not recorded".to_string()
+        } else {
+            chrono::DateTime::from_timestamp(outcome.verified_at, 0)
+                .map_or_else(|| outcome.verified_at.to_string(), |t| t.to_rfc3339())
+        };
+        format!(
+            "- {} → {} (×{}, last verified {})\n",
+            verified_subject_preview(&outcome.subject),
+            outcome.outcome,
+            outcome.times,
+            when,
+        )
+    };
+
+    let mut folded = 0usize;
+    let mut evidence: Vec<(usize, String)> = Vec::new();
+    for (index, outcome) in outcomes.iter().enumerate() {
+        if outcome.outcome == "exit 0" && is_inspection_command(&outcome.subject) {
+            folded += 1;
+        } else {
+            evidence.push((index, line_for(outcome)));
+        }
+    }
+
+    // Newest-verified first (ties: the later-recorded), until the budget is spent.
+    let mut by_recency: Vec<usize> = (0..evidence.len()).collect();
+    by_recency.sort_by_key(|&i| {
+        let index = evidence[i].0;
+        std::cmp::Reverse((outcomes[index].verified_at, index))
+    });
+    let mut shown = vec![false; evidence.len()];
+    let mut used = 0usize;
+    for i in by_recency {
+        let len = evidence[i].1.len();
+        if used + len <= budget_bytes {
+            used += len;
+            shown[i] = true;
+        }
+    }
+
+    let mut text = String::with_capacity(used + 512);
+    for (i, (_, line)) in evidence.iter().enumerate() {
+        if shown[i] {
+            text.push_str(line);
+        }
+    }
+    let omitted = shown.iter().filter(|s| !**s).count();
+    if omitted > 0 {
+        let _ = writeln!(
+            text,
+            "- …and {omitted} earlier-verified outcome(s) not listed here, to keep this block \
+             small. They still stand: nothing was lost, the commands ran and returned what \
+             they returned. Re-run one only if you changed what it covers."
+        );
+    }
+    if folded > 0 {
+        let _ = writeln!(
+            text,
+            "- plus {folded} read-only inspection command(s) (ls, cat, grep, git status, …) \
+             that exited 0 — folded into this count: they show what was looked at, not work \
+             that passed."
+        );
+    }
+    debug_assert!(used <= budget_bytes, "shown lines stay within the budget");
+    debug_assert_eq!(omitted + folded + shown.iter().filter(|s| **s).count(), outcomes.len());
+    text
+}
+
 /// Compose the in-context announcement for a summarization failure that
 /// forced messages to be dropped un-summarized.
 ///
@@ -378,7 +510,8 @@ pub struct AgentContext {
     /// Bound: one entry per distinct (subject, outcome) pair this run
     /// actually executed — the slot grows strictly slower than the work
     /// feeding it, since every entry costs at least one real command
-    /// execution.
+    /// execution. What reaches the request is bounded separately, by
+    /// [`VERIFIED_SLOT_BYTES_MAX`] (see [`Self::verified_outcomes_block`]).
     #[serde(default)]
     pub verified_outcomes: Vec<VerifiedOutcome>,
     /// Live growth measurement feeding `proactive_compression_due`.
@@ -652,14 +785,20 @@ impl AgentContext {
 
     /// Render the verified-outcomes slot, one line per outcome.
     ///
-    /// Losslessness: every recorded execution is represented — a new
-    /// (subject, outcome) pair appends a line; an identical re-execution
-    /// increments that line's count and refreshes its timestamp (a reword,
-    /// never a drop). No code path removes a line, so the asserted facts
-    /// only accumulate. Bound: lines ≤ distinct (subject, outcome) pairs ≤
-    /// executions this run actually performed — each line costs at least one
-    /// real command execution, so the slot grows strictly slower than the
-    /// work feeding it.
+    /// Storage is lossless: every recorded execution is represented — a new
+    /// (subject, outcome) pair appends an entry; an identical re-execution
+    /// increments that entry's count and refreshes its timestamp (a reword,
+    /// never a drop), and no compression path removes one.
+    ///
+    /// The *rendering* is bounded, because this block is the one part of the
+    /// preamble no compression tier can shrink: it rode into every request
+    /// whole, so a long session of distinct commands grew a preamble that
+    /// eventually crowded out the work. Two reductions, both announced:
+    /// read-only inspection commands that exited 0 (`ls`, `cat`, `git status`
+    /// — they show what was looked at, not work that passed) fold into one
+    /// counted line, and the remaining lines are shown newest-verified first
+    /// within [`VERIFIED_SLOT_BYTES_MAX`], with the rest counted, never
+    /// silently dropped.
     #[must_use]
     pub fn verified_outcomes_block(&self) -> Option<String> {
         if self.verified_outcomes.is_empty() {
@@ -672,22 +811,7 @@ impl AgentContext {
              outlives every summarization pass. Trust it over any summary above; do NOT \
              re-do or rewrite work these lines already prove.\n",
         );
-        for outcome in &self.verified_outcomes {
-            let when = if outcome.verified_at <= 0 {
-                "time not recorded".to_string()
-            } else {
-                chrono::DateTime::from_timestamp(outcome.verified_at, 0)
-                    .map_or_else(|| outcome.verified_at.to_string(), |t| t.to_rfc3339())
-            };
-            let _ = writeln!(
-                block,
-                "- {} → {} (×{}, last verified {})",
-                verified_subject_preview(&outcome.subject),
-                outcome.outcome,
-                outcome.times,
-                when,
-            );
-        }
+        block.push_str(&render_verified_lines(&self.verified_outcomes, VERIFIED_SLOT_BYTES_MAX));
         block.push_str("</verified_outcomes>");
         Some(block)
     }
@@ -3322,6 +3446,63 @@ mod tests {
             !text.contains("reading files"),
             "the distilled slot itself is a rolling replace"
         );
+    }
+
+    /// A long session's slot stays within its bound: the newest verdicts are
+    /// listed, the rest are counted, read-only inspections fold into one
+    /// line — and storage keeps every entry.
+    #[test]
+    fn the_rendered_slot_is_bounded_and_announces_what_it_leaves_out() {
+        let mut ctx = AgentContext::new("s1");
+        for i in 0..200 {
+            ctx.record_verified_outcome_at(format!("sh tests/test_{i}.sh"), "exit 0", 1_700_000_000 + i);
+        }
+        ctx.record_verified_outcome("ls -la src", "exit 0");
+        ctx.record_verified_outcome("cat Cargo.toml | grep version", "exit 0");
+        ctx.record_verified_outcome("git status --short", "exit 0");
+        assert_eq!(ctx.verified_outcomes.len(), 203, "storage is lossless");
+
+        let block = ctx.verified_outcomes_block().expect("renders");
+        let listed: usize = block
+            .lines()
+            .filter(|l| l.starts_with("- sh tests/"))
+            .map(|l| l.len() + 1)
+            .sum();
+        assert!(listed <= VERIFIED_SLOT_BYTES_MAX, "{listed} bytes");
+        assert!(block.contains("test_199.sh"), "the newest verdict is shown");
+        assert!(!block.contains("test_0.sh "), "the oldest gives way");
+        assert!(block.contains("earlier-verified outcome(s) not listed"), "{block}");
+        assert!(block.contains("plus 3 read-only inspection"), "{block}");
+        assert!(!block.contains("- ls -la src"), "inspections are folded, not listed");
+    }
+
+    /// Only a command that is read-only in every segment folds; anything that
+    /// writes, builds, tests or is unrecognised keeps its own line — and so
+    /// does an inspection that FAILED, which is information.
+    #[test]
+    fn only_clean_read_only_commands_fold() {
+        for inspection in ["ls", "cd src && ls -la", "git log --oneline -5", "grep -rn foo . | head", "find . -name '*.rs'"] {
+            assert!(is_inspection_command(inspection), "{inspection}");
+        }
+        for work in [
+            "cargo test",
+            "sh tests/test_1.sh",
+            "echo x > out.txt",
+            "ls && rm -rf target",
+            "git commit -m x",
+            "find . -name '*.tmp' -delete",
+            "",
+        ] {
+            assert!(!is_inspection_command(work), "{work}");
+        }
+        let failed = [VerifiedOutcome {
+            subject: "cat missing.txt".to_string(),
+            outcome: "exit 1".to_string(),
+            verified_at: 1_700_000_000,
+            times: 1,
+        }];
+        let text = render_verified_lines(&failed, VERIFIED_SLOT_BYTES_MAX);
+        assert!(text.contains("cat missing.txt → exit 1"), "{text}");
     }
 
     #[test]

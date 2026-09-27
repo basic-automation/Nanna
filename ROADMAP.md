@@ -7996,6 +7996,52 @@ as its turn (`TurnAdmission`, scope default `session`).
 - [ ] `RouterService` per workspace subscribed to the bus; decisions are small structured outputs
       (assign / split / clarify / park), each mirrored as a thread post. It runs on the router
       member's `ModelChain`.
+      - [x] *(2026-09-27)* **The model-free half: the decision contract and its application.**
+            `nanna_storage::routing` — `RouterDecision` (serde-tagged `{"decision": "assign" |
+            "split" | "clarify" | "park", …}`, the structured output the router model will be
+            asked for), `parse_decision` (bounded to 64 KiB, takes the outermost `{…}` so a fenced
+            block or a sentence around it is fine, validates, and returns an error worded to
+            re-ask the model with), and `apply_decision`, which performs each as store writes plus
+            the router's thread post: **assign** sets the assignee (must be a board member, never
+            a router — decision 4); **split** creates up to `SPLIT_SUBTASKS_MAX` = 30 children
+            under the card, inheriting scope and priority (30 = how many maximal titles one
+            16 KiB post can name); **clarify** creates a `clarification`-labelled card for the
+            human and adds it to the work card's `depends_on`, so the work is derived-`blocked`
+            (decision 6); **park** labels `parked` once and posts every time. A card with a live
+            run can only be parked (decision 7 — the caller says whether a run is live, since only
+            the daemon's run registry knows); closed cards are refused. Writes run created-cards →
+            this card → post, so a post never names a card that does not exist. `nanna-storage`
+            took `#![recursion_limit = "256"]` like the daemon/server/core/memory roots: proving
+            the nested repository future `Send` overran the default. 8 tests.
+      - [x] *(2026-09-27, later)* **The model half: `nanna_daemon::board_router::route_card`.**
+            Gathers what the router reads (the card, its last 8 posts oldest-first, the board's
+            roster from `list_for_workspace` minus every router, and `verdict_rollup` over the
+            last 500 verdicts), builds the prompt within `ROUTER_PROMPT_BYTES_MAX` = 9 216 bytes
+            (half the 4 608-token minimum window at ~4 B/token; posts previewed at 480 B so the
+            fixed sections can never crowd the roster below ~1.8 KB; members that do not fit are
+            counted and announced), asks the injected completion function — the
+            `summarize_with_failover` shape, so the model list fails over like every other
+            one-shot caller — and re-asks **once** with the parse error appended; a second
+            unusable reply leaves the card untouched. Session-scoped cards are refused before any
+            model call. 5 tests on a scripted model.
+      - [x] *(2026-09-27)* **A card knows who created it.** A `created` event's `actor` was
+            the card's **assignee** (`create` passed `new.assignee` to both `log_activity` and
+            `emit`), which the activity row already stamps in its own column since migration
+            021 — so the creator was recorded nowhere, and "skip cards the router itself
+            created" could not be told from the event. `NewTask::created_by` is now the
+            `created` actor (`None` when unknown, never guessed from the assignee). Writers:
+            the router's splits and clarifications stamp the router id; IPC create records
+            `gui` (as IPC update/complete do); `seed_plan` records `harness`; `tasks.add`
+            takes the caller's `actor` param, as `tasks.update` does. 1 test.
+      - [ ] **Wire the trigger — deliberately not yet.** Everything it needs now exists:
+            wake on `created` in a board scope whose actor is not a router (and on a failed
+            `verdict`), via a bounded queue fed from `TaskEventBridge` like the memory
+            write-through (drops counted), then `route_card`, the router member's model list
+            from its profile else the agent's `model_priority`. **Held back because the chat
+            harness still exists:** the chat model's own `tasks.add` cards in workspace scope
+            would be routed too, and a `clarify` would block the harness's work on a human card
+            mid-mission. Land it with the board client's create (Stage 4) or restricted to
+            `created_by = gui` until then — never on every board-scoped card while chat lives.
 - [ ] Triggers: `created` (skip cards the router itself created), clarification `done`, `verdict`
       failed (bounded retries, then a clarification to the human), recurring reopen, `stalled`
       (`in_progress` with no live run past threshold), heartbeat.
@@ -8440,7 +8486,7 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       elision and re-condensation) now `forget_summarized_hashes`, since a hash that says "the
       summary covers this" after that part of the summary is gone points a placeholder at
       nothing. Deduplicating less is the safe direction. 1 new test, 1 extended.
-- [~] `verified_outcomes` needs a reduction path (fold read-only successes, cap by budget) and
+- [x] `verified_outcomes` needs a reduction path (fold read-only successes, cap by budget) and
       must be pruned when an item is reopened as regressed (`loop_runner.rs:7188`, `harness.rs:3574`).
       *(2026-09-26 — the pruning half.)* Both regression-reopen sites (end-of-run and mid-run
       sweep) now call `forget_verified(id)`, dropping the item from `verified_outcomes` and
@@ -8449,6 +8495,15 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       was listed twice in the run report. The mid-run test now asserts both, red without the
       call. **Still open:** the context slot's reduction path (`AgentContext::verified_outcomes`,
       which only grows; the digest side is already byte-capped).
+      *(2026-09-27 — the reduction path; the line is complete.)* Storage stays lossless — no
+      entry is ever removed — but the **rendering** is now bounded, because this block is the one
+      preamble section no compression tier can shrink. Read-only inspections that exited 0
+      (`ls`, `cat`, `git status`, … — every pipeline segment read-only, no `>`, no `find
+      -delete/-exec`; unrecognised = work) fold into one counted line, and the rest are shown
+      newest-verified first within `VERIFIED_SLOT_BYTES_MAX` = 2 304 bytes (an eighth of the
+      4 608-token `DEFAULT_MIN_VIABLE_NUM_CTX` floor at ~4 B/token), with the remainder counted
+      and announced as still standing. A failed inspection keeps its own line. 2 tests (200
+      verdicts + 3 inspections render within the bound; the classifier's both sides).
 - [x] `is_context_length_error` must not match provider 400s about `max_tokens`; the token-budget
       check must run after the paid-for reply is stored; a cancel after a finalised `tool_use` must
       pair it with "[Skipped]" results (`loop_runner.rs:8130,4587,4592`).
@@ -8482,7 +8537,7 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       round trip on every routed step and a false failure charged to the routed model. Bare names
       are still the client's to resolve. **Still open:** actually calling the routed provider,
       which is the per-member `ModelChain`. 1 test.
-- [~] *(2026-09-26 — the first finding, the high-severity one, is done; the rest of this line is
+- [x] *(2026-09-26 — the first finding, the high-severity one, is done; the rest of this line is
       open.)* **It was wider than Anthropic:** the agent's stream loop matched neither
       `StreamEvent::Error` *nor* `StreamEvent::RecoverableError` — both fell into `_ => {}` — so
       every mid-stream failure on any provider (an overload, a 429, a dropped connection that
@@ -8533,6 +8588,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       splitter keeping it out of the reply. Both now use `ollama_separates_thinking`. 1 test.
       **Still open on this line:** native Anthropic stream errors as `Err` to the chain walk
       (the agent loop side is done; the `LlmClient` stream still yields them as events).
+      *(2026-09-27 — examined, closed without an API change.)* `LlmClient::stream` (and
+      `stream_with_recovery`, which wraps it) has exactly **one** consumer in the workspace, the
+      GUI and the root binary — `loop_runner`'s stream loop — and it already turns both
+      `StreamEvent::Error` and `RecoverableError` into `Err` via `stream_failure` before the
+      chain walk sees anything. Changing the stream's item type to `Result` would move that one
+      match into the library without changing any behaviour. Revisit only if a second consumer
+      appears (Stage 3's per-member runs reuse the same loop).
 - [~] *(2026-09-26 — the Boa loop half, plus the `exec`-style cap for `python.exec` noted on the
       "Smaller" line.)* Boa has no interrupt API, so a timed-out script cannot be stopped from
       outside and its blocking thread kept spinning a core for the life of the process. Every tool
@@ -8557,6 +8619,34 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       VM's `signal_handlers` are initialised, and user code's bare `except:` catches the raised
       exception. A correct fix re-sends until the thread reports back and is tested with two
       interpreters running at once.
+      *(2026-09-27 — the Python engine; only regex backtracking is left on this line.)* A
+      timed-out `python.exec` is now **stopped**: each interpreter gets a user signal channel
+      (`init_hook` → `set_user_signal_channel`), and on timeout a reaper sends a
+      `KeyboardInterrupt` (a `BaseException`, so `except Exception:` cannot swallow it) every
+      50 ms until the thread reports back, bounded by a 5 s grace after which it warns that the
+      thread is abandoned (blocked outside bytecode, or a bare `except:`). The re-send is the
+      answer to the global `ANY_TRIGGERED` race: every `send` re-arms the flag, so another
+      interpreter consuming it only delays the interrupt. Nothing is sent until the thread
+      reports it has entered the user's code — set-up runs frozen-stdlib bytecode, and an
+      exception there under the release profile's `panic = "abort"` is not a risk worth taking.
+      **Found on the way:** interpreters ran with `install_signal_handlers: true`, so any
+      `python.exec` that imported `signal` — which `subprocess` does — installed RustPython's
+      libc SIGINT handler **process-wide**, taking Ctrl-C and `kill -INT` away from the daemon's
+      graceful shutdown for the rest of its life. Off now. 3 tests, each red without its fix
+      (a loop and two concurrent loops observed to stop; `SigCgt` in `/proc/self/status`
+      unchanged across `import signal, subprocess`).
+      **The reaper runs on its own OS thread, and the real daemon is why.** The first version
+      `tokio::spawn`ed it — and tool services are driven by a throwaway `current_thread`
+      runtime inside the script engine (`boa_impl`'s `block_on`), so the reaper was dropped the
+      moment the call returned. Its unit test passed anyway, twice over: under
+      `#[tokio::test]`'s long-lived runtime, and through a stillness check that two empty reads
+      (`open(p, 'w')` truncates first) satisfied. Driving the built daemon over IPC showed the
+      counter still climbing. The test now calls `execute` on a throwaway runtime and only
+      accepts a parsed value holding still — red with the spawned reaper, green with the
+      thread. **Live, debug daemon on a scratch HOME:** a `while True` given `timeout: 3` froze
+      at 674 000 with no `nanna-python` thread left (`stopped sends=2`); after `python.exec`
+      imported `signal` and `subprocess`, `kill -INT` still produced `Received SIGINT →
+      Shutting down daemon`.
       *(2026-09-26, later)* Manifest (`tool.yaml`) skills enforce their own timeout and kill the
       whole tree. The timeout used to exist only as the registry dropping the future, which
       killed nothing: the shell and anything it started ran on, orphaned. `run_contained` now
@@ -8595,7 +8685,7 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `tool.ts` anywhere could be overwritten. `delete_skill`'s check is now the shared
       `validate_existing_skill_name`, and `update_skill` also canonicalises the resolved directory
       against the skills root (a symlinked skill dir). 3 tests.
-- [~] *(2026-09-26 — the `as_u64` one, plus the uncapped model-supplied `python.exec` timeout from
+- [x] *(2026-09-26 — the `as_u64` one, plus the uncapped model-supplied `python.exec` timeout from
       the Engines line; the rest of this line is open.)* Six service params (`memory.search`
       `limit`/`page_chars`/`offset`, `agent.spawn` `max_iterations`, `python.exec` `timeout`,
       `session.history` `limit`) were read with a strict `as_u64` — but Boa hands every JS number
@@ -8609,6 +8699,19 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       cap; `dump_empty_step` unbounded log outside the data dir; strict `as_u64` where Boa hands
       over `f64`; `fit_image_to_limit` ignores `quality` (`bridge.rs`, `scripted.rs:83`,
       `git.rs:206`, `tasks.rs:2344`, `server.rs:916`, `image_util.rs`).
+      *(2026-09-27 — the rest of the "Smaller" list; the line is complete.)*
+      `strip_ansi_escapes` handles every ECMA-48 shape (CSI to its real final byte, so `ESC[2~`
+      goes whole; OSC/DCS/APC to BEL or `ESC \` — cargo's OSC 8 hyperlinks used to leave
+      `8;;file:///…` glued to paths; nF like `ESC (B`). A missing or non-directory workdir is
+      named as such before the spawn (ENOENT read as a missing program), distinguishing an
+      explicit `workdir` from a vanished workspace. `Nanna.readFile` reads at most
+      `READ_FILE_BYTES_MAX` (64 MiB) + 1 bytes — `/dev/zero` used to read until OOM. Manifest
+      `timeout` saturates, and `from_source` now applies it too (it silently ignored it). `run_git`
+      reads at most the 64 KiB cap then kills git — an endless writer used to run out the 5 s
+      timeout and yield nothing. `dump_empty_step` writes beside the daemon logs (0600, rolled at
+      8 MiB, off the runtime), never to world-readable `/tmp`. `fit_image_to_limit` really walks
+      its quality ladder, and flattens RGBA first — JPEG has no alpha, so a transparent PNG
+      screenshot failed both encodes and went to the provider over its limit. 8 tests.
 - [x] MCP (kept, healthiest crate): transport timeout must honour the advertised 60 s and not cut
       SSE bodies; `ToolContent` must accept `resource_link`/`audio`; drain `pending` on EOF; follow
       `next_cursor`; log `tools/list` failures; drop the dead duplicates
@@ -9343,6 +9446,19 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `pnpm outdated` reports `4.1.0 → 2.24.3` — the v4 line is published under `next`, so `latest`
            points at the *older* Vue-2 package. **Never let `pnpm update --latest` "upgrade" this one**;
            it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
+   - *(2026-09-27 sweep)* `cargo update` → the Tauri plugin minors (`dialog 2.8.0`, `fs 2.6.0`,
+     `notification 2.5.0`, `process 2.4.0`, `shell 2.4.0`, `updater 2.13.0`,
+     `tauri-winrt-notification 0.8.1`) plus `notify-rust 4.18.1`; the JS halves bumped in
+     lockstep. `cargo upgrade --incompatible` offered nothing. Pin-backs again: `libc 0.2.189 →
+     0.2.186`, `malachite-bigint 0.12.0 → 0.9.2` (`rustpython-vm` still ends at 0.5.0).
+     TypeScript 7 still blocked (`vue-tsc` 3.3.11). Toolchain pin not moved.
+     - [ ] *(research 2026-09-27)* **Tauri 3 is in alpha** (`tauri 3.0.0-alpha.3`, 2026-09-26).
+           Breaks we would hit: `Plugin` must be `Sync` and its hooks take `&self` (they may run
+           concurrently), `run_on_main_thread` moves to the `Manager` trait, and the **Linux tray
+           moves to `ksni` (StatusNotifierItem over D-Bus) instead of libappindicator** — worth
+           knowing on this Hyprland host, where the tray is a D-Bus client. Do nothing until a
+           beta; then one migration item, verified over the `e2e-webdriver` harness.
+           ([release](https://github.com/tauri-apps/tauri/releases/tag/tauri-v3.0.0-alpha.3))
    - *(2026-09-26 sweep)* `cargo update` → 57 lock changes, driven by **tauri 2.12.0** (`tauri-build`/
      `-codegen`/`-macros`/`-plugin` 2.7.0, `tao 0.37`, `muda 0.20`, `tray-icon 0.25`) plus `aegis 0.9.20`,
      `fancy-regex 0.19`, `brotli 9`. **`tauri-build 2.7.0` is the release carrying tauri#15831, so

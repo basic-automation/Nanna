@@ -289,9 +289,18 @@ impl TaskRepository {
         drop(rows);
         drop(conn);
 
-        self.log_activity(task.id, new.assignee.as_deref(), "created", None)
+        // The actor is the creator. It used to be the assignee, which the row
+        // already carries in its own `assignee` column (migration 021) — so the
+        // creator was recorded nowhere, and the router could not tell a card it
+        // split off itself from one a person made.
+        self.log_activity(task.id, new.created_by.as_deref(), "created", None)
             .await?;
-        self.emit(TaskEventKind::Created, &task, new.assignee.as_deref(), created_detail(&task));
+        self.emit(
+            TaskEventKind::Created,
+            &task,
+            new.created_by.as_deref(),
+            created_detail(&task),
+        );
         Ok(task)
     }
 

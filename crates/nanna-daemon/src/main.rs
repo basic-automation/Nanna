@@ -166,6 +166,10 @@ fn file_log_writer(
         "resolved log dir must be non-empty"
     );
 
+    // Forensic dumps (whole prompts) go beside the logs, never to the shared
+    // temp directory.
+    nanna_daemon::log_file::set_forensics_dir(&log_dir);
+
     match nanna_daemon::log_file::build_appender(&log_dir) {
         Ok(appender) => {
             let (writer, guard) = tracing_appender::non_blocking(appender);

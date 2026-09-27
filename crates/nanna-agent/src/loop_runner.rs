@@ -3837,7 +3837,7 @@ async fn run_tool_batch<F: std::future::Future>(futures: Vec<F>, parallel: bool)
     outputs
 }
 
-/// A provider error mid-stream as the `Err` it is; every other event passes./// A provider error mid-stream as the `Err` it is; every other event passes.
+/// A provider error mid-stream as the `Err` it is; every other event passes.
 ///
 /// Both error events used to fall into the stream loop's `_ => {}`: an
 /// overload, a 429 or a dropped connection ended the loop as though the model

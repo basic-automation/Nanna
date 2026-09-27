@@ -203,25 +203,57 @@ async fn run_git(root: &Path, args: &[&str]) -> Option<String> {
         .stderr(Stdio::null())
         .kill_on_drop(true);
 
-    let output = match tokio::time::timeout(GIT_TIMEOUT, command.output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => {
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
             debug!(error = %e, "git not available for workspace context");
-            return None;
-        }
-        Err(_) => {
-            debug!(?args, "git timed out building workspace context");
             return None;
         }
     };
 
-    if !output.status.success() {
-        debug!(?args, code = ?output.status.code(), "git exited non-zero");
+    let Ok(output) =
+        tokio::time::timeout(GIT_TIMEOUT, read_capped(child, GIT_OUTPUT_BYTES_MAX)).await
+    else {
+        debug!(?args, "git timed out building workspace context");
         return None;
-    }
+    };
+    let Some(bytes) = output else {
+        debug!(?args, "git exited non-zero");
+        return None;
+    };
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
 
-    let capped = &output.stdout[..output.stdout.len().min(GIT_OUTPUT_BYTES_MAX)];
-    Some(String::from_utf8_lossy(capped).into_owned())
+/// Read at most `cap` bytes of `child`'s stdout, then stop it.
+///
+/// Returns `None` when the child exits unsuccessfully (or cannot be read).
+/// Output past `cap` is never read: once one byte beyond the cap arrives the
+/// child is killed and the first `cap` bytes are the answer, exactly the bytes
+/// the old read-everything-then-slice kept. That read buffered the whole
+/// stream first — megabytes for `git status` over an unignored
+/// `node_modules` — and a child that never stopped writing ran the whole
+/// timeout out and produced nothing at all.
+async fn read_capped(mut child: tokio::process::Child, cap: usize) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+    assert!(cap > 0, "a zero cap reads nothing");
+    let stdout = child.stdout.take()?;
+    let limit = u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1);
+    let mut bytes = Vec::with_capacity(cap.min(8 * 1024));
+    stdout.take(limit).read_to_end(&mut bytes).await.ok()?;
+
+    if bytes.len() > cap {
+        bytes.truncate(cap);
+        // More than we keep: stop it rather than drain the rest. The pipe is
+        // already closed, so a killed or SIGPIPE'd exit is expected here and
+        // says nothing about the bytes we have.
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        debug_assert_eq!(bytes.len(), cap, "a truncated read is exactly the cap");
+        return Some(bytes);
+    }
+    let status = child.wait().await.ok()?;
+    debug_assert!(bytes.len() <= cap, "never more than the cap");
+    status.success().then_some(bytes)
 }
 
 /// Split `git status --short --branch` output into the branch line and the
@@ -447,6 +479,54 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".git"), "gitdir: ../elsewhere\n").unwrap();
         assert!(is_git_repo(dir.path()));
+    }
+
+    /// A child that never stops writing is cut at the cap and answered at
+    /// once. Buffering everything first, as the old read did, ran the whole
+    /// timeout out on this shape and returned nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_endless_writer_is_cut_at_the_cap_not_the_timeout() {
+        let child = Command::new("yes")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let bytes = tokio::time::timeout(GIT_TIMEOUT, read_capped(child, 4096))
+            .await
+            .expect("answered before the timeout")
+            .expect("a truncated read is still an answer");
+        assert_eq!(bytes.len(), 4096);
+        assert!(bytes.starts_with(b"y\ny\n"));
+        assert!(
+            started.elapsed() < GIT_TIMEOUT / 2,
+            "{:?}",
+            started.elapsed()
+        );
+
+        // Under the cap, the exit status decides.
+        let failing = Command::new("sh")
+            .args(["-c", "echo partial; exit 3"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            read_capped(failing, 4096).await,
+            None,
+            "non-zero exit is no answer"
+        );
+        let ok = Command::new("sh")
+            .args(["-c", "echo whole"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            read_capped(ok, 4096).await.as_deref(),
+            Some(&b"whole\n"[..])
+        );
     }
 
     /// Run `git` synchronously for the fixture setup below. Returns false when

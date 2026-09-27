@@ -25,6 +25,7 @@
 // reads it, so the control plane and `DreamingService` share **one** clock
 // instead of each keeping a private notion of "last activity". Re-exported
 // below because the daemon is where it is stamped.
+pub mod board_router;
 pub mod agent_service;
 pub mod channels;
 pub mod control;

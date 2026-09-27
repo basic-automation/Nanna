@@ -768,16 +768,26 @@ impl NannaBridge {
             c
         };
 
-        if let Some(wd) = workdir {
-            cmd.current_dir(self.resolve_path(wd));
-        } else if let Some(ref wd) = self.default_workdir {
-            // No explicit workdir: run in the active workspace directory (the
-            // registry seeds `default_workdir` from it). This is what makes exec
-            // run "in the workspace you're in" rather than the home dir.
-            cmd.current_dir(wd);
-        } else if let Some(home) = Self::home_dir() {
-            // Last resort only when there is genuinely no active workspace.
-            cmd.current_dir(home);
+        // No explicit workdir: run in the active workspace directory (the
+        // registry seeds `default_workdir` from it). This is what makes exec
+        // run "in the workspace you're in" rather than the home dir. The home
+        // dir is the last resort, only when there is genuinely no workspace.
+        let run_dir = workdir
+            .map(|wd| self.resolve_path(wd))
+            .or_else(|| self.default_workdir.clone())
+            .or_else(Self::home_dir);
+        if let Some(ref dir) = run_dir {
+            // A missing directory fails the spawn with the same ENOENT a
+            // missing program does, so it used to read "Failed to execute
+            // command: No such file or directory" — which names neither the
+            // directory nor the fact that the command itself was fine.
+            if !dir.is_dir() {
+                return Err(ScriptError::Bridge(missing_workdir_message(
+                    dir,
+                    workdir.is_some(),
+                )));
+            }
+            cmd.current_dir(dir);
         }
 
         cmd.stdout(std::process::Stdio::piped());
@@ -1078,7 +1088,8 @@ impl NannaBridge {
     ///
     /// Returns [`ScriptError::Permission`] if the resolved path is outside the
     /// tool's read scope, and [`ScriptError::Bridge`] if the file cannot be read
-    /// (including when its contents are not valid UTF-8).
+    /// (including when its contents are not valid UTF-8, or it is larger than
+    /// [`READ_FILE_BYTES_MAX`]).
     pub async fn read_file(&self, path: &str) -> Result<String> {
         let path = self.resolve_path(path);
         
@@ -1089,9 +1100,7 @@ impl NannaBridge {
             )));
         }
 
-        tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|e| ScriptError::Bridge(format!("Failed to read '{}': {e}", path.display())))
+        read_to_string_capped(&path, READ_FILE_BYTES_MAX).await
     }
 
     /// Write a file (if permitted)
@@ -1631,29 +1640,123 @@ mod appimage_library_path_tests {
     }
 }
 
+/// Ceiling for one `Nanna.readFile`, in bytes.
+///
+/// Every tool that reads whole files already refuses far below this
+/// (`read_file` at 10 MB, file history snapshots at 8 MiB), so no working call
+/// meets it. It exists for the calls that bypass those checks — a tool without
+/// one, a file that grew between `stat` and read, or a device that never ends
+/// (`/dev/zero` is valid UTF-8 forever) — each of which used to read until the
+/// daemon ran out of memory. The engine holds text as UTF-16, so a read costs
+/// about twice this before any copy.
+pub const READ_FILE_BYTES_MAX: u64 = 64 * 1024 * 1024;
+
+/// Read `path` as UTF-8, refusing once more than `max_bytes` have arrived.
+///
+/// Reads at most `max_bytes + 1` bytes whatever the file claims its size is, so
+/// neither a growing file nor an endless device can outrun the bound.
+async fn read_to_string_capped(path: &Path, max_bytes: u64) -> Result<String> {
+    use tokio::io::AsyncReadExt as _;
+    assert!(max_bytes > 0, "a zero ceiling reads nothing");
+    let fail = |e: &dyn std::fmt::Display| {
+        ScriptError::Bridge(format!("Failed to read '{}': {e}", path.display()))
+    };
+    let file = tokio::fs::File::open(path).await.map_err(|e| fail(&e))?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|e| fail(&e))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(ScriptError::Bridge(format!(
+            "Failed to read '{}': it is larger than the {} MiB a script may read at once. \
+             Nothing was returned — read it in parts (exec with head/tail/sed) instead.",
+            path.display(),
+            max_bytes / (1024 * 1024)
+        )));
+    }
+    debug_assert!(u64::try_from(bytes.len()).is_ok_and(|n| n <= max_bytes));
+    String::from_utf8(bytes).map_err(|e| fail(&e))
+}
+
+/// The error for an exec whose working directory is not a directory.
+///
+/// `explicit` is whether the caller passed `workdir`; otherwise the directory
+/// is the active workspace's, and the fix is different (the workspace moved or
+/// was deleted, so passing a real `workdir` works where retrying cannot).
+fn missing_workdir_message(dir: &Path, explicit: bool) -> String {
+    let what = if dir.exists() { "is not a directory" } else { "does not exist" };
+    if explicit {
+        format!(
+            "The working directory {} {what}. Nothing ran — pass an existing directory as workdir.",
+            dir.display()
+        )
+    } else {
+        format!(
+            "The active workspace directory {} {what}. Nothing ran — pass an existing directory as workdir.",
+            dir.display()
+        )
+    }
+}
+
 /// Strip ANSI escape sequences from text.
 /// Tools like cargo, git, and npm emit color codes that break text matching
 /// (e.g., `findstr "error:"` fails because the actual text is `\x1b[31merror\x1b[0m:`).
+///
+/// Covers the ECMA-48 shapes a terminal program actually emits, not only
+/// colour: CSI (`ESC [` params, ended by a final byte in `@`..=`~`, so
+/// `ESC[2~` and `ESC[?25h` go whole), the string commands OSC/DCS/SOS/PM/APC
+/// (`ESC ]`, `ESC P`, `ESC X`, `ESC ^`, `ESC _`, ended by BEL or `ESC \`) —
+/// cargo and `ls --hyperlink` wrap paths in OSC 8 hyperlinks, which used to
+/// leave `8;;file:///…` glued into the text — and the nF/Fp/Fe/Fs escapes
+/// (`ESC (B`, `ESC 7`, `ESC =`). An unterminated sequence at the end of the
+/// text is dropped, never echoed half-parsed.
 fn strip_ansi_escapes(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // Skip CSI sequence: ESC [ ... <final byte>
-            if let Some(next) = chars.next()
-                && next == '[' {
-                    // Consume until we hit a letter (the terminator)
-                    for seq_char in chars.by_ref() {
-                        if seq_char.is_ascii_alphabetic() {
-                            break;
-                        }
+        if c != '\x1b' {
+            result.push(c);
+            continue;
+        }
+        match chars.next() {
+            // CSI: parameter and intermediate bytes, then one final byte.
+            Some('[') => {
+                for seq_char in chars.by_ref() {
+                    if ('@'..='~').contains(&seq_char) {
+                        break;
                     }
                 }
-                // else: other escape (ESC without [) — just skip the ESC and next char
-        } else {
-            result.push(c);
+            }
+            // String commands: everything up to BEL or the ST `ESC \`.
+            Some(']' | 'P' | 'X' | '^' | '_') => {
+                while let Some(seq_char) = chars.next() {
+                    if seq_char == '\x07' {
+                        break;
+                    }
+                    if seq_char == '\x1b' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            // nF: intermediate bytes (`(`, `)`, `#`, …) then one final byte.
+            Some(' '..='/') => {
+                for seq_char in chars.by_ref() {
+                    if !(' '..='/').contains(&seq_char) {
+                        break;
+                    }
+                }
+            }
+            // Fp/Fe/Fs two-byte escapes (`ESC 7`, `ESC =`, `ESC c`), or a
+            // lone ESC at the end of the text.
+            Some(_) | None => {}
         }
     }
+    debug_assert!(result.len() <= s.len(), "stripping never adds bytes");
+    debug_assert!(!result.contains('\x1b'), "no escape introducer survives");
     result
 }
 
@@ -2250,6 +2353,95 @@ mod tests {
             .expect("exec should not error");
         assert!(out.success, "command should succeed, got {out:?}");
         assert_eq!(out.stdout.trim(), "c", "stdout was {:?}", out.stdout);
+    }
+
+    /// Every escape shape a terminal program emits is removed whole, and the
+    /// text between them survives byte for byte. OSC 8 is the one that bit:
+    /// cargo wraps paths in hyperlinks, and the old CSI-only stripper left
+    /// `8;;file:///…` glued to the path the model then tried to open.
+    #[test]
+    fn strip_ansi_escapes_removes_every_sequence_shape_whole() {
+        let cases = [
+            ("\x1b[31merror\x1b[0m: x", "error: x"),
+            ("a\x1b[2~b", "ab"),
+            ("\x1b[?25hshown", "shown"),
+            ("see \x1b]8;;file:///src/lib.rs\x1b\\src/lib.rs\x1b]8;;\x1b\\ now", "see src/lib.rs now"),
+            ("\x1b]0;window title\x07text", "text"),
+            ("\x1b(Bplain", "plain"),
+            ("\x1b7saved\x1b8", "saved"),
+            ("\x1bPdcs payload\x1b\\after", "after"),
+            ("tail \x1b[", "tail "),
+            ("tail \x1b", "tail "),
+            ("no escapes — ünïcode", "no escapes — ünïcode"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(strip_ansi_escapes(input), want, "input {input:?}");
+        }
+    }
+
+    /// A read stops at its ceiling instead of running the daemon out of
+    /// memory: an endless device is refused, not drained, and a file at the
+    /// ceiling still reads whole.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_refuses_past_its_ceiling() {
+        let err = read_to_string_capped(Path::new("/dev/zero"), 4096)
+            .await
+            .expect_err("an endless device is refused");
+        assert!(err.to_string().contains("larger than"), "{err}");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let at = dir.path().join("at.txt");
+        std::fs::write(&at, "a".repeat(4096)).expect("seed");
+        let text = read_to_string_capped(&at, 4096).await.expect("a file at the ceiling reads");
+        assert_eq!(text.len(), 4096);
+
+        std::fs::write(&at, "a".repeat(4097)).expect("seed");
+        assert!(read_to_string_capped(&at, 4096).await.is_err(), "one byte over is refused");
+    }
+
+    /// A missing working directory is reported as the directory, not as a
+    /// failed command: the spawn's ENOENT used to read "Failed to execute
+    /// command: No such file or directory", and the model went looking for a
+    /// missing program.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_in_a_missing_workdir_names_the_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let gone = dir.path().join("gone");
+        let mut perms = ToolPermissions::none();
+        perms.run = true;
+        let bridge = NannaBridge::new(perms);
+
+        let err = bridge
+            .exec("true", Some(&gone.to_string_lossy()))
+            .await
+            .expect_err("a missing workdir must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("working directory"), "names the cause: {msg}");
+        assert!(msg.contains(&*gone.to_string_lossy()), "names the path: {msg}");
+        assert!(msg.contains("does not exist"), "says what is wrong: {msg}");
+
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, "x").expect("seed file");
+        let bridge = bridge.with_default_workdir(&file);
+        let err = bridge
+            .exec("true", None)
+            .await
+            .expect_err("a workspace dir that is a file must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("active workspace directory"), "names the source: {msg}");
+        assert!(msg.contains("is not a directory"), "says what is wrong: {msg}");
+
+        let ok = NannaBridge::new({
+            let mut p = ToolPermissions::none();
+            p.run = true;
+            p
+        })
+        .exec("pwd", Some(&dir.path().to_string_lossy()))
+        .await
+        .expect("an existing workdir runs");
+        assert!(ok.success, "ran: {ok:?}");
     }
 
     // ---------------------------------------------------------------------
