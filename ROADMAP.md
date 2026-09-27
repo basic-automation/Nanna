@@ -8635,6 +8635,18 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       graceful shutdown for the rest of its life. Off now. 3 tests, each red without its fix
       (a loop and two concurrent loops observed to stop; `SigCgt` in `/proc/self/status`
       unchanged across `import signal, subprocess`).
+      **The reaper runs on its own OS thread, and the real daemon is why.** The first version
+      `tokio::spawn`ed it — and tool services are driven by a throwaway `current_thread`
+      runtime inside the script engine (`boa_impl`'s `block_on`), so the reaper was dropped the
+      moment the call returned. Its unit test passed anyway, twice over: under
+      `#[tokio::test]`'s long-lived runtime, and through a stillness check that two empty reads
+      (`open(p, 'w')` truncates first) satisfied. Driving the built daemon over IPC showed the
+      counter still climbing. The test now calls `execute` on a throwaway runtime and only
+      accepts a parsed value holding still — red with the spawned reaper, green with the
+      thread. **Live, debug daemon on a scratch HOME:** a `while True` given `timeout: 3` froze
+      at 674 000 with no `nanna-python` thread left (`stopped sends=2`); after `python.exec`
+      imported `signal` and `subprocess`, `kill -INT` still produced `Received SIGINT →
+      Shutting down daemon`.
       *(2026-09-26, later)* Manifest (`tool.yaml`) skills enforce their own timeout and kill the
       whole tree. The timeout used to exist only as the registry dropping the future, which
       killed nothing: the shell and anything it started ran on, orphaned. `run_contained` now

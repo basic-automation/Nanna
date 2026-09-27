@@ -166,8 +166,12 @@ impl PythonEngine {
             )),
             Err(_) => {
                 // The caller gets its answer now; stopping the thread is the
-                // reaper's job, off this call's clock.
-                tokio::spawn(stop_abandoned_interpreter(interrupt, running, receiver));
+                // reaper's job, off this call's clock — and off this call's
+                // runtime: tool services are driven by a throwaway
+                // `current_thread` runtime inside the script engine
+                // (`boa_impl`'s `block_on`), so a `tokio::spawn`ed reaper was
+                // dropped the moment this call returned, and the loop ran on.
+                spawn_reaper(interrupt, running, receiver);
                 Err(ScriptError::Timeout(timeout_secs.saturating_mul(1000)))
             }
         }
@@ -184,6 +188,29 @@ const INTERRUPT_RESEND: std::time::Duration = std::time::Duration::from_millis(5
 /// is not running bytecode (a blocking read, a long native call) or code that
 /// catches `BaseException` and carries on — neither of which more waiting fixes.
 const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Start [`stop_abandoned_interpreter`] on its own small OS thread.
+///
+/// If the thread cannot be spawned the interpreter is left running, as every
+/// timed-out interpreter used to be, and the log says so.
+fn spawn_reaper(
+    interrupt: rustpython_vm::signal::UserSignalSender,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    done: tokio::sync::oneshot::Receiver<PythonResult>,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("nanna-python-reaper".to_string())
+        .stack_size(REAPER_STACK_BYTES)
+        .spawn(move || stop_abandoned_interpreter(&interrupt, &running, done));
+    if let Err(e) = spawned {
+        tracing::warn!(
+            "could not start the Python reaper ({e}); the timed-out interpreter runs on"
+        );
+    }
+}
+
+/// Stack for the reaper thread: it only polls, sleeps and sends.
+const REAPER_STACK_BYTES: usize = 64 * 1024;
 
 /// Stop an interpreter whose caller timed out.
 ///
@@ -206,20 +233,31 @@ const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// user's to catch; in a `panic = "abort"` release build a set-up that treated
 /// it as fatal would take the daemon down with it. Before `running`, the reaper
 /// only waits; the grace clock starts once it is set.
-async fn stop_abandoned_interpreter(
-    interrupt: rustpython_vm::signal::UserSignalSender,
-    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+///
+/// Synchronous on purpose (see [`spawn_reaper`]): it must outlive the runtime
+/// that made the call.
+fn stop_abandoned_interpreter(
+    interrupt: &rustpython_vm::signal::UserSignalSender,
+    running: &std::sync::atomic::AtomicBool,
     mut done: tokio::sync::oneshot::Receiver<PythonResult>,
 ) {
+    use tokio::sync::oneshot::error::TryRecvError;
+    let finished = |done: &mut tokio::sync::oneshot::Receiver<PythonResult>| {
+        !matches!(done.try_recv(), Err(TryRecvError::Empty))
+    };
+    // Bounded like everything else: set-up takes seconds, never minutes.
+    let setup_deadline = std::time::Instant::now() + INTERRUPT_SETUP_MAX;
     while !running.load(std::sync::atomic::Ordering::Acquire) {
-        if tokio::time::timeout(INTERRUPT_RESEND, &mut done)
-            .await
-            .is_ok()
-        {
+        if finished(&mut done) {
             return;
         }
+        if std::time::Instant::now() >= setup_deadline {
+            tracing::warn!("a timed-out Python interpreter never finished set-up; left alone");
+            return;
+        }
+        std::thread::sleep(INTERRUPT_RESEND);
     }
-    let deadline = tokio::time::Instant::now() + INTERRUPT_GRACE;
+    let deadline = std::time::Instant::now() + INTERRUPT_GRACE;
     let mut sends = 0u32;
     loop {
         let signal: rustpython_vm::signal::UserSignal = Box::new(|vm| {
@@ -233,22 +271,20 @@ async fn stop_abandoned_interpreter(
             return;
         }
         sends = sends.saturating_add(1);
-        match tokio::time::timeout(INTERRUPT_RESEND, &mut done).await {
-            Ok(_) => {
-                debug!(sends, "timed-out Python interpreter stopped");
-                return;
-            }
-            Err(_) if tokio::time::Instant::now() >= deadline => {
-                tracing::warn!(
-                    sends,
-                    "a timed-out Python interpreter did not stop within {}s of being \
-                     interrupted (blocked outside bytecode, or catching BaseException); \
-                     its thread is abandoned",
-                    INTERRUPT_GRACE.as_secs()
-                );
-                return;
-            }
-            Err(_) => {}
+        std::thread::sleep(INTERRUPT_RESEND);
+        if finished(&mut done) {
+            debug!(sends, "timed-out Python interpreter stopped");
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                sends,
+                "a timed-out Python interpreter did not stop within {}s of being \
+                 interrupted (blocked outside bytecode, or catching BaseException); \
+                 its thread is abandoned",
+                INTERRUPT_GRACE.as_secs()
+            );
+            return;
         }
     }
 }
@@ -258,6 +294,11 @@ impl Default for PythonEngine {
         Self::new()
     }
 }
+
+/// How long the reaper waits for a timed-out interpreter to finish set-up
+/// before it gives up on interrupting it. Set-up is measured at ~2.7 s in a
+/// debug build under contention; ten times that is a hung set-up.
+const INTERRUPT_SETUP_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Run one isolated interpreter on a dedicated thread with a stack large enough for
 /// `RustPython`, returning a receiver for its result.
@@ -879,19 +920,31 @@ print(msg)
         )
     }
 
-    /// Wait until the file a runaway writer rewrites exists and then stops
-    /// changing — i.e. the loop really ended. Bounded well past the reaper's
-    /// grace plus a debug-build interpreter start-up.
+    /// Wait until the counter a runaway writer rewrites holds still at a real
+    /// value — the loop ran, and has stopped. Unparseable reads are skipped:
+    /// `open(p, 'w')` truncates before it writes, so two reads can both land
+    /// in that empty gap, which is how a looser check once passed against a
+    /// loop that was still running. A stopped loop may never be seen
+    /// advancing (the interrupt lands within ~100 ms of set-up), so stillness
+    /// alone is the signal. Bounded well past the reaper's grace plus a
+    /// debug-build interpreter start-up.
     async fn wait_until_still(path: &std::path::Path) -> bool {
+        let read = || {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|t| t.trim().parse::<u64>().ok())
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
-        let mut last: Option<String> = None;
+        let mut last: Option<u64> = None;
         while std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-            let now = std::fs::read_to_string(path).ok();
-            if now.is_some() && now == last {
+            let Some(now) = read() else {
+                continue;
+            };
+            if last == Some(now) {
                 return true;
             }
-            last = now;
+            last = Some(now);
         }
         false
     }
@@ -904,10 +957,22 @@ print(msg)
         let _serialize = PYTHON_TEST_GUARD.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("counter.txt");
-        let err = PythonEngine::new()
-            .execute(&runaway_writer(&path), None, 1)
-            .await
-            .expect_err("a runaway loop times out");
+        // Called the way tool services are: on a throwaway runtime that is
+        // gone the moment the call returns (`boa_impl`'s `block_on`). A reaper
+        // spawned onto the caller's runtime died with it, and this was green
+        // under `#[tokio::test]`'s long-lived runtime while the daemon's loop
+        // ran on.
+        let code = runaway_writer(&path);
+        let err = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(PythonEngine::new().execute(&code, None, 1))
+        })
+        .join()
+        .unwrap()
+        .expect_err("a runaway loop times out");
         assert!(matches!(err, ScriptError::Timeout(1000)), "{err:?}");
         assert!(
             wait_until_still(&path).await,
