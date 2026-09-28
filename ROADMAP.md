@@ -8033,7 +8033,7 @@ as its turn (`TurnAdmission`, scope default `session`).
             the router's splits and clarifications stamp the router id; IPC create records
             `gui` (as IPC update/complete do); `seed_plan` records `harness`; `tasks.add`
             takes the caller's `actor` param, as `tasks.update` does. 1 test.
-      - [ ] **Wire the trigger — deliberately not yet.** Everything it needs now exists:
+      - [x] **Wire the trigger — deliberately not yet.** Everything it needs now exists:
             wake on `created` in a board scope whose actor is not a router (and on a failed
             `verdict`), via a bounded queue fed from `TaskEventBridge` like the memory
             write-through (drops counted), then `route_card`, the router member's model list
@@ -8042,6 +8042,22 @@ as its turn (`TurnAdmission`, scope default `session`).
             would be routed too, and a `clarify` would block the harness's work on a human card
             mid-mission. Land it with the board client's create (Stage 4) or restricted to
             `created_by = gui` until then — never on every board-scoped card while chat lives.
+            *(2026-09-28)* **Wired, restricted to `created_by = gui`.**
+            `nanna_daemon::board_router_trigger`: `TaskEventBridge::with_router_queue` hands
+            the id of every `created` event in a board scope whose actor is the IPC create's
+            `gui` to a bounded queue (`ROUTE_QUEUE_MAX` = `TASKS_PER_SCOPE_MAX`, 8 B an entry;
+            full = counted + logged, never waited on), and one worker routes them in order on
+            the router member's `profile.model_priority`, else the agent's chat models, read
+            live per card. A card already closed is skipped; an `in_progress` one can only be
+            parked (decision 7, judged from the card's status — conservative until `stalled`
+            exists). The failover walk is now `complete_with_failover(…, purpose)`, so a
+            router failure logs as "Board router", not as a dream cycle. Proven end to end:
+            `a_card_created_on_the_board_is_routed_by_its_router` (e2e, scripted model) creates
+            a global card over IPC and watches the router assign it and post its reason.
+            Known limit: `tasks.add` takes its `actor` from the caller, so a model passing
+            `actor: "gui"` would be routed — the restriction is a convention until Stage 4
+            deletes the chat's own card writes. The failed-verdict wake stays with the
+            Triggers item below (it needs the bounded-retry rule).
 - [ ] Triggers: `created` (skip cards the router itself created), clarification `done`, `verdict`
       failed (bounded retries, then a clarification to the human), recurring reopen, `stalled`
       (`in_progress` with no live run past threshold), heartbeat.

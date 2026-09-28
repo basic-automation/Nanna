@@ -3189,6 +3189,10 @@ pub struct DaemonServer {
     /// memory service exists (P25 Stage 1). Left `None` — and so dropped —
     /// when memory is disabled, which the sink reads as "no copies owed".
     board_copies: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<nanna_storage::TaskEvent>>>,
+    /// The board router's route queue (card ids), created with the task event
+    /// sink and taken by `init_services` once the LLM router and the agent
+    /// config exist (P25 Stage 2).
+    board_routes: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<i64>>>,
     /// Terminal reason file: a durable record of WHY this process stopped, so
     /// the next boot can tell a clean shutdown from a hard death whose only
     /// other evidence is a log that simply ends (2026-08-10 ministral leg).
@@ -3345,6 +3349,7 @@ impl DaemonServer {
             memory_recovery: None,
             storage_error: None,
             board_copies: std::sync::Mutex::new(None),
+            board_routes: std::sync::Mutex::new(None),
             exit_reason,
         }
     }
@@ -3410,14 +3415,21 @@ impl DaemonServer {
                 let (copies_tx, copies_rx) = tokio::sync::mpsc::channel(
                     crate::memory_write_through::WRITE_THROUGH_QUEUE_MAX,
                 );
+                let (routes_tx, routes_rx) =
+                    tokio::sync::mpsc::channel(crate::board_router_trigger::ROUTE_QUEUE_MAX);
                 if storage.set_task_events(Arc::new(
                     crate::task_event_bridge::TaskEventBridge::new(self.ipc.event_sender())
-                        .with_memory_write_through(copies_tx),
+                        .with_memory_write_through(copies_tx)
+                        .with_router_queue(routes_tx),
                 )) {
                     *self
                         .board_copies
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(copies_rx);
+                    *self
+                        .board_routes
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(routes_rx);
                 } else {
                     warn!("task event sink was already attached; keeping the existing one");
                 }
@@ -4888,6 +4900,7 @@ impl DaemonServer {
         // staleness that ran a whole benchmark series on the wrong summarizer
         // (2026-08-15).
         let shared_agent_config = Arc::new(tokio::sync::RwLock::new(self.config.agent.clone()));
+        self.start_board_router(&router, &shared_agent_config);
 
         // Shared session history for the recall_messages tool service
         let session_history: SharedSessionHistory = Arc::new(tokio::sync::RwLock::new(Vec::new()));
@@ -5222,6 +5235,30 @@ impl DaemonServer {
                 memory_copies = memory.is_some(),
                 "Board write-through running: cards and posts feed the timeline and memory"
             );
+        }
+    }
+
+    /// Start routing the cards the board client creates (P25 Stage 2).
+    ///
+    /// Runs at most once: the receiver is taken. Without storage there is no
+    /// board, and the receiver is dropped here.
+    fn start_board_router(
+        &self,
+        router: &Arc<LlmRouter>,
+        agent_config: &Arc<tokio::sync::RwLock<AgentServiceConfig>>,
+    ) {
+        let queue = self
+            .board_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let (Some(queue), Some(storage)) = (queue, self.storage.as_ref()) {
+            tokio::spawn(crate::board_router_trigger::run(
+                queue,
+                Arc::clone(storage),
+                Arc::clone(router),
+                Arc::clone(agent_config),
+            ));
         }
     }
 

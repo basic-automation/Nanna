@@ -3289,3 +3289,86 @@ async fn a_regenerated_reply_stays_replaced_after_a_restart() {
     client.disconnect().await;
     restarted.stop();
 }
+
+/// A card the board client creates wakes the board router (P25 Stage 2): the
+/// router member's model is asked for one decision, and the decision lands on
+/// the card — the assignee it named, and the router's reason as a thread post.
+/// No chat turn is involved; the card is the only ingress.
+#[tokio::test]
+async fn a_card_created_on_the_board_is_routed_by_its_router() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"{"decision":"assign","member":"human","reason":"only a person can sign this"}"#
+            .to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+
+    let created = client
+        .request(nanna_client::Action::Task(nanna_client::TaskAction::Create {
+            title: "Sign the lease renewal".to_string(),
+            scope: Some("global".to_string()),
+            session_id: None,
+            parent_id: None,
+            description: None,
+            priority: None,
+            labels: None,
+            tools: None,
+            due_at: None,
+            deadline_at: None,
+            recurrence: None,
+            depends_on: None,
+            acceptance: None,
+            project: None,
+            assignee: None,
+        }))
+        .await
+        .expect("task.create answers");
+    let id = created["task"]["id"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("a created card: {created}"));
+
+    // The router runs off the store's event sink on its own worker; poll the
+    // card until its decision lands (bounded by the hang ceiling).
+    let started = std::time::Instant::now();
+    let card = loop {
+        let card = client
+            .request(nanna_client::Action::Task(nanna_client::TaskAction::Get { id }))
+            .await
+            .expect("task.get answers");
+        if card["task"]["assignee"].as_str().is_some() {
+            break card;
+        }
+        assert!(
+            started.elapsed() < READY_HANG_CEILING,
+            "the router never decided on card #{id}: {card}"
+        );
+        tokio::time::sleep(READY_POLL_INTERVAL).await;
+    };
+
+    assert_eq!(card["task"]["assignee"], "human", "the member it named: {card}");
+    let notes = card["notes"].as_array().cloned().unwrap_or_default();
+    assert!(
+        notes.iter().any(|n| n["author_member_id"] == "router:global"
+            && n["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("only a person can sign this"))),
+        "the router posts its reason on the card's thread: {card}"
+    );
+    let asked = ollama.chat_bodies.lock().await;
+    assert!(
+        asked
+            .iter()
+            .any(|body| body.contains("Task Management Agent") && body.contains("Sign the lease")),
+        "the router model was shown the card: {asked:?}"
+    );
+    drop(asked);
+    client.disconnect().await;
+    daemon.stop();
+}

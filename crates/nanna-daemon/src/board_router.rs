@@ -11,10 +11,10 @@
 //! walks a model list with failover exactly as every other one-shot caller
 //! does, and tests drive it with a scripted reply.
 //!
-//! Not yet wired to the bus, on purpose: while the chat harness lives, its
-//! own workspace-scoped todos are board cards too, and routing them (a
-//! `clarify` blocks the harness's work on a human card) would fight it. The
-//! trigger lands with the board client's create (ROADMAP P25 Stage 2).
+//! Woken by [`crate::board_router_trigger`] — only for cards the board
+//! client creates, while the chat harness lives: its own workspace-scoped
+//! todos are board cards too, and routing them (a `clarify` blocks the
+//! harness's work on a human card) would fight it.
 
 use std::fmt::Write as _;
 use std::future::Future;
