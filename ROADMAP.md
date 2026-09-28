@@ -8083,8 +8083,25 @@ as its turn (`TurnAdmission`, scope default `session`).
       `acceptance_checked` activity row — no event fires — and nothing but the human's own Done
       can fail one on a board card until Stage 3's runs exist; build it with the run start, so
       the retry bound has a producer to bound. Still open: failed verdict, `stalled`, heartbeat.
-- [ ] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
+- [x] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
+      *(2026-09-28)* `RouterDecision::Assign` gained optional `labels` and `acceptance`. Labels
+      are **added** to the card's own (≤ `ASSIGN_LABELS_MAX` = 8, one word of ≤ 64 B each, `#`
+      dropped, no duplicates); the check is written **only when the card has none** — decision 5
+      says the router's check "stands unless the human edits it", so the human's always stands
+      (overriding a human's acceptance was judged the wrong half of "may override" to ship
+      first). Assignee, labels and check go in ONE patch, so the store admits all or none; a
+      malformed check is refused at parse time through the store's own
+      `admit_acceptance` (now public) and the model is re-asked with the reason. The post says
+      what was filled (`Labelled:`, `Done when:`); the prompt shows a set check as "keep it" and
+      tells the model the three check shapes. Sub-tasks were already `split`, assignee `assign`,
+      live-run refusal `apply_decision`. Post previews 480 → 400 B so the worst-case prompt
+      still lists three members (`the_roster_keeps_room_in_the_worst_case_prompt`). e2e: the
+      clarify→answer→assign run now also asserts the filled label and check.
+- [ ] *(found 2026-09-28)* **`tasks.labels` has no bound in the store.** `create`/`update` admit
+      any number of labels of any length (the router bounds its own additions; IPC, `tasks.add`
+      and `tasks.update` do not). Bound it in `TaskRepository` like titles and notes — count and
+      bytes — derived from what the filter row and the router prompt can show.
 - [ ] Capability-tag adjustment at verdict time; posts the change on the agent's profile thread.
 - [ ] Heartbeat becomes a recurring card assigned to the router; the `heartbeat_prompt` config and
       the scheduler's chat-turn path are removed.
@@ -9534,6 +9551,14 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            unreleased); `fsrs-rs` is at 6.6.2 with no FSRS-7, and no FSRS-7 default parameters are
            published (srs-benchmark experiments are still open). Re-check when `fsrs-rs` ships it;
            adopting it is the same retention-harness A/B the FSRS-6 weight decision needed.
+     - [ ] *(P20, research 2026-09-28)* **Qwen 3.8 ships no model for the 16 GB tier.** The open
+           weights are 27B dense (2026-08-14, Apache-2.0), Flash-Next (180B-A6B) and 2.4T-A95B —
+           no 4B/8B/14B this generation ([lineup](https://codersera.com/blog/qwen-3-8-model-lineup-2026/),
+           [repo](https://github.com/QwenLM/Qwen3.8)). 27B at Q4 is ~16 GB before the desktop's
+           5–6 GB, so it does not fit the reference card; the local roster stays qwen3.5:9b /
+           ornith. Re-check if a Qwen3.8 small dense model lands. Also noted: turso is now at
+           `0.8.0-pre.14` (2026-09-28), still pre-release — the one-minor-at-a-time item above
+           stands.
      - [ ] *(P20, research 2026-09-26)* **IBM Granite 4.2 8B** (Apache-2.0, card dated 2026-08-25,
            "reasoning-augmented tool calling", 512K context) is the one new tool-calling model in the
            16 GB class this month ([card](https://huggingface.co/ibm-granite/granite-4.2-8b)). No

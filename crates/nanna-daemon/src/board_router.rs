@@ -52,11 +52,16 @@ pub const ROUTER_TEXT_PREVIEW_BYTES: usize = 800;
 /// Bytes of one thread post shown to the router.
 ///
 /// Sized so the fixed sections cannot crowd out the roster: the instructions
-/// (~1.1 KB), a maximal title (500 B), the description and labels (800 B
-/// each) and eight posts at this size total about 7.4 KB, leaving the roster
-/// at least 1.8 KB of [`ROUTER_PROMPT_BYTES_MAX`] — room for the human and a
-/// handful of agents even in the worst case.
-pub const ROUTER_POST_PREVIEW_BYTES: usize = 480;
+/// (~1.6 KB), a maximal title (500 B), the description and labels (800 B
+/// each), the acceptance check (240 B), eight posts at this size (3.2 KB) and
+/// two answered clarifications (~0.7 KB) total about 7.9 KB, leaving the
+/// roster at least 1.3 KB of [`ROUTER_PROMPT_BYTES_MAX`] — room for the human
+/// and a few agents even in the worst case (pinned by
+/// `the_roster_keeps_room_in_the_worst_case_prompt`).
+pub const ROUTER_POST_PREVIEW_BYTES: usize = 400;
+
+/// Bytes of the card's acceptance check shown to the router.
+pub const ROUTER_ACCEPTANCE_PREVIEW_BYTES: usize = 240;
 
 /// How many recent verdicts the router's outcome history is drawn from.
 pub const ROUTER_VERDICT_WINDOW: usize = 500;
@@ -206,82 +211,26 @@ pub async fn answered_clarifications(
 /// silently absent, so the router knows the list is partial.
 #[must_use]
 pub fn router_prompt(context: &RouterContext) -> String {
-    let card = &context.card;
     let mut prompt = String::from(
         "You are the board's Task Management Agent. You take no work yourself: you read one \
          card and decide who does it. Answer with exactly ONE JSON object and nothing else:\n\
-         {\"decision\":\"assign\",\"member\":\"<member id>\",\"reason\":\"…\"}\n\
+         {\"decision\":\"assign\",\"member\":\"<member id>\",\"labels\":[\"…\"],\"acceptance\":<check or null>,\"reason\":\"…\"}\n\
          {\"decision\":\"split\",\"subtasks\":[{\"title\":\"…\",\"assignee\":\"<member id or null>\"}],\"reason\":\"…\"}\n\
          {\"decision\":\"clarify\",\"question\":\"<what the human must answer>\",\"reason\":\"…\"}\n\
          {\"decision\":\"park\",\"reason\":\"…\"}\n\
          Assign when one member fits; split when the card is several independent pieces of \
          work; clarify only when the card cannot be done without an answer from the human; \
          park when it should wait. Prefer members whose profile and past verdicts fit the \
-         card. Every decision is posted on the card's thread with your reason.\n\n== CARD ==\n",
+         card. Every decision is posted on the card's thread with your reason. When you assign \
+         a card that has no acceptance check, write the one it is done by — \
+         {\"kind\":\"command\",\"command\":\"…\"}, {\"kind\":\"file_exists\",\"path\":\"…\"} or \
+         {\"kind\":\"regex\",\"path\":\"…\",\"pattern\":\"…\"} — or null if no machine check \
+         fits; labels (one word each, at most 8) file the card for the members who match it.\
+         \n\n== CARD ==\n",
     );
-    let _ = writeln!(prompt, "#{} {} (p{})", card.id, card.title, card.priority);
-    if let Some(description) = card.description.as_deref().filter(|d| !d.trim().is_empty()) {
-        let _ = writeln!(
-            prompt,
-            "{}",
-            preview(description, ROUTER_TEXT_PREVIEW_BYTES)
-        );
-    }
-    if !card.labels.is_empty() {
-        let _ = writeln!(
-            prompt,
-            "Labels: {}",
-            preview(&card.labels.join(", "), ROUTER_TEXT_PREVIEW_BYTES)
-        );
-    }
-    if let Some(assignee) = &card.assignee {
-        let _ = writeln!(prompt, "Currently assigned to: {assignee}");
-    }
-    if let Some(deadline) = &card.deadline_at {
-        let _ = writeln!(prompt, "Deadline: {deadline}");
-    }
-    if let Some(recurrence) = &card.recurrence {
-        let _ = writeln!(
-            prompt,
-            "Recurs (cron): {}",
-            preview(recurrence, ROUTER_POST_PREVIEW_BYTES)
-        );
-    }
-    if !context.thread.is_empty() {
-        prompt.push_str("\n== THREAD (oldest first) ==\n");
-        for note in &context.thread {
-            let who = note.author_member_id.as_deref().unwrap_or("unknown");
-            let _ = writeln!(
-                prompt,
-                "[{}] {who}: {}",
-                note.kind.as_str(),
-                preview(&note.content, ROUTER_POST_PREVIEW_BYTES)
-            );
-        }
-    }
-
-    if !context.answers.is_empty() {
-        prompt.push_str("\n== ANSWERED CLARIFICATIONS (newest first) ==\n");
-        for answered in &context.answers {
-            match answered.answer.as_deref() {
-                Some(text) => {
-                    let _ = writeln!(
-                        prompt,
-                        "#{} answered: {}",
-                        answered.card_id,
-                        preview(text, ROUTER_ANSWER_PREVIEW_BYTES)
-                    );
-                }
-                None => {
-                    let _ = writeln!(
-                        prompt,
-                        "#{} was completed with no answer posted",
-                        answered.card_id
-                    );
-                }
-            }
-        }
-    }
+    write_card(&mut prompt, &context.card);
+    write_thread(&mut prompt, &context.thread);
+    write_answers(&mut prompt, &context.answers);
 
     prompt.push_str("\n== MEMBERS ==\n");
     let mut omitted = 0usize;
@@ -305,6 +254,87 @@ pub fn router_prompt(context: &RouterContext) -> String {
         "within budget unless the fixed part alone overflows"
     );
     prompt
+}
+
+/// The card's own lines: title, description, labels, and the fields set.
+fn write_card(prompt: &mut String, card: &Task) {
+    let _ = writeln!(prompt, "#{} {} (p{})", card.id, card.title, card.priority);
+    if let Some(description) = card.description.as_deref().filter(|d| !d.trim().is_empty()) {
+        let _ = writeln!(
+            prompt,
+            "{}",
+            preview(description, ROUTER_TEXT_PREVIEW_BYTES)
+        );
+    }
+    if !card.labels.is_empty() {
+        let _ = writeln!(
+            prompt,
+            "Labels: {}",
+            preview(&card.labels.join(", "), ROUTER_TEXT_PREVIEW_BYTES)
+        );
+    }
+    if let Some(assignee) = &card.assignee {
+        let _ = writeln!(prompt, "Currently assigned to: {assignee}");
+    }
+    if let Some(deadline) = &card.deadline_at {
+        let _ = writeln!(prompt, "Deadline: {deadline}");
+    }
+    if let Some(check) = &card.acceptance {
+        let _ = writeln!(
+            prompt,
+            "Acceptance (set; keep it): {}",
+            preview(&check.to_string(), ROUTER_ACCEPTANCE_PREVIEW_BYTES)
+        );
+    }
+    if let Some(recurrence) = &card.recurrence {
+        let _ = writeln!(
+            prompt,
+            "Recurs (cron): {}",
+            preview(recurrence, ROUTER_POST_PREVIEW_BYTES)
+        );
+    }
+}
+
+/// The card's recent thread, oldest first.
+fn write_thread(prompt: &mut String, thread: &[TaskNote]) {
+    if !thread.is_empty() {
+        prompt.push_str("\n== THREAD (oldest first) ==\n");
+        for note in thread {
+            let who = note.author_member_id.as_deref().unwrap_or("unknown");
+            let _ = writeln!(
+                prompt,
+                "[{}] {who}: {}",
+                note.kind.as_str(),
+                preview(&note.content, ROUTER_POST_PREVIEW_BYTES)
+            );
+        }
+    }
+}
+
+/// The human's answers to the clarifications the card waited on.
+fn write_answers(prompt: &mut String, answers: &[ClarificationAnswer]) {
+    if !answers.is_empty() {
+        prompt.push_str("\n== ANSWERED CLARIFICATIONS (newest first) ==\n");
+        for answered in answers {
+            match answered.answer.as_deref() {
+                Some(text) => {
+                    let _ = writeln!(
+                        prompt,
+                        "#{} answered: {}",
+                        answered.card_id,
+                        preview(text, ROUTER_ANSWER_PREVIEW_BYTES)
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        prompt,
+                        "#{} was completed with no answer posted",
+                        answered.card_id
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// One roster line: id, name, kind, status, profile preview, verdict record.
@@ -496,6 +526,50 @@ mod tests {
             "the question is on the thread already: {prompt}"
         );
         assert!(prompt.len() <= ROUTER_PROMPT_BYTES_MAX);
+    }
+
+    /// The budget arithmetic on [`ROUTER_POST_PREVIEW_BYTES`], run: every
+    /// section at its maximum still leaves the human and two agents listed.
+    #[tokio::test]
+    async fn the_roster_keeps_room_in_the_worst_case_prompt() {
+        let storage = board().await;
+        let task = card(&storage, "global").await;
+        let mut context = gather_context(&storage, task.id).await.unwrap();
+        let long = "x".repeat(4 * ROUTER_TEXT_PREVIEW_BYTES);
+        context.card.title = "t".repeat(nanna_storage::TASK_TITLE_MAX_BYTES);
+        context.card.description = Some(long.clone());
+        context.card.labels = vec![long.clone()];
+        context.card.acceptance = Some(serde_json::json!({"kind": "command", "command": long}));
+        context.card.assignee = Some("agent:coder".to_string());
+        context.card.recurrence = Some("0 9 * * 1".to_string());
+        let post = TaskNote {
+            id: 1,
+            task_id: task.id,
+            author: None,
+            author_member_id: Some("human".to_string()),
+            kind: nanna_storage::TaskNoteKind::Comment,
+            content: long.clone(),
+            created_at: String::new(),
+        };
+        context.thread = vec![post; ROUTER_THREAD_POSTS_MAX];
+        context.answers = (0..ROUTER_ANSWERS_MAX)
+            .map(|i| ClarificationAnswer {
+                card_id: i64::try_from(i).unwrap() + 100,
+                answer: Some(long.clone()),
+            })
+            .collect();
+        assert_eq!(context.roster.len(), 2, "the human and the coder");
+        let mut second = context.roster[1].clone();
+        second.id = "agent:reviewer".to_string();
+        context.roster.push(second);
+
+        let prompt = router_prompt(&context);
+        assert!(prompt.len() <= ROUTER_PROMPT_BYTES_MAX, "{}", prompt.len());
+        assert!(
+            !prompt.contains("not listed"),
+            "every member fits: {prompt}"
+        );
+        assert!(prompt.contains("- agent:reviewer "), "{prompt}");
     }
 
     #[tokio::test]

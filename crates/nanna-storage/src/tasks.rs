@@ -2210,8 +2210,14 @@ fn repair_js_object_literal(text: &str) -> Option<String> {
 ///
 /// Every write path funnels through here, so what `create`/`update` persist
 /// is exactly what [`canonicalize_acceptance`] admits — never the raw value a
-/// caller happened to hold.
-fn admit_acceptance(value: &serde_json::Value) -> Result<serde_json::Value, StorageError> {
+/// caller happened to hold. Public so a caller can refuse a check before it
+/// reaches a write (the board router re-asks its model with the reason).
+///
+/// # Errors
+/// [`StorageError::Invalid`] naming what is wrong with the check.
+pub fn admit_acceptance(
+    value: &serde_json::Value,
+) -> Result<serde_json::Value, StorageError> {
     let canonical = canonicalize_acceptance(value).map_err(StorageError::Invalid)?;
     validate_acceptance(&canonical)?;
     Ok(canonical)

@@ -3316,34 +3316,12 @@ async fn card_when(
     }
 }
 
-/// A card the board client creates wakes the board router (P25 Stage 2), and
-/// so does the human answering the clarification the router asked for
-/// (decision 6): the router first blocks the card on a question card for the
-/// human; the human posts an answer and completes it over IPC; the router
-/// decides again, with the answer in its prompt, and assigns the card. No chat
-/// turn is involved — the card is the only ingress.
-#[tokio::test]
-async fn the_board_router_asks_the_human_then_routes_on_the_answer() {
-    let ollama = ScriptedOllama::start(vec![
-        r#"{"decision":"clarify","question":"Which lease, the flat or the garage?","reason":"two leases renew this month"}"#
-            .to_string(),
-        r#"{"decision":"assign","member":"human","reason":"only a person can sign this"}"#
-            .to_string(),
-    ])
-    .await;
-    let host = ollama.base_url.clone();
-    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
-        b.with_model(STUB_MODEL)
-            .with_ollama_host(host)
-            .with_scheduler(false)
-    })
-    .await;
-    let client = daemon.connect_client().await;
-
+/// Create a global-scope card over IPC, as the board client does.
+async fn create_global_card(client: &Client, title: &str) -> i64 {
     let created = client
         .request(nanna_client::Action::Task(
             nanna_client::TaskAction::Create {
-                title: "Sign the lease renewal".to_string(),
+                title: title.to_string(),
                 scope: Some("global".to_string()),
                 session_id: None,
                 parent_id: None,
@@ -3362,9 +3340,40 @@ async fn the_board_router_asks_the_human_then_routes_on_the_answer() {
         ))
         .await
         .expect("task.create answers");
-    let id = created["task"]["id"]
+    created["task"]["id"]
         .as_i64()
-        .unwrap_or_else(|| panic!("a created card: {created}"));
+        .unwrap_or_else(|| panic!("a created card: {created}"))
+}
+
+/// A card the board client creates wakes the board router (P25 Stage 2), and
+/// so does the human answering the clarification the router asked for
+/// (decision 6): the router first blocks the card on a question card for the
+/// human; the human posts an answer and completes it over IPC; the router
+/// decides again, with the answer in its prompt, and assigns the card. No chat
+/// turn is involved — the card is the only ingress.
+#[tokio::test]
+async fn the_board_router_asks_the_human_then_routes_on_the_answer() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"{"decision":"clarify","question":"Which lease, the flat or the garage?","reason":"two leases renew this month"}"#
+            .to_string(),
+        concat!(
+            r#"{"decision":"assign","member":"human","labels":["paperwork"],"#,
+            r#""acceptance":{"kind":"file_exists","path":"lease-signed.pdf"},"#,
+            r#""reason":"only a person can sign this"}"#
+        )
+        .to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+
+    let id = create_global_card(&client, "Sign the lease renewal").await;
 
     // First decision: a clarification card the work card waits on.
     let blocked = card_when(&client, id, "blocked on a clarification", |card| {
@@ -3411,6 +3420,16 @@ async fn the_board_router_asks_the_human_then_routes_on_the_answer() {
     assert_eq!(
         card["task"]["assignee"], "human",
         "the member it named: {card}"
+    );
+    // Decision 5: what the human left blank, the router filled in.
+    assert_eq!(
+        card["task"]["labels"],
+        serde_json::json!(["paperwork"]),
+        "{card}"
+    );
+    assert_eq!(
+        card["task"]["acceptance"]["path"], "lease-signed.pdf",
+        "the blank acceptance check was written: {card}"
     );
     let notes = card["notes"].as_array().cloned().unwrap_or_default();
     assert!(
