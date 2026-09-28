@@ -8074,6 +8074,15 @@ as its turn (`TurnAdmission`, scope default `session`).
       posts + completes over IPC → the second decision's prompt carries the answer → assigned.
       Still open: failed `verdict` (with its retry bound), recurring reopen, `stalled`,
       heartbeat.
+      *(2026-09-28, later)* **Recurring reopen landed.** `sweep_recurrences` now reopens through
+      `reopen_for_next_round`: a board-client card's assignee is released *before* the reopen
+      (decision 7 — the router's wake reads a card nobody holds), and the reopen's own
+      `status_changed {reopened: true}` by the `recurrence` actor is the wake. Cards the chat
+      harness made keep their assignee, as before. The router's prompt shows `Recurs (cron):`.
+      **Failed `verdict` deliberately not yet:** a failed acceptance is only an
+      `acceptance_checked` activity row — no event fires — and nothing but the human's own Done
+      can fail one on a board card until Stage 3's runs exist; build it with the run start, so
+      the retry bound has a producer to bound. Still open: failed verdict, `stalled`, heartbeat.
 - [ ] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
 - [ ] Capability-tag adjustment at verdict time; posts the change on the agent's profile thread.

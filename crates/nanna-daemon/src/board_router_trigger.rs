@@ -14,7 +14,10 @@
 //! - [`WakeReason::Created`] — a card was put on a board;
 //! - [`WakeReason::ClarificationAnswered`] — a card the router had blocked on
 //!   a clarification is unblocked because the human completed it, so the
-//!   router decides again with the answer in hand.
+//!   router decides again with the answer in hand;
+//! - [`WakeReason::RecurringReopened`] — the recurrence sweep reopened a
+//!   recurring card, which goes back to the router (decision 7) rather than
+//!   silently to whoever held it last time.
 //!
 //! **Only cards the board client created are routed, for now.** While the
 //! chat harness lives, its model writes workspace-scoped cards of its own
@@ -30,7 +33,7 @@
 use crate::agent_service::AgentServiceConfig;
 use crate::board_router::{RouterComplete, answered_clarifications, route_card, router_for};
 use crate::llm_router::LlmRouter;
-use nanna_storage::{Storage, Task, TaskEvent, TaskEventKind};
+use nanna_storage::{Storage, StorageError, Task, TaskEvent, TaskEventKind, TaskRepository};
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
@@ -38,6 +41,10 @@ use tracing::{debug, info, warn};
 /// The `created` actor whose cards wake the router: the board client's IPC
 /// create. See the module docs for why no other creator does yet.
 pub const BOARD_CLIENT_ACTOR: &str = "gui";
+
+/// The actor the recurrence sweep reopens a card as
+/// (`crate::tasks::sweep_recurrences`).
+pub const RECURRENCE_ACTOR: &str = "recurrence";
 
 /// Member-profile key holding the router's own model list, walked in order
 /// with failover. Absent or empty means the agent's chat models.
@@ -61,6 +68,8 @@ pub enum WakeReason {
     /// routes it only when a completed clarification is among its
     /// dependencies, which takes store reads the sink must not do.
     ClarificationAnswered,
+    /// The recurrence sweep reopened the card.
+    RecurringReopened,
 }
 
 /// One queued wake: route card `task_id` because of `reason`.
@@ -82,6 +91,12 @@ pub fn wake_for(event: &TaskEvent) -> Option<Wake> {
             WakeReason::Created
         }
         TaskEventKind::Unblocked => WakeReason::ClarificationAnswered,
+        TaskEventKind::StatusChanged
+            if event.actor.as_deref() == Some(RECURRENCE_ACTOR)
+                && event.detail.get("reopened") == Some(&serde_json::Value::Bool(true)) =>
+        {
+            WakeReason::RecurringReopened
+        }
         _ => return None,
     };
     debug_assert!(event.task_id > 0, "store ids start at 1");
@@ -154,6 +169,18 @@ pub async fn run(
     debug!("board router queue closed; worker exiting");
 }
 
+/// Whether card `task_id` was created by the board client — the rule every
+/// wake after `created` is held to while the chat harness lives (module docs).
+///
+/// # Errors
+/// The store failure reading the card's `created` row.
+pub async fn created_by_board_client(
+    tasks: &TaskRepository,
+    task_id: i64,
+) -> Result<bool, StorageError> {
+    Ok(tasks.created_by(task_id).await?.as_deref() == Some(BOARD_CLIENT_ACTOR))
+}
+
 /// The card `wake` names, if the router should decide on it now.
 ///
 /// Every refusal is ordinary (the card closed, was picked up, came from the
@@ -176,9 +203,9 @@ pub async fn card_to_route(storage: &Storage, wake: Wake) -> Option<Task> {
     if wake.reason == WakeReason::Created {
         return Some(card);
     }
-    match tasks.created_by(task_id).await {
-        Ok(Some(creator)) if creator == BOARD_CLIENT_ACTOR => {}
-        Ok(_) => {
+    match created_by_board_client(&tasks, task_id).await {
+        Ok(true) => {}
+        Ok(false) => {
             debug!(task_id, "board router: not a board-client card; skipped");
             return None;
         }
@@ -187,6 +214,10 @@ pub async fn card_to_route(storage: &Storage, wake: Wake) -> Option<Task> {
             return None;
         }
     }
+    if wake.reason == WakeReason::RecurringReopened {
+        return Some(card);
+    }
+    debug_assert_eq!(wake.reason, WakeReason::ClarificationAnswered);
     match answered_clarifications(&tasks, &card).await {
         Ok(answers) if !answers.is_empty() => Some(card),
         Ok(_) => {
@@ -286,6 +317,30 @@ mod tests {
             );
         }
         assert_eq!(reason(TaskEventKind::Unblocked, "session", None), None);
+    }
+
+    #[test]
+    fn the_recurrence_sweeps_reopen_wakes_it_and_no_other_status_change_does() {
+        let mut reopened = event(
+            TaskEventKind::StatusChanged,
+            "workspace",
+            Some(RECURRENCE_ACTOR),
+        );
+        reopened.detail = json!({"status": "pending", "reopened": true});
+        assert_eq!(
+            wake_for(&reopened).map(|w| w.reason),
+            Some(WakeReason::RecurringReopened)
+        );
+        // A replan reopening a wrong verdict is not the sweep.
+        let mut by_hand = reopened.clone();
+        by_hand.actor = Some(BOARD_CLIENT_ACTOR.to_string());
+        assert_eq!(wake_for(&by_hand), None);
+        // An ordinary status move by the sweep's actor is not a reopen.
+        let mut moved = reopened.clone();
+        moved.detail = json!({"status": "in_progress"});
+        assert_eq!(wake_for(&moved), None);
+        reopened.scope = "session".to_string();
+        assert_eq!(wake_for(&reopened), None);
     }
 
     #[test]
@@ -426,6 +481,35 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn a_reopened_recurring_card_is_routed_only_if_the_board_client_made_it() {
+        let storage = Storage::in_memory().await.unwrap();
+        let tasks = storage.tasks();
+        let mut routed = Vec::new();
+        for creator in [BOARD_CLIENT_ACTOR, "harness"] {
+            let card = tasks
+                .create(nanna_storage::NewTask {
+                    scope: "global".to_string(),
+                    title: format!("Weekly review by {creator}"),
+                    priority: 3,
+                    recurrence: Some("0 9 * * 1".to_string()),
+                    created_by: Some(creator.to_string()),
+                    ..nanna_storage::NewTask::default()
+                })
+                .await
+                .unwrap();
+            tasks.complete(card.id, Some(creator), None).await.unwrap();
+            let done = tasks.get(card.id).await.unwrap();
+            assert!(crate::tasks::reopen_for_next_round(&tasks, &done).await);
+            let wake = Wake {
+                task_id: card.id,
+                reason: WakeReason::RecurringReopened,
+            };
+            routed.push(card_to_route(&storage, wake).await.is_some());
+        }
+        assert_eq!(routed, vec![true, false]);
     }
 
     #[tokio::test]

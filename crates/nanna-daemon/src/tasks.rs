@@ -4551,13 +4551,47 @@ pub async fn sweep_recurrences(storage: &Arc<Storage>) -> usize {
             .and_then(parse_db_time)
             .unwrap_or(now);
         if expr.next(&completed).is_some_and(|next| next <= now)
-            && repo.reopen(task.id, Some("recurrence")).await.is_ok()
+            && reopen_for_next_round(&repo, &task).await
         {
             info!(task_id = task.id, "recurring task reopened");
             reopened += 1;
         }
     }
     reopened
+}
+
+/// Reopen recurring `task` for its next round; `true` when it reopened.
+///
+/// A card the board client created goes back to the board router (P25
+/// decision 7), not silently to whoever held it last round: its assignee is
+/// released *before* the reopen, so the router's wake — the reopen's own
+/// event — reads a card nobody holds. A card whose creator cannot be read
+/// keeps its assignee (the reopen still happens; routing it is not owed).
+pub(crate) async fn reopen_for_next_round(
+    repo: &nanna_storage::TaskRepository,
+    task: &Task,
+) -> bool {
+    use crate::board_router_trigger::{RECURRENCE_ACTOR, created_by_board_client};
+    debug_assert!(task.recurrence.is_some(), "only recurring cards come round");
+    if task.assignee.is_some() && task.scope != "session" {
+        match created_by_board_client(repo, task.id).await {
+            Ok(true) => {
+                let release = TaskPatch {
+                    assignee: Some(None),
+                    ..TaskPatch::default()
+                };
+                if let Err(e) = repo.update(task.id, release, Some(RECURRENCE_ACTOR)).await {
+                    tracing::warn!(task_id = task.id, "recurring card kept its assignee: {e}");
+                }
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                task_id = task.id,
+                "recurring card's creator unreadable: {e}"
+            ),
+        }
+    }
+    repo.reopen(task.id, Some(RECURRENCE_ACTOR)).await.is_ok()
 }
 
 /// Parse a stored timestamp: RFC3339 first, then turso's
@@ -4938,6 +4972,49 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recurring card the board client created, completed and assigned.
+    async fn finished_recurring_card(storage: &Storage, creator: &str) -> Task {
+        let tasks = storage.tasks();
+        let card = tasks
+            .create(NewTask {
+                scope: "global".to_string(),
+                title: "Water the plants".to_string(),
+                priority: 3,
+                recurrence: Some("0 9 * * *".to_string()),
+                assignee: Some(nanna_storage::HUMAN_MEMBER_ID.to_string()),
+                created_by: Some(creator.to_string()),
+                ..NewTask::default()
+            })
+            .await
+            .unwrap();
+        tasks.complete(card.id, Some("gui"), None).await.unwrap();
+        tasks.get(card.id).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_board_cards_next_round_goes_back_to_the_router_unassigned() {
+        let storage = Storage::in_memory().await.unwrap();
+        let card = finished_recurring_card(&storage, "gui").await;
+        assert!(reopen_for_next_round(&storage.tasks(), &card).await);
+        let next = storage.tasks().get(card.id).await.unwrap();
+        assert_eq!(next.status, "pending");
+        assert_eq!(next.assignee, None, "released for the router");
+    }
+
+    #[tokio::test]
+    async fn the_chat_harness_recurring_card_keeps_its_assignee() {
+        let storage = Storage::in_memory().await.unwrap();
+        let card = finished_recurring_card(&storage, "harness").await;
+        assert!(reopen_for_next_round(&storage.tasks(), &card).await);
+        let next = storage.tasks().get(card.id).await.unwrap();
+        assert_eq!(next.status, "pending");
+        assert_eq!(
+            next.assignee.as_deref(),
+            Some(nanna_storage::HUMAN_MEMBER_ID),
+            "not a board-client card: nothing routes it, so nothing releases it"
+        );
+    }
 
     // -----------------------------------------------------------------
     // Step outcomes: what counts as progress

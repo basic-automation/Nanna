@@ -240,6 +240,13 @@ pub fn router_prompt(context: &RouterContext) -> String {
     if let Some(deadline) = &card.deadline_at {
         let _ = writeln!(prompt, "Deadline: {deadline}");
     }
+    if let Some(recurrence) = &card.recurrence {
+        let _ = writeln!(
+            prompt,
+            "Recurs (cron): {}",
+            preview(recurrence, ROUTER_POST_PREVIEW_BYTES)
+        );
+    }
     if !context.thread.is_empty() {
         prompt.push_str("\n== THREAD (oldest first) ==\n");
         for note in &context.thread {
