@@ -8098,10 +8098,15 @@ as its turn (`TurnAdmission`, scope default `session`).
       live-run refusal `apply_decision`. Post previews 480 → 400 B so the worst-case prompt
       still lists three members (`the_roster_keeps_room_in_the_worst_case_prompt`). e2e: the
       clarify→answer→assign run now also asserts the filled label and check.
-- [ ] *(found 2026-09-28)* **`tasks.labels` has no bound in the store.** `create`/`update` admit
+- [x] *(found 2026-09-28)* **`tasks.labels` has no bound in the store.** `create`/`update` admit
       any number of labels of any length (the router bounds its own additions; IPC, `tasks.add`
       and `tasks.update` do not). Bound it in `TaskRepository` like titles and notes — count and
       bytes — derived from what the filter row and the router prompt can show.
+      *(2026-09-28)* `TASK_LABELS_MAX` = 32, `TASK_LABEL_MAX_BYTES` = 64 (a card's set ≤ 2 KiB),
+      enforced on create and on any patch that sets labels — a card stored before the bound
+      stays editable in its other fields. The router's `LABEL_BYTES_MAX` is now the store's
+      constant. Known edge: a router `assign`/`park` that would push a card past 32 is refused
+      whole and the card left as it was. `tool_scope` is the same shape and still unbounded.
 - [ ] Capability-tag adjustment at verdict time; posts the change on the agent's profile thread.
 - [ ] Heartbeat becomes a recurring card assigned to the router; the `heartbeat_prompt` config and
       the scheduler's chat-turn path are removed.

@@ -34,6 +34,21 @@ pub const TASK_TITLE_MAX_BYTES: usize = 500;
 /// ever usefully contribute to a context injection.
 pub const TASK_NOTE_MAX_BYTES: usize = 16 * 1024;
 
+/// Maximum labels on one task.
+///
+/// Bound justification: labels are filters (`#label` in the quick-add and
+/// the filter language) and are shown whole on a card, in the board's filter
+/// row and in the router's prompt (which previews them at 800 B). 32 labels
+/// is several times any real filing and keeps a card's label set, at
+/// [`TASK_LABEL_MAX_BYTES`] each, within 2 KiB.
+pub const TASK_LABELS_MAX: usize = 32;
+
+/// Maximum bytes of one label.
+///
+/// Bound justification: a label is a short token, not prose; 64 bytes holds
+/// any word-or-phrase tag and keeps one label inside a filter chip.
+pub const TASK_LABEL_MAX_BYTES: usize = 64;
+
 /// Maximum direct dependencies per task.
 ///
 /// Bound justification: `next()` and the cycle check walk dependency edges;
@@ -1783,6 +1798,9 @@ fn apply_patch(task: &mut Task, patch: TaskPatch) -> Result<Vec<&'static str>, S
         task.priority = priority;
     }
     if let Some(labels) = patch.labels {
+        // Checked only when the patch sets labels: a card stored before the
+        // bound existed stays editable in every other field.
+        validate_labels(&labels)?;
         changed.push("labels");
         task.labels = labels;
     }
@@ -1979,6 +1997,23 @@ fn validate_title(title: &str) -> Result<(), StorageError> {
             trimmed.len()
         )));
     }
+    Ok(())
+}
+
+fn validate_labels(labels: &[String]) -> Result<(), StorageError> {
+    if labels.len() > TASK_LABELS_MAX {
+        return Err(StorageError::Invalid(format!(
+            "too many labels: {} (max {TASK_LABELS_MAX})",
+            labels.len()
+        )));
+    }
+    if let Some(long) = labels.iter().find(|l| l.len() > TASK_LABEL_MAX_BYTES) {
+        return Err(StorageError::Invalid(format!(
+            "label exceeds {TASK_LABEL_MAX_BYTES} bytes (got {})",
+            long.len()
+        )));
+    }
+    debug_assert!(labels.len() <= TASK_LABELS_MAX, "count checked");
     Ok(())
 }
 
@@ -2215,9 +2250,7 @@ fn repair_js_object_literal(text: &str) -> Option<String> {
 ///
 /// # Errors
 /// [`StorageError::Invalid`] naming what is wrong with the check.
-pub fn admit_acceptance(
-    value: &serde_json::Value,
-) -> Result<serde_json::Value, StorageError> {
+pub fn admit_acceptance(value: &serde_json::Value) -> Result<serde_json::Value, StorageError> {
     let canonical = canonicalize_acceptance(value).map_err(StorageError::Invalid)?;
     validate_acceptance(&canonical)?;
     Ok(canonical)
@@ -2982,6 +3015,7 @@ fn validate_new_task_fields(new: &NewTask) -> Result<(), StorageError> {
     validate_title(&new.title)?;
     validate_priority(new.priority)?;
     validate_dates(new.due_at.as_deref(), new.deadline_at.as_deref())?;
+    validate_labels(&new.labels)?;
     if new.depends_on.len() > TASK_DEPS_MAX {
         return Err(StorageError::Invalid(format!(
             "too many dependencies: {} (max {TASK_DEPS_MAX})",
@@ -3154,6 +3188,36 @@ mod tests {
         let activity = repo.activity(task.id, 10).await.unwrap();
         assert_eq!(activity.len(), 1);
         assert_eq!(activity[0].action, "created");
+    }
+
+    #[tokio::test]
+    async fn labels_are_bounded_on_create_and_on_update() {
+        let (_s, repo) = repo().await;
+        let mut too_many = new_task("filed everywhere");
+        too_many.labels = (0..=TASK_LABELS_MAX).map(|i| format!("l{i}")).collect();
+        let err = repo.create(too_many).await.unwrap_err();
+        assert!(err.to_string().contains("too many labels"), "{err}");
+
+        let mut at_bound = new_task("filed widely");
+        at_bound.labels = (0..TASK_LABELS_MAX).map(|i| format!("l{i}")).collect();
+        let card = repo.create(at_bound).await.unwrap();
+        assert_eq!(
+            card.labels.len(),
+            TASK_LABELS_MAX,
+            "the bound itself is admitted"
+        );
+
+        let long = TaskPatch {
+            labels: Some(vec!["x".repeat(TASK_LABEL_MAX_BYTES + 1)]),
+            ..TaskPatch::default()
+        };
+        let err = repo.update(card.id, long, None).await.unwrap_err();
+        assert!(err.to_string().contains("label exceeds"), "{err}");
+        assert_eq!(
+            repo.get(card.id).await.unwrap().labels.len(),
+            TASK_LABELS_MAX,
+            "a refused patch changes nothing"
+        );
     }
 
     #[tokio::test]

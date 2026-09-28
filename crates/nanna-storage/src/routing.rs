@@ -49,9 +49,10 @@ pub const DECISION_TEXT_BYTES_MAX: usize = 4 * TASK_NOTE_MAX_BYTES;
 /// the board's filter row would have to render.
 pub const ASSIGN_LABELS_MAX: usize = 8;
 
-/// Longest label the router may add, in bytes. A label is a `#token` in the
-/// quick-add and filter language, so it is short and has no whitespace.
-pub const LABEL_BYTES_MAX: usize = 64;
+/// Longest label the router may add, in bytes: the store's own bound. A
+/// label is a `#token` in the quick-add and filter language, so it is short
+/// and has no whitespace.
+pub const LABEL_BYTES_MAX: usize = crate::TASK_LABEL_MAX_BYTES;
 
 /// Label stamped on a clarification card, so the board can filter them.
 pub const CLARIFICATION_LABEL: &str = "clarification";
