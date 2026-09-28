@@ -4,8 +4,8 @@
 
 **A personal AI presence that runs entirely on your machine.** Nanna is a calm, capable assistant written in Rust — not a chatbot, but a *presence*. It runs as a headless daemon on your own hardware, thinks with a small open model on a single consumer GPU, remembers across sessions, and reaches you on any channel.
 
-[![Download for Windows](https://img.shields.io/badge/Download-Windows%20x64-blue?style=for-the-badge&logo=windows)](https://github.com/physics515/Nanna/releases/latest)
-[![Build from Source](https://img.shields.io/badge/Build-from%20Source-green?style=for-the-badge&logo=rust)](https://github.com/physics515/Nanna#building-from-source)
+[![Download for Windows](https://img.shields.io/badge/Download-Windows%20x64-blue?style=for-the-badge&logo=windows)](https://github.com/basic-automation/Nanna/releases/latest)
+[![Build from Source](https://img.shields.io/badge/Build-from%20Source-green?style=for-the-badge&logo=rust)](https://github.com/basic-automation/Nanna#building-from-source)
 
 **Status:** 🧪 Public Beta · v0.2.1 · Windows x64 (macOS/Linux build from source)
 
@@ -20,7 +20,7 @@ ollama pull qwen3.5:9b
 ```
 
 ### 2. Download Nanna
-Get the latest installer from [Releases](https://github.com/physics515/Nanna/releases):
+Get the latest installer from [Releases](https://github.com/basic-automation/Nanna/releases):
 - **Windows:** `Nanna_x.y.z_x64-setup.exe` or `.msi`
 
 ### 3. Run It
@@ -156,7 +156,7 @@ A fully local run needs none.
 
 ### Windows
 
-1. Download the installer from [Releases](https://github.com/physics515/Nanna/releases)
+1. Download the installer from [Releases](https://github.com/basic-automation/Nanna/releases)
 2. Run `Nanna_x.y.z_x64-setup.exe`
 3. Accept the SmartScreen warning (*More info → Run anyway*)
 4. Launch from Start Menu
@@ -178,7 +178,7 @@ Build from source (see below). After building:
 
 ### Linux
 
-Build from source, or use the AppImage/deb from [Releases](https://github.com/physics515/Nanna/releases):
+Build from source, or use the AppImage/deb from [Releases](https://github.com/basic-automation/Nanna/releases):
 
 **AppImage:**
 ```bash
@@ -387,7 +387,7 @@ NANNA_CONFIG_PATH=/tmp/try.toml nanna-daemon --data-dir /tmp/try-data run
 ## Building from Source
 
 ```bash
-git clone https://github.com/physics515/Nanna.git
+git clone https://github.com/basic-automation/Nanna.git
 cd Nanna
 
 # Build

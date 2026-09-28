@@ -16,7 +16,7 @@ to archive tags.
 **Please do not open a public GitHub issue for security reports.**
 
 Email **security@nanna.bot** (or, if that address is unreachable, open a
-[private security advisory](https://github.com/physics515/Nanna/security/advisories/new)
+[private security advisory](https://github.com/basic-automation/Nanna/security/advisories/new)
 on the GitHub repository).
 
 Include, where you can:

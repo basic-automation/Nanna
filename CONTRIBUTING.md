@@ -10,7 +10,7 @@ By participating in this project, you agree to abide by our [Code of Conduct](CO
 
 ### Reporting Bugs
 
-1. **Check existing issues** — search [GitHub Issues](https://github.com/physics515/Nanna/issues) to see if the bug has already been reported.
+1. **Check existing issues** — search [GitHub Issues](https://github.com/basic-automation/Nanna/issues) to see if the bug has already been reported.
 2. **Create a new issue** with:
    - A clear, descriptive title
    - Steps to reproduce the problem
@@ -49,7 +49,7 @@ By participating in this project, you agree to abide by our [Code of Conduct](CO
 ### Building from Source
 
 ```bash
-git clone https://github.com/physics515/Nanna.git
+git clone https://github.com/basic-automation/Nanna.git
 cd Nanna
 
 # Build
