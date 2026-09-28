@@ -983,7 +983,7 @@ health checks). **Shipped**, except:
       (`tests/fixtures/sdk-servers/client-probe.mjs`) against `nanna mcp serve`: `legacy` →
       2024-11-05, `auto` → **2026-07-28**, `pin` → 2026-07-28 (was a hard failure), 47 tools and a
       call in each; an unknown tool → `Tool not found`.
-- [~] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
+- [x] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
       *(2026-08-23)* **Half of this was already stale, and the half that was true hid a real bug.**
       `perform_health_check` does run a genuine agent loop — `Agent::run(probe_prompt)` under a
       `timeout`, folded into the `apply_health_result` state machine — so "the health check is a
@@ -1020,10 +1020,13 @@ health checks). **Shipped**, except:
       bounded input, so pin that the cap's early return happened — which is what the exit assertion
       should have been saying. Worth remembering as a check-your-checks lesson: an assertion that
       cannot fail is the same failure mode as the health probe it was guarding.)*
-      - [ ] **Still open: give a supervised agent a real body.** `start_agent` must run the agent loop
-            rather than parking on `shutdown_rx`. Until it does, the health probe measures the *LLM's*
-            reachability, not the supervised agent's — which is worth knowing, but is not what the
-            name promises. Rename or re-scope the check when the body lands.
+      - [x] **Closed by deletion, not by giving it a body.** *(2026-09-28)* `58e11e1d` deleted
+            `Supervisor` and `AgentRegistry` (2 082 lines, eleven re-exported types) because nothing
+            in the workspace, the GUI or the root crate called them. `start_agent` no longer exists
+            to park on `shutdown_rx`, and there is no health probe left whose name over-promises.
+            Restoring a supervised-agent body would resurrect a subsystem the review listed as
+            delete-rather-than-fix; sub-agents are sub-tasks. The probe-answer fix above shipped
+            with the file and left with it.
 - [~] *(research 2026-07-20)* **Harden the MCP client for the 2026-07-28 spec RC.** Roots/Sampling/Logging
       are deprecated (file scoping moves to tool params / URIs / server config); tools move to full JSON
       Schema 2020-12 (`oneOf`/`anyOf`/conditionals). Two hard requirements for our client: **must not
