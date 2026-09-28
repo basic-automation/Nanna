@@ -920,7 +920,7 @@ with send/react/edit/delete/pin/threads/media where supported. **Shipped.**
 MCP client (stdio + HTTP/SSE transports, tool discovery, adapter into nanna-tools), background task
 spawning, agent-to-agent messaging (mailbox), Erlang/OTP-style supervisors (RestartPolicy, strategies,
 health checks). **Shipped**, except:
-- [~] **Verify or build MCP *server* mode** — doc claims `crates/nanna-server/src/mcp.rs`; that file does
+- [x] **Verify or build MCP *server* mode** — doc claims `crates/nanna-server/src/mcp.rs`; that file does
       not exist and no MCP refs found under `nanna-server/src`.
       *(2026-07-23)* **Located: the server lives at `crates/nanna-mcp/src/server.rs`** (532 lines —
       `McpServer` with tool/resource/prompt registration, `handle_request` covering initialize/tools/
@@ -948,8 +948,11 @@ health checks). **Shipped**, except:
       `initialize` result, a `tools/list` advertising all **39** skills (every one carrying an
       `inputSchema`), and a `tools/call` of `list_dir` that really executed and returned directory
       contents — with **stdout containing exactly the 2/2 protocol lines and every log on stderr**.
-      Remaining: memory/agent-backed tools (`remember`/`recall`/`reflect`/`task`) need the daemon's script
-      services, which this standalone path does not build — see the new item below.
+      *(2026-09-28)* **Closed.** The only remainder named here — memory/agent-backed tools on the
+      standalone path — is the item below, and that item is done: `nanna mcp serve` proxies to the
+      running daemon, so `remember`/`recall`/`reflect`/`task` execute there rather than in a second
+      process. The server also answers `server/discover` for the 2026-07-28 revision. Nothing in this
+      item is still open.
 - [x] *(2026-07-23)* **Give `nanna mcp serve` the memory/agent-backed tools.** It loads skills via
       `ToolRegistry::load_skills` (no services), so the tools that need `build_script_services` —
       `remember`, `recall`, `reflect`, `task` — load but cannot reach memory or spawn sub-agents. Options:
