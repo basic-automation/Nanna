@@ -20,7 +20,7 @@ pub struct TaskEventBridge {
     /// Copies the queue refused because it was full. Counted so the loss is
     /// visible (logged with a running total), never silent.
     write_through_dropped: AtomicU64,
-    routes: Option<mpsc::Sender<i64>>,
+    routes: Option<mpsc::Sender<crate::board_router_trigger::Wake>>,
     /// Cards the route queue refused because it was full — same contract as
     /// `write_through_dropped`.
     routes_dropped: AtomicU64,
@@ -41,7 +41,10 @@ impl TaskEventBridge {
     /// Also queue the cards that wake the board router for
     /// [`crate::board_router_trigger::run`].
     #[must_use]
-    pub fn with_router_queue(mut self, queue: mpsc::Sender<i64>) -> Self {
+    pub fn with_router_queue(
+        mut self,
+        queue: mpsc::Sender<crate::board_router_trigger::Wake>,
+    ) -> Self {
         self.routes = Some(queue);
         self
     }
@@ -52,13 +55,13 @@ impl TaskEventBridge {
         let Some(queue) = self.routes.as_ref() else {
             return;
         };
-        if !crate::board_router_trigger::wakes_router(event) {
+        let Some(wake) = crate::board_router_trigger::wake_for(event) else {
             return;
-        }
-        debug_assert!(event.task_id > 0, "store ids start at 1");
+        };
+        debug_assert_eq!(wake.task_id, event.task_id, "the event's own card");
         // `Closed` means no worker (no storage-backed router on this daemon),
         // so nothing is owed a decision.
-        if let Err(mpsc::error::TrySendError::Full(_)) = queue.try_send(event.task_id) {
+        if let Err(mpsc::error::TrySendError::Full(_)) = queue.try_send(wake) {
             let dropped = self.routes_dropped.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::warn!(
                 "board router queue is full; card #{} was not routed ({dropped} dropped so \
@@ -185,7 +188,7 @@ mod tests {
         bridge.publish(by_harness);
 
         assert_eq!(
-            routes_rx.try_recv().ok(),
+            routes_rx.try_recv().ok().map(|wake| wake.task_id),
             Some(7),
             "the gui's card is queued"
         );

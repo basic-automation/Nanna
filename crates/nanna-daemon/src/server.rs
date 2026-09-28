@@ -3189,10 +3189,11 @@ pub struct DaemonServer {
     /// memory service exists (P25 Stage 1). Left `None` — and so dropped —
     /// when memory is disabled, which the sink reads as "no copies owed".
     board_copies: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<nanna_storage::TaskEvent>>>,
-    /// The board router's route queue (card ids), created with the task event
+    /// The board router's route queue, created with the task event
     /// sink and taken by `init_services` once the LLM router and the agent
     /// config exist (P25 Stage 2).
-    board_routes: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<i64>>>,
+    board_routes:
+        std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<crate::board_router_trigger::Wake>>>,
     /// Terminal reason file: a durable record of WHY this process stopped, so
     /// the next boot can tell a clean shutdown from a hard death whose only
     /// other evidence is a log that simply ends (2026-08-10 ministral leg).

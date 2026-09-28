@@ -7,21 +7,28 @@
 //! reasoning as [`crate::memory_write_through`]: a lagging `broadcast`
 //! receiver loses events, and a lost `created` here is a card nobody ever
 //! routes. [`crate::task_event_bridge::TaskEventBridge`] hands every waking
-//! event's card id to a bounded `mpsc` queue; one worker drains it in order.
-//! The sink never waits: a full queue is counted and logged.
+//! event to a bounded `mpsc` queue as a [`Wake`]; one worker drains it in
+//! order. The sink never waits: a full queue is counted and logged.
 //!
-//! **Only cards the board client created wake the router, for now.** While
-//! the chat harness lives, its model writes workspace-scoped cards of its own
+//! **Two wakes so far** (P25 decisions 4 and 6):
+//! - [`WakeReason::Created`] — a card was put on a board;
+//! - [`WakeReason::ClarificationAnswered`] — a card the router had blocked on
+//!   a clarification is unblocked because the human completed it, so the
+//!   router decides again with the answer in hand.
+//!
+//! **Only cards the board client created are routed, for now.** While the
+//! chat harness lives, its model writes workspace-scoped cards of its own
 //! (`tasks.add`), and routing those would fight it — a `clarify` blocks the
-//! harness's own work on a human card mid-mission. So the wake is restricted
-//! to `created` events whose actor is [`BOARD_CLIENT_ACTOR`], the actor the
-//! IPC create (`TaskAction::Create`) stamps. The router's own splits and
-//! clarifications carry the router's id, so they never wake it either. The
-//! remaining wakes (failed verdict, clarification done, recurring reopen,
-//! stalled, heartbeat) are separate roadmap items.
+//! harness's own work on a human card mid-mission. A card is routed only if
+//! its creator is [`BOARD_CLIENT_ACTOR`], the actor the IPC create
+//! (`TaskAction::Create`) stamps: checked on the event itself for `created`,
+//! and against the card's `created` activity row for every later wake. The
+//! router's own splits and clarifications carry the router's id, so they never
+//! wake it. The remaining wakes (failed verdict, recurring reopen, stalled,
+//! heartbeat) are separate roadmap items.
 
 use crate::agent_service::AgentServiceConfig;
-use crate::board_router::{RouterComplete, route_card, router_for};
+use crate::board_router::{RouterComplete, answered_clarifications, route_card, router_for};
 use crate::llm_router::LlmRouter;
 use nanna_storage::{Storage, Task, TaskEvent, TaskEventKind};
 use std::sync::Arc;
@@ -36,22 +43,52 @@ pub const BOARD_CLIENT_ACTOR: &str = "gui";
 /// with failover. Absent or empty means the agent's chat models.
 pub const PROFILE_MODELS_KEY: &str = "model_priority";
 
-/// Card ids the route queue holds before the sink starts reporting drops.
+/// Wakes the route queue holds before the sink starts reporting drops.
 ///
-/// Bound justification: a queued entry is one `i64`, and the largest burst a
-/// board client can produce is filling one scope, which the store caps at
-/// [`nanna_storage::TASKS_PER_SCOPE_MAX`] cards — so a whole scope's worth of
-/// creates fits (~8 KiB) even while the worker is busy with a slow model.
+/// Bound justification: a queued [`Wake`] is 16 bytes, and the largest burst
+/// the store can produce is one event per card of a scope (a board client
+/// filling it, or a cascade unblocking all of it), which the store caps at
+/// [`nanna_storage::TASKS_PER_SCOPE_MAX`] cards — so a whole scope's worth
+/// fits (~16 KiB) even while the worker is busy with a slow model.
 pub const ROUTE_QUEUE_MAX: usize = nanna_storage::TASKS_PER_SCOPE_MAX;
 
-/// Whether `event` should wake the router: a card the board client created on
-/// a board (workspace or global scope). Pure, so the sink can call it on the
-/// task store's write path.
+/// Why the router was woken for a card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeReason {
+    /// The board client created the card.
+    Created,
+    /// The card became unblocked. Queued for every board card; the worker
+    /// routes it only when a completed clarification is among its
+    /// dependencies, which takes store reads the sink must not do.
+    ClarificationAnswered,
+}
+
+/// One queued wake: route card `task_id` because of `reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wake {
+    pub task_id: i64,
+    pub reason: WakeReason,
+}
+
+/// The wake `event` produces, if any. Pure, so the sink can call it on the
+/// task store's write path; everything that needs a read is the worker's.
 #[must_use]
-pub fn wakes_router(event: &TaskEvent) -> bool {
-    event.kind == TaskEventKind::Created
-        && event.scope != "session"
-        && event.actor.as_deref() == Some(BOARD_CLIENT_ACTOR)
+pub fn wake_for(event: &TaskEvent) -> Option<Wake> {
+    if event.scope == "session" {
+        return None;
+    }
+    let reason = match event.kind {
+        TaskEventKind::Created if event.actor.as_deref() == Some(BOARD_CLIENT_ACTOR) => {
+            WakeReason::Created
+        }
+        TaskEventKind::Unblocked => WakeReason::ClarificationAnswered,
+        _ => return None,
+    };
+    debug_assert!(event.task_id > 0, "store ids start at 1");
+    Some(Wake {
+        task_id: event.task_id,
+        reason,
+    })
 }
 
 /// The models the router walks: its profile's [`PROFILE_MODELS_KEY`] list
@@ -83,15 +120,14 @@ pub fn router_models(profile: &serde_json::Value, fallback: &[String]) -> Vec<St
     models
 }
 
-/// Whether the router may decide anything about `card` beyond parking it.
+/// Whether the router may take `card` up at all: open and not picked up.
 ///
-/// P25 decision 7: a card being worked is never reassigned. Only the card's
-/// own status says so here — a card is `in_progress` exactly while something
-/// has picked it up — which is conservative: a stalled `in_progress` card
-/// can only be parked until the `stalled` trigger exists.
+/// P25 decision 7: a card being worked is never reassigned, and a card is
+/// `in_progress` exactly while something has picked it up. A stalled
+/// `in_progress` card is the `stalled` trigger's, not a wake's.
 #[must_use]
-pub fn card_is_being_worked(card: &Task) -> bool {
-    card.status == "in_progress"
+pub fn card_is_routable(card: &Task) -> bool {
+    card.status == "pending" && card.completed_at.is_none()
 }
 
 /// Drain the route queue until every sender is gone, routing each card.
@@ -99,39 +135,81 @@ pub fn card_is_being_worked(card: &Task) -> bool {
 /// One card at a time: the router is one member, and its decisions read the
 /// board they change (a split creates cards the next decision may see).
 pub async fn run(
-    mut queue: mpsc::Receiver<i64>,
+    mut queue: mpsc::Receiver<Wake>,
     storage: Arc<Storage>,
     llm: Arc<LlmRouter>,
     agent_config: Arc<RwLock<AgentServiceConfig>>,
 ) {
     info!("Board router running: cards created on a board are routed by its router member");
-    while let Some(task_id) = queue.recv().await {
-        debug_assert!(task_id > 0, "store ids start at 1");
+    while let Some(wake) = queue.recv().await {
         let fallback = {
             let config = agent_config.read().await;
             crate::agent_service::configured_models(&config.model, &config.model_priority)
         };
-        route_one(&storage, &llm, &fallback, task_id).await;
+        let Some(card) = card_to_route(&storage, wake).await else {
+            continue;
+        };
+        route_one(&storage, &llm, &fallback, &card).await;
     }
     debug!("board router queue closed; worker exiting");
 }
 
-/// Route card `task_id`, logging the outcome. Every failure is operational
-/// (the card is gone, no model, the model or store failed) and leaves the
-/// card as it was, so it is logged and the worker moves on.
-async fn route_one(storage: &Storage, llm: &Arc<LlmRouter>, fallback: &[String], task_id: i64) {
-    let card = match storage.tasks().get(task_id).await {
+/// The card `wake` names, if the router should decide on it now.
+///
+/// Every refusal is ordinary (the card closed, was picked up, came from the
+/// chat harness, or was unblocked by something other than an answered
+/// clarification) and is logged at debug; only a store failure warns.
+pub async fn card_to_route(storage: &Storage, wake: Wake) -> Option<Task> {
+    let tasks = storage.tasks();
+    let task_id = wake.task_id;
+    let card = match tasks.get(task_id).await {
         Ok(card) => card,
         Err(e) => {
             warn!(task_id, error = %e, "board router: card could not be read; not routed");
-            return;
+            return None;
         }
     };
-    if card.completed_at.is_some() || card.status == "done" || card.status == "cancelled" {
-        debug!(task_id, status = %card.status, "board router: card already closed; skipped");
-        return;
+    if !card_is_routable(&card) {
+        debug!(task_id, status = %card.status, "board router: card closed or taken; skipped");
+        return None;
     }
-    let Some(router_id) = router_for(&card) else {
+    if wake.reason == WakeReason::Created {
+        return Some(card);
+    }
+    match tasks.created_by(task_id).await {
+        Ok(Some(creator)) if creator == BOARD_CLIENT_ACTOR => {}
+        Ok(_) => {
+            debug!(task_id, "board router: not a board-client card; skipped");
+            return None;
+        }
+        Err(e) => {
+            warn!(task_id, error = %e, "board router: creator unreadable; not routed");
+            return None;
+        }
+    }
+    match answered_clarifications(&tasks, &card).await {
+        Ok(answers) if !answers.is_empty() => Some(card),
+        Ok(_) => {
+            debug!(
+                task_id,
+                "board router: unblocked by no clarification; skipped"
+            );
+            None
+        }
+        Err(why) => {
+            warn!(task_id, %why, "board router: clarifications unreadable; not routed");
+            None
+        }
+    }
+}
+
+/// Route `card`, logging the outcome. Every failure is operational (no
+/// model, the model or store failed) and leaves the card as it was, so it is
+/// logged and the worker moves on.
+async fn route_one(storage: &Storage, llm: &Arc<LlmRouter>, fallback: &[String], card: &Task) {
+    debug_assert!(card_is_routable(card), "checked by card_to_route");
+    let task_id = card.id;
+    let Some(router_id) = router_for(card) else {
         debug!(task_id, "board router: card is not on a board; skipped");
         return;
     };
@@ -156,7 +234,9 @@ async fn route_one(storage: &Storage, llm: &Arc<LlmRouter>, fallback: &[String],
     let walk =
         crate::dream_summarizer::complete_with_failover(Arc::clone(llm), models, "Board router");
     let complete: Box<RouterComplete> = Box::new(walk);
-    match route_card(storage, &complete, task_id, card_is_being_worked(&card)).await {
+    // Not being worked: `card_to_route` just said so. A pickup in the window
+    // since is the same race any other member's edit has.
+    match route_card(storage, &complete, task_id, false).await {
         Ok(applied) => info!(task_id, router = %router_id, ?applied, "board router decided"),
         Err(why) => warn!(task_id, router = %router_id, %why, "board router: card not routed"),
     }
@@ -178,64 +258,215 @@ mod tests {
         }
     }
 
+    fn reason(kind: TaskEventKind, scope: &str, actor: Option<&str>) -> Option<WakeReason> {
+        wake_for(&event(kind, scope, actor)).map(|wake| {
+            assert_eq!(wake.task_id, 3, "the event's card");
+            wake.reason
+        })
+    }
+
     #[test]
     fn a_card_the_board_client_creates_on_a_board_wakes_the_router() {
-        assert!(wakes_router(&event(
-            TaskEventKind::Created,
-            "workspace",
-            Some(BOARD_CLIENT_ACTOR)
-        )));
-        assert!(wakes_router(&event(
-            TaskEventKind::Created,
-            "global",
-            Some(BOARD_CLIENT_ACTOR)
-        )));
+        for scope in ["workspace", "global"] {
+            assert_eq!(
+                reason(TaskEventKind::Created, scope, Some(BOARD_CLIENT_ACTOR)),
+                Some(WakeReason::Created)
+            );
+        }
+    }
+
+    #[test]
+    fn an_unblocked_board_card_is_a_candidate_whoever_unblocked_it() {
+        // The creator and the dependency are the worker's to check: the sink
+        // cannot read the store.
+        for actor in [Some(BOARD_CLIENT_ACTOR), Some("harness"), None] {
+            assert_eq!(
+                reason(TaskEventKind::Unblocked, "workspace", actor),
+                Some(WakeReason::ClarificationAnswered)
+            );
+        }
+        assert_eq!(reason(TaskEventKind::Unblocked, "session", None), None);
     }
 
     #[test]
     fn nothing_else_wakes_it_while_the_chat_harness_lives() {
-        // The chat model's own cards: it would route the harness's plan.
-        assert!(!wakes_router(&event(
-            TaskEventKind::Created,
-            "workspace",
-            Some("harness")
-        )));
-        assert!(!wakes_router(&event(
-            TaskEventKind::Created,
-            "workspace",
-            Some("agent")
-        )));
-        // The router's own splits and clarifications.
-        assert!(!wakes_router(&event(
-            TaskEventKind::Created,
-            "workspace",
-            Some("router:ws1")
-        )));
-        // A creator nobody recorded is not the board client.
-        assert!(!wakes_router(&event(
-            TaskEventKind::Created,
-            "workspace",
-            None
-        )));
+        // The chat model's own cards, the router's own splits and
+        // clarifications, and a creator nobody recorded.
+        for actor in [Some("harness"), Some("agent"), Some("router:ws1"), None] {
+            assert_eq!(reason(TaskEventKind::Created, "workspace", actor), None);
+        }
         // Session scope is chat scaffolding, never a board.
-        assert!(!wakes_router(&event(
-            TaskEventKind::Created,
-            "session",
-            Some(BOARD_CLIENT_ACTOR)
-        )));
-        // Other kinds are other triggers, not this one.
+        assert_eq!(
+            reason(TaskEventKind::Created, "session", Some(BOARD_CLIENT_ACTOR)),
+            None
+        );
+        // Other kinds are other triggers, not these.
         for kind in [
             TaskEventKind::Assigned,
+            TaskEventKind::Blocked,
             TaskEventKind::Posted,
             TaskEventKind::Verdict,
             TaskEventKind::StatusChanged,
+            TaskEventKind::Due,
+            TaskEventKind::Overdue,
         ] {
-            assert!(!wakes_router(&event(
-                kind,
-                "workspace",
-                Some(BOARD_CLIENT_ACTOR)
-            )));
+            assert_eq!(reason(kind, "workspace", Some(BOARD_CLIENT_ACTOR)), None);
         }
+    }
+
+    /// A global card that waits on one dependency, created by `creator`.
+    async fn waiting_card(
+        storage: &Storage,
+        creator: &str,
+        dependency_labels: Vec<String>,
+    ) -> (i64, i64) {
+        let tasks = storage.tasks();
+        let dependency = tasks
+            .create(nanna_storage::NewTask {
+                scope: "global".to_string(),
+                title: "What colour?".to_string(),
+                priority: 3,
+                labels: dependency_labels,
+                assignee: Some(nanna_storage::HUMAN_MEMBER_ID.to_string()),
+                created_by: Some("router:global".to_string()),
+                ..nanna_storage::NewTask::default()
+            })
+            .await
+            .unwrap();
+        let card = tasks
+            .create(nanna_storage::NewTask {
+                scope: "global".to_string(),
+                title: "Paint the shed".to_string(),
+                priority: 3,
+                depends_on: vec![dependency.id],
+                created_by: Some(creator.to_string()),
+                ..nanna_storage::NewTask::default()
+            })
+            .await
+            .unwrap();
+        (card.id, dependency.id)
+    }
+
+    fn answered(task_id: i64) -> Wake {
+        Wake {
+            task_id,
+            reason: WakeReason::ClarificationAnswered,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_answered_clarification_hands_the_card_back_to_the_router() {
+        let storage = Storage::in_memory().await.unwrap();
+        let (card, clarification) = waiting_card(
+            &storage,
+            BOARD_CLIENT_ACTOR,
+            vec![nanna_storage::routing::CLARIFICATION_LABEL.to_string()],
+        )
+        .await;
+        let tasks = storage.tasks();
+        tasks
+            .post(
+                clarification,
+                Some(BOARD_CLIENT_ACTOR),
+                Some(nanna_storage::HUMAN_MEMBER_ID),
+                nanna_storage::TaskNoteKind::Comment,
+                "Green, the same as the fence.",
+            )
+            .await
+            .unwrap();
+        tasks
+            .complete(clarification, Some(BOARD_CLIENT_ACTOR), None)
+            .await
+            .unwrap();
+
+        let routed = card_to_route(&storage, answered(card)).await;
+        assert_eq!(
+            routed.map(|c| c.id),
+            Some(card),
+            "the work card is routed again"
+        );
+        let answers = answered_clarifications(&tasks, &tasks.get(card).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].card_id, clarification);
+        assert_eq!(
+            answers[0].answer.as_deref(),
+            Some("Green, the same as the fence."),
+            "the human's post is the answer the router reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unblock_that_answers_nothing_does_not_wake_the_router() {
+        let storage = Storage::in_memory().await.unwrap();
+        // Unblocked by an ordinary dependency, not a clarification.
+        let (card, dependency) = waiting_card(&storage, BOARD_CLIENT_ACTOR, Vec::new()).await;
+        storage
+            .tasks()
+            .complete(dependency, Some(BOARD_CLIENT_ACTOR), None)
+            .await
+            .unwrap();
+        assert!(card_to_route(&storage, answered(card)).await.is_none());
+
+        // The chat harness's own card, even when a clarification unblocks it.
+        let (harness_card, clarification) = waiting_card(
+            &storage,
+            "harness",
+            vec![nanna_storage::routing::CLARIFICATION_LABEL.to_string()],
+        )
+        .await;
+        storage
+            .tasks()
+            .complete(clarification, Some(BOARD_CLIENT_ACTOR), None)
+            .await
+            .unwrap();
+        assert!(
+            card_to_route(&storage, answered(harness_card))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_card_already_picked_up_or_closed_is_not_routed() {
+        let storage = Storage::in_memory().await.unwrap();
+        let tasks = storage.tasks();
+        let card = tasks
+            .create(nanna_storage::NewTask {
+                scope: "global".to_string(),
+                title: "Taken".to_string(),
+                priority: 3,
+                created_by: Some(BOARD_CLIENT_ACTOR.to_string()),
+                ..nanna_storage::NewTask::default()
+            })
+            .await
+            .unwrap();
+        let created = Wake {
+            task_id: card.id,
+            reason: WakeReason::Created,
+        };
+        assert!(card_to_route(&storage, created).await.is_some());
+        tasks
+            .update(
+                card.id,
+                nanna_storage::TaskPatch {
+                    status: Some("in_progress".to_string()),
+                    ..nanna_storage::TaskPatch::default()
+                },
+                Some("harness"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            card_to_route(&storage, created).await.is_none(),
+            "being worked"
+        );
+        tasks
+            .complete(card.id, Some("harness"), None)
+            .await
+            .unwrap();
+        assert!(card_to_route(&storage, created).await.is_none(), "closed");
     }
 
     #[test]

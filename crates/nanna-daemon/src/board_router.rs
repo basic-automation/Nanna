@@ -20,9 +20,12 @@ use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
 
-use nanna_storage::routing::{AppliedDecision, apply_decision, parse_decision};
+use nanna_storage::routing::{
+    AppliedDecision, CLARIFICATION_LABEL, apply_decision, parse_decision,
+};
 use nanna_storage::{
-    Member, ROUTER_MEMBER_PREFIX, Storage, Task, TaskNote, VerdictTally, router_member_id,
+    Member, ROUTER_MEMBER_PREFIX, Storage, Task, TaskNote, TaskRepository, VerdictTally,
+    router_member_id,
 };
 
 /// A one-shot completion: prompt in, reply text out, or why not.
@@ -58,6 +61,28 @@ pub const ROUTER_POST_PREVIEW_BYTES: usize = 480;
 /// How many recent verdicts the router's outcome history is drawn from.
 pub const ROUTER_VERDICT_WINDOW: usize = 500;
 
+/// Answered clarifications the router reads, newest first.
+///
+/// The question is already on the card's thread (the router's own `clarify`
+/// post), so only the answer is shown. Two answers at
+/// [`ROUTER_ANSWER_PREVIEW_BYTES`] cost ~700 B of [`ROUTER_PROMPT_BYTES_MAX`],
+/// which still leaves the roster ~1.1 KB in the worst case the post-preview
+/// bound was sized for.
+pub const ROUTER_ANSWERS_MAX: usize = 2;
+
+/// Bytes of one clarification answer shown to the router.
+pub const ROUTER_ANSWER_PREVIEW_BYTES: usize = 320;
+
+/// A clarification card the human has completed, and what they said on it.
+#[derive(Debug, Clone)]
+pub struct ClarificationAnswer {
+    pub card_id: i64,
+    /// The human's newest post on the clarification card, or `None` when they
+    /// completed it without posting — which the router is told, not left to
+    /// infer from silence.
+    pub answer: Option<String>,
+}
+
 /// What the router reads before it decides.
 #[derive(Debug, Clone)]
 pub struct RouterContext {
@@ -67,6 +92,9 @@ pub struct RouterContext {
     /// Members who can take the card — never a router.
     pub roster: Vec<Member>,
     pub verdicts: Vec<VerdictTally>,
+    /// Completed clarifications the card depends on, at most
+    /// [`ROUTER_ANSWERS_MAX`].
+    pub answers: Vec<ClarificationAnswer>,
 }
 
 /// The router member for `card`'s board, or `None` for a card that is not on
@@ -114,13 +142,61 @@ pub async fn gather_context(storage: &Storage, task_id: i64) -> Result<RouterCon
         .verdict_rollup(ROUTER_VERDICT_WINDOW)
         .await
         .map_err(|e| e.to_string())?;
+    let answers = answered_clarifications(&tasks, &card).await?;
     debug_assert!(thread.len() <= ROUTER_THREAD_POSTS_MAX, "thread bounded");
+    debug_assert!(answers.len() <= ROUTER_ANSWERS_MAX, "answers bounded");
     Ok(RouterContext {
         card,
         thread,
         roster,
         verdicts,
+        answers,
     })
+}
+
+/// The completed clarifications `card` depends on, newest first, at most
+/// [`ROUTER_ANSWERS_MAX`]. A dependency that no longer exists is skipped: it
+/// answers nothing.
+///
+/// # Errors
+/// A description of the store failure.
+pub async fn answered_clarifications(
+    tasks: &TaskRepository,
+    card: &Task,
+) -> Result<Vec<ClarificationAnswer>, String> {
+    let mut answers = Vec::new();
+    // Newest dependency last: a later clarification supersedes an earlier one.
+    for dep_id in card.depends_on.iter().rev() {
+        if answers.len() == ROUTER_ANSWERS_MAX {
+            break;
+        }
+        let Ok(dep) = tasks.get(*dep_id).await else {
+            continue;
+        };
+        if dep.status != "done" || !dep.labels.iter().any(|l| l == CLARIFICATION_LABEL) {
+            continue;
+        }
+        let answer = tasks
+            .notes(
+                dep.id,
+                i64::try_from(ROUTER_THREAD_POSTS_MAX).unwrap_or(i64::MAX),
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|n| {
+                !n.author_member_id
+                    .as_deref()
+                    .is_some_and(|who| who.starts_with(ROUTER_MEMBER_PREFIX))
+            })
+            .map(|n| n.content);
+        answers.push(ClarificationAnswer {
+            card_id: dep.id,
+            answer,
+        });
+    }
+    debug_assert!(answers.len() <= ROUTER_ANSWERS_MAX, "bounded");
+    Ok(answers)
 }
 
 /// The router prompt for `context`, at most [`ROUTER_PROMPT_BYTES_MAX`] bytes.
@@ -174,6 +250,29 @@ pub fn router_prompt(context: &RouterContext) -> String {
                 note.kind.as_str(),
                 preview(&note.content, ROUTER_POST_PREVIEW_BYTES)
             );
+        }
+    }
+
+    if !context.answers.is_empty() {
+        prompt.push_str("\n== ANSWERED CLARIFICATIONS (newest first) ==\n");
+        for answered in &context.answers {
+            match answered.answer.as_deref() {
+                Some(text) => {
+                    let _ = writeln!(
+                        prompt,
+                        "#{} answered: {}",
+                        answered.card_id,
+                        preview(text, ROUTER_ANSWER_PREVIEW_BYTES)
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        prompt,
+                        "#{} was completed with no answer posted",
+                        answered.card_id
+                    );
+                }
+            }
         }
     }
 
@@ -341,6 +440,55 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    /// P25 decision 6: once the human completes a clarification, the router
+    /// decides again — and must see what the human said, not only that the
+    /// card is unblocked.
+    #[tokio::test]
+    async fn the_prompt_carries_the_humans_answer_to_a_clarification() {
+        let storage = board().await;
+        let task = card(&storage, "global").await;
+        let (complete, _) = scripted(vec![
+            r#"{"decision":"clarify","question":"Which AST crate?","reason":"two exist"}"#,
+        ]);
+        let applied = route_card(&storage, &complete, task.id, false)
+            .await
+            .unwrap();
+        let clarification = applied.created[0];
+        let tasks = storage.tasks();
+        tasks
+            .post(
+                clarification,
+                Some("gui"),
+                Some(nanna_storage::HUMAN_MEMBER_ID),
+                nanna_storage::TaskNoteKind::Comment,
+                "The new one\nin crates/ast.",
+            )
+            .await
+            .unwrap();
+        let before = router_prompt(&gather_context(&storage, task.id).await.unwrap());
+        assert!(
+            !before.contains("ANSWERED CLARIFICATIONS"),
+            "an open clarification answers nothing yet: {before}"
+        );
+
+        tasks
+            .complete(clarification, Some("gui"), None)
+            .await
+            .unwrap();
+        let prompt = router_prompt(&gather_context(&storage, task.id).await.unwrap());
+        assert!(
+            prompt.contains(&format!(
+                "#{clarification} answered: The new one in crates/ast."
+            )),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Which AST crate?"),
+            "the question is on the thread already: {prompt}"
+        );
+        assert!(prompt.len() <= ROUTER_PROMPT_BYTES_MAX);
     }
 
     #[tokio::test]

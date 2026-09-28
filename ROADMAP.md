@@ -8061,6 +8061,19 @@ as its turn (`TurnAdmission`, scope default `session`).
 - [ ] Triggers: `created` (skip cards the router itself created), clarification `done`, `verdict`
       failed (bounded retries, then a clarification to the human), recurring reopen, `stalled`
       (`in_progress` with no live run past threshold), heartbeat.
+      *(2026-09-28)* **`created` and clarification `done` landed** (both for board-client cards
+      only, see the wiring note above). Clarification `done` rides the derived `unblocked`
+      event: the sink queues every board card that unblocks, and the worker routes it only if
+      its `created` activity row says `gui` (new `TaskRepository::created_by`, looked up by
+      action so it never falls out of a window) and a completed `clarification`-labelled card
+      is among its dependencies. The router's prompt gains an *ANSWERED CLARIFICATIONS*
+      section — the human's newest non-router post on each (≤ 2, 320 B each, ~700 B of the
+      9 216 B budget), or "completed with no answer posted"; the question itself is already
+      on the thread. A card that is `in_progress` or closed is never taken up by a wake.
+      e2e `the_board_router_asks_the_human_then_routes_on_the_answer`: clarify → the human
+      posts + completes over IPC → the second decision's prompt carries the answer → assigned.
+      Still open: failed `verdict` (with its retry bound), recurring reopen, `stalled`,
+      heartbeat.
 - [ ] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
 - [ ] Capability-tag adjustment at verdict time; posts the change on the agent's profile thread.

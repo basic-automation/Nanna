@@ -915,6 +915,37 @@ impl TaskRepository {
         Ok(cards)
     }
 
+    /// Who created card `task_id`: the actor on its `created` activity row.
+    ///
+    /// `None` when the creator was not recorded (a writer that named no
+    /// actor, or a row older than `NewTask::created_by`) — never guessed from
+    /// the assignee. The row is looked up by its action, so however long the
+    /// card's activity log grows, the answer does not fall out of a window.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::NotFound`] if the card has no `created` row
+    /// (it does not exist), or [`StorageError::Database`] if the query fails.
+    pub async fn created_by(&self, task_id: i64) -> Result<Option<String>, StorageError> {
+        debug_assert!(task_id > 0, "store ids start at 1");
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT actor FROM task_activity WHERE task_id = ?1 AND action = 'created' \
+                 ORDER BY id LIMIT 1",
+                turso::params![task_id],
+            )
+            .await?;
+        let found: Option<Option<String>> = match rows.next().await? {
+            Some(row) => Some(row.get(0)?),
+            None => None,
+        };
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        found.ok_or_else(|| StorageError::NotFound(format!("created row for task #{task_id}")))
+    }
+
     /// One thread post by its id.
     ///
     /// Task events name a post by id rather than carrying it (the bus is not a
@@ -3117,6 +3148,26 @@ mod tests {
         let activity = repo.activity(task.id, 10).await.unwrap();
         assert_eq!(activity.len(), 1);
         assert_eq!(activity[0].action, "created");
+    }
+
+    #[tokio::test]
+    async fn created_by_names_the_creator_and_never_the_assignee() {
+        let (_s, repo) = repo().await;
+        let mut by_gui = new_task("from the board");
+        by_gui.created_by = Some("gui".to_string());
+        by_gui.assignee = Some("human".to_string());
+        let by_gui = repo.create(by_gui).await.unwrap();
+        let anonymous = repo.create(new_task("nobody said")).await.unwrap();
+
+        assert_eq!(
+            repo.created_by(by_gui.id).await.unwrap().as_deref(),
+            Some("gui")
+        );
+        assert_eq!(repo.created_by(anonymous.id).await.unwrap(), None);
+        assert!(matches!(
+            repo.created_by(anonymous.id + 100).await,
+            Err(StorageError::NotFound(_))
+        ));
     }
 
     #[tokio::test]
