@@ -48,6 +48,8 @@ can also set the router's own model list here; before, there was nowhere to set 
 - Dependencies: `softaes` 0.1.7, plus `playwright-rs` 0.19, `bigdecimal` 0.4.11 and
   `tokio-rustls` 0.26.6. TypeScript 7 is still blocked (`vue-tsc` 3.3.11 has no support).
 - Built with the Rust nightly of 2026-09-28 (rustc 1.101.0).
+- `undici` 8.11.2 (pulled in by Nuxt), fixing a WebSocket denial-of-service advisory
+  ([GHSA-3wwx-pv8p-q78v](https://github.com/advisories/GHSA-3wwx-pv8p-q78v)).
 
 ## Still open
 
