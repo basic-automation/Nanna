@@ -8107,6 +8107,10 @@ as its turn (`TurnAdmission`, scope default `session`).
       stays editable in its other fields. The router's `LABEL_BYTES_MAX` is now the store's
       constant. Known edge: a router `assign`/`park` that would push a card past 32 is refused
       whole and the card left as it was. `tool_scope` is the same shape and still unbounded.
+      *(2026-09-29)* `tool_scope` bounded too: `TASK_TOOLS_MAX` = 64 names (the registry serves
+      ~60), `TASK_TOOL_NAME_MAX_BYTES` = 64 (the providers' own tool-name ceiling), on create and
+      on a patch that sets it. The planner's scope never reaches the store (`seed_plan` leaves it
+      empty), so no chat mission can be refused by it.
 - [x] *(found 2026-09-29)* **The roster had no write surface.** `MemberRepository` was reachable
       from nothing but the migration's seeds, so the router could assign a card to nobody but the
       human, and a router's own `profile.model_priority` (which `board_router_trigger` reads first)

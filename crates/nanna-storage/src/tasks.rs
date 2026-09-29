@@ -49,6 +49,21 @@ pub const TASK_LABELS_MAX: usize = 32;
 /// any word-or-phrase tag and keeps one label inside a filter chip.
 pub const TASK_LABEL_MAX_BYTES: usize = 64;
 
+/// Maximum tool names in one task's `tool_scope`.
+///
+/// Bound justification: the scope is a hint (it gates nothing — the harness
+/// logs it and the card shows it), naming tools the task is expected to use.
+/// The registry serves ~60 tools at boot, so a scope wider than 64 names no
+/// longer says anything a card could show usefully.
+pub const TASK_TOOLS_MAX: usize = 64;
+
+/// Maximum bytes of one tool name in a `tool_scope`.
+///
+/// Bound justification: 64 is the providers' own tool-name ceiling (the Anthropic
+/// and `OpenAI` APIs both admit `^[a-zA-Z0-9_-]{1,64}$`), so a longer name cannot be
+/// a tool any model was ever offered.
+pub const TASK_TOOL_NAME_MAX_BYTES: usize = 64;
+
 /// Maximum direct dependencies per task.
 ///
 /// Bound justification: `next()` and the cycle check walk dependency edges;
@@ -1805,6 +1820,8 @@ fn apply_patch(task: &mut Task, patch: TaskPatch) -> Result<Vec<&'static str>, S
         task.labels = labels;
     }
     if let Some(tool_scope) = patch.tool_scope {
+        // Like labels: checked only when the patch sets it.
+        validate_tool_scope(&tool_scope)?;
         changed.push("tool_scope");
         task.tool_scope = tool_scope;
     }
@@ -2014,6 +2031,24 @@ fn validate_labels(labels: &[String]) -> Result<(), StorageError> {
         )));
     }
     debug_assert!(labels.len() <= TASK_LABELS_MAX, "count checked");
+    Ok(())
+}
+
+fn validate_tool_scope(tools: &[String]) -> Result<(), StorageError> {
+    if tools.len() > TASK_TOOLS_MAX {
+        return Err(StorageError::Invalid(format!(
+            "too many tools in scope: {} (max {TASK_TOOLS_MAX})",
+            tools.len()
+        )));
+    }
+    if let Some(long) = tools.iter().find(|t| t.len() > TASK_TOOL_NAME_MAX_BYTES) {
+        return Err(StorageError::Invalid(format!(
+            "tool name exceeds {TASK_TOOL_NAME_MAX_BYTES} bytes (got {}) — no provider admits \
+             a tool name that long",
+            long.len()
+        )));
+    }
+    debug_assert!(tools.len() <= TASK_TOOLS_MAX, "count checked");
     Ok(())
 }
 
@@ -3016,6 +3051,7 @@ fn validate_new_task_fields(new: &NewTask) -> Result<(), StorageError> {
     validate_priority(new.priority)?;
     validate_dates(new.due_at.as_deref(), new.deadline_at.as_deref())?;
     validate_labels(&new.labels)?;
+    validate_tool_scope(&new.tool_scope)?;
     if new.depends_on.len() > TASK_DEPS_MAX {
         return Err(StorageError::Invalid(format!(
             "too many dependencies: {} (max {TASK_DEPS_MAX})",
@@ -3216,6 +3252,32 @@ mod tests {
         assert_eq!(
             repo.get(card.id).await.unwrap().labels.len(),
             TASK_LABELS_MAX,
+            "a refused patch changes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_scope_is_bounded_on_create_and_on_update() {
+        let (_s, repo) = repo().await;
+        let mut too_many = new_task("uses everything");
+        too_many.tool_scope = (0..=TASK_TOOLS_MAX).map(|i| format!("t{i}")).collect();
+        let err = repo.create(too_many).await.unwrap_err();
+        assert!(err.to_string().contains("too many tools"), "{err}");
+
+        let mut at_bound = new_task("uses a lot");
+        at_bound.tool_scope = (0..TASK_TOOLS_MAX).map(|i| format!("t{i}")).collect();
+        let card = repo.create(at_bound).await.unwrap();
+        assert_eq!(card.tool_scope.len(), TASK_TOOLS_MAX, "the bound is admitted");
+
+        let long = TaskPatch {
+            tool_scope: Some(vec!["x".repeat(TASK_TOOL_NAME_MAX_BYTES + 1)]),
+            ..TaskPatch::default()
+        };
+        let err = repo.update(card.id, long, None).await.unwrap_err();
+        assert!(err.to_string().contains("tool name exceeds"), "{err}");
+        assert_eq!(
+            repo.get(card.id).await.unwrap().tool_scope.len(),
+            TASK_TOOLS_MAX,
             "a refused patch changes nothing"
         );
     }
