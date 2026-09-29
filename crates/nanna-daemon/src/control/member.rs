@@ -5,7 +5,7 @@
 //! nobody but the human, and a router's own `profile.model_priority` could not
 //! be set from anywhere.
 
-use super::{ControlPlane, MemberAction, Value, json};
+use super::{ControlPlane, Event, MemberAction, Value, json};
 use nanna_storage::{
     HUMAN_MEMBER_ID, MEMBER_ID_MAX_BYTES, MemberKind, MemberOwner, MemberPatch, MemberRepository,
     MemberStatus, NewMember, StorageError,
@@ -32,7 +32,8 @@ impl ControlPlane {
             return json!({"error": "storage_unavailable", "message": "the board roster requires storage"});
         };
         let repo = storage.members();
-        match action {
+        let mutates = !matches!(action, MemberAction::List { .. } | MemberAction::Get { .. });
+        let response = match action {
             MemberAction::List { workspace_id } => {
                 match repo.list_for_workspace(workspace_id.as_deref()).await {
                     Ok(members) => json!({ "members": members }),
@@ -70,6 +71,18 @@ impl ControlPlane {
                 Ok(removed) => json!({ "removed": removed }),
                 Err(e) => storage_error("member_delete_failed", &e),
             },
+        };
+        if mutates && roster_changed(&response) {
+            self.notify_members_changed();
+        }
+        response
+    }
+
+    /// Tell every connected client the roster changed. Fire-and-forget: a
+    /// send error only means nobody is subscribed.
+    fn notify_members_changed(&self) {
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(Event::MembersChanged);
         }
     }
 
@@ -228,6 +241,15 @@ fn agent_member_id(name: &str) -> String {
         "the slug is ASCII letters, digits and dashes"
     );
     id
+}
+
+/// Whether a mutating action's response says the roster changed: a member
+/// came back (create, update) or one was removed. A refusal or a delete of an
+/// id that did not exist changed nothing, and announcing it would send every
+/// client to re-list for no reason.
+fn roster_changed(response: &Value) -> bool {
+    response.get("error").is_none()
+        && (response.get("member").is_some() || response["removed"] == true)
 }
 
 fn invalid(message: &str) -> Value {

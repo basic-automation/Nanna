@@ -2310,7 +2310,8 @@ async fn task_verdicts_answers_the_rollup_over_ipc() {
 #[tokio::test]
 async fn the_board_roster_is_managed_over_ipc() {
     let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
-    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    let (events, mut received) = tokio::sync::broadcast::channel(64);
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new())).with_event_tx(events);
     cp.storage = Some(Arc::clone(&storage));
     let cp = Arc::new(cp);
     let ask = |raw: Value| {
@@ -2394,4 +2395,16 @@ async fn the_board_roster_is_managed_over_ipc() {
 
     let removed = ask(serde_json::json!({ "type": "member", "action": "delete", "id": "agent:scribe" })).await;
     assert_eq!(removed["removed"], true, "{removed}");
+    let gone = ask(serde_json::json!({ "type": "member", "action": "delete", "id": "agent:scribe" })).await;
+    assert_eq!(gone["removed"], false, "{gone}");
+
+    // One MembersChanged per write that changed the roster: create, update
+    // status, update router, create personal, delete. Reads, refusals and the
+    // second (no-op) delete announce nothing.
+    let mut announced = 0;
+    while let Ok(event) = received.try_recv() {
+        assert!(matches!(event, Event::MembersChanged), "{event:?}");
+        announced += 1;
+    }
+    assert_eq!(announced, 5);
 }

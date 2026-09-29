@@ -1101,6 +1101,14 @@ pub enum Event {
     /// invisible to it until restart.
     WorkspacesChanged,
 
+    /// The board roster changed — a member was created, updated or deleted
+    /// (P25 decision 3).
+    ///
+    /// Payload-free like [`Event::WorkspacesChanged`]: a client re-lists the
+    /// roster of the board it shows. Without it an agent added in one client
+    /// was not assignable from another until that one re-listed.
+    MembersChanged,
+
     /// The daemon's configuration was mutated and committed (set / reset /
     /// reload / import).
     ///
@@ -1292,6 +1300,7 @@ impl Event {
             | Self::SessionRenamed { id, .. } => Some(id),
             Self::Error { session_id, .. } => session_id.as_deref(),
             Self::WorkspacesChanged
+            | Self::MembersChanged
             | Self::ConfigChanged
             | Self::MemoryCreated { .. }
             | Self::MemoryStoreRebuilt { .. }

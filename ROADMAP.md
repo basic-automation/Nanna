@@ -8123,8 +8123,10 @@ as its turn (`TurnAdmission`, scope default `session`).
       JSON object (the router reads named fields off it); a workspace member needs a registered
       workspace; ownership, kind and id are not editable. e2e-shaped control-plane test
       `the_board_roster_is_managed_over_ipc` (create → assignable → status → router model list →
-      five refusals → personal agent → delete). Still open: no member events on the bus, so a
-      second client does not see a roster change until it re-lists.
+      five refusals → personal agent → delete). *(later)* Every write that changed the roster
+      announces a payload-free `Event::MembersChanged` (like `WorkspacesChanged`); refusals and a
+      no-op delete announce nothing. The GUI's `DaemonEvent` parses it as `Unknown` until the
+      Stage 4 board client maps it.
 - [x] *(found 2026-09-29)* **Boards opened after migration 017 had no router member.** The
       migration seeded `router:<id>` for the workspaces that existed then, and `ensure_router` —
       the path meant for every workspace registered afterwards — had no caller. The router still
