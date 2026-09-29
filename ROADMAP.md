@@ -920,7 +920,7 @@ with send/react/edit/delete/pin/threads/media where supported. **Shipped.**
 MCP client (stdio + HTTP/SSE transports, tool discovery, adapter into nanna-tools), background task
 spawning, agent-to-agent messaging (mailbox), Erlang/OTP-style supervisors (RestartPolicy, strategies,
 health checks). **Shipped**, except:
-- [~] **Verify or build MCP *server* mode** — doc claims `crates/nanna-server/src/mcp.rs`; that file does
+- [x] **Verify or build MCP *server* mode** — doc claims `crates/nanna-server/src/mcp.rs`; that file does
       not exist and no MCP refs found under `nanna-server/src`.
       *(2026-07-23)* **Located: the server lives at `crates/nanna-mcp/src/server.rs`** (532 lines —
       `McpServer` with tool/resource/prompt registration, `handle_request` covering initialize/tools/
@@ -948,8 +948,11 @@ health checks). **Shipped**, except:
       `initialize` result, a `tools/list` advertising all **39** skills (every one carrying an
       `inputSchema`), and a `tools/call` of `list_dir` that really executed and returned directory
       contents — with **stdout containing exactly the 2/2 protocol lines and every log on stderr**.
-      Remaining: memory/agent-backed tools (`remember`/`recall`/`reflect`/`task`) need the daemon's script
-      services, which this standalone path does not build — see the new item below.
+      *(2026-09-28)* **Closed.** The only remainder named here — memory/agent-backed tools on the
+      standalone path — is the item below, and that item is done: `nanna mcp serve` proxies to the
+      running daemon, so `remember`/`recall`/`reflect`/`task` execute there rather than in a second
+      process. The server also answers `server/discover` for the 2026-07-28 revision. Nothing in this
+      item is still open.
 - [x] *(2026-07-23)* **Give `nanna mcp serve` the memory/agent-backed tools.** It loads skills via
       `ToolRegistry::load_skills` (no services), so the tools that need `build_script_services` —
       `remember`, `recall`, `reflect`, `task` — load but cannot reach memory or spawn sub-agents. Options:
@@ -983,7 +986,7 @@ health checks). **Shipped**, except:
       (`tests/fixtures/sdk-servers/client-probe.mjs`) against `nanna mcp serve`: `legacy` →
       2024-11-05, `auto` → **2026-07-28**, `pin` → 2026-07-28 (was a hard failure), 47 tools and a
       call in each; an unknown tool → `Tool not found`.
-- [~] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
+- [x] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
       *(2026-08-23)* **Half of this was already stale, and the half that was true hid a real bug.**
       `perform_health_check` does run a genuine agent loop — `Agent::run(probe_prompt)` under a
       `timeout`, folded into the `apply_health_result` state machine — so "the health check is a
@@ -1020,10 +1023,13 @@ health checks). **Shipped**, except:
       bounded input, so pin that the cap's early return happened — which is what the exit assertion
       should have been saying. Worth remembering as a check-your-checks lesson: an assertion that
       cannot fail is the same failure mode as the health probe it was guarding.)*
-      - [ ] **Still open: give a supervised agent a real body.** `start_agent` must run the agent loop
-            rather than parking on `shutdown_rx`. Until it does, the health probe measures the *LLM's*
-            reachability, not the supervised agent's — which is worth knowing, but is not what the
-            name promises. Rename or re-scope the check when the body lands.
+      - [x] **Closed by deletion, not by giving it a body.** *(2026-09-28)* `58e11e1d` deleted
+            `Supervisor` and `AgentRegistry` (2 082 lines, eleven re-exported types) because nothing
+            in the workspace, the GUI or the root crate called them. `start_agent` no longer exists
+            to park on `shutdown_rx`, and there is no health probe left whose name over-promises.
+            Restoring a supervised-agent body would resurrect a subsystem the review listed as
+            delete-rather-than-fix; sub-agents are sub-tasks. The probe-answer fix above shipped
+            with the file and left with it.
 - [~] *(research 2026-07-20)* **Harden the MCP client for the 2026-07-28 spec RC.** Roots/Sampling/Logging
       are deprecated (file scoping moves to tool params / URIs / server config); tools move to full JSON
       Schema 2020-12 (`oneOf`/`anyOf`/conditionals). Two hard requirements for our client: **must not
