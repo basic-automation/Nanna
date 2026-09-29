@@ -2352,6 +2352,7 @@ async fn the_board_roster_is_managed_over_ipc() {
         .create(nanna_storage::NewTask {
             title: "review the diff".to_string(),
             scope: "global".to_string(),
+            priority: 3,
             assignee: Some("agent:code-reviewer".to_string()),
             ..nanna_storage::NewTask::default()
         })
