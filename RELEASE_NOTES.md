@@ -1,77 +1,57 @@
-# Nanna v0.3.32-beta.41 — Stopped Means Stopped
+# Nanna v0.3.33-beta.42 — The Board Gets a Team
 
-A repair release with one step forward on the task board. The headline fixes are about Python:
-a timed-out `python.exec` used to keep running forever in the background, and any Python script
-that imported `subprocess` quietly took Ctrl-C away from the daemon. Both are fixed, and both
-were checked on a real running daemon, not only in tests. The board also gains the first half
-of its Task Management Agent: the part that decides who works on a card.
+The Task Management Agent is now switched on for cards you put on the board, and the board can
+finally hold more than just you. Until this release the only member a card could go to was you:
+nothing could add an agent to the roster. Now agents can be added, the router hears about new
+cards, answered questions and recurring cards, and every workspace's board has its own router.
+There is still no board screen in the app; everything here works through the daemon's
+connection and is the groundwork the board client will sit on.
 
 ## What's Changed
 
-**A Python script that runs past its time limit is stopped.** The embedded interpreter can't be
-stopped from outside, so when a script timed out Nanna reported the timeout and let it keep
-running. A `while True:` loop used a whole CPU core until the daemon restarted. Nanna now
-interrupts the script at its next step and keeps interrupting until it stops. On a running
-daemon, a runaway loop given a 3-second limit stopped within a moment of timing out.
+**The router takes up cards you create on the board.** When a workspace or global card is
+created through the daemon's connection (not by the chat's own model), that board's Task
+Management Agent reads it and decides: assign it, split it into sub-tasks, ask you a question,
+or park it. It uses its own model list if one is set, otherwise your chat models. Cards the chat makes for itself are left
+alone on purpose, so a question from the router can never stall a chat mid-task. (The app's
+current chat checklist makes chat-only cards, which are never routed.)
 
-**Python can no longer take Ctrl-C away from the daemon.** The interpreter was allowed to install
-its own Ctrl-C handler for the whole process. Any script that imported `signal` did this, and so
-does `subprocess`. After that, Ctrl-C and `kill -INT` no longer shut the daemon down cleanly.
-That permission is now off. Checked on a real daemon: after a script imported both modules,
-`kill -INT` still shut it down cleanly.
+**Answering the router's question sends the card back to it.** When the router asks you
+something, it makes a card for you and the original card waits. Before this release, finishing
+that card unblocked the original but nobody picked it up again. Now the router decides again,
+with your answer in front of it.
 
-**The board's router can decide who does a card (not switched on yet).** The Task Management
-Agent now has its decision-making half. It reads a card, the card's recent thread, the members
-of the board and how each has done on past cards, and gives one answer: assign the card, split
-it into sub-tasks, ask you a question, or park it with a reason. Every answer is posted on the
-card's thread. When it asks you something, it creates a card for you, and the original card waits
-until you finish that card. A card that is being worked on is never reassigned. The router is
-**not switched on yet**: while the chat still exists, the router would also pick up the chat's
-own to-do cards, and a question from it could stall a chat mid-task. It will be switched on
-together with the board.
+**A recurring card goes back to the router each round.** A recurring card used to reopen
+straight to whoever had it last time. Now it is released and the router places it again.
 
-**A card records who created it.** Until now the "created" entry named the card's assignee as
-its author. That entry now names the actual creator, which the router needs to tell cards it made
-itself from new work.
+**The router fills in what you left blank.** When it assigns a card it can add labels and a
+"done when" check. A check you wrote yourself is never replaced.
+
+**Agents can join the board.** The daemon can now list, add, edit and remove board members. An
+agent belongs to one workspace's board, to the global board, or to you personally (a personal
+agent follows you to every board). You and each board's router cannot be removed. Every change
+is announced to all connected clients, so a second window sees a new agent straight away. You
+can also set the router's own model list here; before, there was nowhere to set it.
 
 ## Fixes
 
-- **Command output with terminal links is clean.** `cargo` and `ls --hyperlink` wrap file paths
-  in invisible terminal-link codes, and those codes used to leak into the output as
-  `8;;file:///…` next to the path. Every kind of terminal escape code is now removed completely.
-- **A missing working directory is reported as a missing directory.** Running a command in a
-  directory that doesn't exist used to fail with "No such file or directory", which looks as if
-  the command is missing. The error now names the directory.
-- **Scripts can't read an endless file into memory.** A script reading `/dev/zero`, or a file that
-  kept growing, read until the daemon ran out of memory. Reads now stop at 64 MiB and say so.
-- **Git context is capped while it is being read.** Nanna used to read all of `git status`'s
-  output before keeping the first 64 KiB, and a command that never stopped writing used up the
-  whole timeout and produced nothing. It now stops reading at the limit.
-- **Transparent screenshots are shrunk before sending.** An image with a transparent background
-  couldn't be converted to a smaller JPEG, so it was sent over the provider's size limit and
-  rejected. The "lower the quality" step also never took effect. Both are fixed.
-- **The list of verified results in a long session no longer grows without limit.** It is the
-  one part of the context that is never summarized. Simple look-around commands (`ls`, `cat`,
-  `git status`) that succeeded are now counted on one line instead of listed one by one. The
-  rest are listed newest first within a fixed size, and the list says how many it left out.
-- **Debug copies of prompts are private and size-limited.** Copies of prompts saved for
-  debugging are kept next to the daemon's logs, readable only by you and limited in size. They
-  used to be written to the shared `/tmp` folder, where other users could read them, with no
-  size limit.
-- A tool's own `timeout` setting now applies no matter how the tool is loaded, and an absurdly
-  large value can no longer overflow to a timeout of a few milliseconds.
+- **Every workspace's board has a router.** Only workspaces that existed when the board was
+  introduced got one. Any workspace opened since then had none, so its router's settings had
+  nowhere to live. New workspaces now get one when opened, and older ones get theirs at the next
+  start.
+- **A card's labels and tool list have limits.** A card could carry any number of labels or tool
+  names of any length. Now the limit is 32 labels of up to 64 bytes each, and 64 tool names of up
+  to 64 bytes each (the longest tool name any model provider accepts).
 
-## Dependencies
+## Under the hood
 
-Tauri plugins updated (dialog 2.8, fs 2.6, notification 2.5, process 2.4, shell 2.4,
-updater 2.13), with the JavaScript packages updated to match. The app was checked by launching it
-with its own daemon and driving it through WebDriver.
+- Dependencies: `softaes` 0.1.7, plus `playwright-rs` 0.19, `bigdecimal` 0.4.11 and
+  `tokio-rustls` 0.26.6. TypeScript 7 is still blocked (`vue-tsc` 3.3.11 has no support).
+- Built with the Rust nightly of 2026-09-28 (rustc 1.101.0).
 
 ## Still open
 
-- The router is ready but not connected to the board. That connection comes with the board
-  itself.
-- Python that is waiting on the network or a file can't be interrupted until the wait ends, and
-  a script that catches every exception can ignore the interrupt. After 5 seconds Nanna stops
-  trying and logs a warning.
-- TypeScript 7 is still blocked on `vue-tsc`.
+- Assigning a card to an agent does not start work on it yet. That is the next stage.
+- There is no board screen in the app yet.
+- The router does not react yet to a failed acceptance check or to a card that has stalled.
+  Both need agents that actually run cards first.
