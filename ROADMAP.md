@@ -9592,6 +9592,13 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            unreleased); `fsrs-rs` is at 6.6.2 with no FSRS-7, and no FSRS-7 default parameters are
            published (srs-benchmark experiments are still open). Re-check when `fsrs-rs` ships it;
            adopting it is the same retention-harness A/B the FSRS-6 weight decision needed.
+     - [ ] *(research 2026-09-29)* **Upstream is moving `turso_core` to pure Rust by default** —
+           [tursodatabase/turso#7660](https://github.com/tursodatabase/turso/issues/7660) proposes
+           putting `aegis` and `simsimd` behind a feature flag. We already select
+           `pure-rust-crypto`; when the 0.8 line lands, check whether the default feature set
+           drops the C builds outright (and whether our feature list can shrink). Also re-checked:
+           `vue-tsc` is still 3.3.11 with no TypeScript 7 support, and TS 7.1 (the stable API)
+           has no date.
      - [ ] *(P20, research 2026-09-28)* **Qwen 3.8 ships no model for the 16 GB tier.** The open
            weights are 27B dense (2026-08-14, Apache-2.0), Flash-Next (180B-A6B) and 2.4T-A95B —
            no 4B/8B/14B this generation ([lineup](https://codersera.com/blog/qwen-3-8-model-lineup-2026/),
@@ -9791,6 +9798,10 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            remembered pin would have missed. Re-checked both retirement conditions: rustpython-
            {vm,stdlib,codegen} still 0.5.0 (2026-03-31) and pymath still 0.2.0, so both pins stay.
            GUI: `pnpm outdated` clean except the blocked TypeScript 7. 1722 tests green.
+     - [x] *(2026-09-29)* **Toolchain pin moved `nightly-2026-09-20` → `nightly-2026-09-28`**
+           (rustc 1.101.0, d080e7dff). Cold `cargo build --release -p nanna-daemon` green in
+           8m12s; full gate re-run from a cold debug dir: 2731 tests, clippy 0 warnings — no new
+           lints this time. Mirrored into `budget-gate`, `release-check` and `test-compile`.
      - [x] *(2026-09-20)* **Toolchain pin moved `nightly-2026-09-08` → `nightly-2026-09-20`**
            (rustc `feaadeeac`, cargo `495c385d0`). Release-built `-p nanna-daemon` green from a
            cold, isolated target dir in **9m06s** — no tokio ICE, no `turso_core` depth overflow —
