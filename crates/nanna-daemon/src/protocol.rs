@@ -72,10 +72,72 @@ pub enum Action {
     Task(TaskAction),
 
     // =========================================================================
+    // Board members (P25 decision 3: the human and every agent, one entity)
+    // =========================================================================
+    Member(MemberAction),
+
+    // =========================================================================
     // Subscriptions
     // =========================================================================
     Subscribe(SubscribeAction),
     Unsubscribe(UnsubscribeAction),
+}
+
+// =============================================================================
+// Member Actions (P25 board members)
+// =============================================================================
+
+/// The board's roster over IPC: who can be assigned a card.
+///
+/// Only **agents** are created here — the install has one human, seeded by the
+/// members migration, and the Task Management Agent of each board is created
+/// with its workspace. Identity (`id`, `kind`, owner) never changes after
+/// creation; re-creating the member is the honest way to change what it is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum MemberAction {
+    /// The roster one board sees: its workspace's members plus every
+    /// human-owned one (the human and their personal agents). No
+    /// `workspace_id` means the global board.
+    List {
+        #[serde(default)]
+        workspace_id: Option<String>,
+    },
+    /// One member.
+    Get { id: String },
+    /// Add an agent. Its id is `agent:<slug of name>`. `personal` makes it the
+    /// human's own agent, which travels with them between boards (P25
+    /// decision 12); otherwise it belongs to `workspace_id`'s board (none =
+    /// global).
+    Create {
+        name: String,
+        #[serde(default)]
+        workspace_id: Option<String>,
+        #[serde(default)]
+        personal: bool,
+        #[serde(default)]
+        avatar: Option<String>,
+        /// Model tier, capability tags, tools, skills, cost — what the router
+        /// reads. For a router, `model_priority` is its own model list.
+        #[serde(default)]
+        profile: Option<Value>,
+    },
+    /// Change what may change: name, avatar, status, profile. Absent fields
+    /// are left as they are.
+    Update {
+        id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        avatar: Option<String>,
+        /// `idle` | `busy` | `offline`
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        profile: Option<Value>,
+    },
+    /// Remove an agent. The human and the routers are refused.
+    Delete { id: String },
 }
 
 // =============================================================================

@@ -8107,6 +8107,20 @@ as its turn (`TurnAdmission`, scope default `session`).
       stays editable in its other fields. The router's `LABEL_BYTES_MAX` is now the store's
       constant. Known edge: a router `assign`/`park` that would push a card past 32 is refused
       whole and the card left as it was. `tool_scope` is the same shape and still unbounded.
+- [x] *(found 2026-09-29)* **The roster had no write surface.** `MemberRepository` was reachable
+      from nothing but the migration's seeds, so the router could assign a card to nobody but the
+      human, and a router's own `profile.model_priority` (which `board_router_trigger` reads first)
+      could not be set from anywhere. *(2026-09-29)* `Action::Member` over IPC —
+      `list {workspace_id?}` (the board's roster, `list_for_workspace`), `get`, `create {name,
+      workspace_id? | personal, avatar?, profile?}`, `update {id, name?, avatar?, status?,
+      profile?}`, `delete`. Only agents are created; the id is `agent:<slug of name>` (disjoint
+      from `human`/`router:…`, cut to the 128-byte id bound, a random 8-hex slug when the name has
+      nothing ASCII), so a same-slug create is refused rather than merged. A profile must be a
+      JSON object (the router reads named fields off it); a workspace member needs a registered
+      workspace; ownership, kind and id are not editable. e2e-shaped control-plane test
+      `the_board_roster_is_managed_over_ipc` (create → assignable → status → router model list →
+      five refusals → personal agent → delete). Still open: no member events on the bus, so a
+      second client does not see a roster change until it re-lists.
 - [ ] Capability-tag adjustment at verdict time; posts the change on the agent's profile thread.
 - [ ] Heartbeat becomes a recurring card assigned to the router; the `heartbeat_prompt` config and
       the scheduler's chat-turn path are removed.

@@ -12,7 +12,7 @@
 use crate::agent_service::AgentService;
 use crate::llm_router::LlmRouter;
 use crate::log_buffer::LogBuffer;
-use crate::protocol::{ChannelAction, ChatAction, Event, ConfigAction, MemoryAction, SchedulerAction, SessionAction, SystemAction, TaskAction, ToolAction, WorkspaceAction, Action, SubscribeAction, UnsubscribeAction};
+use crate::protocol::{ChannelAction, ChatAction, Event, ConfigAction, MemberAction, MemoryAction, SchedulerAction, SessionAction, SystemAction, TaskAction, ToolAction, WorkspaceAction, Action, SubscribeAction, UnsubscribeAction};
 use crate::session::{MessageRole, SessionManager, SubSessionInfo, SubSessionState};
 use crate::user_tools::UserToolManager;
 use nanna_channels::StatusManager;
@@ -32,6 +32,7 @@ mod chat;
 pub mod chat_harness;
 mod config;
 mod config_watch;
+mod member;
 mod memory;
 mod scheduler;
 mod session;
@@ -824,6 +825,7 @@ impl ControlPlane {
             Action::System(system) => self.handle_system(client_id, system).await,
             Action::Workspace(workspace) => self.handle_workspace(client_id, workspace).await,
             Action::Task(task) => self.handle_task(client_id, task).await,
+            Action::Member(member) => self.handle_member(member).await,
             Action::Subscribe(sub) => self.handle_subscribe(client_id, sub).await,
             Action::Unsubscribe(unsub) => self.handle_unsubscribe(client_id, unsub).await,
         }
