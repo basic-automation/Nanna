@@ -4341,6 +4341,11 @@ impl DaemonServer {
                                 );
                             }
                             registry.register(ws);
+                            // A workspace saved before `upsert` ensured its
+                            // router has none; heal it here, once per boot.
+                            if let Err(e) = storage.members().ensure_router(Some(&record.id)).await {
+                                warn!("Workspace {} has no board router: {}", record.id, e);
+                            }
                             if record.active {
                                 active_id = Some(record.id.clone());
                             }

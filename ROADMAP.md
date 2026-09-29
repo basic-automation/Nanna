@@ -8121,6 +8121,16 @@ as its turn (`TurnAdmission`, scope default `session`).
       `the_board_roster_is_managed_over_ipc` (create → assignable → status → router model list →
       five refusals → personal agent → delete). Still open: no member events on the bus, so a
       second client does not see a roster change until it re-lists.
+- [x] *(found 2026-09-29)* **Boards opened after migration 017 had no router member.** The
+      migration seeded `router:<id>` for the workspaces that existed then, and `ensure_router` —
+      the path meant for every workspace registered afterwards — had no caller. The router still
+      routed such a board's cards (on the chat models, with a `board router member unreadable`
+      warning), but its `profile.model_priority` had no row to live in and it was missing from
+      the roster. *(2026-09-29)* `WorkspaceRepository::upsert` now ensures the board's router
+      (every open and activation saves through it), and `restore_workspaces` heals persisted
+      workspaces once per boot. Test `registering_a_workspace_gives_its_board_a_router`.
+      Not done: closing a workspace leaves its router row (routers are delete-protected); harmless
+      until a board client lists closed boards.
 - [ ] Capability-tag adjustment at verdict time; posts the change on the agent's profile thread.
 - [ ] Heartbeat becomes a recurring card assigned to the router; the `heartbeat_prompt` config and
       the scheduler's chat-turn path are removed.
