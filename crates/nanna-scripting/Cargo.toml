@@ -67,7 +67,7 @@ rustpython-pylib = { version = "0.5", features = ["freeze-stdlib"], optional = t
 # `rustpython-common`'s requirement, not pymath's).
 # Optional so it never enters a build that has no Python; the version
 # constraint still binds the lockfile either way, which is the point.
-malachite-bigint = { version = "=0.9.2", optional = true }
+malachite-bigint = { version = "=0.12.0", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
