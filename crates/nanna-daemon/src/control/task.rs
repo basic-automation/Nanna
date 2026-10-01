@@ -112,6 +112,18 @@ impl ControlPlane {
             }
 
             TaskAction::StartRun {
+                card_id: Some(card_id),
+                workdir,
+                max_wall_clock_secs,
+                max_total_tokens,
+                ..
+            } => {
+                let limits = (max_wall_clock_secs, max_total_tokens);
+                self.start_card_run(storage, card_id, workdir, limits).await
+            }
+
+            TaskAction::StartRun {
+                card_id: None,
                 goal,
                 scope,
                 session_id,
@@ -123,9 +135,27 @@ impl ControlPlane {
                 self.start_task_run(storage, goal, (scope, session_id), workdir, limits).await
             }
 
-            TaskAction::RunStatus { scope, session_id } => self.task_run_status(scope, session_id).await,
+            TaskAction::RunStatus {
+                card_id: Some(card_id),
+                ..
+            } => self.card_run_status(card_id).await,
 
-            TaskAction::CancelRun { scope, session_id } => self.cancel_task_run(scope, session_id).await,
+            TaskAction::RunStatus {
+                card_id: None,
+                scope,
+                session_id,
+            } => self.task_run_status(scope, session_id).await,
+
+            TaskAction::CancelRun {
+                card_id: Some(card_id),
+                ..
+            } => self.cancel_card_run(card_id).await,
+
+            TaskAction::CancelRun {
+                card_id: None,
+                scope,
+                session_id,
+            } => self.cancel_task_run(scope, session_id).await,
 
             TaskAction::Verdicts { window } => Self::task_verdicts(&repo, window).await,
         }
@@ -482,7 +512,39 @@ impl ControlPlane {
             "harness".to_string(),
             Some(event_tx.clone()),
         );
-        let runner = AgentStepRunner {
+        let models = agent.chat_model_chain().await;
+        let runner = self
+            .background_runner((agent, router, tools), workspace_root, models)
+            .await;
+        let mut config = LongHorizonConfig::default();
+        if let Some(secs) = max_wall_clock_secs {
+            config.max_wall_clock = std::time::Duration::from_secs(secs);
+        }
+        config.max_total_tokens = max_total_tokens;
+
+        match task_runs
+            .start(goal, source, runner, config, dir, event_tx)
+            .await
+        {
+            Ok(()) => json!({"started": true, "scope": scope, "scope_id": scope_id}),
+            Err(message) => json!({"error": "run_start_failed", "message": message}),
+        }
+    }
+
+    /// The step runner a background run uses: no chat, no transcript, no
+    /// attachments, one repeat ledger for the whole run, and `models` walked
+    /// with failover (empty = the router's own default).
+    async fn background_runner(
+        &self,
+        (agent, router, tools): (
+            &Arc<crate::agent_service::AgentService>,
+            &Arc<crate::llm_router::LlmRouter>,
+            &Arc<nanna_tools::ToolRegistry>,
+        ),
+        workspace_root: Option<PathBuf>,
+        models: Vec<String>,
+    ) -> AgentStepRunner {
+        AgentStepRunner {
             discovered_tools: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
             // Background runs have no chat, so no user tool picks.
             user_selected_tools: Vec::new(),
@@ -508,24 +570,189 @@ impl ControlPlane {
             attachments: Arc::default(),
             // Background runs fall back down the priority list like chat.
             model_chain: {
-                let models = agent.chat_model_chain().await;
                 (!models.is_empty())
                     .then(|| Arc::new(crate::tasks::ModelChain::new(models, router)))
             },
+        }
+    }
+
+    /// What a card run needs to know before it may start: the card, the
+    /// member it is assigned to, and the card's lineage. Every refusal is the
+    /// IPC reply.
+    pub(super) async fn card_claim(
+        storage: &nanna_storage::Storage,
+        card_id: i64,
+    ) -> Result<
+        (
+            nanna_storage::Task,
+            nanna_storage::Member,
+            crate::tasks::CardClaim,
+        ),
+        Value,
+    > {
+        let repo = storage.tasks();
+        let card = repo
+            .get(card_id)
+            .await
+            .map_err(|e| json!({"error": "task_not_found", "message": e.to_string()}))?;
+        if card.scope == "session" {
+            return Err(json!({"error": "not_a_board_card", "message": format!(
+                "card #{card_id} is session-scoped; only board cards (workspace or global) are worked by members"
+            )}));
+        }
+        if card.status != "pending" && card.status != "in_progress" {
+            return Err(json!({"error": "card_closed", "message": format!(
+                "card #{card_id} is {}", card.status
+            )}));
+        }
+        let Some(assignee) = card.assignee.clone() else {
+            return Err(json!({"error": "card_unassigned", "message": format!(
+                "card #{card_id} has no assignee; assign it to an agent first"
+            )}));
         };
+        let member = storage
+            .members()
+            .get(&assignee)
+            .await
+            .map_err(|e| json!({"error": "member_unreadable", "message": e.to_string()}))?;
+        if member.kind != nanna_storage::MemberKind::Agent
+            || member.id.starts_with(nanna_storage::ROUTER_MEMBER_PREFIX)
+        {
+            return Err(json!({"error": "not_an_agent", "message": format!(
+                "card #{card_id} is assigned to {}, who is not an agent that takes work", member.id
+            )}));
+        }
+        let lineage = Self::card_lineage(&repo, &card).await?;
+        let claim = crate::tasks::CardClaim {
+            card_id,
+            member_id: member.id.clone(),
+            lineage,
+        };
+        Ok((card, member, claim))
+    }
+
+    /// `card` and its ancestors, nearest first — bounded by the store's own
+    /// depth limit, which it enforces at write time.
+    async fn card_lineage(
+        repo: &TaskRepository,
+        card: &nanna_storage::Task,
+    ) -> Result<Vec<i64>, Value> {
+        let mut lineage = vec![card.id];
+        let mut parent = card.parent_id;
+        while let Some(id) = parent {
+            if lineage.len() > nanna_storage::TASK_DEPTH_MAX || lineage.contains(&id) {
+                return Err(json!({"error": "bad_hierarchy", "message": format!(
+                    "card #{}'s ancestry does not end within {} levels", card.id, nanna_storage::TASK_DEPTH_MAX
+                )}));
+            }
+            lineage.push(id);
+            parent = repo
+                .get(id)
+                .await
+                .map_err(|e| json!({"error": "task_not_found", "message": e.to_string()}))?
+                .parent_id;
+        }
+        debug_assert_eq!(
+            lineage.first(),
+            Some(&card.id),
+            "a lineage starts at its own card"
+        );
+        Ok(lineage)
+    }
+
+    /// `TaskAction::StartRun {card_id}`: the card's assignee works the card's
+    /// subtree in the background (P25 Stage 3). Its notes and closings become
+    /// posts on the card threads, and it shows as busy until the run ends.
+    async fn start_card_run(
+        &self,
+        storage: &Arc<nanna_storage::Storage>,
+        card_id: i64,
+        workdir: Option<String>,
+        (max_wall_clock_secs, max_total_tokens): (Option<u64>, Option<u64>),
+    ) -> Value {
+        let Some(ref task_runs) = self.task_runs else {
+            return json!({"error": "task_runs_unavailable", "message": "run manager not attached"});
+        };
+        let (Some(agent), Some(router), Some(tools)) = (
+            self.agent.as_ref(),
+            self.router.as_ref(),
+            self.tools.as_ref(),
+        ) else {
+            return json!({"error": "agent_unavailable", "message": "agent service required"});
+        };
+        let Some(event_tx) = self.event_tx.clone() else {
+            return json!({"error": "events_unavailable", "message": "event bus required"});
+        };
+        let (card, member, claim) = match Self::card_claim(storage, card_id).await {
+            Ok(found) => found,
+            Err(reply) => return reply,
+        };
+        // Workdir: explicit > the card's own board > the active workspace.
+        let workspace_root = {
+            let registry = self.workspaces.read().await;
+            card.scope_id
+                .as_deref()
+                .filter(|_| card.scope == "workspace")
+                .and_then(|id| registry.get(id))
+                .or_else(|| registry.active())
+                .map(|w| w.path.clone())
+        };
+        let dir = workdir
+            .map(PathBuf::from)
+            .or_else(|| workspace_root.clone())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let models = crate::board_router_trigger::router_models(
+            &member.profile,
+            &agent.chat_model_chain().await,
+        );
+        let runner = self
+            .background_runner((agent, router, tools), workspace_root, models)
+            .await;
+        let source = TursoTaskSource::new(
+            storage.clone(),
+            card.scope.clone(),
+            card.scope_id.clone(),
+            member.id.clone(),
+            Some(event_tx.clone()),
+        )
+        .within_subtree(card_id)
+        .posting_as(member.id.clone());
         let mut config = LongHorizonConfig::default();
         if let Some(secs) = max_wall_clock_secs {
             config.max_wall_clock = std::time::Duration::from_secs(secs);
         }
         config.max_total_tokens = max_total_tokens;
-
-        match task_runs
-            .start(goal, source, runner, config, dir, event_tx)
-            .await
-        {
-            Ok(()) => json!({"started": true, "scope": scope, "scope_id": scope_id}),
+        let goal = card.description.as_deref().map_or_else(
+            || card.title.clone(),
+            |description| format!("{}\n\n{description}", card.title),
+        );
+        let spec = crate::tasks::TaskRunSpec {
+            goal,
+            source,
+            runner,
+            config,
+            workdir: dir,
+        };
+        match task_runs.start_card(spec, claim, event_tx).await {
+            Ok(()) => json!({"started": true, "card_id": card_id, "member_id": member.id}),
             Err(message) => json!({"error": "run_start_failed", "message": message}),
         }
+    }
+    /// `TaskAction::RunStatus {card_id}`.
+    async fn card_run_status(&self, card_id: i64) -> Value {
+        let Some(ref task_runs) = self.task_runs else {
+            return json!({"error": "task_runs_unavailable", "message": "run manager not attached"});
+        };
+        serde_json::to_value(task_runs.card_status(card_id).await)
+            .unwrap_or_else(|_| json!({"running": false}))
+    }
+
+    /// `TaskAction::CancelRun {card_id}`.
+    async fn cancel_card_run(&self, card_id: i64) -> Value {
+        let Some(ref task_runs) = self.task_runs else {
+            return json!({"error": "task_runs_unavailable", "message": "run manager not attached"});
+        };
+        json!({"cancelled": task_runs.cancel_card(card_id).await})
     }
 
     /// `TaskAction::RunStatus`.

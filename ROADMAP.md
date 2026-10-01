@@ -8151,6 +8151,36 @@ as its turn (`TurnAdmission`, scope default `session`).
 - [ ] `assigned` → start a harness run for that member on that card (reuse `AgentStepRunner` and
       `TaskRunManager`); progress → `progress` posts; completion → the acceptance check → a
       `verdict` post. No streaming to the UI.
+      - [x] *(2026-10-01)* **The card run itself, started over IPC.** The two blockers recorded
+            on 09-29 are gone. *Subtree admission:* `TursoTaskSource::within_subtree(card)` serves
+            only the card and its descendants (`subtree_admits`, walked over the scope's parent
+            links incl. closed cards, bounded by `TASK_DEPTH_MAX`), so a card the human adds beside
+            it mid-run is never worked. *Per-card / per-member keys:* `TaskRunManager::start_card`
+            keys the run `card:<id>` and `run_conflict` refuses, under one write guard, a second
+            run on any card above or below a worked one, a scope run over a scope with a card run
+            in it (and vice versa), and a member's second card on any board — one member, one
+            card. `posting_as(member)` turns the run's working notes into `progress` posts and
+            each closing into a `verdict` post ("Done — the acceptance check passed: …" / "…no
+            acceptance check ran"), cut to one post (`truncate_post`); the member is `busy` for
+            the run's life. IPC: `task.start_run {card_id}` (assignee must be an agent, not a
+            router; board scope only; open), `run_status`/`cancel_run {card_id}`; the run walks the
+            member's `profile.model_priority`, else the chat models, and works in the card's own
+            workspace. e2e `an_assigned_card_is_worked_by_its_member_and_closed_with_a_verdict_post`
+            (router assigns → start → verdict post → member idle). **Still open:** the
+            automatic start on `assigned` — wire it like the router's wake (gui-created cards
+            only while chat lives) once the failed-verdict retry bound below exists, so an
+            auto-started run has a bounded way to fail.
+      - [ ] *(research 2026-10-01)* **Borrow Hermes Kanban's failure and stall rules** when the
+            auto-start lands ([docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban)):
+            its dispatcher auto-blocks a card after `failure_limit` (default 2) consecutive failed
+            runs, requeues a rate-limited run *without* counting a failure and blocks at once on
+            a terminal provider error (bad credentials), and reclaims a card whose worker sent
+            no heartbeat within a stale timeout (default 4 h) — again without counting a failure.
+            Map to P25: failed verdict ×2 → a clarification card to the human (decision 7's
+            "bounded retries"); `StopReason::RunnerErrors` → retry, not a failed verdict; the
+            `stalled` trigger = `in_progress`, no live `card:<id>` run, no `progress` post
+            within the threshold. Also per-member concurrency is a *setting* there
+            (`max_in_progress_per_profile`); ours is fixed at 1 by decision 3.
 - [ ] Sub-agent spawning is replaced by "create a sub-task assigned to another member". Delete
       `sub_agent`/`task` tool and `SubSessionInfo`.
 - [ ] `ask_user` becomes "create a clarification card assigned to the human, depended on by this
@@ -9587,6 +9617,13 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            pre-release (pre.13, 2026-09-25). Migrate one minor at a time, release-build gated. It does
            **not** retire RUSTSEC-2026-0253: `tantivy 0.26.2` (2026-09-08) still requires
            `lru ^0.16.3`, and the fix is `lru ≥ 0.18.2`.
+           *(2026-10-01)* **`turso 0.8.0` and `0.8.1` (2026-09-29) are now stable**, and the pin
+           has since moved to `=0.7.2` — so this is one minor step, `0.7.2 → 0.8.1`, not two.
+           `cargo upgrade --incompatible` lists it as the only pinned holdout besides
+           `malachite-bigint`. Gate it like 0.7: release build + the storage suites + a boot
+           against a copy of a real `nanna.db`; check the 0.8 default features against
+           [turso#7660](https://github.com/tursodatabase/turso/issues/7660) while there.
+           ([lib.rs](https://lib.rs/crates/turso))
      - [ ] *(P13, research 2026-09-26)* **FSRS-7 exists but is not shippable yet.** ts-fsrs merged it
            ([PR #520](https://github.com/open-spaced-repetition/ts-fsrs/pull/520), 2026-09-18,
            unreleased); `fsrs-rs` is at 6.6.2 with no FSRS-7, and no FSRS-7 default parameters are

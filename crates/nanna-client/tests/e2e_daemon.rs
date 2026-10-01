@@ -3456,3 +3456,111 @@ async fn the_board_router_asks_the_human_then_routes_on_the_answer() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// P25 Stage 3, end to end on the real daemon: the router assigns a card to an
+/// agent member, a run started for that card is worked by that member, and
+/// the work lands on the card's thread as the member's verdict post — while
+/// the member shows busy only for as long as the run lives.
+#[tokio::test]
+async fn an_assigned_card_is_worked_by_its_member_and_closed_with_a_verdict_post() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"{"decision":"assign","member":"agent:builder","reason":"it writes release notes"}"#
+            .to_string(),
+        "Added the 0.3.34 entry to the changelog.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let created = client
+        .request(nanna_client::Action::Member(
+            nanna_client::MemberAction::Create {
+                name: "Builder".to_string(),
+                workspace_id: None,
+                personal: false,
+                avatar: None,
+                profile: None,
+            },
+        ))
+        .await
+        .expect("member.create answers");
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+
+    let id = create_global_card(&client, "Write the changelog entry").await;
+    card_when(&client, id, "assigned to the builder", |card| {
+        card["task"]["assignee"] == "agent:builder"
+    })
+    .await;
+
+    let started = client
+        .request(nanna_client::Action::Task(
+            nanna_client::TaskAction::StartRun {
+                goal: String::new(),
+                card_id: Some(id),
+                scope: None,
+                session_id: None,
+                workdir: None,
+                max_wall_clock_secs: Some(120),
+                max_total_tokens: None,
+            },
+        ))
+        .await
+        .expect("task.start_run answers");
+    assert_eq!(started["started"], true, "{started}");
+    assert_eq!(started["member_id"], "agent:builder", "{started}");
+
+    let card = card_when(&client, id, "closed by the run", |card| {
+        card["task"]["status"] == "done"
+    })
+    .await;
+    let notes = card["notes"].as_array().cloned().unwrap_or_default();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n["author_member_id"] == "agent:builder"
+                && n["kind"] == "verdict"
+                && n["content"].as_str().is_some_and(|c| c.starts_with("Done"))),
+        "the member's verdict is on the card's thread: {card}"
+    );
+
+    let started = std::time::Instant::now();
+    loop {
+        let member = client
+            .request(nanna_client::Action::Member(
+                nanna_client::MemberAction::Get {
+                    id: "agent:builder".to_string(),
+                },
+            ))
+            .await
+            .expect("member.get answers");
+        let status = client
+            .request(nanna_client::Action::Task(
+                nanna_client::TaskAction::RunStatus {
+                    card_id: Some(id),
+                    scope: None,
+                    session_id: None,
+                },
+            ))
+            .await
+            .expect("task.run_status answers");
+        if member["member"]["status"] == "idle" && status["running"] == false {
+            assert!(
+                status["last_report"].is_object(),
+                "the run reported: {status}"
+            );
+            break;
+        }
+        assert!(
+            started.elapsed() < READY_HANG_CEILING,
+            "the member never went idle: {member} / {status}"
+        );
+        tokio::time::sleep(READY_POLL_INTERVAL).await;
+    }
+    client.disconnect().await;
+    daemon.stop();
+}

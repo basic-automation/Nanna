@@ -236,9 +236,14 @@ pub enum TaskAction {    /// List tasks in a scope
         #[serde(default)]
         session_id: Option<String>,
     },
-    /// Start a long-horizon run over a scope's plan (P14)
+    /// Start a long-horizon run over a scope's plan (P14) — or, with
+    /// `card_id`, the card's assignee working that card's subtree (P25
+    /// Stage 3; `goal` and `scope` are then the card's own and ignored).
     StartRun {
+        #[serde(default)]
         goal: String,
+        #[serde(default)]
+        card_id: Option<i64>,
         #[serde(default)]
         scope: Option<String>,
         #[serde(default)]
@@ -250,15 +255,19 @@ pub enum TaskAction {    /// List tasks in a scope
         #[serde(default)]
         max_total_tokens: Option<u64>,
     },
-    /// Status of the scope's run (live or last report)
+    /// Status of the scope's run (live or last report), or card `card_id`'s
     RunStatus {
+        #[serde(default)]
+        card_id: Option<i64>,
         #[serde(default)]
         scope: Option<String>,
         #[serde(default)]
         session_id: Option<String>,
     },
-    /// Cancel the scope's active run
+    /// Cancel the scope's active run, or card `card_id`'s
     CancelRun {
+        #[serde(default)]
+        card_id: Option<i64>,
         #[serde(default)]
         scope: Option<String>,
         #[serde(default)]

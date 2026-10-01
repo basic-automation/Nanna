@@ -24,7 +24,7 @@ use nanna_agent::harness::{
 use nanna_agent::planner::{Plan, build_plan_prompt, plan_or_fallback};
 use nanna_agent::CancelToken;
 use nanna_scripting::ServiceFn;
-use nanna_storage::{NewTask, Storage, StorageError, Task, TaskPatch};
+use nanna_storage::{MemberStatus, NewTask, Storage, StorageError, Task, TaskPatch};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -1215,6 +1215,75 @@ pub struct TursoTaskSource {
     /// `None` serves the whole scope — the task-run manager, and a chat turn
     /// that IS a resume.
     admission: Option<Arc<TurnAdmission>>,
+    /// A card run's card (P25 Stage 3): only this card and its descendants
+    /// are served. `None` serves whatever `admission` admits.
+    subtree_root: Option<i64>,
+    /// The board member doing the work. When set, working notes become
+    /// `progress` posts and closings become `verdict` posts on the card's
+    /// thread, authored by this member.
+    member_id: Option<String>,
+}
+
+/// Whether card `id` is `root` or one of its descendants, given the scope's
+/// child → parent links.
+///
+/// Bounded: the store refuses hierarchies deeper than
+/// [`nanna_storage::TASK_DEPTH_MAX`], so a walk that has not met `root` after
+/// that many links never will — and a corrupt cycle cannot spin.
+#[must_use]
+pub fn subtree_admits<S: std::hash::BuildHasher>(
+    parent_of: &HashMap<i64, i64, S>,
+    root: i64,
+    id: i64,
+) -> bool {
+    let mut cursor = id;
+    for _ in 0..=nanna_storage::TASK_DEPTH_MAX {
+        if cursor == root {
+            return true;
+        }
+        let Some(&parent) = parent_of.get(&cursor) else {
+            return false;
+        };
+        debug_assert!(parent != cursor, "a card is never its own parent");
+        cursor = parent;
+    }
+    false
+}
+
+/// The thread post a member's run leaves when it closes a card: what the
+/// acceptance check said, or that none ran.
+#[must_use]
+pub fn verdict_post(detail: &Value) -> String {
+    let verified = detail.get("verified").and_then(Value::as_bool) == Some(true);
+    if !verified {
+        return "Done — no acceptance check ran; closed on the agent's word.".to_string();
+    }
+    match detail.get("verdict").and_then(Value::as_str).map(str::trim) {
+        Some(verdict) if !verdict.is_empty() => {
+            format!("Done — the acceptance check passed: {verdict}")
+        }
+        _ => "Done — the acceptance check passed.".to_string(),
+    }
+}
+
+/// `content` cut to what one thread post may hold
+/// ([`nanna_storage::TASK_NOTE_MAX_BYTES`]), on a character boundary, with
+/// the cut announced — a refused post would lose the whole note.
+#[must_use]
+pub fn truncate_post(content: &str) -> String {
+    const MARKER: &str = "\n[… cut to fit one post]";
+    let max_bytes = nanna_storage::TASK_NOTE_MAX_BYTES;
+    let trimmed = content.trim();
+    if trimmed.len() <= max_bytes {
+        return trimmed.to_string();
+    }
+    let mut end = max_bytes.saturating_sub(MARKER.len());
+    while !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = format!("{}{MARKER}", &trimmed[..end]);
+    debug_assert!(cut.len() <= max_bytes, "a cut post fits one post");
+    cut
 }
 
 /// Which open items a chat turn may work.
@@ -1329,6 +1398,58 @@ impl TursoTaskSource {
             actor,
             event_tx,
             admission: None,
+            subtree_root: None,
+            member_id: None,
+        }
+    }
+
+    /// Serve only card `root` and its descendants — a card run never works a
+    /// card the human put on the board beside it mid-run (see
+    /// [`subtree_admits`]).
+    #[must_use]
+    pub const fn within_subtree(mut self, root: i64) -> Self {
+        self.subtree_root = Some(root);
+        self
+    }
+
+    /// Post the run's notes and closings to the card threads as `member_id`.
+    #[must_use]
+    pub fn posting_as(mut self, member_id: String) -> Self {
+        debug_assert!(!member_id.is_empty(), "a member id is never empty");
+        self.member_id = Some(member_id);
+        self
+    }
+
+    /// The parent links of the whole scope, closed cards included — a closed
+    /// card between the root and an open descendant must not cut the chain.
+    async fn scope_parents(&self) -> Result<HashMap<i64, i64>, String> {
+        let all = self
+            .storage
+            .tasks()
+            .list(&self.scope, self.scope_id.as_deref(), true)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(all
+            .into_iter()
+            .filter_map(|t| t.parent_id.map(|p| (t.id, p)))
+            .collect())
+    }
+
+    /// Append `content` to card `id`'s thread as this source's member, when it
+    /// has one. Best effort: the thread is the record of the work, never a
+    /// precondition for it, so a refused post is logged and the run goes on.
+    async fn post_as_member(&self, id: i64, kind: nanna_storage::TaskNoteKind, content: &str) {
+        let Some(member_id) = self.member_id.as_deref() else {
+            return;
+        };
+        let content = truncate_post(content);
+        if let Err(e) = self
+            .storage
+            .tasks()
+            .post(id, Some(&self.actor), Some(member_id), kind, &content)
+            .await
+        {
+            tracing::warn!(task_id = id, member = member_id, error = %e, "card run post refused");
         }
     }
 
@@ -1402,11 +1523,20 @@ impl TaskSource for TursoTaskSource {
         // impossible, but legacy or hand-edited rows must not wedge the run:
         // close them visibly and move on. Bounded: every malformed item is
         // cancelled, strictly shrinking the open set.
+        let parents = match self.subtree_root {
+            Some(_) => Some(self.scope_parents().await?),
+            None => None,
+        };
         for _ in 0..TASK_NEXT_SKIP_MAX {
             let admission = self.admission.as_deref();
             let task = repo
                 .next_admitted(&self.scope, self.scope_id.as_deref(), |task| {
                     admission.is_none_or(|admission| admission.admits(task.id))
+                        && self.subtree_root.is_none_or(|root| {
+                            parents
+                                .as_ref()
+                                .is_some_and(|parents| subtree_admits(parents, root, task.id))
+                        })
                 })
                 .await
                 .map_err(|e| e.to_string())?;
@@ -1487,6 +1617,8 @@ impl TaskSource for TursoTaskSource {
             .await
             .map_err(|e| e.to_string())?;
         self.emit(id, "completed", detail.clone());
+        self.post_as_member(id, nanna_storage::TaskNoteKind::Verdict, &verdict_post(&detail))
+            .await;
         // A VERIFIED-done task cancels its own open children. Not a scoring
         // mechanism — the ancestor-promotion experiment that auto-probed and
         // auto-scored parent checks was cut as benchmark-shaped (it converted
@@ -1508,6 +1640,13 @@ impl TaskSource for TursoTaskSource {
     }
 
     async fn add_note(&self, id: i64, content: &str) -> Result<(), String> {
+        // A member's working notes are its progress posts — the same
+        // `task_notes` rows, so the next step's notes tail reads them too.
+        if self.member_id.is_some() {
+            self.post_as_member(id, nanna_storage::TaskNoteKind::Progress, content)
+                .await;
+            return Ok(());
+        }
         self.storage
             .tasks()
             .add_note(id, Some(&self.actor), content)
@@ -1547,6 +1686,12 @@ impl TaskSource for TursoTaskSource {
         .await
         .map_err(|e| e.to_string())?;
         self.emit(id, "abandoned", json!({ "reason": reason }));
+        self.post_as_member(
+            id,
+            nanna_storage::TaskNoteKind::Progress,
+            &format!("Stopped working on this: {reason}"),
+        )
+        .await;
         Ok(())
     }
 
@@ -7456,6 +7601,84 @@ struct ActiveRun {
     cancel: CancelToken,
     goal: String,
     started_at: chrono::DateTime<chrono::Utc>,
+    /// The scope the run's source draws from (`scope:scope_id`), for card and
+    /// scope runs alike — what [`run_conflict`] compares.
+    scope_key: String,
+    /// Set for a card run: which card, by whom.
+    card: Option<CardClaim>,
+}
+
+/// Show `member_id` as `status` on the board; nothing for a run no member
+/// holds. Best effort: a member deleted mid-run must not fail the run that
+/// outlived it.
+async fn set_member_status(storage: &Storage, member_id: Option<&str>, status: MemberStatus) {
+    let Some(member_id) = member_id else {
+        return;
+    };
+    if let Err(e) = storage.members().set_status(member_id, status).await {
+        tracing::warn!(member = member_id, status = status.as_str(), error = %e, "member status not recorded");
+    }
+}
+
+/// What a card run holds while it lives (P25 Stage 3): one card's subtree,
+/// worked by one member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardClaim {
+    pub card_id: i64,
+    pub member_id: String,
+    /// The card and its ancestors, nearest first. Two runs whose lineages
+    /// meet would serve the same cards: the deeper card is inside the other's
+    /// subtree.
+    pub lineage: Vec<i64>,
+}
+
+/// Why a new run may not start beside `runs`, or `None` when it may.
+///
+/// The invariant: **no card is ever served by two runs**, because two runners
+/// over one plan race `next()`. So, per scope: a scope run (which serves the
+/// whole scope) excludes every other run in that scope; a card run excludes a
+/// card run on any card above or below it. And a member works one card at a
+/// time — P25 decision 3's "busy" is a member's single state, not a count.
+#[must_use]
+fn run_conflict(
+    runs: &HashMap<String, ActiveRun>,
+    scope_key: &str,
+    claim: Option<&CardClaim>,
+) -> Option<String> {
+    for (key, run) in runs {
+        let same_member = matches!(
+            (&run.card, claim),
+            (Some(held), Some(wanted)) if held.member_id == wanted.member_id
+        );
+        if run.scope_key != scope_key && !same_member {
+            continue;
+        }
+        let reason = match (&run.card, claim) {
+            (None, _) => Some(format!("a task run is already active for scope {key}")),
+            (Some(held), None) => Some(format!(
+                "card #{} is being worked in scope {scope_key}; a scope run would serve it too",
+                held.card_id
+            )),
+            (Some(held), Some(wanted)) if held.member_id == wanted.member_id => Some(format!(
+                "member {} is already working card #{}",
+                held.member_id, held.card_id
+            )),
+            (Some(held), Some(wanted))
+                if held.lineage.contains(&wanted.card_id)
+                    || wanted.lineage.contains(&held.card_id) =>
+            {
+                Some(format!(
+                    "card #{} is being worked and shares cards with #{}",
+                    held.card_id, wanted.card_id
+                ))
+            }
+            (Some(_), Some(_)) => None,
+        };
+        if reason.is_some() {
+            return reason;
+        }
+    }
+    None
 }
 
 /// Status snapshot returned over IPC.
@@ -7531,27 +7754,89 @@ impl TaskRunManager {
         event_tx: tokio::sync::broadcast::Sender<Event>,
         interjector: Option<Arc<SessionInterjector>>,
     ) -> Result<(), String> {
+        self.launch(spec, event_tx, interjector, None).await
+    }
+
+    fn card_key(card_id: i64) -> String {
+        format!("card:{card_id}")
+    }
+
+    /// Start a member's run on one card (P25 Stage 3): the source serves only
+    /// that card's subtree and posts to its threads as the member, who shows
+    /// as busy until the run ends.
+    ///
+    /// # Errors
+    /// Returns an error when the run would share a card or a member with a
+    /// live run (see [`run_conflict`]).
+    ///
+    /// # Panics
+    /// When `claim.lineage` does not start at `claim.card_id` — a caller bug
+    /// that would let two runs share cards unnoticed.
+    pub async fn start_card(
+        self: &Arc<Self>,
+        spec: TaskRunSpec,
+        claim: CardClaim,
+        event_tx: tokio::sync::broadcast::Sender<Event>,
+    ) -> Result<(), String> {
+        assert_eq!(
+            claim.lineage.first(),
+            Some(&claim.card_id),
+            "a lineage starts at its own card"
+        );
+        debug_assert_eq!(
+            spec.source.subtree_root,
+            Some(claim.card_id),
+            "a card run's source serves that card's subtree"
+        );
+        self.launch(spec, event_tx, None, Some(claim)).await
+    }
+
+    /// Register a run under `key`, or say why it may not start. Checked and
+    /// inserted under one write guard, so two starts cannot both pass.
+    async fn claim_slot(
+        &self,
+        key: String,
+        scope_key: String,
+        goal: String,
+        card: Option<CardClaim>,
+    ) -> Result<CancelToken, String> {
+        let mut runs = self.runs.write().await;
+        if let Some(reason) = run_conflict(&runs, &scope_key, card.as_ref()) {
+            return Err(reason);
+        }
+        let cancel = CancelToken::new();
+        let previous = runs.insert(
+            key,
+            ActiveRun {
+                cancel: cancel.clone(),
+                goal,
+                started_at: chrono::Utc::now(),
+                scope_key,
+                card,
+            },
+        );
+        drop(runs);
+        debug_assert!(previous.is_none(), "run_conflict refuses an occupied key");
+        Ok(cancel)
+    }
+
+    async fn launch(
+        self: &Arc<Self>,
+        spec: TaskRunSpec,
+        event_tx: tokio::sync::broadcast::Sender<Event>,
+        interjector: Option<Arc<SessionInterjector>>,
+        card: Option<CardClaim>,
+    ) -> Result<(), String> {
         let TaskRunSpec { goal, source, runner, config, workdir } = spec;
-        let key = Self::scope_key(&source.scope, source.scope_id.as_deref());
-        {
-            let mut runs = self.runs.write().await;
-            if runs.contains_key(&key) {
-                return Err(format!("a task run is already active for scope {key}"));
-            }
-            runs.insert(
-                key.clone(),
-                ActiveRun {
-                    cancel: CancelToken::new(),
-                    goal: goal.clone(),
-                    started_at: chrono::Utc::now(),
-                },
-            );
-        }
-        let cancel = {
-            let runs = self.runs.read().await;
-            runs.get(&key).map(|r| r.cancel.clone())
-        }
-        .ok_or_else(|| "run vanished during start".to_string())?;
+        let scope_key = Self::scope_key(&source.scope, source.scope_id.as_deref());
+        let key = card
+            .as_ref()
+            .map_or_else(|| scope_key.clone(), |claim| Self::card_key(claim.card_id));
+        let cancel = self
+            .claim_slot(key.clone(), scope_key, goal.clone(), card.clone())
+            .await?;
+        let busy_member = card.map(|claim| claim.member_id);
+        set_member_status(&source.storage, busy_member.as_deref(), MemberStatus::Busy).await;
 
         let scope = source.scope.clone();
         let scope_id = source.scope_id.clone();
@@ -7637,17 +7922,32 @@ impl TaskRunManager {
                 scope_id: scope_id.clone(),
                 report: serde_json::to_value(&report).unwrap_or(Value::Null),
             });
+            set_member_status(&source.storage, busy_member.as_deref(), MemberStatus::Idle).await;
             manager.runs.write().await.remove(&key);
             manager.reports.write().await.insert(key, (report, resumes));
         });
         Ok(())
     }
 
+    /// Request cancellation of card `card_id`'s run. Returns false when no
+    /// run is working that card.
+    pub async fn cancel_card(&self, card_id: i64) -> bool {
+        self.cancel_key(&Self::card_key(card_id)).await
+    }
+
+    /// Status of card `card_id`'s run (live, or its last report).
+    pub async fn card_status(&self, card_id: i64) -> RunStatus {
+        self.status_for_key(&Self::card_key(card_id)).await
+    }
+
     /// Request cancellation. Returns false when no run is active.
     pub async fn cancel(&self, scope: &str, scope_id: Option<&str>) -> bool {
-        let key = Self::scope_key(scope, scope_id);
+        self.cancel_key(&Self::scope_key(scope, scope_id)).await
+    }
+
+    async fn cancel_key(&self, key: &str) -> bool {
         let runs = self.runs.read().await;
-        runs.get(&key).is_some_and(|run| {
+        runs.get(key).is_some_and(|run| {
             run.cancel.cancel();
             true
         })
@@ -7655,7 +7955,10 @@ impl TaskRunManager {
 
     /// Current status for a scope.
     pub async fn status(&self, scope: &str, scope_id: Option<&str>) -> RunStatus {
-        let key = Self::scope_key(scope, scope_id);
+        self.status_for_key(&Self::scope_key(scope, scope_id)).await
+    }
+
+    async fn status_for_key(&self, key: &str) -> RunStatus {
         let runs = self.runs.read().await;
         // `runs` is held first and throughout: a finishing run removes itself
         // from `runs` before recording its report, so while this guard is held
@@ -7664,9 +7967,11 @@ impl TaskRunManager {
             .reports
             .read()
             .await
-            .get(&key)
-            .map_or((None, 0), |(report, resumes)| (Some(report.clone()), *resumes));
-        runs.get(&key).map_or_else(
+            .get(key)
+            .map_or((None, 0), |(report, resumes)| {
+                (Some(report.clone()), *resumes)
+            });
+        runs.get(key).map_or_else(
             || RunStatus {
                 running: false,
                 goal: None,
@@ -9064,6 +9369,218 @@ mod model_fallback_tests {
         assert!(
             seen.lock().expect("seen").iter().all(|r| r.model.as_deref() != Some("alive:1b")),
             "no other model was asked"
+        );
+    }
+}
+
+#[cfg(test)]
+mod card_run_tests {
+    use super::{
+        ActiveRun, CardClaim, TursoTaskSource, run_conflict, subtree_admits, truncate_post,
+        verdict_post,
+    };
+    use nanna_agent::CancelToken;
+    use nanna_agent::harness::TaskSource;
+    use nanna_storage::{
+        MemberKind, MemberOwner, MemberStatus, NewMember, NewTask, Storage, TaskNoteKind,
+    };
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    const AGENT: &str = "agent:builder";
+
+    fn claim(card_id: i64, member: &str, lineage: &[i64]) -> CardClaim {
+        CardClaim {
+            card_id,
+            member_id: member.to_string(),
+            lineage: lineage.to_vec(),
+        }
+    }
+
+    fn run(scope_key: &str, card: Option<CardClaim>) -> ActiveRun {
+        ActiveRun {
+            cancel: CancelToken::new(),
+            goal: "g".to_string(),
+            started_at: chrono::Utc::now(),
+            scope_key: scope_key.to_string(),
+            card,
+        }
+    }
+
+    #[test]
+    fn a_subtree_is_the_card_and_everything_under_it() {
+        // 1 ─ 2 ─ 3, and 4 beside 1; 5 ↔ 6 is a corrupt cycle.
+        let parents: HashMap<i64, i64> = [(2, 1), (3, 2), (5, 6), (6, 5)].into_iter().collect();
+        assert!(subtree_admits(&parents, 1, 1), "the card itself");
+        assert!(subtree_admits(&parents, 1, 3), "a grandchild");
+        assert!(!subtree_admits(&parents, 2, 1), "never an ancestor");
+        assert!(!subtree_admits(&parents, 1, 4), "never a card beside it");
+        assert!(!subtree_admits(&parents, 1, 5), "a cycle ends, refused");
+    }
+
+    #[test]
+    fn a_card_is_worked_by_one_run_and_a_member_works_one_card() {
+        let mut runs = HashMap::new();
+        runs.insert(
+            "card:2".to_string(),
+            run("global:", Some(claim(2, AGENT, &[2, 1]))),
+        );
+
+        let child = claim(3, "agent:other", &[3, 2, 1]);
+        assert!(
+            run_conflict(&runs, "global:", Some(&child)).is_some(),
+            "inside a worked card"
+        );
+        let parent = claim(1, "agent:other", &[1]);
+        assert!(
+            run_conflict(&runs, "global:", Some(&parent)).is_some(),
+            "above a worked card"
+        );
+        let same_member = claim(9, AGENT, &[9]);
+        let reason = run_conflict(&runs, "workspace:w", Some(&same_member));
+        assert!(
+            reason.is_some_and(|r| r.contains("already working")),
+            "one card per member, any board"
+        );
+        assert!(
+            run_conflict(&runs, "global:", None).is_some(),
+            "a scope run would serve card 2"
+        );
+
+        let beside = claim(4, "agent:other", &[4]);
+        assert_eq!(
+            run_conflict(&runs, "global:", Some(&beside)),
+            None,
+            "disjoint cards run together"
+        );
+        assert_eq!(
+            run_conflict(&runs, "session:s", None),
+            None,
+            "another scope is untouched"
+        );
+
+        runs.insert("session:s".to_string(), run("session:s", None));
+        assert!(
+            run_conflict(&runs, "session:s", None).is_some(),
+            "one scope run per scope"
+        );
+    }
+
+    #[test]
+    fn a_closing_post_says_what_the_check_said() {
+        let passed = verdict_post(&json!({"verified": true, "verdict": " exit 0 "}));
+        assert_eq!(passed, "Done — the acceptance check passed: exit 0");
+        let bare = verdict_post(&json!({"verified": true}));
+        assert_eq!(bare, "Done — the acceptance check passed.");
+        let unchecked = verdict_post(&json!({"verified": false, "tokens_spent": 9}));
+        assert!(unchecked.contains("no acceptance check"), "{unchecked}");
+    }
+
+    #[test]
+    fn an_oversized_note_is_cut_to_one_post_on_a_char_boundary() {
+        let max = nanna_storage::TASK_NOTE_MAX_BYTES;
+        let note = "é".repeat(max);
+        let cut = truncate_post(&note);
+        assert!(cut.len() <= max, "{} > {max}", cut.len());
+        assert!(
+            cut.ends_with("cut to fit one post]"),
+            "the cut is announced"
+        );
+        assert_eq!(truncate_post("  short  "), "short");
+    }
+
+    async fn card(storage: &Storage, title: &str, parent_id: Option<i64>, priority: i64) -> i64 {
+        storage
+            .tasks()
+            .create(NewTask {
+                title: title.to_string(),
+                scope: "global".to_string(),
+                parent_id,
+                priority,
+                assignee: Some(AGENT.to_string()),
+                ..NewTask::default()
+            })
+            .await
+            .expect("card")
+            .id
+    }
+
+    /// The card run's source: works the card's subtree and nothing beside it,
+    /// and leaves its notes and its verdict on the card threads as the member.
+    #[tokio::test]
+    async fn a_card_run_serves_its_subtree_and_posts_as_its_member() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        storage
+            .members()
+            .create(NewMember {
+                id: AGENT.to_string(),
+                name: "Builder".to_string(),
+                avatar: None,
+                kind: MemberKind::Agent,
+                owner_kind: MemberOwner::Workspace,
+                owner_id: None,
+                status: MemberStatus::Idle,
+                profile: json!({}),
+            })
+            .await
+            .expect("member");
+        let root = card(&storage, "ship the parser", None, 3).await;
+        let step = card(&storage, "write the lexer", Some(root), 3).await;
+        // Higher priority and beside the card: a scope run would take it first.
+        let beside = card(&storage, "unrelated card the human added", None, 1).await;
+
+        let source = TursoTaskSource::new(
+            storage.clone(),
+            "global".to_string(),
+            None,
+            AGENT.to_string(),
+            None,
+        )
+        .within_subtree(root)
+        .posting_as(AGENT.to_string());
+
+        let next = source.next().await.expect("next").expect("work");
+        assert_eq!(next.id, step, "the card's own leaf, never card #{beside}");
+        source
+            .add_note(step, "lexer handles strings now")
+            .await
+            .expect("note");
+        source
+            .complete(
+                step,
+                json!({"verified": true, "verdict": "cargo test: 4 passed"}),
+            )
+            .await
+            .expect("complete");
+
+        let thread = storage.tasks().notes(step, 10).await.expect("thread");
+        let kinds: Vec<(TaskNoteKind, Option<&str>)> = thread
+            .iter()
+            .map(|n| (n.kind, n.author_member_id.as_deref()))
+            .collect();
+        assert!(
+            kinds.contains(&(TaskNoteKind::Progress, Some(AGENT))),
+            "{thread:?}"
+        );
+        assert!(
+            kinds.contains(&(TaskNoteKind::Verdict, Some(AGENT))),
+            "{thread:?}"
+        );
+
+        // The root had no check of its own, so its last child closed it — and
+        // the card beside it is still not this run's to work.
+        assert_eq!(
+            storage.tasks().get(root).await.expect("root").status,
+            "done"
+        );
+        assert!(
+            source.next().await.expect("next").is_none(),
+            "nothing left in the subtree"
+        );
+        assert_eq!(
+            storage.tasks().get(beside).await.expect("beside").status,
+            "pending"
         );
     }
 }
