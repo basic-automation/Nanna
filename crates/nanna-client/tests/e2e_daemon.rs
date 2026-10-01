@@ -3564,3 +3564,103 @@ async fn an_assigned_card_is_worked_by_its_member_and_closed_with_a_verdict_post
     client.disconnect().await;
     daemon.stop();
 }
+
+/// P25 decision 7, end to end: a member's run that cannot pass its card's
+/// check hands the card back — pending, unassigned, the failure posted as the
+/// member's verdict — and that hand-back wakes the router to decide again.
+#[tokio::test]
+async fn a_card_its_member_cannot_finish_goes_back_to_the_router() {
+    let ollama = ScriptedOllama::start(vec![
+        concat!(
+            r#"{"decision":"assign","member":"agent:builder","#,
+            r#""acceptance":{"kind":"file_exists","path":"never-written-by-anyone.txt"},"#,
+            r#""reason":"it builds things"}"#
+        )
+        .to_string(),
+        "Still looking into it.".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let created = client
+        .request(nanna_client::Action::Member(
+            nanna_client::MemberAction::Create {
+                name: "Builder".to_string(),
+                workspace_id: None,
+                personal: false,
+                avatar: None,
+                profile: None,
+            },
+        ))
+        .await
+        .expect("member.create answers");
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+
+    let id = create_global_card(&client, "Write the file nobody can write").await;
+    card_when(&client, id, "assigned to the builder", |card| {
+        card["task"]["assignee"] == "agent:builder"
+    })
+    .await;
+    let started = client
+        .request(nanna_client::Action::Task(
+            nanna_client::TaskAction::StartRun {
+                goal: String::new(),
+                card_id: Some(id),
+                scope: None,
+                session_id: None,
+                workdir: None,
+                max_wall_clock_secs: Some(240),
+                max_total_tokens: None,
+            },
+        ))
+        .await
+        .expect("task.start_run answers");
+    assert_eq!(started["started"], true, "{started}");
+
+    let card = card_when(&client, id, "handed back", |card| {
+        card["activity"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|row| row["action"] == "handed_back"))
+    })
+    .await;
+    assert_eq!(card["task"]["status"], "pending", "never cancelled: {card}");
+    assert!(card["task"]["assignee"].is_null(), "released: {card}");
+    let notes = card["notes"].as_array().cloned().unwrap_or_default();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n["author_member_id"] == "agent:builder"
+                && n["kind"] == "verdict"
+                && n["content"]
+                    .as_str()
+                    .is_some_and(|c| c.starts_with("Not done"))),
+        "the failure is on the card's thread: {card}"
+    );
+    // The hand-back woke the router: a second decision was asked for.
+    let started = std::time::Instant::now();
+    loop {
+        let asked = ollama
+            .chat_bodies
+            .lock()
+            .await
+            .iter()
+            .filter(|body| body.contains("Task Management Agent"))
+            .count();
+        if asked >= 2 {
+            break;
+        }
+        assert!(
+            started.elapsed() < READY_HANG_CEILING,
+            "the router was never woken by the hand-back ({asked} decisions asked)"
+        );
+        tokio::time::sleep(READY_POLL_INTERVAL).await;
+    }
+    client.disconnect().await;
+    daemon.stop();
+}

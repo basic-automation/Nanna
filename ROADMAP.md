@@ -8089,6 +8089,22 @@ as its turn (`TurnAdmission`, scope default `session`).
       `acceptance_checked` activity row — no event fires — and nothing but the human's own Done
       can fail one on a board card until Stage 3's runs exist; build it with the run start, so
       the retry bound has a producer to bound. Still open: failed verdict, `stalled`, heartbeat.
+      *(2026-10-01)* **Failed verdict landed, with its retry bound.** A member's card run that
+      gives up on its card (the harness's `abandon` on the subtree root) no longer cancels the
+      human's card: `TursoTaskSource::hand_back` writes a `handed_back` activity row, posts the
+      failure as the member's `verdict` ("Not done — …"), releases the card (pending,
+      unassigned) and stops serving it. The release — an `agent:` member clearing its own
+      assignment — is the wake (`WakeReason::HandedBack`; the worker confirms it against the
+      activity row, so an agent unassigning for any other reason routes nothing). The router
+      decides again with the failure in the last posts it reads; after `HAND_BACKS_MAX` = 2 in a
+      row it instead applies its own `clarify` model-free — a question card for the human that
+      quotes the last run's reason — and logs `hand_back_limit`, which starts the count over
+      (one retry, as Hermes Kanban's `failure_limit`). Sub-tasks a run gives up on are still
+      cancelled: they are its own scaffolding. e2e
+      `a_card_its_member_cannot_finish_goes_back_to_the_router`. **Not covered:** a run that
+      ends with its card still open for another reason (wall clock or token budget, a cancel) —
+      that card is `in_progress` with no live run, i.e. the `stalled` trigger's. Still open:
+      `stalled`, heartbeat.
 - [x] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
       *(2026-09-28)* `RouterDecision::Assign` gained optional `labels` and `acceptance`. Labels
@@ -8168,8 +8184,8 @@ as its turn (`TurnAdmission`, scope default `session`).
             workspace. e2e `an_assigned_card_is_worked_by_its_member_and_closed_with_a_verdict_post`
             (router assigns → start → verdict post → member idle). **Still open:** the
             automatic start on `assigned` — wire it like the router's wake (gui-created cards
-            only while chat lives) once the failed-verdict retry bound below exists, so an
-            auto-started run has a bounded way to fail.
+            only while chat lives). Its prerequisite, a bounded way for a run to fail, landed
+            the same day (the hand-back, see Triggers).
       - [ ] *(research 2026-10-01)* **Borrow Hermes Kanban's failure and stall rules** when the
             auto-start lands ([docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban)):
             its dispatcher auto-blocks a card after `failure_limit` (default 2) consecutive failed

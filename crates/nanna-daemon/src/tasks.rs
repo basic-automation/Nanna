@@ -1222,7 +1222,14 @@ pub struct TursoTaskSource {
     /// `progress` posts and closings become `verdict` posts on the card's
     /// thread, authored by this member.
     member_id: Option<String>,
+    /// Set once this run handed its card back (see [`Self::hand_back`]):
+    /// from then on the card is the router's again, so nothing is served.
+    handed_back: std::sync::atomic::AtomicBool,
 }
+
+/// The activity row a member's run leaves when it hands its card back to the
+/// router unfinished. The router's worker counts them to bound retries.
+pub const HANDED_BACK_ACTION: &str = "handed_back";
 
 /// Whether card `id` is `root` or one of its descendants, given the scope's
 /// child → parent links.
@@ -1400,6 +1407,7 @@ impl TursoTaskSource {
             admission: None,
             subtree_root: None,
             member_id: None,
+            handed_back: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1451,6 +1459,51 @@ impl TursoTaskSource {
         {
             tracing::warn!(task_id = id, member = member_id, error = %e, "card run post refused");
         }
+    }
+
+    /// A member's run gave up on its card: P25 decision 7 — a failed verdict
+    /// goes back to the router with the failure posted, never to `cancelled`
+    /// (a card is the human's; only they close it unfinished).
+    ///
+    /// The `handed_back` activity row is written FIRST: the release below is
+    /// what wakes the router (an agent clearing its own assignment, see
+    /// `board_router_trigger::wake_for`), and the router's worker counts these
+    /// rows to bound the retries — the row must exist before the wake can be
+    /// read.
+    async fn hand_back(&self, id: i64, reason: &str) -> Result<(), String> {
+        debug_assert_eq!(
+            self.subtree_root,
+            Some(id),
+            "only the run's own card is handed back"
+        );
+        let repo = self.storage.tasks();
+        let reason = truncate_post(reason);
+        repo.log_activity(
+            id,
+            Some(&self.actor),
+            HANDED_BACK_ACTION,
+            Some(json!({ "member": self.member_id, "reason": reason })),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        self.post_as_member(
+            id,
+            nanna_storage::TaskNoteKind::Verdict,
+            &format!("Not done — {reason}\nHanded back to the router."),
+        )
+        .await;
+        let release = TaskPatch {
+            status: Some("pending".to_string()),
+            assignee: Some(None),
+            ..TaskPatch::default()
+        };
+        repo.update(id, release, Some(&self.actor))
+            .await
+            .map_err(|e| e.to_string())?;
+        self.handed_back
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.emit(id, "handed_back", json!({ "reason": reason }));
+        Ok(())
     }
 
     /// Serve only what `admission` admits (see [`TurnAdmission`]).
@@ -1523,6 +1576,9 @@ impl TaskSource for TursoTaskSource {
         // impossible, but legacy or hand-edited rows must not wedge the run:
         // close them visibly and move on. Bounded: every malformed item is
         // cancelled, strictly shrinking the open set.
+        if self.handed_back.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(None);
+        }
         let parents = match self.subtree_root {
             Some(_) => Some(self.scope_parents().await?),
             None => None,
@@ -1666,6 +1722,9 @@ impl TaskSource for TursoTaskSource {
     }
 
     async fn abandon(&self, id: i64, reason: &str) -> Result<(), String> {
+        if self.member_id.is_some() && self.subtree_root == Some(id) {
+            return self.hand_back(id, reason).await;
+        }
         let repo = self.storage.tasks();
         repo.update(
             id,
@@ -9581,6 +9640,73 @@ mod card_run_tests {
         assert_eq!(
             storage.tasks().get(beside).await.expect("beside").status,
             "pending"
+        );
+    }
+
+    /// Decision 7: a member that gives up on its card hands it back to the
+    /// router — pending, unassigned, the failure on the thread — instead of
+    /// cancelling the human's card; and the run stops serving it at once.
+    #[tokio::test]
+    async fn a_card_run_that_gives_up_hands_the_card_back_unfinished() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        storage
+            .members()
+            .create(NewMember {
+                id: AGENT.to_string(),
+                name: "Builder".to_string(),
+                avatar: None,
+                kind: MemberKind::Agent,
+                owner_kind: MemberOwner::Workspace,
+                owner_id: None,
+                status: MemberStatus::Idle,
+                profile: json!({}),
+            })
+            .await
+            .expect("member");
+        let root = card(&storage, "make CI green", None, 3).await;
+        let scaffold = card(&storage, "bisect the flake", Some(root), 3).await;
+        let source = TursoTaskSource::new(
+            storage.clone(),
+            "global".to_string(),
+            None,
+            AGENT.to_string(),
+            None,
+        )
+        .within_subtree(root)
+        .posting_as(AGENT.to_string());
+
+        // A sub-task the run gives up on is its own scaffolding: cancelled.
+        source.abandon(scaffold, "no repro").await.expect("abandon");
+        let tasks = storage.tasks();
+        assert_eq!(tasks.get(scaffold).await.expect("sub").status, "cancelled");
+
+        let step = source.next().await.expect("next").expect("the card itself");
+        assert_eq!(step.id, root);
+        source.start(root).await.expect("start");
+        source
+            .abandon(root, "its check never passed in 6 attempts")
+            .await
+            .expect("hand back");
+        let card = tasks.get(root).await.expect("root");
+        assert_eq!(card.status, "pending", "never cancelled by the run");
+        assert_eq!(card.assignee, None, "back to the router");
+        let activity = tasks.activity(root, 20).await.expect("activity");
+        assert!(
+            activity
+                .iter()
+                .any(|a| a.action == super::HANDED_BACK_ACTION),
+            "{activity:?}"
+        );
+        let thread = tasks.notes(root, 10).await.expect("thread");
+        assert!(
+            thread.iter().any(|n| n.kind == TaskNoteKind::Verdict
+                && n.author_member_id.as_deref() == Some(AGENT)
+                && n.content.starts_with("Not done — its check never passed")),
+            "{thread:?}"
+        );
+        assert!(
+            source.next().await.expect("next").is_none(),
+            "no longer this run's card"
         );
     }
 }

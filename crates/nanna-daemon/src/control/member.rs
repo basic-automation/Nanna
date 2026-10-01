@@ -11,11 +11,11 @@ use nanna_storage::{
     MemberStatus, NewMember, StorageError,
 };
 
-/// Prefix of every member created over IPC.
-///
-/// Disjoint from the seeded ids (`human`, `router:…`), so a created agent can
-/// never shadow a member the board depends on.
-const AGENT_MEMBER_PREFIX: &str = "agent:";
+// Prefix of every member created over IPC — disjoint from the seeded ids
+// (`human`, `router:…`), so a created agent can never shadow a member the
+// board depends on. Shared with the router's hand-back wake, which tells an
+// agent's own writes by it.
+use crate::board_router_trigger::AGENT_MEMBER_PREFIX;
 
 /// Bytes of the id left for the slug once the prefix is in.
 const AGENT_SLUG_MAX_BYTES: usize = MEMBER_ID_MAX_BYTES - AGENT_MEMBER_PREFIX.len();

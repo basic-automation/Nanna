@@ -10,14 +10,17 @@
 //! event to a bounded `mpsc` queue as a [`Wake`]; one worker drains it in
 //! order. The sink never waits: a full queue is counted and logged.
 //!
-//! **Two wakes so far** (P25 decisions 4 and 6):
+//! **The wakes so far** (P25 decisions 4, 6 and 7):
 //! - [`WakeReason::Created`] — a card was put on a board;
 //! - [`WakeReason::ClarificationAnswered`] — a card the router had blocked on
 //!   a clarification is unblocked because the human completed it, so the
 //!   router decides again with the answer in hand;
 //! - [`WakeReason::RecurringReopened`] — the recurrence sweep reopened a
 //!   recurring card, which goes back to the router (decision 7) rather than
-//!   silently to whoever held it last time.
+//!   silently to whoever held it last time;
+//! - [`WakeReason::HandedBack`] — an agent's run gave the card back
+//!   unfinished (decision 7's failed verdict); past [`HAND_BACKS_MAX`] in a
+//!   row the router asks the human instead of routing it again.
 //!
 //! **Only cards the board client created are routed, for now.** While the
 //! chat harness lives, its model writes workspace-scoped cards of its own
@@ -27,8 +30,8 @@
 //! (`TaskAction::Create`) stamps: checked on the event itself for `created`,
 //! and against the card's `created` activity row for every later wake. The
 //! router's own splits and clarifications carry the router's id, so they never
-//! wake it. The remaining wakes (failed verdict, recurring reopen, stalled,
-//! heartbeat) are separate roadmap items.
+//! wake it. The remaining wakes (stalled, heartbeat) are separate roadmap
+//! items.
 
 use crate::agent_service::AgentServiceConfig;
 use crate::board_router::{RouterComplete, answered_clarifications, route_card, router_for};
@@ -45,6 +48,34 @@ pub const BOARD_CLIENT_ACTOR: &str = "gui";
 /// The actor the recurrence sweep reopens a card as
 /// (`crate::tasks::sweep_recurrences`).
 pub const RECURRENCE_ACTOR: &str = "recurrence";
+
+/// The id prefix of every agent member (`agent:<slug>`), the actor a
+/// member's card run writes as.
+pub const AGENT_MEMBER_PREFIX: &str = "agent:";
+
+/// Hand-backs in a row the router may answer by routing the card again;
+/// the next one asks the human instead (decision 7's "bounded retries, then a
+/// clarification to the human").
+///
+/// Bound justification: two is one retry. A second member (or the same one
+/// with what the first run posted) gets a real second attempt; a third
+/// unattended attempt would spend a model run on a card two runs could not
+/// finish, with nothing new to go on. Hermes Kanban's dispatcher blocks at
+/// the same count (`failure_limit`, default 2).
+pub const HAND_BACKS_MAX: usize = 2;
+
+/// The activity row that resets the hand-back count: the router asked the
+/// human after [`HAND_BACKS_MAX`] hand-backs, so whatever comes after the
+/// answer is a fresh attempt.
+pub const HAND_BACK_LIMIT_ACTION: &str = "hand_back_limit";
+
+/// How much of a card's activity is read to count its hand-backs.
+///
+/// Bound justification: one run leaves a handful of rows on its card
+/// (started, notes, checks, the hand-back, the release, the router's post),
+/// so 256 rows hold dozens of runs — far more than [`HAND_BACKS_MAX`] — while
+/// staying one small indexed read.
+const HAND_BACK_SCAN_ROWS: i64 = 256;
 
 /// Member-profile key holding the router's own model list, walked in order
 /// with failover. Absent or empty means the agent's chat models.
@@ -70,6 +101,10 @@ pub enum WakeReason {
     ClarificationAnswered,
     /// The recurrence sweep reopened the card.
     RecurringReopened,
+    /// An agent's run gave the card back unfinished (decision 7's failed
+    /// verdict). Queued for every agent that clears its own assignment; the
+    /// worker routes it only when the card's activity says it was handed back.
+    HandedBack,
 }
 
 /// One queued wake: route card `task_id` because of `reason`.
@@ -96,6 +131,15 @@ pub fn wake_for(event: &TaskEvent) -> Option<Wake> {
                 && event.detail.get("reopened") == Some(&serde_json::Value::Bool(true)) =>
         {
             WakeReason::RecurringReopened
+        }
+        TaskEventKind::Assigned
+            if event
+                .actor
+                .as_deref()
+                .is_some_and(|actor| actor.starts_with(AGENT_MEMBER_PREFIX))
+                && event.detail.get("assignee") == Some(&serde_json::Value::Null) =>
+        {
+            WakeReason::HandedBack
         }
         _ => return None,
     };
@@ -164,6 +208,26 @@ pub async fn run(
         let Some(card) = card_to_route(&storage, wake).await else {
             continue;
         };
+        if wake.reason == WakeReason::HandedBack {
+            match hand_backs_in_a_row(&storage.tasks(), card.id).await {
+                Ok((0, _)) => {
+                    debug!(
+                        task_id = card.id,
+                        "board router: unassigned, not handed back; skipped"
+                    );
+                    continue;
+                }
+                Ok((count, latest)) if count >= HAND_BACKS_MAX => {
+                    ask_the_human(&storage, &card, count, &latest).await;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(task_id = card.id, error = %e, "board router: hand-backs unreadable; not routed");
+                    continue;
+                }
+            }
+        }
         route_one(&storage, &llm, &fallback, &card).await;
     }
     debug!("board router queue closed; worker exiting");
@@ -214,7 +278,10 @@ pub async fn card_to_route(storage: &Storage, wake: Wake) -> Option<Task> {
             return None;
         }
     }
-    if wake.reason == WakeReason::RecurringReopened {
+    if matches!(
+        wake.reason,
+        WakeReason::RecurringReopened | WakeReason::HandedBack
+    ) {
         return Some(card);
     }
     debug_assert_eq!(wake.reason, WakeReason::ClarificationAnswered);
@@ -233,6 +300,100 @@ pub async fn card_to_route(storage: &Storage, wake: Wake) -> Option<Task> {
         }
     }
 }
+
+/// How many times in a row card `task_id` was handed back — counted newest
+/// first until the last time the human was asked about it — and the newest
+/// hand-back's reason.
+///
+/// # Errors
+/// The store failure reading the card's activity.
+pub async fn hand_backs_in_a_row(
+    tasks: &TaskRepository,
+    task_id: i64,
+) -> Result<(usize, String), StorageError> {
+    let activity = tasks.activity(task_id, HAND_BACK_SCAN_ROWS).await?;
+    let mut count = 0usize;
+    let mut latest: Option<String> = None;
+    // `activity` is the newest rows, oldest first: walk it backwards.
+    for row in activity.iter().rev() {
+        if row.action == HAND_BACK_LIMIT_ACTION {
+            break;
+        }
+        if row.action == crate::tasks::HANDED_BACK_ACTION {
+            count += 1;
+            if latest.is_none() {
+                latest = row
+                    .detail
+                    .as_ref()
+                    .and_then(|d| d.get("reason"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            }
+        }
+    }
+    debug_assert!(count <= activity.len(), "counted from the rows read");
+    Ok((count, latest.unwrap_or_default()))
+}
+
+/// The retry bound is spent: block the card on a question for the human
+/// rather than spend another run (decision 7). Model-free — the router's own
+/// `clarify`, applied as the router, so it reads on the thread like any other
+/// decision and the human's answer wakes the router as usual.
+async fn ask_the_human(storage: &Storage, card: &Task, count: usize, latest: &str) {
+    debug_assert!(count >= HAND_BACKS_MAX, "only past the bound");
+    let task_id = card.id;
+    let Some(router_id) = router_for(card) else {
+        debug!(task_id, "board router: card is not on a board; skipped");
+        return;
+    };
+    let latest = crate::tasks::truncate_post(latest);
+    let latest: String = latest.chars().take(HAND_BACK_REASON_CHARS_MAX).collect();
+    let decision = nanna_storage::routing::RouterDecision::Clarify {
+        question: format!(
+            "Card #{task_id} was handed back unfinished {count} times in a row. The last \
+             run said: {latest}\nWhat should change — the card, its acceptance check, or \
+             who does it?"
+        ),
+        reason: format!(
+            "{count} runs could not finish it; another would spend a run on the same guess"
+        ),
+    };
+    let tasks = storage.tasks();
+    match nanna_storage::routing::apply_decision(
+        &tasks,
+        &storage.members(),
+        &router_id,
+        task_id,
+        &decision,
+        false,
+    )
+    .await
+    {
+        Ok(applied) => {
+            info!(task_id, router = %router_id, count, ?applied, "board router asked the human after hand-backs");
+            let detail = serde_json::json!({ "count": count });
+            if let Err(e) = tasks
+                .log_activity(
+                    task_id,
+                    Some(&router_id),
+                    HAND_BACK_LIMIT_ACTION,
+                    Some(detail),
+                )
+                .await
+            {
+                warn!(task_id, error = %e, "board router: hand-back count not reset");
+            }
+        }
+        Err(e) => {
+            warn!(task_id, router = %router_id, error = %e, "board router: could not ask the human");
+        }
+    }
+}
+
+/// How much of the last run's reason the human's question quotes. Bound
+/// justification: the question is a card title's source and one post; ~600
+/// characters say what failed without burying the question.
+const HAND_BACK_REASON_CHARS_MAX: usize = 600;
 
 /// Route `card`, logging the outcome. Every failure is operational (no
 /// model, the model or store failed) and leaves the card as it was, so it is
@@ -578,6 +739,88 @@ mod tests {
         assert_eq!(
             router_models(&json!({}), &[" ".to_string()]),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn an_agent_clearing_its_own_assignment_is_a_hand_back() {
+        let mut released = event(TaskEventKind::Assigned, "global", Some("agent:builder"));
+        released.detail = json!({"assignee": null});
+        assert_eq!(
+            wake_for(&released).map(|w| w.reason),
+            Some(WakeReason::HandedBack)
+        );
+        // The human unassigning a card is theirs to do; it routes nothing.
+        let mut by_hand = released.clone();
+        by_hand.actor = Some(BOARD_CLIENT_ACTOR.to_string());
+        assert_eq!(wake_for(&by_hand), None);
+        // An agent handing a card ON is an assignment, not a hand-back.
+        let mut onward = released.clone();
+        onward.detail = json!({"assignee": "agent:reviewer"});
+        assert_eq!(wake_for(&onward), None);
+        released.scope = "session".to_string();
+        assert_eq!(wake_for(&released), None);
+    }
+
+    /// Decision 7's bound: hand-backs are counted newest first up to the last
+    /// time the human was asked, and the count past the bound asks the human
+    /// instead of routing — once, after which the count starts over.
+    #[tokio::test]
+    async fn hand_backs_past_the_bound_ask_the_human_and_start_the_count_over() {
+        let storage = Storage::in_memory().await.unwrap();
+        let tasks = storage.tasks();
+        let card = tasks
+            .create(nanna_storage::NewTask {
+                scope: "global".to_string(),
+                title: "Fix the flaky test".to_string(),
+                priority: 3,
+                created_by: Some(BOARD_CLIENT_ACTOR.to_string()),
+                ..nanna_storage::NewTask::default()
+            })
+            .await
+            .unwrap();
+        let hand_back = |reason: &'static str| {
+            let tasks = storage.tasks();
+            async move {
+                tasks
+                    .log_activity(
+                        card.id,
+                        Some("agent:builder"),
+                        crate::tasks::HANDED_BACK_ACTION,
+                        Some(json!({"member": "agent:builder", "reason": reason})),
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        assert_eq!(hand_backs_in_a_row(&tasks, card.id).await.unwrap().0, 0);
+        hand_back("the check never passed").await;
+        hand_back("still red: test_io timed out").await;
+        let (count, latest) = hand_backs_in_a_row(&tasks, card.id).await.unwrap();
+        assert_eq!(count, HAND_BACKS_MAX);
+        assert_eq!(latest, "still red: test_io timed out", "the newest reason");
+
+        let current = tasks.get(card.id).await.unwrap();
+        ask_the_human(&storage, &current, count, &latest).await;
+        let asked = tasks.get(card.id).await.unwrap();
+        assert!(asked.blocked, "the card waits on the human: {asked:?}");
+        let question = tasks.get(asked.depends_on[0]).await.unwrap();
+        assert_eq!(
+            question.assignee.as_deref(),
+            Some(nanna_storage::HUMAN_MEMBER_ID)
+        );
+        let thread = tasks.notes(card.id, 10).await.unwrap();
+        assert!(
+            thread
+                .iter()
+                .any(|n| n.author_member_id.as_deref() == Some("router:global")
+                    && n.content.contains("2 runs could not finish it")),
+            "the router says why on the thread: {thread:?}"
+        );
+        assert_eq!(
+            hand_backs_in_a_row(&tasks, card.id).await.unwrap().0,
+            0,
+            "asking the human starts the count over"
         );
     }
 }
