@@ -2409,3 +2409,111 @@ async fn the_board_roster_is_managed_over_ipc() {
     }
     assert_eq!(announced, 5);
 }
+
+/// P25 Stage 3: a card is worked only by the agent it is assigned to, only on
+/// a board, only while open — a sub-card included, under its own claim.
+#[tokio::test]
+async fn a_card_run_is_claimed_only_for_an_agent_on_an_open_board_card() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let created = Arc::new(cp)
+        .handle(
+            "test",
+            serde_json::from_value(serde_json::json!({
+                "type": "member", "action": "create", "name": "Builder",
+            }))
+            .expect("parses"),
+        )
+        .await;
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+    let tasks = storage.tasks();
+    let card =
+        |title: &str, scope: &str, scope_id: Option<&str>, parent_id, assignee: Option<&str>| {
+            nanna_storage::NewTask {
+                title: title.to_string(),
+                scope: scope.to_string(),
+                scope_id: scope_id.map(str::to_string),
+                parent_id,
+                priority: 3,
+                assignee: assignee.map(str::to_string),
+                ..nanna_storage::NewTask::default()
+            }
+        };
+    let refusal = |claimed: Result<_, Value>| match claimed {
+        Ok(_) => "claimed".to_string(),
+        Err(reply) => reply["error"].as_str().unwrap_or("?").to_string(),
+    };
+
+    let nobody = tasks
+        .create(card("a", "global", None, None, None))
+        .await
+        .expect("card");
+    let human = tasks
+        .create(card("b", "global", None, None, Some("human")))
+        .await
+        .expect("card");
+    let chat = tasks
+        .create(card(
+            "c",
+            "session",
+            Some("s1"),
+            None,
+            Some("agent:builder"),
+        ))
+        .await
+        .expect("card");
+    let parent = tasks
+        .create(card("d", "global", None, None, Some("agent:builder")))
+        .await
+        .expect("card");
+    let child = tasks
+        .create(card(
+            "e",
+            "global",
+            None,
+            Some(parent.id),
+            Some("agent:builder"),
+        ))
+        .await
+        .expect("card");
+
+    assert_eq!(
+        refusal(ControlPlane::card_claim(&storage, nobody.id).await),
+        "card_unassigned"
+    );
+    assert_eq!(
+        refusal(ControlPlane::card_claim(&storage, human.id).await),
+        "not_an_agent"
+    );
+    assert_eq!(
+        refusal(ControlPlane::card_claim(&storage, chat.id).await),
+        "not_a_board_card"
+    );
+    assert_eq!(
+        refusal(ControlPlane::card_claim(&storage, 9_999).await),
+        "task_not_found"
+    );
+
+    let (_, member, claim) = ControlPlane::card_claim(&storage, child.id)
+        .await
+        .expect("an agent's open board card is claimable");
+    assert_eq!(member.id, "agent:builder");
+    assert_eq!(
+        (claim.card_id, claim.member_id.as_str()),
+        (child.id, "agent:builder")
+    );
+    assert!(
+        child.parent_id == Some(parent.id),
+        "a sub-card is claimable too"
+    );
+
+    tasks
+        .complete(child.id, Some("human"), None)
+        .await
+        .expect("done");
+    assert_eq!(
+        refusal(ControlPlane::card_claim(&storage, child.id).await),
+        "card_closed"
+    );
+}

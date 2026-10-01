@@ -653,3 +653,132 @@ async fn an_unknown_note_kind_is_an_error_not_a_comment() {
         "{err:?}"
     );
 }
+
+/// What a freed member works next (P25 decision 3): its own open board cards,
+/// best priority first then the oldest — never a card it has already picked
+/// up, a closed one, another member's, or chat scaffolding.
+#[tokio::test]
+async fn a_members_waiting_cards_are_its_open_board_cards_best_first() {
+    let storage = storage().await;
+    storage
+        .members()
+        .create(agent("agent:a"))
+        .await
+        .expect("agent a");
+    storage
+        .members()
+        .create(agent("agent:b"))
+        .await
+        .expect("agent b");
+    let tasks = storage.tasks();
+    let card = |title: &str, scope: &str, priority: i64, assignee: &str| nanna_storage::NewTask {
+        title: title.to_string(),
+        scope: scope.to_string(),
+        scope_id: (scope == "session").then(|| "s1".to_string()),
+        priority,
+        assignee: Some(assignee.to_string()),
+        ..nanna_storage::NewTask::default()
+    };
+    let low = tasks
+        .create(card("low", "global", 4, "agent:a"))
+        .await
+        .expect("low");
+    let urgent = tasks
+        .create(card("urgent", "global", 1, "agent:a"))
+        .await
+        .expect("urgent");
+    let also_low = tasks
+        .create(card("also low", "global", 4, "agent:a"))
+        .await
+        .expect("also low");
+    tasks
+        .create(card("b's", "global", 1, "agent:b"))
+        .await
+        .expect("b's");
+    tasks
+        .create(card("chat", "session", 1, "agent:a"))
+        .await
+        .expect("chat");
+    let started = tasks
+        .create(card("started", "global", 1, "agent:a"))
+        .await
+        .expect("started");
+    tasks
+        .update(
+            started.id,
+            nanna_storage::TaskPatch {
+                status: Some("in_progress".to_string()),
+                ..nanna_storage::TaskPatch::default()
+            },
+            None,
+        )
+        .await
+        .expect("picked up");
+    let done = tasks
+        .create(card("done", "global", 1, "agent:a"))
+        .await
+        .expect("done");
+    tasks.complete(done.id, None, None).await.expect("closed");
+
+    let waiting: Vec<i64> = tasks
+        .open_board_cards_assigned_to("agent:a", 64)
+        .await
+        .expect("waiting")
+        .iter()
+        .map(|t| t.id)
+        .collect();
+    assert_eq!(waiting, vec![urgent.id, low.id, also_low.id]);
+    let first_only = tasks
+        .open_board_cards_assigned_to("agent:a", 1)
+        .await
+        .expect("one");
+    assert_eq!(first_only.len(), 1, "the scan is bounded");
+}
+
+/// What a restarted daemon resumes: cards whose newest run marker is a start
+/// — never one whose run ended, however it ended, and each card once.
+#[tokio::test]
+async fn a_card_whose_newest_run_marker_is_a_start_was_interrupted() {
+    let storage = storage().await;
+    let tasks = storage.tasks();
+    let mut ids = Vec::new();
+    for title in [
+        "ended",
+        "interrupted",
+        "restarted then interrupted",
+        "only ended",
+    ] {
+        let card = tasks
+            .create(nanna_storage::NewTask {
+                title: title.to_string(),
+                scope: "global".to_string(),
+                priority: 3,
+                ..nanna_storage::NewTask::default()
+            })
+            .await
+            .expect("card");
+        ids.push(card.id);
+    }
+    let mark = |id: i64, action: &'static str| {
+        let tasks = storage.tasks();
+        async move {
+            tasks
+                .log_activity(id, None, action, None)
+                .await
+                .expect("marker");
+        }
+    };
+    mark(ids[0], "run_started").await;
+    mark(ids[1], "run_started").await;
+    mark(ids[0], "run_ended").await;
+    mark(ids[2], "run_started").await;
+    mark(ids[2], "run_ended").await;
+    mark(ids[3], "run_ended").await;
+    mark(ids[2], "run_started").await;
+
+    let unended = tasks
+        .cards_with_unended("run_started", "run_ended", 1024)
+        .await
+        .expect("scan");
+    assert_eq!(unended, vec![ids[2], ids[1]], "newest first, each once");
+}

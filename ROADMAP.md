@@ -8089,6 +8089,22 @@ as its turn (`TurnAdmission`, scope default `session`).
       `acceptance_checked` activity row — no event fires — and nothing but the human's own Done
       can fail one on a board card until Stage 3's runs exist; build it with the run start, so
       the retry bound has a producer to bound. Still open: failed verdict, `stalled`, heartbeat.
+      *(2026-10-01)* **Failed verdict landed, with its retry bound.** A member's card run that
+      gives up on its card (the harness's `abandon` on the subtree root) no longer cancels the
+      human's card: `TursoTaskSource::hand_back` writes a `handed_back` activity row, posts the
+      failure as the member's `verdict` ("Not done — …"), releases the card (pending,
+      unassigned) and stops serving it. The release — an `agent:` member clearing its own
+      assignment — is the wake (`WakeReason::HandedBack`; the worker confirms it against the
+      activity row, so an agent unassigning for any other reason routes nothing). The router
+      decides again with the failure in the last posts it reads; after `HAND_BACKS_MAX` = 2 in a
+      row it instead applies its own `clarify` model-free — a question card for the human that
+      quotes the last run's reason — and logs `hand_back_limit`, which starts the count over
+      (one retry, as Hermes Kanban's `failure_limit`). Sub-tasks a run gives up on are still
+      cancelled: they are its own scaffolding. e2e
+      `a_card_its_member_cannot_finish_goes_back_to_the_router`. **Not covered:** a run that
+      ends with its card still open for another reason (wall clock or token budget, a cancel) —
+      that card is `in_progress` with no live run, i.e. the `stalled` trigger's. Still open:
+      `stalled`, heartbeat.
 - [x] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
       *(2026-09-28)* `RouterDecision::Assign` gained optional `labels` and `acceptance`. Labels
@@ -8148,13 +8164,119 @@ as its turn (`TurnAdmission`, scope default `session`).
       the scheduler's chat-turn path are removed.
 
 **Stage 3 — runs started by assignment.**
-- [ ] `assigned` → start a harness run for that member on that card (reuse `AgentStepRunner` and
+- [x] `assigned` → start a harness run for that member on that card (reuse `AgentStepRunner` and
       `TaskRunManager`); progress → `progress` posts; completion → the acceptance check → a
-      `verdict` post. No streaming to the UI.
+      `verdict` post. No streaming to the UI. *(2026-10-01 — landed in three steps below.)*
+      - [x] *(2026-10-01)* **The card run itself, started over IPC.** The two blockers recorded
+            on 09-29 are gone. *Subtree admission:* `TursoTaskSource::within_subtree(card)` serves
+            only the card and its descendants (`subtree_admits`, walked over the scope's parent
+            links incl. closed cards, bounded by `TASK_DEPTH_MAX`), so a card the human adds beside
+            it mid-run is never worked. *Per-card / per-member keys:* `TaskRunManager::start_card`
+            keys the run `card:<id>` and `run_conflict` refuses, under one write guard, a second
+            run on any card above or below a worked one, a scope run over a scope with a card run
+            in it (and vice versa), and a member's second card on any board — one member, one
+            card. `posting_as(member)` turns the run's working notes into `progress` posts and
+            each closing into a `verdict` post ("Done — the acceptance check passed: …" / "…no
+            acceptance check ran"), cut to one post (`truncate_post`); the member is `busy` for
+            the run's life. IPC: `task.start_run {card_id}` (assignee must be an agent, not a
+            router; board scope only; open), `run_status`/`cancel_run {card_id}`; the run walks the
+            member's `profile.model_priority`, else the chat models, and works in the card's own
+            workspace. e2e `an_assigned_card_is_worked_by_its_member_and_closed_with_a_verdict_post`
+            (router assigns → start → verdict post → member idle).
+      - [x] *(2026-10-01, later)* **Assignment starts the run.** `nanna_daemon::card_run_trigger`:
+            the task event sink queues (bounded, `RUN_QUEUE_MAX` = `TASKS_PER_SCOPE_MAX`, drops
+            counted) every board card assigned to an `agent:` member and every card whose date
+            arrives (`due` — decision 10, a date defers a card); one worker starts the run if
+            the card is pending, unblocked, not deferred and board-client-created (the router's
+            rule while chat lives). A member busy on another card refuses the start; when a
+            card run ends the run manager hands the freed member back to the worker
+            (`RunWake::MemberFree`), which starts its best waiting card
+            (`TaskRepository::open_board_cards_assigned_to`, priority then age, ≤ 64 read). So
+            a card assigned to an agent is worked with no further call, one card per member,
+            and a failing card is bounded by the hand-back rule (Triggers). e2e: the assigned
+            and the cannot-finish cards now run with no `start_run`, and
+            `a_member_given_two_cards_works_them_one_after_the_other`. **Known gap:** a card
+            the router *re-assigns to the same member* after a clarification emits no
+            `assigned` (nothing changed), so it starts only when that member next frees or by
+            `task.start_run` — wire `unblocked` too if that shows up in use.
+            *(later the same day)* `unblocked` is wired, closing that gap.
+      - [x] *(2026-10-01)* **A card its run leaves open is settled, never orphaned.** Without
+            this a card outlived its run as `in_progress` with nobody on it — not startable,
+            not the router's. `card_after_run` by stop reason: out of time / tokens / working
+            models, or a store failure → the hand-back (router, bounded); `Cancelled` → a pause
+            (stays `in_progress` with its member, "Stopped on request" posted — so a freed
+            member never restarts what the human stopped; `task.start_run {card_id}` resumes
+            it); plan drained with the card open (it waits on another card) → back to
+            `pending`. The worker now asks `subtree_has_work` (the run source's own choice,
+            without starting) before every start, so an all-waiting subtree is never started,
+            stopped empty and restarted in a loop. e2e
+            `a_cancelled_card_run_leaves_the_card_paused_with_its_member`.
+      - [x] *(2026-10-01)* **A run the daemon died inside resumes at boot.** Every card run
+            leaves `run_started` / `run_ended` on its card (a cancel ends with its marker too,
+            so a pause is never mistaken for a death). When the card-run worker starts it reads
+            the newest `RESUME_SCAN_ROWS` = 1 024 markers (`cards_with_unended` — two per run,
+            at most one interrupted run per member), closes each unmatched start with an end
+            marker, shows its member idle again, puts the card back to `pending` and starts it
+            like an assignment — the store is the checkpoint, as for the run manager's own
+            provider-incident resumes. Proven model-free (`an_interrupted_card_run_is_closed_out_at_boot`,
+            the marker scan in `members.rs`); **not** proven across a real restart — the e2e
+            rig runs the daemon in-process, so an aborted daemon's run task outlives it and
+            would hold the store.
+      - [ ] *(research 2026-10-01)* **Borrow Hermes Kanban's failure and stall rules** when the
+            auto-start lands ([docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban)):
+            its dispatcher auto-blocks a card after `failure_limit` (default 2) consecutive failed
+            runs, requeues a rate-limited run *without* counting a failure and blocks at once on
+            a terminal provider error (bad credentials), and reclaims a card whose worker sent
+            no heartbeat within a stale timeout (default 4 h) — again without counting a failure.
+            Map to P25: failed verdict ×2 → a clarification card to the human (decision 7's
+            "bounded retries"); `StopReason::RunnerErrors` → retry, not a failed verdict; the
+            `stalled` trigger = `in_progress`, no live `card:<id>` run, no `progress` post
+            within the threshold. Also per-member concurrency is a *setting* there
+            (`max_in_progress_per_profile`); ours is fixed at 1 by decision 3.
 - [ ] Sub-agent spawning is replaced by "create a sub-task assigned to another member". Delete
       `sub_agent`/`task` tool and `SubSessionInfo`.
+      - [x] *(2026-10-01)* **The half that does not need chat deleted: a card run's `todo` works
+            its own card.** From a `card:<id>` tool session, the `tasks.*` services' default
+            (session) scope resolves to the card's board scope (`calling_card` in
+            `resolve_scope`): `add` with no parent makes a sub-card of the card — which the run's
+            subtree admission then serves — `next` never leaves the card's subtree, and `clear`
+            is refused (its scope would be the human's whole board). An explicit
+            `workspace`/`global` scope is honoured as asked. e2e
+            `a_card_runs_todo_adds_sub_cards_under_its_card`.
+      - [x] *(2026-10-01)* **Handing a sub-card to another member.** `todo add {assignee}` from a
+            card run makes a sub-card that is that member's work: `CardTree::serves` keeps a
+            run off any card on whose path up to its root someone else is the assignee (and off
+            everything under it), so the two runs never share a card — which made the old
+            lineage-overlap refusal redundant; `run_conflict` is now one run per card, one card
+            per member, scope runs exclusive (`CardClaim::lineage` and `card_lineage` deleted).
+            The sub-card starts its member's run at once: a card *created* already assigned to
+            an agent wakes the run worker, and board work is now anything the board client, a
+            router (its splits) or an agent member made (`is_board_creator`), so the router's
+            splits assigned to agents start too. The parent's run ends while the handed-on card
+            is open (its claim to be done is deferred with a post, `waits_on_an_answer` now
+            covers open sub-cards too), and a closed card wakes its parent
+            (`RunWake::ChildClosed`). e2e `a_member_hands_a_sub_card_to_another_member`.
+            **Still open:** deleting `sub_agent`/`task` + `SubSessionInfo` — with chat.
 - [ ] `ask_user` becomes "create a clarification card assigned to the human, depended on by this
       card"; the 30-minute wait and the channel broadcast go away.
+      - [x] *(2026-10-01)* **For card runs, it already is.** A card run's tools now execute in a
+            `card:<id>` tool-session scope (`card_run_session_id`, wrapped around the spawned
+            run). That also **fixes a cross-talk bug**: background runs had no scope, so
+            session-scoped tools fell back to the shared slot — a card run's `ask_user` would
+            have posted into, and taken its "answer" from, whichever chat was last active. In
+            that scope `session.ask_user` calls `routing::ask_on_card` (the router's clarify,
+            now public and asked by any member): a clarification card for the human that the
+            card `depends_on`, the question posted by the member, nothing waits. The run ends
+            when nothing else is servable (Waiting → `pending`), `unblocked` restarts it, and
+            the resumed step's notes carry "The human answered your question #N: …"
+            (`answers_for`). A model that claims the card done on its word while it waits is
+            not believed (`waits_on_an_answer`; a verified completion still stands). e2e
+            `a_card_runs_question_becomes_a_clarification_card` (real skill + service). **Still
+            open:** the chat path's 30-minute wait and channel broadcast — they go with chat in
+            Stage 4. *(later the same day)* Background *scope* runs (`task.start_run` without
+            `card_id`) are scoped too (`background_run_session`): a session plan's run is that
+            session, a workspace/global run `run:<scope>:<id>` — no background run reads the
+            shared slot any more.
 - [ ] Skills tier: markdown files with name + description, matched to cards by label and to
       members by allow-list, loaded into the run's context. Rename `default-skills/` → tools
       (directory, `DEFAULT_SKILLS`, build.rs, tests) in one mechanical PR.
@@ -9587,6 +9709,13 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            pre-release (pre.13, 2026-09-25). Migrate one minor at a time, release-build gated. It does
            **not** retire RUSTSEC-2026-0253: `tantivy 0.26.2` (2026-09-08) still requires
            `lru ^0.16.3`, and the fix is `lru ≥ 0.18.2`.
+           *(2026-10-01)* **`turso 0.8.0` and `0.8.1` (2026-09-29) are now stable**, and the pin
+           has since moved to `=0.7.2` — so this is one minor step, `0.7.2 → 0.8.1`, not two.
+           `cargo upgrade --incompatible` lists it as the only pinned holdout besides
+           `malachite-bigint`. Gate it like 0.7: release build + the storage suites + a boot
+           against a copy of a real `nanna.db`; check the 0.8 default features against
+           [turso#7660](https://github.com/tursodatabase/turso/issues/7660) while there.
+           ([lib.rs](https://lib.rs/crates/turso))
      - [ ] *(P13, research 2026-09-26)* **FSRS-7 exists but is not shippable yet.** ts-fsrs merged it
            ([PR #520](https://github.com/open-spaced-repetition/ts-fsrs/pull/520), 2026-09-18,
            unreleased); `fsrs-rs` is at 6.6.2 with no FSRS-7, and no FSRS-7 default parameters are

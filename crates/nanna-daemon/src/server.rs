@@ -3134,6 +3134,13 @@ async fn deliver_scheduled_reminder(
     }
 }
 
+/// The card-run queue's two ends, parked between the task store's creation
+/// and the control plane's (see `board_runs`).
+type CardRunQueue = (
+    tokio::sync::mpsc::Sender<crate::card_run_trigger::RunWake>,
+    tokio::sync::mpsc::Receiver<crate::card_run_trigger::RunWake>,
+);
+
 /// The main daemon server
 pub struct DaemonServer {
     config: DaemonConfig,
@@ -3194,6 +3201,10 @@ pub struct DaemonServer {
     /// config exist (P25 Stage 2).
     board_routes:
         std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<crate::board_router_trigger::Wake>>>,
+    /// The card-run queue (P25 Stage 3), created with the task event sink:
+    /// its sender is also handed to the run manager (a freed member) and its
+    /// receiver to the worker, both by `build_control_plane`.
+    board_runs: std::sync::Mutex<Option<CardRunQueue>>,
     /// Terminal reason file: a durable record of WHY this process stopped, so
     /// the next boot can tell a clean shutdown from a hard death whose only
     /// other evidence is a log that simply ends (2026-08-10 ministral leg).
@@ -3351,6 +3362,7 @@ impl DaemonServer {
             storage_error: None,
             board_copies: std::sync::Mutex::new(None),
             board_routes: std::sync::Mutex::new(None),
+            board_runs: std::sync::Mutex::new(None),
             exit_reason,
         }
     }
@@ -3418,11 +3430,19 @@ impl DaemonServer {
                 );
                 let (routes_tx, routes_rx) =
                     tokio::sync::mpsc::channel(crate::board_router_trigger::ROUTE_QUEUE_MAX);
+                let (runs_tx, runs_rx) =
+                    tokio::sync::mpsc::channel(crate::card_run_trigger::RUN_QUEUE_MAX);
                 if storage.set_task_events(Arc::new(
                     crate::task_event_bridge::TaskEventBridge::new(self.ipc.event_sender())
                         .with_memory_write_through(copies_tx)
-                        .with_router_queue(routes_tx),
+                        .with_router_queue(routes_tx)
+                        .with_run_queue(runs_tx.clone()),
                 )) {
+                    *self
+                        .board_runs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some((runs_tx, runs_rx));
                     *self
                         .board_copies
                         .lock()
@@ -4223,6 +4243,13 @@ impl DaemonServer {
             activity_clock,
             dreaming,
         } = deps;
+        // Taken once: one run manager is told when members free, one worker
+        // starts the runs.
+        let card_runs = self
+            .board_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
 
         // Create control plane with all services (including router for consolidation).
         // The data dir is the one this daemon resolved (`[general] data_dir`,
@@ -4248,7 +4275,12 @@ impl DaemonServer {
         .with_turn_baselines(turn_baselines)
         .with_scheduler(scheduler)
         .with_mcp_status(Arc::clone(&self.mcp_status))
-        .with_task_runs(Arc::new(crate::tasks::TaskRunManager::new()))
+        .with_task_runs(Arc::new(match &card_runs {
+            Some((member_free, _)) => {
+                crate::tasks::TaskRunManager::new().with_member_free(member_free.clone())
+            }
+            None => crate::tasks::TaskRunManager::new(),
+        }))
         .with_memory_recovery(self.memory_recovery.clone())
         .with_live_embedding(self.live_embedding())
         .with_chat_runs(chat_runs.clone())
@@ -4309,6 +4341,13 @@ impl DaemonServer {
         }
 
         let control = Arc::new(control);
+        if let (Some((_, queue)), Some(storage)) = (card_runs, self.storage.as_ref()) {
+            tokio::spawn(crate::card_run_trigger::run(
+                queue,
+                Arc::clone(&control),
+                Arc::clone(storage),
+            ));
+        }
         // Hand edits of config.toml apply without a restart.
         control.spawn_config_watcher(self.shutdown_tx.subscribe());
         *self.control_slot.write().await = Some(control.clone());
@@ -4805,6 +4844,7 @@ impl DaemonServer {
                     sessions: Arc::clone(&self.sessions),
                     events: self.ipc.event_sender(),
                     chat_runs: Arc::clone(chat_runs),
+                    storage: self.storage.clone(),
                 },
             })),
         )
@@ -5109,6 +5149,7 @@ impl DaemonServer {
                 sessions: Arc::clone(&self.sessions),
                 events: self.ipc.event_sender(),
                 chat_runs: Arc::clone(chat_runs),
+                storage: self.storage.clone(),
             }),
         });
         // Fill the slot before any skill can be executed. `set` returning
