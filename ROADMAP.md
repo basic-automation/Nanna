@@ -8199,6 +8199,21 @@ as its turn (`TurnAdmission`, scope default `session`).
             the router *re-assigns to the same member* after a clarification emits no
             `assigned` (nothing changed), so it starts only when that member next frees or by
             `task.start_run` — wire `unblocked` too if that shows up in use.
+            *(later the same day)* `unblocked` is wired, closing that gap.
+      - [x] *(2026-10-01)* **A card its run leaves open is settled, never orphaned.** Without
+            this a card outlived its run as `in_progress` with nobody on it — not startable,
+            not the router's. `card_after_run` by stop reason: out of time / tokens / working
+            models, or a store failure → the hand-back (router, bounded); `Cancelled` → a pause
+            (stays `in_progress` with its member, "Stopped on request" posted — so a freed
+            member never restarts what the human stopped; `task.start_run {card_id}` resumes
+            it); plan drained with the card open (it waits on another card) → back to
+            `pending`. The worker now asks `subtree_has_work` (the run source's own choice,
+            without starting) before every start, so an all-waiting subtree is never started,
+            stopped empty and restarted in a loop. e2e
+            `a_cancelled_card_run_leaves_the_card_paused_with_its_member`. **Still open:** a
+            daemon that dies mid-run leaves its cards `in_progress` with no run — resume them
+            at boot (record run start/end on the card's activity, resume the unmatched ones)
+            or leave them to the `stalled` trigger.
       - [ ] *(research 2026-10-01)* **Borrow Hermes Kanban's failure and stall rules** when the
             auto-start lands ([docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban)):
             its dispatcher auto-blocks a card after `failure_limit` (default 2) consecutive failed

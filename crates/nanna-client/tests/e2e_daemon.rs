@@ -3686,3 +3686,87 @@ async fn a_member_given_two_cards_works_them_one_after_the_other() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// Stopping a member's run on a card is a pause, not a release: the card
+/// stays picked up by its member (so nothing restarts it on its own), the
+/// thread says it was stopped, and the member is free for other work.
+#[tokio::test]
+async fn a_cancelled_card_run_leaves_the_card_paused_with_its_member() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"{"decision":"assign","member":"agent:builder","reason":"it builds things"}"#.to_string(),
+        "WAIT 20000 TASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let created = client
+        .request(nanna_client::Action::Member(
+            nanna_client::MemberAction::Create {
+                name: "Builder".to_string(),
+                workspace_id: None,
+                personal: false,
+                avatar: None,
+                profile: None,
+            },
+        ))
+        .await
+        .expect("member.create answers");
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+
+    let id = create_global_card(&client, "Rebuild the index").await;
+    card_when(&client, id, "picked up by its run", |card| {
+        card["task"]["status"] == "in_progress"
+    })
+    .await;
+    let cancelled = client
+        .request(nanna_client::Action::Task(
+            nanna_client::TaskAction::CancelRun {
+                card_id: Some(id),
+                scope: None,
+                session_id: None,
+            },
+        ))
+        .await
+        .expect("task.cancel_run answers");
+    assert_eq!(cancelled["cancelled"], true, "{cancelled}");
+
+    let card = card_when(&client, id, "settled as paused", |card| {
+        card["notes"].as_array().is_some_and(|notes| {
+            notes.iter().any(|n| {
+                n["content"]
+                    .as_str()
+                    .is_some_and(|c| c.starts_with("Stopped on request"))
+            })
+        })
+    })
+    .await;
+    assert_eq!(card["task"]["status"], "in_progress", "{card}");
+    assert_eq!(card["task"]["assignee"], "agent:builder", "{card}");
+    let started = std::time::Instant::now();
+    loop {
+        let member = client
+            .request(nanna_client::Action::Member(
+                nanna_client::MemberAction::Get {
+                    id: "agent:builder".to_string(),
+                },
+            ))
+            .await
+            .expect("member.get answers");
+        if member["member"]["status"] == "idle" {
+            break;
+        }
+        assert!(
+            started.elapsed() < READY_HANG_CEILING,
+            "the member never went idle: {member}"
+        );
+        tokio::time::sleep(READY_POLL_INTERVAL).await;
+    }
+    client.disconnect().await;
+    daemon.stop();
+}

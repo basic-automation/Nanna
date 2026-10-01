@@ -7,8 +7,9 @@
 //! [`crate::task_event_bridge::TaskEventBridge`] hands every card that may
 //! have become workable to a bounded queue, and one worker starts the runs.
 //!
-//! **Three things make a card workable**, so three things wake the worker:
+//! **Four things make a card workable**, so four things wake the worker:
 //! - it was assigned to an agent ([`RunWake::Card`] from `assigned`);
+//! - the card it waited on closed ([`RunWake::Card`] from `unblocked`);
 //! - its date arrived — P25 decision 10, a date defers a card
 //!   ([`RunWake::Card`] from `due`);
 //! - its member finished another card — decision 3, a member works one card
@@ -66,7 +67,10 @@ pub fn run_wake_for(event: &TaskEvent) -> Option<RunWake> {
             .get("assignee")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|assignee| assignee.starts_with(AGENT_MEMBER_PREFIX)),
-        TaskEventKind::Due => true,
+        // A card that waited on another (a clarification, a dependency) may
+        // be workable now — including one the router gave back to the member
+        // it already had, which emits no `assigned`.
+        TaskEventKind::Due | TaskEventKind::Unblocked => true,
         _ => false,
     };
     debug_assert!(event.task_id > 0, "store ids start at 1");
@@ -164,6 +168,20 @@ async fn try_start(control: &ControlPlane, storage: &Storage, card_id: i64) -> b
         debug!(card_id, status = %card.status, "card runs: not workable now");
         return false;
     }
+    match crate::tasks::subtree_has_work(storage, &card).await {
+        Ok(true) => {}
+        Ok(false) => {
+            debug!(
+                card_id,
+                "card runs: nothing in the card's subtree can be worked yet"
+            );
+            return false;
+        }
+        Err(e) => {
+            warn!(card_id, error = %e, "card runs: subtree unreadable; not started");
+            return false;
+        }
+    }
     match created_by_board_client(&tasks, card_id).await {
         Ok(true) => {}
         Ok(false) => {
@@ -211,6 +229,8 @@ mod tests {
         assert_eq!(run_wake_for(&to_agent), Some(RunWake::Card(5)));
         let due = event(TaskEventKind::Due, "workspace", json!({}));
         assert_eq!(run_wake_for(&due), Some(RunWake::Card(5)));
+        let unblocked = event(TaskEventKind::Unblocked, "global", json!({}));
+        assert_eq!(run_wake_for(&unblocked), Some(RunWake::Card(5)));
         // A person's card is theirs to do; a released card is the router's.
         for assignee in [json!("human"), json!(null)] {
             let not_an_agent = event(

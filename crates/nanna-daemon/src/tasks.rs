@@ -1227,6 +1227,76 @@ pub struct TursoTaskSource {
     handed_back: std::sync::atomic::AtomicBool,
 }
 
+/// Whether a run on `card` would have anything to serve: the same choice
+/// [`TursoTaskSource::next`] makes for a card run, without starting one.
+///
+/// The card-run worker asks this before every start, so a card whose subtree
+/// is all waiting (its open children blocked on cards elsewhere) is not
+/// started, stopped empty-handed, freed and started again forever.
+///
+/// # Errors
+/// The store failure listing the card's scope.
+pub(crate) async fn subtree_has_work(storage: &Storage, card: &Task) -> Result<bool, String> {
+    let repo = storage.tasks();
+    let all = repo
+        .list(&card.scope, card.scope_id.as_deref(), true)
+        .await
+        .map_err(|e| e.to_string())?;
+    let parents: HashMap<i64, i64> = all
+        .iter()
+        .filter_map(|t| t.parent_id.map(|p| (t.id, p)))
+        .collect();
+    let next = repo
+        .next_admitted(&card.scope, card.scope_id.as_deref(), |task| {
+            subtree_admits(&parents, card.id, task.id)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    debug_assert!(
+        next.as_ref()
+            .is_none_or(|t| subtree_admits(&parents, card.id, t.id)),
+        "only the card's own subtree is served"
+    );
+    Ok(next.is_some())
+}
+
+/// What a card is owed when its run ends with it still open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CardAfterRun {
+    /// Done or cancelled: nothing is owed.
+    Closed,
+    /// The run failed to finish it: back to the router, with this reason.
+    HandBack(String),
+    /// The human stopped the run: the card stays picked up.
+    Paused,
+    /// The run had nothing left it could work (the card waits on another):
+    /// pending again, for the wake that unblocks it.
+    Waiting,
+}
+
+/// Decide [`CardAfterRun`] for `card` after a run that stopped with `stop`.
+#[must_use]
+pub fn card_after_run(card: &Task, stop: &StopReason) -> CardAfterRun {
+    if card.status == "done" || card.status == "cancelled" {
+        return CardAfterRun::Closed;
+    }
+    match stop {
+        StopReason::Cancelled => CardAfterRun::Paused,
+        StopReason::AllTasksDone => CardAfterRun::Waiting,
+        StopReason::WallClockExhausted => CardAfterRun::HandBack(
+            "the run used its whole time budget without finishing the card".to_string(),
+        ),
+        StopReason::TokenBudgetExhausted => CardAfterRun::HandBack(
+            "the run used its whole token budget without finishing the card".to_string(),
+        ),
+        StopReason::RunnerErrors { message } => {
+            CardAfterRun::HandBack(format!("the model kept failing: {message}"))
+        }
+        StopReason::SourceError { message } => {
+            CardAfterRun::HandBack(format!("the task store failed mid-run: {message}"))
+        }
+    }
+}
 /// The activity row a member's run leaves when it hands its card back to the
 /// router unfinished. The router's worker counts them to bound retries.
 pub const HANDED_BACK_ACTION: &str = "handed_back";
@@ -1461,6 +1531,59 @@ impl TursoTaskSource {
         }
     }
 
+    /// Leave a card run's card in a state someone owns once the run is over
+    /// and the card is still open (a no-op for every other run).
+    ///
+    /// Without this a card outlives its run as `in_progress` with nobody
+    /// working it — never startable again, never the router's. By how the run
+    /// stopped ([`card_after_run`]): out of budget or out of working models is
+    /// a failure the router hears about (the hand-back, bounded by its retry
+    /// rule); a cancel is the human's pause, so the card stays picked up; a
+    /// plan that drained with the card still open (it waits on another card)
+    /// puts it back to `pending` for its next wake.
+    pub(crate) async fn settle_after_run(&self, stop: &StopReason) {
+        let (Some(root), Some(_)) = (self.subtree_root, self.member_id.as_ref()) else {
+            return;
+        };
+        if self.handed_back.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let repo = self.storage.tasks();
+        let card = match repo.get(root).await {
+            Ok(card) => card,
+            Err(e) => {
+                tracing::warn!(task_id = root, error = %e, "card run's card unreadable at its end");
+                return;
+            }
+        };
+        match card_after_run(&card, stop) {
+            CardAfterRun::Closed => {}
+            CardAfterRun::HandBack(reason) => {
+                if let Err(e) = self.hand_back(root, &reason).await {
+                    tracing::warn!(task_id = root, error = %e, "card run's card not handed back");
+                }
+            }
+            CardAfterRun::Paused => {
+                self.post_as_member(
+                    root,
+                    nanna_storage::TaskNoteKind::Progress,
+                    "Stopped on request; the card stays with me until it is restarted or reassigned.",
+                )
+                .await;
+            }
+            CardAfterRun::Waiting => {
+                if card.status == "in_progress" {
+                    let wait = TaskPatch {
+                        status: Some("pending".to_string()),
+                        ..TaskPatch::default()
+                    };
+                    if let Err(e) = repo.update(root, wait, Some(&self.actor)).await {
+                        tracing::warn!(task_id = root, error = %e, "card run's card left in progress");
+                    }
+                }
+            }
+        }
+    }
     /// A member's run gave up on its card: P25 decision 7 — a failed verdict
     /// goes back to the router with the failure posted, never to `cancelled`
     /// (a card is the human's; only they close it unfinished).
@@ -7989,6 +8112,7 @@ impl TaskRunManager {
                 resumes,
                 "Long-horizon run finished"
             );
+            source.settle_after_run(&report.stop).await;
             let _ = event_tx.send(Event::TaskRunCompleted {
                 scope: scope.clone(),
                 scope_id: scope_id.clone(),
@@ -9758,5 +9882,152 @@ mod card_run_tests {
             ))
         );
         assert!(rx.try_recv().is_err(), "nothing for a run without a member");
+    }
+
+    async fn builder_storage() -> Arc<Storage> {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        storage
+            .members()
+            .create(NewMember {
+                id: AGENT.to_string(),
+                name: "Builder".to_string(),
+                avatar: None,
+                kind: MemberKind::Agent,
+                owner_kind: MemberOwner::Workspace,
+                owner_id: None,
+                status: MemberStatus::Idle,
+                profile: json!({}),
+            })
+            .await
+            .expect("member");
+        storage
+    }
+
+    fn card_source(storage: &Arc<Storage>, root: i64) -> TursoTaskSource {
+        TursoTaskSource::new(
+            storage.clone(),
+            "global".to_string(),
+            None,
+            AGENT.to_string(),
+            None,
+        )
+        .within_subtree(root)
+        .posting_as(AGENT.to_string())
+    }
+
+    #[tokio::test]
+    async fn how_a_run_stopped_decides_what_its_open_card_is_owed() {
+        use super::{CardAfterRun, card_after_run};
+        use nanna_agent::harness::StopReason;
+        let storage = builder_storage().await;
+        let id = card(&storage, "c", None, 3).await;
+        let open = storage.tasks().get(id).await.expect("card");
+        assert_eq!(
+            card_after_run(&open, &StopReason::Cancelled),
+            CardAfterRun::Paused
+        );
+        assert_eq!(
+            card_after_run(&open, &StopReason::AllTasksDone),
+            CardAfterRun::Waiting
+        );
+        for stop in [
+            StopReason::WallClockExhausted,
+            StopReason::TokenBudgetExhausted,
+            StopReason::RunnerErrors {
+                message: "502".to_string(),
+            },
+            StopReason::SourceError {
+                message: "io".to_string(),
+            },
+        ] {
+            assert!(
+                matches!(card_after_run(&open, &stop), CardAfterRun::HandBack(_)),
+                "{stop:?} is a failure the router hears about"
+            );
+        }
+        storage
+            .tasks()
+            .complete(id, None, None)
+            .await
+            .expect("done");
+        let closed = storage.tasks().get(id).await.expect("card");
+        assert_eq!(
+            card_after_run(&closed, &StopReason::WallClockExhausted),
+            CardAfterRun::Closed
+        );
+    }
+
+    /// A run that ran out of budget hands its card back; a cancelled one
+    /// leaves it picked up and says so; neither leaves it orphaned.
+    #[tokio::test]
+    async fn a_card_left_open_by_its_run_is_settled() {
+        use nanna_agent::harness::StopReason;
+        let storage = builder_storage().await;
+        let tasks = storage.tasks();
+
+        let timed_out = card(&storage, "slow card", None, 3).await;
+        let source = card_source(&storage, timed_out);
+        source.start(timed_out).await.expect("picked up");
+        source
+            .settle_after_run(&StopReason::WallClockExhausted)
+            .await;
+        let card_now = tasks.get(timed_out).await.expect("card");
+        assert_eq!(
+            (card_now.status.as_str(), card_now.assignee),
+            ("pending", None)
+        );
+
+        let stopped = card(&storage, "stopped card", None, 3).await;
+        let source = card_source(&storage, stopped);
+        source.start(stopped).await.expect("picked up");
+        source.settle_after_run(&StopReason::Cancelled).await;
+        let card_now = tasks.get(stopped).await.expect("card");
+        assert_eq!(card_now.status, "in_progress", "a pause, not a release");
+        assert_eq!(card_now.assignee.as_deref(), Some(AGENT));
+        let thread = tasks.notes(stopped, 5).await.expect("thread");
+        assert!(
+            thread
+                .iter()
+                .any(|n| n.content.starts_with("Stopped on request")),
+            "{thread:?}"
+        );
+    }
+
+    /// The worker's loop guard: a card whose whole subtree waits on a card
+    /// elsewhere has nothing a run could serve.
+    #[tokio::test]
+    async fn a_card_waiting_on_another_has_no_work_to_start() {
+        let storage = builder_storage().await;
+        let tasks = storage.tasks();
+        let leaf = card(&storage, "a leaf", None, 3).await;
+        let leaf_card = tasks.get(leaf).await.expect("leaf");
+        assert!(
+            super::subtree_has_work(&storage, &leaf_card)
+                .await
+                .expect("read")
+        );
+
+        let elsewhere = card(&storage, "the other team's card", None, 3).await;
+        let parent = card(&storage, "parent", None, 3).await;
+        let child = tasks
+            .create(NewTask {
+                title: "child that waits".to_string(),
+                scope: "global".to_string(),
+                parent_id: Some(parent),
+                priority: 3,
+                depends_on: vec![elsewhere],
+                assignee: Some(AGENT.to_string()),
+                ..NewTask::default()
+            })
+            .await
+            .expect("child");
+        assert!(child.id > parent);
+        let parent_card = tasks.get(parent).await.expect("parent");
+        assert!(
+            !super::subtree_has_work(&storage, &parent_card)
+                .await
+                .expect("read"),
+            "its only leaf is blocked, and the parent is not a leaf"
+        );
     }
 }
