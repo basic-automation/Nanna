@@ -107,6 +107,43 @@ async fn ensure_router_is_idempotent_and_scoped_to_the_workspace() {
     assert_ne!(global.id, first.id);
 }
 
+/// A workspace registered after the members migration ran still gets its
+/// router: before `upsert` ensured one, only the migration's seed made routers,
+/// so every board opened since had nobody to own its router profile.
+#[tokio::test]
+async fn registering_a_workspace_gives_its_board_a_router() {
+    let storage = storage().await;
+    let router = router_member_id(Some("ws-late"));
+    assert!(
+        !storage.members().exists(&router).await.expect("lookup"),
+        "no router before the workspace exists"
+    );
+    let record = WorkspaceRecord {
+        id: "ws-late".to_string(),
+        name: "Late".to_string(),
+        path: "/tmp/ws-late".to_string(),
+        active: false,
+        created_at: String::new(),
+        last_accessed: String::new(),
+    };
+    storage.workspaces().upsert(&record).await.expect("register");
+    let member = storage.members().get(&router).await.expect("the router exists");
+    assert_eq!(member.owner_id.as_deref(), Some("ws-late"));
+    assert_eq!(member.owner_kind, MemberOwner::Workspace);
+
+    // Saving again (every activation re-saves the registry) is not a second router.
+    storage.workspaces().upsert(&record).await.expect("re-save");
+    let routers = storage
+        .members()
+        .list_for_workspace(Some("ws-late"))
+        .await
+        .expect("roster")
+        .into_iter()
+        .filter(|m| m.id == router)
+        .count();
+    assert_eq!(routers, 1);
+}
+
 /// A board sees its own workspace's members plus every human-owned one — a
 /// personal agent travels with its owner (P25 decision 13).
 #[tokio::test]

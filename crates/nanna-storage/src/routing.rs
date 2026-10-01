@@ -42,6 +42,18 @@ pub const SPLIT_SUBTASKS_MAX: usize = TASK_NOTE_MAX_BYTES / (TASK_TITLE_MAX_BYTE
 /// room for that with its JSON punctuation and any prose around it.
 pub const DECISION_TEXT_BYTES_MAX: usize = 4 * TASK_NOTE_MAX_BYTES;
 
+/// Most labels one `assign` may add to a card.
+///
+/// Labels are how the router files a card for the members who match it
+/// (capability tags, P25 decision 15); a handful is a filing, more is noise
+/// the board's filter row would have to render.
+pub const ASSIGN_LABELS_MAX: usize = 8;
+
+/// Longest label the router may add, in bytes: the store's own bound. A
+/// label is a `#token` in the quick-add and filter language, so it is short
+/// and has no whitespace.
+pub const LABEL_BYTES_MAX: usize = crate::TASK_LABEL_MAX_BYTES;
+
 /// Label stamped on a clarification card, so the board can filter them.
 pub const CLARIFICATION_LABEL: &str = "clarification";
 
@@ -64,8 +76,18 @@ pub struct SubtaskSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum RouterDecision {
-    /// Give the card to one member.
-    Assign { member: String, reason: String },
+    /// Give the card to one member, filling in what the human left blank
+    /// (P25 decision 5): labels are added to the card's own, and an
+    /// acceptance check is written only when the card has none — the human's
+    /// check always stands.
+    Assign {
+        member: String,
+        reason: String,
+        #[serde(default)]
+        labels: Vec<String>,
+        #[serde(default)]
+        acceptance: Option<serde_json::Value>,
+    },
     /// Break the card into sub-tasks under it.
     Split {
         subtasks: Vec<SubtaskSpec>,
@@ -158,12 +180,22 @@ fn validate(decision: &RouterDecision) -> Result<(), String> {
         ));
     }
     match decision {
-        RouterDecision::Assign { member, .. } => {
+        RouterDecision::Assign {
+            member,
+            labels,
+            acceptance,
+            ..
+        } => {
             if member.trim().is_empty() {
                 return Err("an assign decision names no member".to_string());
             }
             if member.starts_with(ROUTER_MEMBER_PREFIX) {
                 return Err("the router takes no work; assign a person or an agent".to_string());
+            }
+            validate_labels(labels)?;
+            if let Some(check) = acceptance.as_ref().filter(|c| !c.is_null()) {
+                crate::tasks::admit_acceptance(check)
+                    .map_err(|e| format!("the acceptance check is unusable: {e}"))?;
             }
         }
         RouterDecision::Split { subtasks, .. } => {
@@ -210,6 +242,29 @@ fn validate(decision: &RouterDecision) -> Result<(), String> {
             }
         }
         RouterDecision::Park { .. } => {}
+    }
+    Ok(())
+}
+
+/// Labels an `assign` adds: at most [`ASSIGN_LABELS_MAX`], each one token of
+/// 1..=[`LABEL_BYTES_MAX`] bytes.
+fn validate_labels(labels: &[String]) -> Result<(), String> {
+    if labels.len() > ASSIGN_LABELS_MAX {
+        return Err(format!(
+            "{} labels; an assign adds at most {ASSIGN_LABELS_MAX}",
+            labels.len()
+        ));
+    }
+    for label in labels {
+        let label = label.trim().trim_start_matches('#');
+        if label.is_empty() || label.len() > LABEL_BYTES_MAX {
+            return Err(format!("a label must be 1..={LABEL_BYTES_MAX} bytes"));
+        }
+        if label.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "the label '{label}' has a space; a label is one word"
+            ));
+        }
     }
     Ok(())
 }
@@ -263,8 +318,17 @@ pub async fn apply_decision(
     }
 
     let applied = match decision {
-        RouterDecision::Assign { member, reason } => {
-            apply_assign(tasks, members, router_id, &task, member, reason).await?
+        RouterDecision::Assign {
+            member,
+            reason,
+            labels,
+            acceptance,
+        } => {
+            let fill = Fill {
+                labels,
+                acceptance: acceptance.as_ref().filter(|c| !c.is_null()),
+            };
+            apply_assign(tasks, members, router_id, &task, member, reason, &fill).await?
         }
         RouterDecision::Split { subtasks, reason } => {
             apply_split(tasks, router_id, &task, subtasks, reason).await?
@@ -278,6 +342,26 @@ pub async fn apply_decision(
     Ok(applied)
 }
 
+/// What an `assign` fills in besides the assignee.
+struct Fill<'a> {
+    labels: &'a [String],
+    acceptance: Option<&'a serde_json::Value>,
+}
+
+/// The card's labels plus the new ones it lacks (trimmed, `#` dropped),
+/// or `None` when nothing is new.
+fn labels_after(card: &[String], added: &[String]) -> Option<Vec<String>> {
+    let mut labels = card.to_vec();
+    for label in added {
+        let label = label.trim().trim_start_matches('#');
+        if !labels.iter().any(|l| l == label) {
+            labels.push(label.to_string());
+        }
+    }
+    debug_assert!(labels.len() <= card.len() + added.len(), "only additions");
+    (labels.len() > card.len()).then_some(labels)
+}
+
 async fn apply_assign(
     tasks: &TaskRepository,
     members: &MemberRepository,
@@ -285,6 +369,7 @@ async fn apply_assign(
     task: &Task,
     member_id: &str,
     reason: &str,
+    fill: &Fill<'_>,
 ) -> Result<AppliedDecision, StorageError> {
     let member = members.get(member_id).await.map_err(|e| match e {
         StorageError::NotFound(_) => StorageError::Invalid(format!(
@@ -292,18 +377,39 @@ async fn apply_assign(
         )),
         other => other,
     })?;
-    if task.assignee.as_deref() != Some(member_id) {
+    let labels = labels_after(&task.labels, fill.labels);
+    // Decision 5: the router writes the check only when the human left it
+    // blank; one the human set always stands.
+    let acceptance = fill.acceptance.filter(|_| task.acceptance.is_none());
+    let reassigned = task.assignee.as_deref() != Some(member_id);
+    if reassigned || labels.is_some() || acceptance.is_some() {
+        // One patch, so the store admits all of it or none of it.
         let patch = TaskPatch {
-            assignee: Some(Some(member_id.to_string())),
+            assignee: reassigned.then(|| Some(member_id.to_string())),
+            labels: labels.clone(),
+            acceptance: acceptance.map(|check| Some(check.clone())),
             ..TaskPatch::default()
         };
         tasks.update(task.id, patch, Some(router_id)).await?;
     }
-    let text = format!(
+    let mut text = format!(
         "Assigned to {} ({member_id}). {}",
         member.name,
         reason.trim()
     );
+    if let Some(labels) = &labels {
+        let added = &labels[task.labels.len()..];
+        let _ = write!(text, "\nLabelled: {}", added.join(", "));
+    }
+    if acceptance.is_some() {
+        let written = tasks.get(task.id).await?.acceptance;
+        let shown = written.map_or_else(String::new, |check| check.to_string());
+        let _ = write!(
+            text,
+            "\nDone when: {}",
+            cut_to(&shown, TASK_NOTE_MAX_BYTES / 4)
+        );
+    }
     let note = post(tasks, router_id, task.id, TaskNoteKind::Comment, &text).await?;
     Ok(AppliedDecision {
         note_id: note,
@@ -512,7 +618,9 @@ mod tests {
             parse_decision(reply).unwrap(),
             RouterDecision::Assign {
                 member: "agent:coder".to_string(),
-                reason: "it writes Rust".to_string()
+                reason: "it writes Rust".to_string(),
+                labels: Vec::new(),
+                acceptance: None,
             }
         );
         let park = r#"{"decision":"park","reason":"waiting on the release"}"#;
@@ -573,6 +681,8 @@ mod tests {
         let decision = RouterDecision::Assign {
             member: "agent:coder".to_string(),
             reason: "it has the Rust tools".to_string(),
+            labels: Vec::new(),
+            acceptance: None,
         };
         let applied = apply_decision(&tasks, &members, ROUTER, task.id, &decision, false)
             .await
@@ -595,11 +705,106 @@ mod tests {
         let ghost = RouterDecision::Assign {
             member: "agent:ghost".to_string(),
             reason: "x".to_string(),
+            labels: Vec::new(),
+            acceptance: None,
         };
         let err = apply_decision(&tasks, &members, ROUTER, task.id, &ghost, false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not a board member"), "{err}");
+    }
+
+    /// Decision 5: the human fills in what they like and the router completes
+    /// the rest — it adds labels and writes the check a blank card lacks, and
+    /// never replaces a check the human wrote.
+    #[tokio::test]
+    async fn assign_fills_what_the_human_left_blank_and_keeps_what_they_set() {
+        let (_s, tasks, members) = board().await;
+        let check = serde_json::json!({"kind": "file_exists", "path": "out/parser.rs"});
+        let fill = |labels: &[&str]| RouterDecision::Assign {
+            member: "agent:coder".to_string(),
+            reason: "it writes Rust".to_string(),
+            labels: labels.iter().map(|l| (*l).to_string()).collect(),
+            acceptance: Some(check.clone()),
+        };
+
+        let blank = card(&tasks, "port the parser").await;
+        apply_decision(
+            &tasks,
+            &members,
+            ROUTER,
+            blank.id,
+            &fill(&["#rust", "parser"]),
+            false,
+        )
+        .await
+        .unwrap();
+        let filled = tasks.get(blank.id).await.unwrap();
+        assert_eq!(
+            filled.labels,
+            vec!["rust".to_string(), "parser".to_string()]
+        );
+        assert_eq!(
+            filled.acceptance.as_ref().and_then(|c| c.get("path")),
+            Some(&serde_json::json!("out/parser.rs")),
+            "the blank check is written"
+        );
+        let post = &tasks.notes(blank.id, 1).await.unwrap()[0].content;
+        assert!(post.contains("Labelled: rust, parser"), "{post}");
+        assert!(post.contains("Done when:"), "{post}");
+
+        let mut set = NewTask {
+            scope: "global".to_string(),
+            title: "the human's own check".to_string(),
+            priority: 3,
+            labels: vec!["rust".to_string()],
+            ..NewTask::default()
+        };
+        set.acceptance = Some(serde_json::json!({"kind": "command", "command": "cargo test"}));
+        let set = tasks.create(set).await.unwrap();
+        apply_decision(&tasks, &members, ROUTER, set.id, &fill(&["rust"]), false)
+            .await
+            .unwrap();
+        let kept = tasks.get(set.id).await.unwrap();
+        assert_eq!(kept.labels, vec!["rust".to_string()], "no duplicate label");
+        assert_eq!(
+            kept.acceptance.as_ref().and_then(|c| c.get("command")),
+            Some(&serde_json::json!("cargo test")),
+            "the human's check stands"
+        );
+        let post = &tasks.notes(set.id, 1).await.unwrap()[0].content;
+        assert!(
+            !post.contains("Labelled") && !post.contains("Done when"),
+            "{post}"
+        );
+    }
+
+    #[test]
+    fn an_assign_whose_fill_could_not_be_stored_is_sent_back() {
+        let too_many = serde_json::json!({
+            "decision": "assign", "member": "agent:coder", "reason": "x",
+            "labels": ["a", "b", "c", "d", "e", "f", "g", "h", "i"],
+        });
+        let cases = [
+            (too_many.to_string(), "at most"),
+            (
+                r#"{"decision":"assign","member":"agent:coder","reason":"x","labels":["two words"]}"#
+                    .to_string(),
+                "one word",
+            ),
+            (
+                r#"{"decision":"assign","member":"agent:coder","reason":"x","acceptance":{"kind":"vibes"}}"#
+                    .to_string(),
+                "acceptance check is unusable",
+            ),
+        ];
+        for (reply, expected) in cases {
+            let err = parse_decision(&reply).unwrap_err();
+            assert!(err.contains(expected), "{reply}: {err}");
+        }
+        // Absent and null fill are both "nothing to fill".
+        let bare = r#"{"decision":"assign","member":"agent:coder","reason":"x","acceptance":null}"#;
+        assert!(parse_decision(bare).is_ok());
     }
 
     #[tokio::test]
@@ -681,6 +886,8 @@ mod tests {
         let assign = RouterDecision::Assign {
             member: "agent:coder".to_string(),
             reason: "x".to_string(),
+            labels: Vec::new(),
+            acceptance: None,
         };
         let err = apply_decision(&tasks, &members, ROUTER, task.id, &assign, true)
             .await

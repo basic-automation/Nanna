@@ -8039,7 +8039,7 @@ as its turn (`TurnAdmission`, scope default `session`).
             the router's splits and clarifications stamp the router id; IPC create records
             `gui` (as IPC update/complete do); `seed_plan` records `harness`; `tasks.add`
             takes the caller's `actor` param, as `tasks.update` does. 1 test.
-      - [ ] **Wire the trigger — deliberately not yet.** Everything it needs now exists:
+      - [x] **Wire the trigger — deliberately not yet.** Everything it needs now exists:
             wake on `created` in a board scope whose actor is not a router (and on a failed
             `verdict`), via a bounded queue fed from `TaskEventBridge` like the memory
             write-through (drops counted), then `route_card`, the router member's model list
@@ -8048,11 +8048,101 @@ as its turn (`TurnAdmission`, scope default `session`).
             would be routed too, and a `clarify` would block the harness's work on a human card
             mid-mission. Land it with the board client's create (Stage 4) or restricted to
             `created_by = gui` until then — never on every board-scoped card while chat lives.
+            *(2026-09-28)* **Wired, restricted to `created_by = gui`.**
+            `nanna_daemon::board_router_trigger`: `TaskEventBridge::with_router_queue` hands
+            the id of every `created` event in a board scope whose actor is the IPC create's
+            `gui` to a bounded queue (`ROUTE_QUEUE_MAX` = `TASKS_PER_SCOPE_MAX`, 8 B an entry;
+            full = counted + logged, never waited on), and one worker routes them in order on
+            the router member's `profile.model_priority`, else the agent's chat models, read
+            live per card. A card already closed is skipped; an `in_progress` one can only be
+            parked (decision 7, judged from the card's status — conservative until `stalled`
+            exists). The failover walk is now `complete_with_failover(…, purpose)`, so a
+            router failure logs as "Board router", not as a dream cycle. Proven end to end:
+            `a_card_created_on_the_board_is_routed_by_its_router` (e2e, scripted model) creates
+            a global card over IPC and watches the router assign it and post its reason.
+            Known limit: `tasks.add` takes its `actor` from the caller, so a model passing
+            `actor: "gui"` would be routed — the restriction is a convention until Stage 4
+            deletes the chat's own card writes. The failed-verdict wake stays with the
+            Triggers item below (it needs the bounded-retry rule).
 - [ ] Triggers: `created` (skip cards the router itself created), clarification `done`, `verdict`
       failed (bounded retries, then a clarification to the human), recurring reopen, `stalled`
       (`in_progress` with no live run past threshold), heartbeat.
-- [ ] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
+      *(2026-09-28)* **`created` and clarification `done` landed** (both for board-client cards
+      only, see the wiring note above). Clarification `done` rides the derived `unblocked`
+      event: the sink queues every board card that unblocks, and the worker routes it only if
+      its `created` activity row says `gui` (new `TaskRepository::created_by`, looked up by
+      action so it never falls out of a window) and a completed `clarification`-labelled card
+      is among its dependencies. The router's prompt gains an *ANSWERED CLARIFICATIONS*
+      section — the human's newest non-router post on each (≤ 2, 320 B each, ~700 B of the
+      9 216 B budget), or "completed with no answer posted"; the question itself is already
+      on the thread. A card that is `in_progress` or closed is never taken up by a wake.
+      e2e `the_board_router_asks_the_human_then_routes_on_the_answer`: clarify → the human
+      posts + completes over IPC → the second decision's prompt carries the answer → assigned.
+      Still open: failed `verdict` (with its retry bound), recurring reopen, `stalled`,
+      heartbeat.
+      *(2026-09-28, later)* **Recurring reopen landed.** `sweep_recurrences` now reopens through
+      `reopen_for_next_round`: a board-client card's assignee is released *before* the reopen
+      (decision 7 — the router's wake reads a card nobody holds), and the reopen's own
+      `status_changed {reopened: true}` by the `recurrence` actor is the wake. Cards the chat
+      harness made keep their assignee, as before. The router's prompt shows `Recurs (cron):`.
+      **Failed `verdict` deliberately not yet:** a failed acceptance is only an
+      `acceptance_checked` activity row — no event fires — and nothing but the human's own Done
+      can fail one on a board card until Stage 3's runs exist; build it with the run start, so
+      the retry bound has a producer to bound. Still open: failed verdict, `stalled`, heartbeat.
+- [x] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
+      *(2026-09-28)* `RouterDecision::Assign` gained optional `labels` and `acceptance`. Labels
+      are **added** to the card's own (≤ `ASSIGN_LABELS_MAX` = 8, one word of ≤ 64 B each, `#`
+      dropped, no duplicates); the check is written **only when the card has none** — decision 5
+      says the router's check "stands unless the human edits it", so the human's always stands
+      (overriding a human's acceptance was judged the wrong half of "may override" to ship
+      first). Assignee, labels and check go in ONE patch, so the store admits all or none; a
+      malformed check is refused at parse time through the store's own
+      `admit_acceptance` (now public) and the model is re-asked with the reason. The post says
+      what was filled (`Labelled:`, `Done when:`); the prompt shows a set check as "keep it" and
+      tells the model the three check shapes. Sub-tasks were already `split`, assignee `assign`,
+      live-run refusal `apply_decision`. Post previews 480 → 400 B so the worst-case prompt
+      still lists three members (`the_roster_keeps_room_in_the_worst_case_prompt`). e2e: the
+      clarify→answer→assign run now also asserts the filled label and check.
+- [x] *(found 2026-09-28)* **`tasks.labels` has no bound in the store.** `create`/`update` admit
+      any number of labels of any length (the router bounds its own additions; IPC, `tasks.add`
+      and `tasks.update` do not). Bound it in `TaskRepository` like titles and notes — count and
+      bytes — derived from what the filter row and the router prompt can show.
+      *(2026-09-28)* `TASK_LABELS_MAX` = 32, `TASK_LABEL_MAX_BYTES` = 64 (a card's set ≤ 2 KiB),
+      enforced on create and on any patch that sets labels — a card stored before the bound
+      stays editable in its other fields. The router's `LABEL_BYTES_MAX` is now the store's
+      constant. Known edge: a router `assign`/`park` that would push a card past 32 is refused
+      whole and the card left as it was. `tool_scope` is the same shape and still unbounded.
+      *(2026-09-29)* `tool_scope` bounded too: `TASK_TOOLS_MAX` = 64 names (the registry serves
+      ~60), `TASK_TOOL_NAME_MAX_BYTES` = 64 (the providers' own tool-name ceiling), on create and
+      on a patch that sets it. The planner's scope never reaches the store (`seed_plan` leaves it
+      empty), so no chat mission can be refused by it.
+- [x] *(found 2026-09-29)* **The roster had no write surface.** `MemberRepository` was reachable
+      from nothing but the migration's seeds, so the router could assign a card to nobody but the
+      human, and a router's own `profile.model_priority` (which `board_router_trigger` reads first)
+      could not be set from anywhere. *(2026-09-29)* `Action::Member` over IPC —
+      `list {workspace_id?}` (the board's roster, `list_for_workspace`), `get`, `create {name,
+      workspace_id? | personal, avatar?, profile?}`, `update {id, name?, avatar?, status?,
+      profile?}`, `delete`. Only agents are created; the id is `agent:<slug of name>` (disjoint
+      from `human`/`router:…`, cut to the 128-byte id bound, a random 8-hex slug when the name has
+      nothing ASCII), so a same-slug create is refused rather than merged. A profile must be a
+      JSON object (the router reads named fields off it); a workspace member needs a registered
+      workspace; ownership, kind and id are not editable. e2e-shaped control-plane test
+      `the_board_roster_is_managed_over_ipc` (create → assignable → status → router model list →
+      five refusals → personal agent → delete). *(later)* Every write that changed the roster
+      announces a payload-free `Event::MembersChanged` (like `WorkspacesChanged`); refusals and a
+      no-op delete announce nothing. The GUI's `DaemonEvent` parses it as `Unknown` until the
+      Stage 4 board client maps it.
+- [x] *(found 2026-09-29)* **Boards opened after migration 017 had no router member.** The
+      migration seeded `router:<id>` for the workspaces that existed then, and `ensure_router` —
+      the path meant for every workspace registered afterwards — had no caller. The router still
+      routed such a board's cards (on the chat models, with a `board router member unreadable`
+      warning), but its `profile.model_priority` had no row to live in and it was missing from
+      the roster. *(2026-09-29)* `WorkspaceRepository::upsert` now ensures the board's router
+      (every open and activation saves through it), and `restore_workspaces` heals persisted
+      workspaces once per boot. Test `registering_a_workspace_gives_its_board_a_router`.
+      Not done: closing a workspace leaves its router row (routers are delete-protected); harmless
+      until a board client lists closed boards.
 - [ ] Capability-tag adjustment at verdict time; posts the change on the agent's profile thread.
 - [ ] Heartbeat becomes a recurring card assigned to the router; the `heartbeat_prompt` config and
       the scheduler's chat-turn path are removed.
@@ -9502,6 +9592,21 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            unreleased); `fsrs-rs` is at 6.6.2 with no FSRS-7, and no FSRS-7 default parameters are
            published (srs-benchmark experiments are still open). Re-check when `fsrs-rs` ships it;
            adopting it is the same retention-harness A/B the FSRS-6 weight decision needed.
+     - [ ] *(research 2026-09-29)* **Upstream is moving `turso_core` to pure Rust by default** —
+           [tursodatabase/turso#7660](https://github.com/tursodatabase/turso/issues/7660) proposes
+           putting `aegis` and `simsimd` behind a feature flag. We already select
+           `pure-rust-crypto`; when the 0.8 line lands, check whether the default feature set
+           drops the C builds outright (and whether our feature list can shrink). Also re-checked:
+           `vue-tsc` is still 3.3.11 with no TypeScript 7 support, and TS 7.1 (the stable API)
+           has no date.
+     - [ ] *(P20, research 2026-09-28)* **Qwen 3.8 ships no model for the 16 GB tier.** The open
+           weights are 27B dense (2026-08-14, Apache-2.0), Flash-Next (180B-A6B) and 2.4T-A95B —
+           no 4B/8B/14B this generation ([lineup](https://codersera.com/blog/qwen-3-8-model-lineup-2026/),
+           [repo](https://github.com/QwenLM/Qwen3.8)). 27B at Q4 is ~16 GB before the desktop's
+           5–6 GB, so it does not fit the reference card; the local roster stays qwen3.5:9b /
+           ornith. Re-check if a Qwen3.8 small dense model lands. Also noted: turso is now at
+           `0.8.0-pre.14` (2026-09-28), still pre-release — the one-minor-at-a-time item above
+           stands.
      - [ ] *(P20, research 2026-09-26)* **IBM Granite 4.2 8B** (Apache-2.0, card dated 2026-08-25,
            "reasoning-augmented tool calling", 512K context) is the one new tool-calling model in the
            16 GB class this month ([card](https://huggingface.co/ibm-granite/granite-4.2-8b)). No
@@ -9693,6 +9798,10 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            remembered pin would have missed. Re-checked both retirement conditions: rustpython-
            {vm,stdlib,codegen} still 0.5.0 (2026-03-31) and pymath still 0.2.0, so both pins stay.
            GUI: `pnpm outdated` clean except the blocked TypeScript 7. 1722 tests green.
+     - [x] *(2026-09-29)* **Toolchain pin moved `nightly-2026-09-20` → `nightly-2026-09-28`**
+           (rustc 1.101.0, d080e7dff). Cold `cargo build --release -p nanna-daemon` green in
+           8m12s; full gate re-run from a cold debug dir: 2731 tests, clippy 0 warnings — no new
+           lints this time. Mirrored into `budget-gate`, `release-check` and `test-compile`.
      - [x] *(2026-09-20)* **Toolchain pin moved `nightly-2026-09-08` → `nightly-2026-09-20`**
            (rustc `feaadeeac`, cargo `495c385d0`). Release-built `-p nanna-daemon` green from a
            cold, isolated target dir in **9m06s** — no tokio ICE, no `turso_core` depth overflow —

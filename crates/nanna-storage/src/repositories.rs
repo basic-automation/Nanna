@@ -2685,13 +2685,34 @@ impl WorkspaceRepository {
         Ok(workspace)
     }
 
-    /// Insert or update a workspace (upsert by path)
+    /// Insert or update a workspace (upsert by path), and make sure its board
+    /// has a Task Management Agent.
+    ///
+    /// The members migration seeded a router for every workspace that existed
+    /// when it ran; this is the path for every workspace registered since, so
+    /// "every stored workspace has a router member" holds from both ends.
     ///
     /// # Errors
     /// Returns [`StorageError::Database`] if the upsert fails — including when
     /// a workspace with a different `id` already holds `record.path`, since
-    /// `path` is unique and the conflict target is `id`.
+    /// `path` is unique and the conflict target is `id` — and
+    /// [`StorageError::Invalid`] when the roster is full, so the router could
+    /// not be added.
     pub async fn upsert(&self, record: &WorkspaceRecord) -> Result<(), StorageError> {
+        debug_assert!(!record.id.is_empty(), "a workspace has an id");
+        self.write_record(record).await?;
+        let router = crate::MemberRepository::new(Arc::clone(&self.conn))
+            .ensure_router(Some(&record.id))
+            .await?;
+        debug_assert_eq!(
+            router.owner_id.as_deref(),
+            Some(record.id.as_str()),
+            "the router belongs to the board it was ensured for"
+        );
+        Ok(())
+    }
+
+    async fn write_record(&self, record: &WorkspaceRecord) -> Result<(), StorageError> {
         let conn = self.conn.lock().await;
         let id = record.id.clone();
         let name = record.name.clone();

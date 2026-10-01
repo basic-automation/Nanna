@@ -34,6 +34,36 @@ pub const TASK_TITLE_MAX_BYTES: usize = 500;
 /// ever usefully contribute to a context injection.
 pub const TASK_NOTE_MAX_BYTES: usize = 16 * 1024;
 
+/// Maximum labels on one task.
+///
+/// Bound justification: labels are filters (`#label` in the quick-add and
+/// the filter language) and are shown whole on a card, in the board's filter
+/// row and in the router's prompt (which previews them at 800 B). 32 labels
+/// is several times any real filing and keeps a card's label set, at
+/// [`TASK_LABEL_MAX_BYTES`] each, within 2 KiB.
+pub const TASK_LABELS_MAX: usize = 32;
+
+/// Maximum bytes of one label.
+///
+/// Bound justification: a label is a short token, not prose; 64 bytes holds
+/// any word-or-phrase tag and keeps one label inside a filter chip.
+pub const TASK_LABEL_MAX_BYTES: usize = 64;
+
+/// Maximum tool names in one task's `tool_scope`.
+///
+/// Bound justification: the scope is a hint (it gates nothing — the harness
+/// logs it and the card shows it), naming tools the task is expected to use.
+/// The registry serves ~60 tools at boot, so a scope wider than 64 names no
+/// longer says anything a card could show usefully.
+pub const TASK_TOOLS_MAX: usize = 64;
+
+/// Maximum bytes of one tool name in a `tool_scope`.
+///
+/// Bound justification: 64 is the providers' own tool-name ceiling (the Anthropic
+/// and `OpenAI` APIs both admit `^[a-zA-Z0-9_-]{1,64}$`), so a longer name cannot be
+/// a tool any model was ever offered.
+pub const TASK_TOOL_NAME_MAX_BYTES: usize = 64;
+
 /// Maximum direct dependencies per task.
 ///
 /// Bound justification: `next()` and the cycle check walk dependency edges;
@@ -915,6 +945,37 @@ impl TaskRepository {
         Ok(cards)
     }
 
+    /// Who created card `task_id`: the actor on its `created` activity row.
+    ///
+    /// `None` when the creator was not recorded (a writer that named no
+    /// actor, or a row older than `NewTask::created_by`) — never guessed from
+    /// the assignee. The row is looked up by its action, so however long the
+    /// card's activity log grows, the answer does not fall out of a window.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::NotFound`] if the card has no `created` row
+    /// (it does not exist), or [`StorageError::Database`] if the query fails.
+    pub async fn created_by(&self, task_id: i64) -> Result<Option<String>, StorageError> {
+        debug_assert!(task_id > 0, "store ids start at 1");
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT actor FROM task_activity WHERE task_id = ?1 AND action = 'created' \
+                 ORDER BY id LIMIT 1",
+                turso::params![task_id],
+            )
+            .await?;
+        let found: Option<Option<String>> = match rows.next().await? {
+            Some(row) => Some(row.get(0)?),
+            None => None,
+        };
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        found.ok_or_else(|| StorageError::NotFound(format!("created row for task #{task_id}")))
+    }
+
     /// One thread post by its id.
     ///
     /// Task events name a post by id rather than carrying it (the bus is not a
@@ -1752,10 +1813,15 @@ fn apply_patch(task: &mut Task, patch: TaskPatch) -> Result<Vec<&'static str>, S
         task.priority = priority;
     }
     if let Some(labels) = patch.labels {
+        // Checked only when the patch sets labels: a card stored before the
+        // bound existed stays editable in every other field.
+        validate_labels(&labels)?;
         changed.push("labels");
         task.labels = labels;
     }
     if let Some(tool_scope) = patch.tool_scope {
+        // Like labels: checked only when the patch sets it.
+        validate_tool_scope(&tool_scope)?;
         changed.push("tool_scope");
         task.tool_scope = tool_scope;
     }
@@ -1948,6 +2014,41 @@ fn validate_title(title: &str) -> Result<(), StorageError> {
             trimmed.len()
         )));
     }
+    Ok(())
+}
+
+fn validate_labels(labels: &[String]) -> Result<(), StorageError> {
+    if labels.len() > TASK_LABELS_MAX {
+        return Err(StorageError::Invalid(format!(
+            "too many labels: {} (max {TASK_LABELS_MAX})",
+            labels.len()
+        )));
+    }
+    if let Some(long) = labels.iter().find(|l| l.len() > TASK_LABEL_MAX_BYTES) {
+        return Err(StorageError::Invalid(format!(
+            "label exceeds {TASK_LABEL_MAX_BYTES} bytes (got {})",
+            long.len()
+        )));
+    }
+    debug_assert!(labels.len() <= TASK_LABELS_MAX, "count checked");
+    Ok(())
+}
+
+fn validate_tool_scope(tools: &[String]) -> Result<(), StorageError> {
+    if tools.len() > TASK_TOOLS_MAX {
+        return Err(StorageError::Invalid(format!(
+            "too many tools in scope: {} (max {TASK_TOOLS_MAX})",
+            tools.len()
+        )));
+    }
+    if let Some(long) = tools.iter().find(|t| t.len() > TASK_TOOL_NAME_MAX_BYTES) {
+        return Err(StorageError::Invalid(format!(
+            "tool name exceeds {TASK_TOOL_NAME_MAX_BYTES} bytes (got {}) — no provider admits \
+             a tool name that long",
+            long.len()
+        )));
+    }
+    debug_assert!(tools.len() <= TASK_TOOLS_MAX, "count checked");
     Ok(())
 }
 
@@ -2179,8 +2280,12 @@ fn repair_js_object_literal(text: &str) -> Option<String> {
 ///
 /// Every write path funnels through here, so what `create`/`update` persist
 /// is exactly what [`canonicalize_acceptance`] admits — never the raw value a
-/// caller happened to hold.
-fn admit_acceptance(value: &serde_json::Value) -> Result<serde_json::Value, StorageError> {
+/// caller happened to hold. Public so a caller can refuse a check before it
+/// reaches a write (the board router re-asks its model with the reason).
+///
+/// # Errors
+/// [`StorageError::Invalid`] naming what is wrong with the check.
+pub fn admit_acceptance(value: &serde_json::Value) -> Result<serde_json::Value, StorageError> {
     let canonical = canonicalize_acceptance(value).map_err(StorageError::Invalid)?;
     validate_acceptance(&canonical)?;
     Ok(canonical)
@@ -2945,6 +3050,8 @@ fn validate_new_task_fields(new: &NewTask) -> Result<(), StorageError> {
     validate_title(&new.title)?;
     validate_priority(new.priority)?;
     validate_dates(new.due_at.as_deref(), new.deadline_at.as_deref())?;
+    validate_labels(&new.labels)?;
+    validate_tool_scope(&new.tool_scope)?;
     if new.depends_on.len() > TASK_DEPS_MAX {
         return Err(StorageError::Invalid(format!(
             "too many dependencies: {} (max {TASK_DEPS_MAX})",
@@ -3117,6 +3224,82 @@ mod tests {
         let activity = repo.activity(task.id, 10).await.unwrap();
         assert_eq!(activity.len(), 1);
         assert_eq!(activity[0].action, "created");
+    }
+
+    #[tokio::test]
+    async fn labels_are_bounded_on_create_and_on_update() {
+        let (_s, repo) = repo().await;
+        let mut too_many = new_task("filed everywhere");
+        too_many.labels = (0..=TASK_LABELS_MAX).map(|i| format!("l{i}")).collect();
+        let err = repo.create(too_many).await.unwrap_err();
+        assert!(err.to_string().contains("too many labels"), "{err}");
+
+        let mut at_bound = new_task("filed widely");
+        at_bound.labels = (0..TASK_LABELS_MAX).map(|i| format!("l{i}")).collect();
+        let card = repo.create(at_bound).await.unwrap();
+        assert_eq!(
+            card.labels.len(),
+            TASK_LABELS_MAX,
+            "the bound itself is admitted"
+        );
+
+        let long = TaskPatch {
+            labels: Some(vec!["x".repeat(TASK_LABEL_MAX_BYTES + 1)]),
+            ..TaskPatch::default()
+        };
+        let err = repo.update(card.id, long, None).await.unwrap_err();
+        assert!(err.to_string().contains("label exceeds"), "{err}");
+        assert_eq!(
+            repo.get(card.id).await.unwrap().labels.len(),
+            TASK_LABELS_MAX,
+            "a refused patch changes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_scope_is_bounded_on_create_and_on_update() {
+        let (_s, repo) = repo().await;
+        let mut too_many = new_task("uses everything");
+        too_many.tool_scope = (0..=TASK_TOOLS_MAX).map(|i| format!("t{i}")).collect();
+        let err = repo.create(too_many).await.unwrap_err();
+        assert!(err.to_string().contains("too many tools"), "{err}");
+
+        let mut at_bound = new_task("uses a lot");
+        at_bound.tool_scope = (0..TASK_TOOLS_MAX).map(|i| format!("t{i}")).collect();
+        let card = repo.create(at_bound).await.unwrap();
+        assert_eq!(card.tool_scope.len(), TASK_TOOLS_MAX, "the bound is admitted");
+
+        let long = TaskPatch {
+            tool_scope: Some(vec!["x".repeat(TASK_TOOL_NAME_MAX_BYTES + 1)]),
+            ..TaskPatch::default()
+        };
+        let err = repo.update(card.id, long, None).await.unwrap_err();
+        assert!(err.to_string().contains("tool name exceeds"), "{err}");
+        assert_eq!(
+            repo.get(card.id).await.unwrap().tool_scope.len(),
+            TASK_TOOLS_MAX,
+            "a refused patch changes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn created_by_names_the_creator_and_never_the_assignee() {
+        let (_s, repo) = repo().await;
+        let mut by_gui = new_task("from the board");
+        by_gui.created_by = Some("gui".to_string());
+        by_gui.assignee = Some("human".to_string());
+        let by_gui = repo.create(by_gui).await.unwrap();
+        let anonymous = repo.create(new_task("nobody said")).await.unwrap();
+
+        assert_eq!(
+            repo.created_by(by_gui.id).await.unwrap().as_deref(),
+            Some("gui")
+        );
+        assert_eq!(repo.created_by(anonymous.id).await.unwrap(), None);
+        assert!(matches!(
+            repo.created_by(anonymous.id + 100).await,
+            Err(StorageError::NotFound(_))
+        ));
     }
 
     #[tokio::test]

@@ -2306,3 +2306,106 @@ async fn task_verdicts_answers_the_rollup_over_ipc() {
         ask(serde_json::json!({ "type": "task", "action": "verdicts", "window": 0 })).await;
     assert_eq!(refused["error"], "bad_window", "{refused}");
 }
+
+#[tokio::test]
+async fn the_board_roster_is_managed_over_ipc() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let (events, mut received) = tokio::sync::broadcast::channel(64);
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new())).with_event_tx(events);
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+
+    let created = ask(serde_json::json!({
+        "type": "member", "action": "create", "name": "Code Reviewer",
+        "profile": { "model_priority": ["qwen3.5:9b"], "tags": ["rust"] },
+    }))
+    .await;
+    assert_eq!(created["member"]["id"], "agent:code-reviewer", "{created}");
+    assert_eq!(created["member"]["kind"], "agent", "{created}");
+    assert_eq!(created["member"]["owner_kind"], "workspace", "{created}");
+    assert!(created["member"]["owner_id"].is_null(), "global board: {created}");
+
+    let duplicate = ask(serde_json::json!({
+        "type": "member", "action": "create", "name": "code reviewer",
+    }))
+    .await;
+    assert_eq!(duplicate["error"], "invalid_member", "{duplicate}");
+
+    // The router reads this roster: the new agent is assignable on the global board.
+    let listed = ask(serde_json::json!({ "type": "member", "action": "list" })).await;
+    let ids: Vec<&str> = listed["members"]
+        .as_array()
+        .expect("members array")
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"human") && ids.contains(&"agent:code-reviewer"), "{listed}");
+    let card = storage
+        .tasks()
+        .create(nanna_storage::NewTask {
+            title: "review the diff".to_string(),
+            scope: "global".to_string(),
+            priority: 3,
+            assignee: Some("agent:code-reviewer".to_string()),
+            ..nanna_storage::NewTask::default()
+        })
+        .await;
+    assert!(card.is_ok(), "an IPC-created member is a real assignee: {card:?}");
+
+    let busy = ask(serde_json::json!({
+        "type": "member", "action": "update", "id": "agent:code-reviewer", "status": "busy",
+    }))
+    .await;
+    assert_eq!(busy["member"]["status"], "busy", "{busy}");
+    assert_eq!(busy["member"]["profile"]["tags"][0], "rust", "untouched fields stay: {busy}");
+
+    // The router's own model list is settable — nothing else could set it.
+    let router = ask(serde_json::json!({
+        "type": "member", "action": "update", "id": "router:global",
+        "profile": { "role": "router", "model_priority": ["ornith:9b"] },
+    }))
+    .await;
+    assert_eq!(router["member"]["profile"]["model_priority"][0], "ornith:9b", "{router}");
+
+    for (refused, why) in [
+        (serde_json::json!({ "type": "member", "action": "update", "id": "human", "status": "asleep" }), "unknown status"),
+        (serde_json::json!({ "type": "member", "action": "create", "name": "x", "profile": ["a"] }), "profile shape"),
+        (serde_json::json!({ "type": "member", "action": "create", "name": "x", "personal": true, "workspace_id": "w" }), "personal + workspace"),
+        (serde_json::json!({ "type": "member", "action": "create", "name": "x", "workspace_id": "nope" }), "unregistered workspace"),
+        (serde_json::json!({ "type": "member", "action": "delete", "id": "human" }), "protected member"),
+    ] {
+        let resp = ask(refused).await;
+        assert_eq!(resp["error"], "invalid_member", "{why}: {resp}");
+    }
+    let missing = ask(serde_json::json!({ "type": "member", "action": "get", "id": "agent:nobody" })).await;
+    assert_eq!(missing["error"], "member_not_found", "{missing}");
+
+    let personal = ask(serde_json::json!({
+        "type": "member", "action": "create", "name": "Scribe", "personal": true,
+    }))
+    .await;
+    assert_eq!(personal["member"]["owner_kind"], "human", "{personal}");
+    assert_eq!(personal["member"]["owner_id"], "human", "{personal}");
+
+    let removed = ask(serde_json::json!({ "type": "member", "action": "delete", "id": "agent:scribe" })).await;
+    assert_eq!(removed["removed"], true, "{removed}");
+    let gone = ask(serde_json::json!({ "type": "member", "action": "delete", "id": "agent:scribe" })).await;
+    assert_eq!(gone["removed"], false, "{gone}");
+
+    // One MembersChanged per write that changed the roster: create, update
+    // status, update router, create personal, delete. Reads, refusals and the
+    // second (no-op) delete announce nothing.
+    let mut announced = 0;
+    while let Ok(event) = received.try_recv() {
+        assert!(matches!(event, Event::MembersChanged), "{event:?}");
+        announced += 1;
+    }
+    assert_eq!(announced, 5);
+}

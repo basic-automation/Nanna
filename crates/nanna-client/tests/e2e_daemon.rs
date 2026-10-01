@@ -3289,3 +3289,170 @@ async fn a_regenerated_reply_stays_replaced_after_a_restart() {
     client.disconnect().await;
     restarted.stop();
 }
+
+/// Poll card `id` until `done` holds for it, bounded by the hang ceiling.
+async fn card_when(
+    client: &Client,
+    id: i64,
+    what: &str,
+    done: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let started = std::time::Instant::now();
+    loop {
+        let card = client
+            .request(nanna_client::Action::Task(nanna_client::TaskAction::Get {
+                id,
+            }))
+            .await
+            .expect("task.get answers");
+        if done(&card) {
+            return card;
+        }
+        assert!(
+            started.elapsed() < READY_HANG_CEILING,
+            "card #{id} never reached: {what}: {card}"
+        );
+        tokio::time::sleep(READY_POLL_INTERVAL).await;
+    }
+}
+
+/// Create a global-scope card over IPC, as the board client does.
+async fn create_global_card(client: &Client, title: &str) -> i64 {
+    let created = client
+        .request(nanna_client::Action::Task(
+            nanna_client::TaskAction::Create {
+                title: title.to_string(),
+                scope: Some("global".to_string()),
+                session_id: None,
+                parent_id: None,
+                description: None,
+                priority: None,
+                labels: None,
+                tools: None,
+                due_at: None,
+                deadline_at: None,
+                recurrence: None,
+                depends_on: None,
+                acceptance: None,
+                project: None,
+                assignee: None,
+            },
+        ))
+        .await
+        .expect("task.create answers");
+    created["task"]["id"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("a created card: {created}"))
+}
+
+/// A card the board client creates wakes the board router (P25 Stage 2), and
+/// so does the human answering the clarification the router asked for
+/// (decision 6): the router first blocks the card on a question card for the
+/// human; the human posts an answer and completes it over IPC; the router
+/// decides again, with the answer in its prompt, and assigns the card. No chat
+/// turn is involved — the card is the only ingress.
+#[tokio::test]
+async fn the_board_router_asks_the_human_then_routes_on_the_answer() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"{"decision":"clarify","question":"Which lease, the flat or the garage?","reason":"two leases renew this month"}"#
+            .to_string(),
+        concat!(
+            r#"{"decision":"assign","member":"human","labels":["paperwork"],"#,
+            r#""acceptance":{"kind":"file_exists","path":"lease-signed.pdf"},"#,
+            r#""reason":"only a person can sign this"}"#
+        )
+        .to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+
+    let id = create_global_card(&client, "Sign the lease renewal").await;
+
+    // First decision: a clarification card the work card waits on.
+    let blocked = card_when(&client, id, "blocked on a clarification", |card| {
+        card["task"]["depends_on"]
+            .as_array()
+            .is_some_and(|d| !d.is_empty())
+    })
+    .await;
+    assert_eq!(blocked["task"]["blocked"], true, "{blocked}");
+    let clarification = blocked["task"]["depends_on"][0]
+        .as_i64()
+        .unwrap_or_else(|| panic!("a clarification id: {blocked}"));
+    let question = client
+        .request(nanna_client::Action::Task(nanna_client::TaskAction::Get {
+            id: clarification,
+        }))
+        .await
+        .expect("task.get answers");
+    assert_eq!(question["task"]["assignee"], "human", "{question}");
+
+    // The human answers on the clarification's thread and completes it.
+    for action in [
+        nanna_client::TaskAction::Note {
+            id: clarification,
+            content: "The garage one.".to_string(),
+        },
+        nanna_client::TaskAction::Done {
+            id: clarification,
+            workdir: None,
+        },
+    ] {
+        let reply = client
+            .request(nanna_client::Action::Task(action))
+            .await
+            .expect("the human's write answers");
+        assert!(reply.get("error").is_none(), "{reply}");
+    }
+
+    // Second decision, made with the answer in hand.
+    let card = card_when(&client, id, "assigned after the answer", |card| {
+        card["task"]["assignee"].as_str().is_some()
+    })
+    .await;
+    assert_eq!(
+        card["task"]["assignee"], "human",
+        "the member it named: {card}"
+    );
+    // Decision 5: what the human left blank, the router filled in.
+    assert_eq!(
+        card["task"]["labels"],
+        serde_json::json!(["paperwork"]),
+        "{card}"
+    );
+    assert_eq!(
+        card["task"]["acceptance"]["path"], "lease-signed.pdf",
+        "the blank acceptance check was written: {card}"
+    );
+    let notes = card["notes"].as_array().cloned().unwrap_or_default();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n["author_member_id"] == "router:global"
+                && n["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("only a person can sign this"))),
+        "the router posts its reason on the card's thread: {card}"
+    );
+    let asked = ollama.chat_bodies.lock().await;
+    let router_prompts: Vec<&String> = asked
+        .iter()
+        .filter(|body| body.contains("Task Management Agent"))
+        .collect();
+    assert_eq!(router_prompts.len(), 2, "one decision per wake: {asked:?}");
+    assert!(
+        router_prompts[1].contains(&format!("#{clarification} answered: The garage one.")),
+        "the second decision saw the answer: {}",
+        router_prompts[1]
+    );
+    drop(asked);
+    client.disconnect().await;
+    daemon.stop();
+}
