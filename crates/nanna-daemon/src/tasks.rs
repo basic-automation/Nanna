@@ -56,10 +56,40 @@ const TASK_NEXT_SKIP_MAX: usize = 100;
 /// scripting bridge fills `session_id` from the session the tool is running
 /// in. Only a caller with no session context at all gets here, so the message
 /// names both ways out instead of just restating the requirement.
+/// The card whose run is calling, when a `tasks.*` call is session-scoped
+/// (the default) from a card run's tool session (`card:<id>`).
+///
+/// A card run has no conversation: "this session's tasks" means its card's
+/// subtree on the board, which is what the run itself works. An explicit
+/// `workspace` / `global` scope is honoured as asked.
+fn calling_card(params: &Value) -> Option<i64> {
+    let scope = params
+        .get("scope")
+        .and_then(Value::as_str)
+        .unwrap_or("session");
+    if !scope.eq_ignore_ascii_case("session") {
+        return None;
+    }
+    params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .and_then(card_of_run_session)
+}
+
 async fn resolve_scope(
+    storage: &Storage,
     params: &Value,
     workspace_id: &Arc<RwLock<Option<String>>>,
 ) -> Result<(String, Option<String>), String> {
+    if let Some(card_id) = calling_card(params) {
+        let card = storage
+            .tasks()
+            .get(card_id)
+            .await
+            .map_err(|e| format!("this run's card #{card_id} is unreadable: {e}"))?;
+        debug_assert_ne!(card.scope, "session", "card runs work board cards");
+        return Ok((card.scope, card.scope_id));
+    }
     let scope = params
         .get("scope")
         .and_then(Value::as_str)
@@ -498,12 +528,33 @@ fn task_next_service(
         let storage = storage.clone();
         let workspace_id = workspace_id.clone();
         Box::pin(async move {
-            let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
-            let next = storage
-                .tasks()
-                .next(&scope, scope_id.as_deref())
-                .await
-                .map_err(err_str)?;
+            let (scope, scope_id) = resolve_scope(&storage, &params, &workspace_id).await?;
+            let next = match calling_card(&params) {
+                // A card run's "next" is its own card's, never the board's.
+                Some(card_id) => {
+                    let all = storage
+                        .tasks()
+                        .list(&scope, scope_id.as_deref(), true)
+                        .await
+                        .map_err(err_str)?;
+                    let parents: HashMap<i64, i64> = all
+                        .iter()
+                        .filter_map(|t| t.parent_id.map(|p| (t.id, p)))
+                        .collect();
+                    storage
+                        .tasks()
+                        .next_admitted(&scope, scope_id.as_deref(), |t| {
+                            subtree_admits(&parents, card_id, t.id)
+                        })
+                        .await
+                        .map_err(err_str)?
+                }
+                None => storage
+                    .tasks()
+                    .next(&scope, scope_id.as_deref())
+                    .await
+                    .map_err(err_str)?,
+            };
             match next {
                 Some(task) => {
                     let notes = storage
@@ -542,7 +593,9 @@ fn task_add_service(
         Box::pin(async move {
             // A subtask always lives in its parent's scope — replan
             // steps only know the parent id, not the run's scope.
-            let parent_id = opt_i64(&params, "parent_id")?;
+            // From a card run, a task with no parent is a sub-card of the
+            // run's card — work the run itself will be served.
+            let parent_id = opt_i64(&params, "parent_id")?.or_else(|| calling_card(&params));
             let (scope, scope_id, parent_sort, parent_acceptance) =
                 if let Some(parent_id) = parent_id {
                     let parent = storage.tasks().get(parent_id).await.map_err(err_str)?;
@@ -553,7 +606,7 @@ fn task_add_service(
                         parent.acceptance,
                     )
                 } else {
-                    let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
+                    let (scope, scope_id) = resolve_scope(&storage, &params, &workspace_id).await?;
                     (scope, scope_id, None, None)
                 };
             let title = opt_string(&params, "title")
@@ -929,7 +982,7 @@ fn task_list_service(
         let storage = storage.clone();
         let workspace_id = workspace_id.clone();
         Box::pin(async move {
-            let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
+            let (scope, scope_id) = resolve_scope(&storage, &params, &workspace_id).await?;
             let include_done = opt_bool(&params, "include_done")?.unwrap_or(true);
             let tasks = storage
                 .tasks()
@@ -953,7 +1006,7 @@ fn task_query_service(
         let storage = storage.clone();
         let workspace_id = workspace_id.clone();
         Box::pin(async move {
-            let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
+            let (scope, scope_id) = resolve_scope(&storage, &params, &workspace_id).await?;
             let filter = opt_string(&params, "filter")
                 .ok_or_else(|| "filter is required".to_string())?;
             let tasks = storage
@@ -1064,7 +1117,14 @@ fn task_clear_service(
         let storage = storage.clone();
         let workspace_id = workspace_id.clone();
         Box::pin(async move {
-            let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
+            if let Some(card_id) = calling_card(&params) {
+                return Err(format!(
+                    "a card run cannot clear tasks: its scope is the whole board, which is not \
+                     yours to empty. Close or cancel the cards of card #{card_id}'s subtree one \
+                     at a time."
+                ));
+            }
+            let (scope, scope_id) = resolve_scope(&storage, &params, &workspace_id).await?;
             let closed_only = opt_bool(&params, "closed_only")?.unwrap_or(true);
 
             // Same contract rule as tasks.remove, applied in bulk —
@@ -1140,7 +1200,7 @@ fn task_counts_service(
         let storage = storage.clone();
         let workspace_id = workspace_id.clone();
         Box::pin(async move {
-            let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
+            let (scope, scope_id) = resolve_scope(&storage, &params, &workspace_id).await?;
             let (open, closed) = storage
                 .tasks()
                 .counts(&scope, scope_id.as_deref())
@@ -10268,5 +10328,70 @@ mod card_run_tests {
             .await
             .expect("verdict");
         assert_eq!(tasks.get(root).await.expect("card").status, "done");
+    }
+
+    /// A card run's `todo` works its own card: a task it adds is a sub-card
+    /// the run will be served, its "next" never leaves the card, and it
+    /// cannot bulk-clear the human's board.
+    #[tokio::test]
+    async fn a_card_runs_todo_works_inside_its_card() {
+        let storage = builder_storage().await;
+        let services = super::build_task_services(
+            storage.clone(),
+            Arc::new(tokio::sync::RwLock::new(None)),
+            Arc::new(super::TurnBaselines::new()),
+        );
+        let call = |name: &str, params: serde_json::Value| {
+            let service = services.get(name).expect("service").clone();
+            async move { service(params).await }
+        };
+        let root = card(&storage, "ship the parser", None, 3).await;
+        let urgent_elsewhere = card(&storage, "someone else's fire", None, 1).await;
+        let session = super::card_run_session_id(root);
+
+        let added = call(
+            "tasks.add",
+            json!({"title": "write the lexer", "session_id": session}),
+        )
+        .await
+        .expect("added");
+        assert_eq!(added["task"]["parent_id"], json!(root), "{added}");
+        assert_eq!(
+            added["task"]["scope"], "global",
+            "on the board, not in a chat"
+        );
+
+        let next = call("tasks.next", json!({"session_id": session}))
+            .await
+            .expect("next");
+        assert_eq!(
+            next["task"]["title"], "write the lexer",
+            "never #{urgent_elsewhere}: {next}"
+        );
+
+        let cleared = call(
+            "tasks.clear",
+            json!({"session_id": session, "closed_only": false}),
+        )
+        .await;
+        assert!(cleared.is_err(), "{cleared:?}");
+        assert_eq!(
+            storage
+                .tasks()
+                .get(urgent_elsewhere)
+                .await
+                .expect("card")
+                .status,
+            "pending"
+        );
+
+        // An explicit scope is honoured as asked.
+        let global = call(
+            "tasks.add",
+            json!({"title": "a board-level card", "scope": "global", "session_id": session}),
+        )
+        .await
+        .expect("added");
+        assert!(global["task"]["parent_id"].is_null(), "{global}");
     }
 }

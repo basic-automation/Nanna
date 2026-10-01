@@ -8235,6 +8235,16 @@ as its turn (`TurnAdmission`, scope default `session`).
             (`max_in_progress_per_profile`); ours is fixed at 1 by decision 3.
 - [ ] Sub-agent spawning is replaced by "create a sub-task assigned to another member". Delete
       `sub_agent`/`task` tool and `SubSessionInfo`.
+      - [x] *(2026-10-01)* **The half that does not need chat deleted: a card run's `todo` works
+            its own card.** From a `card:<id>` tool session, the `tasks.*` services' default
+            (session) scope resolves to the card's board scope (`calling_card` in
+            `resolve_scope`): `add` with no parent makes a sub-card of the card — which the run's
+            subtree admission then serves — `next` never leaves the card's subtree, and `clear`
+            is refused (its scope would be the human's whole board). An explicit
+            `workspace`/`global` scope is honoured as asked. e2e
+            `a_card_runs_todo_adds_sub_cards_under_its_card`. **Still open:** assigning such a
+            sub-card to *another* member (it is the run's own work today, served by the same
+            run), and deleting `sub_agent`/`task` + `SubSessionInfo` with chat.
 - [ ] `ask_user` becomes "create a clarification card assigned to the human, depended on by this
       card"; the 30-minute wait and the channel broadcast go away.
       - [x] *(2026-10-01)* **For card runs, it already is.** A card run's tools now execute in a

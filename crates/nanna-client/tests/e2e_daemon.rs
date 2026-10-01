@@ -3838,3 +3838,67 @@ async fn a_card_runs_question_becomes_a_clarification_card() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// A member that splits its card with the real `todo` tool puts the pieces
+/// on the board under that card — where its own run is served them — not in
+/// a conversation nobody can see.
+#[tokio::test]
+async fn a_card_runs_todo_adds_sub_cards_under_its_card() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"{"decision":"assign","member":"agent:builder","reason":"it builds"}"#.to_string(),
+        r#"CALL todo {"action":"add","title":"Write the lexer first"}"#.to_string(),
+        "Split it: the lexer comes first.".to_string(),
+        "Done.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let created = client
+        .request(nanna_client::Action::Member(
+            nanna_client::MemberAction::Create {
+                name: "Builder".to_string(),
+                workspace_id: None,
+                personal: false,
+                avatar: None,
+                profile: None,
+            },
+        ))
+        .await
+        .expect("member.create answers");
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+
+    let id = create_global_card(&client, "Ship the parser").await;
+    let started = std::time::Instant::now();
+    let sub_card = loop {
+        let board = client
+            .request(nanna_client::Action::Task(
+                nanna_client::TaskAction::Query {
+                    filter: "subtask".to_string(),
+                    scope: Some("global".to_string()),
+                    session_id: None,
+                },
+            ))
+            .await
+            .expect("task.query answers");
+        if let Some(found) = board["tasks"]
+            .as_array()
+            .and_then(|t| t.iter().find(|t| t["title"] == "Write the lexer first"))
+        {
+            break found.clone();
+        }
+        assert!(
+            started.elapsed() < READY_HANG_CEILING,
+            "no sub-card on the board: {board}"
+        );
+        tokio::time::sleep(READY_POLL_INTERVAL).await;
+    };
+    assert_eq!(sub_card["parent_id"], id, "under the card: {sub_card}");
+    client.disconnect().await;
+    daemon.stop();
+}
