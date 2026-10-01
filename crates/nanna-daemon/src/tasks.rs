@@ -1373,6 +1373,23 @@ pub fn card_run_session_id(card_id: i64) -> String {
     format!("{CARD_RUN_SESSION_PREFIX}{card_id}")
 }
 
+/// The tool session a background run's tools see — never the shared slot.
+///
+/// The shared slot is whichever conversation was last active, so a run
+/// without its own scope had its session-scoped tools (`ask_user`, `todo`)
+/// act on an unrelated chat. A card run is `card:<id>`; a run over a
+/// session's plan is that session; a run over a workspace or the global
+/// board has no conversation, and gets `run:<scope>:<id>`, which names none.
+#[must_use]
+pub fn background_run_session(source: &TursoTaskSource) -> String {
+    if let Some(card_id) = source.subtree_root {
+        return card_run_session_id(card_id);
+    }
+    match (source.scope.as_str(), source.scope_id.as_deref()) {
+        ("session", Some(session_id)) => session_id.to_string(),
+        (scope, scope_id) => format!("run:{scope}:{}", scope_id.unwrap_or("")),
+    }
+}
 /// The card a tool-session id belongs to, when it is a card run's.
 #[must_use]
 pub fn card_of_run_session(session_id: &str) -> Option<i64> {
@@ -8233,7 +8250,7 @@ impl TaskRunManager {
         });
 
         let manager = self.clone();
-        let run_session = source.subtree_root.map(card_run_session_id);
+        let run_session = background_run_session(&source);
         let run = async move {
             // Bounded auto-resume (standard for every model): the task store
             // IS the checkpoint, so a run stopped by a provider incident is
@@ -8318,15 +8335,11 @@ impl TaskRunManager {
             manager.announce_member_free(busy_member);
         };
         // Tools execute inline in the run's own future, so the task-local
-        // scope covers every call a card run makes.
-        match run_session {
-            Some(session) => {
-                tokio::spawn(nanna_tools::ToolRegistry::with_run_session(session, run));
-            }
-            None => {
-                tokio::spawn(run);
-            }
-        }
+        // scope covers every call the run makes.
+        tokio::spawn(nanna_tools::ToolRegistry::with_run_session(
+            run_session,
+            run,
+        ));
         Ok(())
     }
 
@@ -10393,5 +10406,37 @@ mod card_run_tests {
         .await
         .expect("added");
         assert!(global["task"]["parent_id"].is_null(), "{global}");
+    }
+
+    /// Every background run has a tool session of its own (never the shared
+    /// slot a chat last set).
+    #[tokio::test]
+    async fn every_background_run_has_its_own_tool_session() {
+        let storage = builder_storage().await;
+        let source = |scope: &str, scope_id: Option<&str>| {
+            TursoTaskSource::new(
+                storage.clone(),
+                scope.to_string(),
+                scope_id.map(str::to_string),
+                "harness".to_string(),
+                None,
+            )
+        };
+        assert_eq!(
+            super::background_run_session(&card_source(&storage, 7)),
+            "card:7"
+        );
+        assert_eq!(
+            super::background_run_session(&source("session", Some("s1"))),
+            "s1"
+        );
+        assert_eq!(
+            super::background_run_session(&source("workspace", Some("w1"))),
+            "run:workspace:w1"
+        );
+        assert_eq!(
+            super::background_run_session(&source("global", None)),
+            "run:global:"
+        );
     }
 }

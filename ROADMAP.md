@@ -8261,8 +8261,10 @@ as its turn (`TurnAdmission`, scope default `session`).
             not believed (`waits_on_an_answer`; a verified completion still stands). e2e
             `a_card_runs_question_becomes_a_clarification_card` (real skill + service). **Still
             open:** the chat path's 30-minute wait and channel broadcast — they go with chat in
-            Stage 4. Background *scope* runs (`task.start_run` without `card_id`) still run
-            unscoped; give them a scope or delete them with chat.
+            Stage 4. *(later the same day)* Background *scope* runs (`task.start_run` without
+            `card_id`) are scoped too (`background_run_session`): a session plan's run is that
+            session, a workspace/global run `run:<scope>:<id>` — no background run reads the
+            shared slot any more.
 - [ ] Skills tier: markdown files with name + description, matched to cards by label and to
       members by allow-list, loaded into the run's context. Rename `default-skills/` → tools
       (directory, `DEFAULT_SKILLS`, build.rs, tests) in one mechanical PR.
