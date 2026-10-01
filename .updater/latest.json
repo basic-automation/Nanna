@@ -1,15 +1,15 @@
 {
-  "version": "0.3.32",
-  "notes": "Stopped means stopped: timed-out Python scripts are stopped, Python can't take Ctrl-C from the daemon, and the board's router can decide who does a card (not switched on yet).",
-  "pub_date": "2026-09-27T13:09:14.966Z",
+  "version": "0.3.34",
+  "notes": "Agents work their cards: assigning a board card to an agent starts the work, and a card it cannot finish goes back to the router.",
+  "pub_date": "2026-10-01T14:45:15.068Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWc3N1NqaFh0RHErc1VOQ3JINlhpempNSUZhV1FyTk93MlloYi9pUWp4eVUwRWtJYkxZOWxhR1hxenBuS3MxODU2dkRYd1Uxb0Jka0RXeHBiUlVodWcwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwNTE0NDMyCWZpbGU6TmFubmFfMC4zLjMyX3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMzIKcDU1N1lBRUl6Mnh4SHh3MUltMXRpUE1JcmsrS1ZFUzVXc2pyTzRueUllSWx3WndsN3FpNFpsTmExbURaQ3cwMUtqbFBwWHp2dGF5T01pZCtaYmJnQWc9PQo=",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.32-beta.41/Nanna_0.3.32_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWtLSlM4dWI0TVBoT21LcHlKMVRzaWdQcW1uTFhUYm0xMTIveXo5empuOG5YbC83YWZJM2hVdFFKTURjODB5UU9kNDhjMmI4M290dDBQSEtub1pMaWdjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwODY1NTc2CWZpbGU6TmFubmFfMC4zLjM0X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMzQKT2J3M0MyVldJUU8zQUJMNExra3ZvdUhkV1RqVE4wZmJOc0J1RzlDODBmOG93S0gzdnp1OFVhc0RzZGdoTTJpWVErdFRaTUQ0MlJxNFFvQm1SNUR6QWc9PQo=",
+      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.34-beta.43/Nanna_0.3.34_x64-setup.exe"
     },
     "linux-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaW5nTWRuMUxxTEZ6NFdDOTRSUDZWOTdDNFczZ3dIU3RQVGtRdDhJeUQzZ2d4dzNLbEljMzZ1ejNMNEQ5dFd4eTMrSDdXZU5GS1lCUjlnVXFwcUp5NHdjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwNTEyOTE0CWZpbGU6TmFubmFfMC4zLjMyX2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjMyClE3V2o4RTVXUU4wNlBuL210ZFhuekt3UFFkYkd2K3ozcmhUeTZlUVI0WHhKdkZQblh2Ti94YnBuU3VDNCtKM0k3MXJCUVRKWnRCOTJVNkJMdGU5V0RBPT0K",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.32-beta.41/Nanna_0.3.32_amd64.AppImage"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWk4VnNpbVVaMERvTVBKWFZXQVhMbS9LRG40ckdtMjlIR0VhK0RmcUdZRUtaUERGSDlqWlRra1VZc0Jhd09nb0hjQ2NyNGd6MTl4OWFDSzdTUGp1SEF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwODYzMDQ4CWZpbGU6TmFubmFfMC4zLjM0X2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjM0Ck00eWcwZ3FweEVOWmd5VUdGMko5a1NmcFVMVUFqQytwMEdIZ0dkdEd6QU1ySTdhZnYvU2t6THJCUkZmdkkyNUdxVDJNMjQ4WVk1bm44bTFIZlNMNERBPT0K",
+      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.34-beta.43/Nanna_0.3.34_amd64.AppImage"
     }
   }
 }
