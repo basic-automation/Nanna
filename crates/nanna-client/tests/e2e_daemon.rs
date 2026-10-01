@@ -3770,3 +3770,71 @@ async fn a_cancelled_card_run_leaves_the_card_paused_with_its_member() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// P25 decision 6 on the real daemon: a member that calls `ask_user` while
+/// working a card asks on the board — a clarification card for the human
+/// that its card waits on, the question posted by the member — through the
+/// real skill, service and tool-session scope.
+#[tokio::test]
+async fn a_card_runs_question_becomes_a_clarification_card() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"{"decision":"assign","member":"agent:builder","reason":"it merges"}"#.to_string(),
+        r#"CALL ask_user {"question":"Which branch should I merge?"}"#.to_string(),
+        "WAIT 60000 Waiting for the answer.".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let created = client
+        .request(nanna_client::Action::Member(
+            nanna_client::MemberAction::Create {
+                name: "Builder".to_string(),
+                workspace_id: None,
+                personal: false,
+                avatar: None,
+                profile: None,
+            },
+        ))
+        .await
+        .expect("member.create answers");
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+
+    let id = create_global_card(&client, "Merge the release branch").await;
+    let card = card_when(&client, id, "waiting on a question", |card| {
+        card["task"]["depends_on"]
+            .as_array()
+            .is_some_and(|d| !d.is_empty())
+    })
+    .await;
+    assert_eq!(card["task"]["blocked"], true, "{card}");
+    let notes = card["notes"].as_array().cloned().unwrap_or_default();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n["author_member_id"] == "agent:builder"
+                && n["kind"] == "question"
+                && n["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("Which branch should I merge?"))),
+        "the member asked on its card: {card}"
+    );
+    let question = card["task"]["depends_on"][0].as_i64().expect("an id");
+    let clarification = client
+        .request(nanna_client::Action::Task(nanna_client::TaskAction::Get {
+            id: question,
+        }))
+        .await
+        .expect("task.get answers");
+    assert_eq!(
+        clarification["task"]["assignee"], "human",
+        "{clarification}"
+    );
+    client.disconnect().await;
+    daemon.stop();
+}

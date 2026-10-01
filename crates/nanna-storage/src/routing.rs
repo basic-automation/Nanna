@@ -467,6 +467,29 @@ async fn apply_clarify(
     question: &str,
     reason: &str,
 ) -> Result<AppliedDecision, StorageError> {
+    ask_on_card(tasks, router_id, task, question, reason).await
+}
+
+/// Put `question` to the human as a clarification card that `task` waits on
+/// (P25 decision 6).
+///
+/// Asked by member `asker_id` — the router deciding, or the
+/// member working the card. The card is derived-`blocked` until the human
+/// completes the clarification; the asker's `question` post on the card says
+/// which card to answer.
+///
+/// # Errors
+/// [`StorageError::Invalid`] when `task` already waits on
+/// [`TASK_DEPS_MAX`] cards, else the store failure creating the
+/// clarification, updating `task` or posting.
+pub async fn ask_on_card(
+    tasks: &TaskRepository,
+    asker_id: &str,
+    task: &Task,
+    question: &str,
+    reason: &str,
+) -> Result<AppliedDecision, StorageError> {
+    let router_id = asker_id;
     if task.depends_on.len() >= TASK_DEPS_MAX {
         return Err(StorageError::Invalid(format!(
             "card #{} already waits on {TASK_DEPS_MAX} cards; it cannot wait on a clarification too",

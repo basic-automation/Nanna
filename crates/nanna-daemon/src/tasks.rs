@@ -1297,6 +1297,30 @@ pub fn card_after_run(card: &Task, stop: &StopReason) -> CardAfterRun {
         }
     }
 }
+/// The tool-session id a card run's tools see: `card:<id>`.
+///
+/// Session-scoped tools resolve their session from the run's own scope (see
+/// `ToolRegistry::with_run_session`); a background run with none fell back to
+/// the shared slot — whatever chat was last active — so a card run's
+/// `ask_user` could have asked, and taken its answer from, an unrelated
+/// conversation. With this id it asks on the board instead
+/// ([`crate::ask_user_service`]).
+pub const CARD_RUN_SESSION_PREFIX: &str = "card:";
+
+/// The tool-session id of card `card_id`'s run.
+#[must_use]
+pub fn card_run_session_id(card_id: i64) -> String {
+    format!("{CARD_RUN_SESSION_PREFIX}{card_id}")
+}
+
+/// The card a tool-session id belongs to, when it is a card run's.
+#[must_use]
+pub fn card_of_run_session(session_id: &str) -> Option<i64> {
+    session_id
+        .strip_prefix(CARD_RUN_SESSION_PREFIX)
+        .and_then(|id| id.parse::<i64>().ok())
+        .filter(|id| *id > 0)
+}
 /// The activity row a member's card run leaves on its card when it starts.
 pub const RUN_STARTED_ACTION: &str = "run_started";
 
@@ -1536,6 +1560,77 @@ impl TursoTaskSource {
         {
             tracing::warn!(task_id = id, member = member_id, error = %e, "card run post refused");
         }
+    }
+
+    /// A card run's member claiming a card done on its word alone while the
+    /// card still waits on another (the question it just asked, decision 6):
+    /// the claim is not a verdict, so the card stays open, the thread says
+    /// why, and `true` tells the caller to skip the completion. The run then
+    /// finds nothing to serve and ends; the answer resumes it. A *verified*
+    /// completion is the environment's verdict and always stands.
+    async fn waits_on_an_answer(&self, id: i64, detail: &Value) -> bool {
+        if self.member_id.is_none() || detail.get("verified").and_then(Value::as_bool) == Some(true)
+        {
+            return false;
+        }
+        let Ok(task) = self.storage.tasks().get(id).await else {
+            return false;
+        };
+        if !task.blocked {
+            return false;
+        }
+        let waits_on: Vec<String> = task.depends_on.iter().map(|d| format!("#{d}")).collect();
+        self.post_as_member(
+            id,
+            nanna_storage::TaskNoteKind::Progress,
+            &format!(
+                "Not closing this on my word while it waits on {}; it resumes once that is done.",
+                waits_on.join(", ")
+            ),
+        )
+        .await;
+        self.emit(
+            id,
+            "completion_deferred",
+            json!({ "waits_on": task.depends_on }),
+        );
+        true
+    }
+
+    /// What the human answered on the clarifications `task` waited on, as
+    /// notes for the step working it — a card run only. The question was
+    /// asked on another card (decision 6), so the card's own notes never
+    /// carry the answer; without this a resumed run would ask again.
+    async fn answers_for(&self, task: &Task) -> Vec<String> {
+        if self.member_id.is_none() || task.depends_on.is_empty() {
+            return Vec::new();
+        }
+        match crate::board_router::answered_clarifications(&self.storage.tasks(), task).await {
+            Ok(answers) => answers
+                .into_iter()
+                .map(|a| match a.answer {
+                    Some(answer) => {
+                        format!("The human answered your question #{}: {answer}", a.card_id)
+                    }
+                    None => format!(
+                        "The human closed your question #{} without an answer.",
+                        a.card_id
+                    ),
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(task_id = task.id, error = %e, "card run: answers unreadable");
+                Vec::new()
+            }
+        }
+    }
+    /// Close out a card run (a no-op for other runs): settle its card, then
+    /// record the end — in that order, so a death between the two resumes a
+    /// card that was already settled rather than one that was not.
+    pub(crate) async fn finish_card_run(&self, stop: &StopReason) {
+        self.settle_after_run(stop).await;
+        self.mark_run(RUN_ENDED_ACTION, json!({ "stop": format!("{stop:?}") }))
+            .await;
     }
 
     /// Record a card run's start or end on its card (a no-op for other runs):
@@ -1786,13 +1881,15 @@ impl TaskSource for TursoTaskSource {
                 .notes(task.id, STEP_NOTES_TAIL)
                 .await
                 .map_err(|e| e.to_string())?;
+            let mut notes_tail: Vec<String> = notes.into_iter().map(|n| n.content).collect();
+            notes_tail.extend(self.answers_for(&task).await);
             return Ok(Some(TaskStep {
                 id: task.id,
                 title: task.title,
                 description: task.description,
                 acceptance,
                 tool_scope: task.tool_scope,
-                notes_tail: notes.into_iter().map(|n| n.content).collect(),
+                notes_tail,
             }));
         }
         Err(format!(
@@ -1820,6 +1917,9 @@ impl TaskSource for TursoTaskSource {
     }
 
     async fn complete(&self, id: i64, detail: Value) -> Result<(), String> {
+        if self.waits_on_an_answer(id, &detail).await {
+            return Ok(());
+        }
         self.storage
             .tasks()
             .complete(id, Some(&self.actor), Some(detail.clone()))
@@ -8073,7 +8173,8 @@ impl TaskRunManager {
         });
 
         let manager = self.clone();
-        tokio::spawn(async move {
+        let run_session = source.subtree_root.map(card_run_session_id);
+        let run = async move {
             // Bounded auto-resume (standard for every model): the task store
             // IS the checkpoint, so a run stopped by a provider incident is
             // resumed by simply starting again — next() picks up exactly
@@ -8143,13 +8244,7 @@ impl TaskRunManager {
                 resumes,
                 "Long-horizon run finished"
             );
-            source.settle_after_run(&report.stop).await;
-            source
-                .mark_run(
-                    RUN_ENDED_ACTION,
-                    json!({ "stop": format!("{:?}", report.stop) }),
-                )
-                .await;
+            source.finish_card_run(&report.stop).await;
             let _ = event_tx.send(Event::TaskRunCompleted {
                 scope: scope.clone(),
                 scope_id: scope_id.clone(),
@@ -8161,7 +8256,17 @@ impl TaskRunManager {
             // After the slot is free, or the member's next card would be
             // refused as "already working".
             manager.announce_member_free(busy_member);
-        });
+        };
+        // Tools execute inline in the run's own future, so the task-local
+        // scope covers every call a card run makes.
+        match run_session {
+            Some(session) => {
+                tokio::spawn(nanna_tools::ToolRegistry::with_run_session(session, run));
+            }
+            None => {
+                tokio::spawn(run);
+            }
+        }
         Ok(())
     }
 
@@ -10066,5 +10171,102 @@ mod card_run_tests {
                 .expect("read"),
             "its only leaf is blocked, and the parent is not a leaf"
         );
+    }
+
+    #[test]
+    fn a_card_runs_tool_session_names_its_card() {
+        assert_eq!(super::card_run_session_id(12), "card:12");
+        assert_eq!(super::card_of_run_session("card:12"), Some(12));
+        for not_a_card in ["card:0", "card:-3", "card:x", "card:", "9f1c-session", ""] {
+            assert_eq!(
+                super::card_of_run_session(not_a_card),
+                None,
+                "{not_a_card:?}"
+            );
+        }
+    }
+
+    /// The answer to a member's question lives on another card (decision 6);
+    /// the step that resumes the waiting card reads it in its notes.
+    #[tokio::test]
+    async fn a_resumed_card_run_reads_the_humans_answer() {
+        let storage = builder_storage().await;
+        let tasks = storage.tasks();
+        let root = card(&storage, "pick the branch and merge", None, 3).await;
+        let waiting = tasks.get(root).await.expect("card");
+        let asked = nanna_storage::routing::ask_on_card(
+            &tasks,
+            AGENT,
+            &waiting,
+            "Which branch?",
+            "waits on you",
+        )
+        .await
+        .expect("asked");
+        let question = asked.created[0];
+        let source = card_source(&storage, root);
+        assert!(
+            source.next().await.expect("next").is_none(),
+            "the card waits"
+        );
+
+        tasks
+            .post(
+                question,
+                Some("gui"),
+                Some(nanna_storage::HUMAN_MEMBER_ID),
+                TaskNoteKind::Comment,
+                "release/0.3",
+            )
+            .await
+            .expect("answer");
+        tasks
+            .complete(question, Some("gui"), None)
+            .await
+            .expect("answered");
+        let step = source.next().await.expect("next").expect("unblocked");
+        assert_eq!(step.id, root);
+        assert!(
+            step.notes_tail
+                .iter()
+                .any(|n| n == &format!("The human answered your question #{question}: release/0.3")),
+            "{:?}",
+            step.notes_tail
+        );
+    }
+
+    /// A member's word cannot close a card that waits on the human's answer;
+    /// the environment's verdict can.
+    #[tokio::test]
+    async fn a_claimed_completion_waits_for_the_answer_a_card_needs() {
+        let storage = builder_storage().await;
+        let tasks = storage.tasks();
+        let root = card(&storage, "merge it", None, 3).await;
+        let waiting = tasks.get(root).await.expect("card");
+        nanna_storage::routing::ask_on_card(&tasks, AGENT, &waiting, "Which branch?", "waits")
+            .await
+            .expect("asked");
+        let source = card_source(&storage, root);
+        source
+            .complete(root, json!({"verified": false}))
+            .await
+            .expect("claim");
+        assert_eq!(
+            tasks.get(root).await.expect("card").status,
+            "pending",
+            "still open"
+        );
+        let thread = tasks.notes(root, 5).await.expect("thread");
+        assert!(
+            thread
+                .iter()
+                .any(|n| n.content.starts_with("Not closing this on my word")),
+            "{thread:?}"
+        );
+        source
+            .complete(root, json!({"verified": true, "verdict": "merged"}))
+            .await
+            .expect("verdict");
+        assert_eq!(tasks.get(root).await.expect("card").status, "done");
     }
 }

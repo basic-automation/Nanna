@@ -4844,6 +4844,7 @@ impl DaemonServer {
                     sessions: Arc::clone(&self.sessions),
                     events: self.ipc.event_sender(),
                     chat_runs: Arc::clone(chat_runs),
+                    storage: self.storage.clone(),
                 },
             })),
         )
@@ -5148,6 +5149,7 @@ impl DaemonServer {
                 sessions: Arc::clone(&self.sessions),
                 events: self.ipc.event_sender(),
                 chat_runs: Arc::clone(chat_runs),
+                storage: self.storage.clone(),
             }),
         });
         // Fill the slot before any skill can be executed. `set` returning

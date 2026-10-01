@@ -8237,6 +8237,22 @@ as its turn (`TurnAdmission`, scope default `session`).
       `sub_agent`/`task` tool and `SubSessionInfo`.
 - [ ] `ask_user` becomes "create a clarification card assigned to the human, depended on by this
       card"; the 30-minute wait and the channel broadcast go away.
+      - [x] *(2026-10-01)* **For card runs, it already is.** A card run's tools now execute in a
+            `card:<id>` tool-session scope (`card_run_session_id`, wrapped around the spawned
+            run). That also **fixes a cross-talk bug**: background runs had no scope, so
+            session-scoped tools fell back to the shared slot — a card run's `ask_user` would
+            have posted into, and taken its "answer" from, whichever chat was last active. In
+            that scope `session.ask_user` calls `routing::ask_on_card` (the router's clarify,
+            now public and asked by any member): a clarification card for the human that the
+            card `depends_on`, the question posted by the member, nothing waits. The run ends
+            when nothing else is servable (Waiting → `pending`), `unblocked` restarts it, and
+            the resumed step's notes carry "The human answered your question #N: …"
+            (`answers_for`). A model that claims the card done on its word while it waits is
+            not believed (`waits_on_an_answer`; a verified completion still stands). e2e
+            `a_card_runs_question_becomes_a_clarification_card` (real skill + service). **Still
+            open:** the chat path's 30-minute wait and channel broadcast — they go with chat in
+            Stage 4. Background *scope* runs (`task.start_run` without `card_id`) still run
+            unscoped; give them a scope or delete them with chat.
 - [ ] Skills tier: markdown files with name + description, matched to cards by label and to
       members by allow-list, loaded into the run's context. Rename `default-skills/` → tools
       (directory, `DEFAULT_SKILLS`, build.rs, tests) in one mechanical PR.
