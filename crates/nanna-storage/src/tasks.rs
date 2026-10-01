@@ -992,6 +992,52 @@ impl TaskRepository {
         Ok(cards)
     }
 
+    /// Cards whose newest `started` / `ended` activity row (by those two
+    /// action names) is a `started` — work something began and never closed
+    /// out — among the newest `scan_rows` such rows, newest first.
+    ///
+    /// A daemon reads this at boot, when nothing can be running, to find the
+    /// runs it died inside. The scan is bounded: interrupted runs are the
+    /// last ones started before the death, so they are among the newest rows.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails.
+    ///
+    /// # Panics
+    /// Panics if `scan_rows` is 0 or the two action names are equal.
+    pub async fn cards_with_unended(
+        &self,
+        started: &str,
+        ended: &str,
+        scan_rows: usize,
+    ) -> Result<Vec<i64>, StorageError> {
+        assert!(scan_rows > 0, "the scan is bounded and non-empty");
+        assert_ne!(started, ended, "a start and an end are different rows");
+        let limit = i64::try_from(scan_rows).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT task_id, action FROM task_activity WHERE action IN (?1, ?2) \
+                 ORDER BY id DESC LIMIT ?3",
+                turso::params![started, ended, limit],
+            )
+            .await?;
+        let mut seen: HashSet<i64> = HashSet::new();
+        let mut unended = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let task_id: i64 = row.get(0)?;
+            let action: String = row.get(1)?;
+            // Newest first: the first row seen for a card is its latest.
+            if seen.insert(task_id) && action == started {
+                unended.push(task_id);
+            }
+        }
+        drop(rows);
+        drop(conn);
+        debug_assert!(unended.len() <= seen.len(), "one answer per card at most");
+        Ok(unended)
+    }
+
     /// Who created card `task_id`: the actor on its `created` activity row.
     ///
     /// `None` when the creator was not recorded (a writer that named no

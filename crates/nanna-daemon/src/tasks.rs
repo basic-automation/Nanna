@@ -1297,6 +1297,13 @@ pub fn card_after_run(card: &Task, stop: &StopReason) -> CardAfterRun {
         }
     }
 }
+/// The activity row a member's card run leaves on its card when it starts.
+pub const RUN_STARTED_ACTION: &str = "run_started";
+
+/// The activity row a member's card run leaves on its card when it ends. A
+/// `run_started` with no later `run_ended` is a run the daemon died inside.
+pub const RUN_ENDED_ACTION: &str = "run_ended";
+
 /// The activity row a member's run leaves when it hands its card back to the
 /// router unfinished. The router's worker counts them to bound retries.
 pub const HANDED_BACK_ACTION: &str = "handed_back";
@@ -1528,6 +1535,29 @@ impl TursoTaskSource {
             .await
         {
             tracing::warn!(task_id = id, member = member_id, error = %e, "card run post refused");
+        }
+    }
+
+    /// Record a card run's start or end on its card (a no-op for other runs):
+    /// the pair is how a restarted daemon tells a run it interrupted from a
+    /// card someone paused (see [`crate::card_run_trigger::resume_interrupted`]).
+    /// Best effort, like the thread posts.
+    pub(crate) async fn mark_run(&self, action: &str, detail: Value) {
+        debug_assert!(
+            action == RUN_STARTED_ACTION || action == RUN_ENDED_ACTION,
+            "only the run markers"
+        );
+        let (Some(root), Some(_)) = (self.subtree_root, self.member_id.as_ref()) else {
+            return;
+        };
+        let detail = (!detail.is_null()).then_some(detail);
+        if let Err(e) = self
+            .storage
+            .tasks()
+            .log_activity(root, Some(&self.actor), action, detail)
+            .await
+        {
+            tracing::warn!(task_id = root, action, error = %e, "card run marker not recorded");
         }
     }
 
@@ -8032,6 +8062,7 @@ impl TaskRunManager {
             .await?;
         let busy_member = card.map(|claim| claim.member_id);
         set_member_status(&source.storage, busy_member.as_deref(), MemberStatus::Busy).await;
+        source.mark_run(RUN_STARTED_ACTION, Value::Null).await;
 
         let scope = source.scope.clone();
         let scope_id = source.scope_id.clone();
@@ -8113,6 +8144,12 @@ impl TaskRunManager {
                 "Long-horizon run finished"
             );
             source.settle_after_run(&report.stop).await;
+            source
+                .mark_run(
+                    RUN_ENDED_ACTION,
+                    json!({ "stop": format!("{:?}", report.stop) }),
+                )
+                .await;
             let _ = event_tx.send(Event::TaskRunCompleted {
                 scope: scope.clone(),
                 scope_id: scope_id.clone(),

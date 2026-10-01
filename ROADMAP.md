@@ -8210,10 +8210,18 @@ as its turn (`TurnAdmission`, scope default `session`).
             `pending`. The worker now asks `subtree_has_work` (the run source's own choice,
             without starting) before every start, so an all-waiting subtree is never started,
             stopped empty and restarted in a loop. e2e
-            `a_cancelled_card_run_leaves_the_card_paused_with_its_member`. **Still open:** a
-            daemon that dies mid-run leaves its cards `in_progress` with no run — resume them
-            at boot (record run start/end on the card's activity, resume the unmatched ones)
-            or leave them to the `stalled` trigger.
+            `a_cancelled_card_run_leaves_the_card_paused_with_its_member`.
+      - [x] *(2026-10-01)* **A run the daemon died inside resumes at boot.** Every card run
+            leaves `run_started` / `run_ended` on its card (a cancel ends with its marker too,
+            so a pause is never mistaken for a death). When the card-run worker starts it reads
+            the newest `RESUME_SCAN_ROWS` = 1 024 markers (`cards_with_unended` — two per run,
+            at most one interrupted run per member), closes each unmatched start with an end
+            marker, shows its member idle again, puts the card back to `pending` and starts it
+            like an assignment — the store is the checkpoint, as for the run manager's own
+            provider-incident resumes. Proven model-free (`an_interrupted_card_run_is_closed_out_at_boot`,
+            the marker scan in `members.rs`); **not** proven across a real restart — the e2e
+            rig runs the daemon in-process, so an aborted daemon's run task outlives it and
+            would hold the store.
       - [ ] *(research 2026-10-01)* **Borrow Hermes Kanban's failure and stall rules** when the
             auto-start lands ([docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban)):
             its dispatcher auto-blocks a card after `failure_limit` (default 2) consecutive failed

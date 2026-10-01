@@ -45,6 +45,15 @@ pub const RUN_QUEUE_MAX: usize = nanna_storage::TASKS_PER_SCOPE_MAX;
 /// a person could keep in their head, as one bounded indexed read.
 pub const MEMBER_NEXT_CARDS_MAX: usize = 64;
 
+/// How many of the newest run markers are read at boot to find the card runs
+/// a dead daemon left unfinished.
+///
+/// Bound justification: a run leaves two markers, and the runs a daemon dies
+/// inside are the last ones it started — at most one per member, since a
+/// member works one card at a time. 1 024 rows reach back 512 runs, beyond
+/// any roster a board holds, in one bounded read.
+pub const RESUME_SCAN_ROWS: usize = 1024;
+
 /// Why the run worker was woken.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunWake {
@@ -115,6 +124,13 @@ pub async fn run(
     storage: Arc<Storage>,
 ) {
     info!("Card runs armed: a board card assigned to an agent is worked by that agent");
+    let resumed = resume_interrupted(&control, &storage).await;
+    if resumed > 0 {
+        info!(
+            resumed,
+            "card runs the last daemon died inside were resumed"
+        );
+    }
     while let Some(wake) = queue.recv().await {
         match wake {
             RunWake::Card(card_id) => {
@@ -124,6 +140,68 @@ pub async fn run(
         }
     }
     debug!("card run queue closed; worker exiting");
+}
+
+/// Resume the card runs the previous daemon died inside; returns how many
+/// started again.
+///
+/// Called once, when the worker starts — nothing can be running yet, so a
+/// card whose newest run marker is a start was interrupted, not paused (a
+/// cancelled run ends with its marker). Each is closed out with an end
+/// marker, its member shown idle again, the card put back to `pending` and
+/// started like any assignment — the task store is the run's checkpoint,
+/// exactly as for the run manager's own provider-incident resumes.
+pub async fn resume_interrupted(control: &ControlPlane, storage: &Storage) -> usize {
+    use crate::tasks::{RUN_ENDED_ACTION, RUN_STARTED_ACTION};
+    let tasks = storage.tasks();
+    let interrupted = match tasks
+        .cards_with_unended(RUN_STARTED_ACTION, RUN_ENDED_ACTION, RESUME_SCAN_ROWS)
+        .await
+    {
+        Ok(interrupted) => interrupted,
+        Err(e) => {
+            warn!(error = %e, "card runs: interrupted runs unreadable; none resumed");
+            return 0;
+        }
+    };
+    let mut resumed = 0usize;
+    for card_id in interrupted {
+        let detail = serde_json::json!({ "stop": "the daemon stopped mid-run" });
+        if let Err(e) = tasks
+            .log_activity(card_id, Some("daemon"), RUN_ENDED_ACTION, Some(detail))
+            .await
+        {
+            warn!(card_id, error = %e, "card runs: interrupted run not closed out; not resumed");
+            continue;
+        }
+        let Ok(card) = tasks.get(card_id).await else {
+            continue;
+        };
+        let Some(member_id) = card.assignee.clone() else {
+            continue;
+        };
+        if let Err(e) = storage
+            .members()
+            .set_status(&member_id, nanna_storage::MemberStatus::Idle)
+            .await
+        {
+            debug!(card_id, member = %member_id, error = %e, "card runs: member status not reset");
+        }
+        if card.status == "in_progress" {
+            let wait = nanna_storage::TaskPatch {
+                status: Some("pending".to_string()),
+                ..nanna_storage::TaskPatch::default()
+            };
+            if let Err(e) = tasks.update(card_id, wait, Some(&member_id)).await {
+                warn!(card_id, error = %e, "card runs: interrupted card left in progress");
+                continue;
+            }
+        }
+        if try_start(control, storage, card_id).await {
+            resumed += 1;
+        }
+    }
+    resumed
 }
 
 /// Start the best waiting card assigned to `member_id`, if any can start.
@@ -329,5 +407,73 @@ mod tests {
             is_startable(&unreadable, now),
             "an unreadable date hides nothing"
         );
+    }
+
+    /// A run the last daemon died inside is closed out at boot — end marker,
+    /// member idle, card pending — even when it cannot start again here (this
+    /// control plane has no agent), so nothing stays stuck as "busy".
+    #[tokio::test]
+    async fn an_interrupted_card_run_is_closed_out_at_boot() {
+        use crate::tasks::{RUN_ENDED_ACTION, RUN_STARTED_ACTION};
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let control = ControlPlane::new(Arc::new(crate::session::SessionManager::new()))
+            .with_storage(Arc::clone(&storage))
+            .await;
+        storage
+            .members()
+            .create(nanna_storage::NewMember {
+                id: "agent:builder".to_string(),
+                name: "Builder".to_string(),
+                avatar: None,
+                kind: nanna_storage::MemberKind::Agent,
+                owner_kind: nanna_storage::MemberOwner::Workspace,
+                owner_id: None,
+                status: nanna_storage::MemberStatus::Busy,
+                profile: json!({}),
+            })
+            .await
+            .expect("member");
+        let tasks = storage.tasks();
+        let card = tasks
+            .create(nanna_storage::NewTask {
+                title: "half done".to_string(),
+                scope: "global".to_string(),
+                priority: 3,
+                assignee: Some("agent:builder".to_string()),
+                ..nanna_storage::NewTask::default()
+            })
+            .await
+            .expect("card");
+        let picked_up = nanna_storage::TaskPatch {
+            status: Some("in_progress".to_string()),
+            ..nanna_storage::TaskPatch::default()
+        };
+        tasks
+            .update(card.id, picked_up, None)
+            .await
+            .expect("picked up");
+        tasks
+            .log_activity(card.id, Some("agent:builder"), RUN_STARTED_ACTION, None)
+            .await
+            .expect("marker");
+
+        assert_eq!(
+            resume_interrupted(&control, &storage).await,
+            0,
+            "no agent here to run it"
+        );
+        let card = tasks.get(card.id).await.expect("card");
+        assert_eq!(card.status, "pending");
+        let member = storage
+            .members()
+            .get("agent:builder")
+            .await
+            .expect("member");
+        assert_eq!(member.status, nanna_storage::MemberStatus::Idle);
+        let unended = tasks
+            .cards_with_unended(RUN_STARTED_ACTION, RUN_ENDED_ACTION, RESUME_SCAN_ROWS)
+            .await
+            .expect("scan");
+        assert!(unended.is_empty(), "closed out: {unended:?}");
     }
 }

@@ -734,3 +734,51 @@ async fn a_members_waiting_cards_are_its_open_board_cards_best_first() {
         .expect("one");
     assert_eq!(first_only.len(), 1, "the scan is bounded");
 }
+
+/// What a restarted daemon resumes: cards whose newest run marker is a start
+/// — never one whose run ended, however it ended, and each card once.
+#[tokio::test]
+async fn a_card_whose_newest_run_marker_is_a_start_was_interrupted() {
+    let storage = storage().await;
+    let tasks = storage.tasks();
+    let mut ids = Vec::new();
+    for title in [
+        "ended",
+        "interrupted",
+        "restarted then interrupted",
+        "only ended",
+    ] {
+        let card = tasks
+            .create(nanna_storage::NewTask {
+                title: title.to_string(),
+                scope: "global".to_string(),
+                priority: 3,
+                ..nanna_storage::NewTask::default()
+            })
+            .await
+            .expect("card");
+        ids.push(card.id);
+    }
+    let mark = |id: i64, action: &'static str| {
+        let tasks = storage.tasks();
+        async move {
+            tasks
+                .log_activity(id, None, action, None)
+                .await
+                .expect("marker");
+        }
+    };
+    mark(ids[0], "run_started").await;
+    mark(ids[1], "run_started").await;
+    mark(ids[0], "run_ended").await;
+    mark(ids[2], "run_started").await;
+    mark(ids[2], "run_ended").await;
+    mark(ids[3], "run_ended").await;
+    mark(ids[2], "run_started").await;
+
+    let unended = tasks
+        .cards_with_unended("run_started", "run_ended", 1024)
+        .await
+        .expect("scan");
+    assert_eq!(unended, vec![ids[2], ids[1]], "newest first, each once");
+}
