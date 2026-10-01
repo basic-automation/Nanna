@@ -16,12 +16,14 @@
 //!   at a time, so a card assigned to a busy member waits for this
 //!   ([`RunWake::MemberFree`], sent by the run manager).
 //!
-//! **Only cards the board client created are started, for now** — the same
-//! rule, for the same reason, as the router's wakes (see
-//! [`crate::board_router_trigger`]): while the chat harness lives, its own
-//! workspace-scoped cards must not grow runs of their own.
+//! **Only board work is started** — cards the board client, a router or an
+//! agent member made ([`is_board_creator`]); never the chat harness's own
+//! workspace-scoped cards while chat lives (the same reason as the router's
+//! wakes, see [`crate::board_router_trigger`]). A closed card also wakes its
+//! parent ([`RunWake::ChildClosed`]): a parent waiting on a sub-card handed
+//! to another member resumes when that member is done.
 
-use crate::board_router_trigger::{AGENT_MEMBER_PREFIX, created_by_board_client};
+use crate::board_router_trigger::{AGENT_MEMBER_PREFIX, BOARD_CLIENT_ACTOR};
 use crate::control::ControlPlane;
 use nanna_storage::{Storage, Task, TaskEvent, TaskEventKind};
 use std::sync::Arc;
@@ -61,6 +63,10 @@ pub enum RunWake {
     Card(i64),
     /// This member's card run ended: start its next card, if one waits.
     MemberFree(String),
+    /// Card `id` closed: its parent, waiting on it, may be workable again —
+    /// a sub-card handed to another member is not the parent run's to serve,
+    /// so the parent's run ends while it is open and resumes here.
+    ChildClosed(i64),
 }
 
 /// The wake `event` produces, if any. Pure, so the sink can call it on the
@@ -70,8 +76,13 @@ pub fn run_wake_for(event: &TaskEvent) -> Option<RunWake> {
     if event.scope == "session" {
         return None;
     }
+    if event.kind == TaskEventKind::Verdict {
+        return Some(RunWake::ChildClosed(event.task_id));
+    }
     let wakes = match event.kind {
-        TaskEventKind::Assigned => event
+        // Assigned to an agent, or created already assigned to one (a
+        // sub-card the router split off or a member handed on).
+        TaskEventKind::Assigned | TaskEventKind::Created => event
             .detail
             .get("assignee")
             .and_then(serde_json::Value::as_str)
@@ -113,6 +124,20 @@ pub fn is_deferred(card: &Task, now: chrono::DateTime<chrono::Utc>) -> bool {
         .is_some_and(|date| date > now)
 }
 
+/// Whether a card made by `creator` is board work a member may be started on.
+///
+/// That is the board client's, a router's (its splits) or an agent member's
+/// (the sub-cards a card run hands on). The chat harness's own cards are not —
+/// the rule the router's wakes keep while chat lives.
+#[must_use]
+pub fn is_board_creator(creator: Option<&str>) -> bool {
+    creator.is_some_and(|creator| {
+        creator == BOARD_CLIENT_ACTOR
+            || creator.starts_with(nanna_storage::ROUTER_MEMBER_PREFIX)
+            || creator.starts_with(AGENT_MEMBER_PREFIX)
+    })
+}
+
 /// Drain the run queue until every sender is gone.
 ///
 /// One wake at a time: starting a run is a few store reads and a spawn, and
@@ -137,6 +162,13 @@ pub async fn run(
                 try_start(&control, &storage, card_id).await;
             }
             RunWake::MemberFree(member_id) => start_next_for(&control, &storage, &member_id).await,
+            RunWake::ChildClosed(child_id) => {
+                if let Ok(Some(parent_id)) =
+                    storage.tasks().get(child_id).await.map(|c| c.parent_id)
+                {
+                    try_start(&control, &storage, parent_id).await;
+                }
+            }
         }
     }
     debug!("card run queue closed; worker exiting");
@@ -260,10 +292,10 @@ async fn try_start(control: &ControlPlane, storage: &Storage, card_id: i64) -> b
             return false;
         }
     }
-    match created_by_board_client(&tasks, card_id).await {
-        Ok(true) => {}
-        Ok(false) => {
-            debug!(card_id, "card runs: not a board-client card; not started");
+    match tasks.created_by(card_id).await {
+        Ok(creator) if is_board_creator(creator.as_deref()) => {}
+        Ok(_) => {
+            debug!(card_id, "card runs: not a board card; not started");
             return false;
         }
         Err(e) => {
@@ -330,7 +362,15 @@ mod tests {
             "global",
             json!({"assignee": "agent:builder"}),
         );
-        assert_eq!(run_wake_for(&created), None);
+        assert_eq!(
+            run_wake_for(&created),
+            Some(RunWake::Card(5)),
+            "made already assigned"
+        );
+        let closed = event(TaskEventKind::Verdict, "global", json!({}));
+        assert_eq!(run_wake_for(&closed), Some(RunWake::ChildClosed(5)));
+        let posted = event(TaskEventKind::Posted, "global", json!({}));
+        assert_eq!(run_wake_for(&posted), None);
     }
 
     fn card(status: &str, assignee: Option<&str>, due_at: Option<&str>) -> Task {
@@ -359,6 +399,17 @@ mod tests {
             blocked: false,
             due_announced_at: None,
             overdue_announced_at: None,
+        }
+    }
+
+    #[test]
+    fn board_work_is_the_board_clients_a_routers_or_an_agents() {
+        for creator in ["gui", "router:global", "router:ws-1", "agent:builder"] {
+            assert!(is_board_creator(Some(creator)), "{creator}");
+        }
+        // The chat harness's own cards, and a creator nobody recorded.
+        for creator in [Some("harness"), Some("agent"), Some("recurrence"), None] {
+            assert!(!is_board_creator(creator), "{creator:?}");
         }
     }
 

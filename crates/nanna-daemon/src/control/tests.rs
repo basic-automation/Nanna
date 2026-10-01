@@ -2411,8 +2411,7 @@ async fn the_board_roster_is_managed_over_ipc() {
 }
 
 /// P25 Stage 3: a card is worked only by the agent it is assigned to, only on
-/// a board, only while open — and the claim names the card's whole lineage so
-/// the run manager can keep two runs off the same cards.
+/// a board, only while open — a sub-card included, under its own claim.
 #[tokio::test]
 async fn a_card_run_is_claimed_only_for_an_agent_on_an_open_board_card() {
     let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
@@ -2501,9 +2500,12 @@ async fn a_card_run_is_claimed_only_for_an_agent_on_an_open_board_card() {
         .expect("an agent's open board card is claimable");
     assert_eq!(member.id, "agent:builder");
     assert_eq!(
-        claim.lineage,
-        vec![child.id, parent.id],
-        "nearest first, up to the root"
+        (claim.card_id, claim.member_id.as_str()),
+        (child.id, "agent:builder")
+    );
+    assert!(
+        child.parent_id == Some(parent.id),
+        "a sub-card is claimable too"
     );
 
     tasks

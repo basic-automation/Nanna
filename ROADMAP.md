@@ -8242,9 +8242,21 @@ as its turn (`TurnAdmission`, scope default `session`).
             subtree admission then serves — `next` never leaves the card's subtree, and `clear`
             is refused (its scope would be the human's whole board). An explicit
             `workspace`/`global` scope is honoured as asked. e2e
-            `a_card_runs_todo_adds_sub_cards_under_its_card`. **Still open:** assigning such a
-            sub-card to *another* member (it is the run's own work today, served by the same
-            run), and deleting `sub_agent`/`task` + `SubSessionInfo` with chat.
+            `a_card_runs_todo_adds_sub_cards_under_its_card`.
+      - [x] *(2026-10-01)* **Handing a sub-card to another member.** `todo add {assignee}` from a
+            card run makes a sub-card that is that member's work: `CardTree::serves` keeps a
+            run off any card on whose path up to its root someone else is the assignee (and off
+            everything under it), so the two runs never share a card — which made the old
+            lineage-overlap refusal redundant; `run_conflict` is now one run per card, one card
+            per member, scope runs exclusive (`CardClaim::lineage` and `card_lineage` deleted).
+            The sub-card starts its member's run at once: a card *created* already assigned to
+            an agent wakes the run worker, and board work is now anything the board client, a
+            router (its splits) or an agent member made (`is_board_creator`), so the router's
+            splits assigned to agents start too. The parent's run ends while the handed-on card
+            is open (its claim to be done is deferred with a post, `waits_on_an_answer` now
+            covers open sub-cards too), and a closed card wakes its parent
+            (`RunWake::ChildClosed`). e2e `a_member_hands_a_sub_card_to_another_member`.
+            **Still open:** deleting `sub_agent`/`task` + `SubSessionInfo` — with chat.
 - [ ] `ask_user` becomes "create a clarification card assigned to the human, depended on by this
       card"; the 30-minute wait and the channel broadcast go away.
       - [x] *(2026-10-01)* **For card runs, it already is.** A card run's tools now execute in a

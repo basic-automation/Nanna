@@ -576,9 +576,8 @@ impl ControlPlane {
         }
     }
 
-    /// What a card run needs to know before it may start: the card, the
-    /// member it is assigned to, and the card's lineage. Every refusal is the
-    /// IPC reply.
+    /// What a card run needs to know before it may start: the card and the
+    /// member it is assigned to. Every refusal is the IPC reply.
     pub(super) async fn card_claim(
         storage: &nanna_storage::Storage,
         card_id: i64,
@@ -622,42 +621,11 @@ impl ControlPlane {
                 "card #{card_id} is assigned to {}, who is not an agent that takes work", member.id
             )}));
         }
-        let lineage = Self::card_lineage(&repo, &card).await?;
         let claim = crate::tasks::CardClaim {
             card_id,
             member_id: member.id.clone(),
-            lineage,
         };
         Ok((card, member, claim))
-    }
-
-    /// `card` and its ancestors, nearest first — bounded by the store's own
-    /// depth limit, which it enforces at write time.
-    async fn card_lineage(
-        repo: &TaskRepository,
-        card: &nanna_storage::Task,
-    ) -> Result<Vec<i64>, Value> {
-        let mut lineage = vec![card.id];
-        let mut parent = card.parent_id;
-        while let Some(id) = parent {
-            if lineage.len() > nanna_storage::TASK_DEPTH_MAX || lineage.contains(&id) {
-                return Err(json!({"error": "bad_hierarchy", "message": format!(
-                    "card #{}'s ancestry does not end within {} levels", card.id, nanna_storage::TASK_DEPTH_MAX
-                )}));
-            }
-            lineage.push(id);
-            parent = repo
-                .get(id)
-                .await
-                .map_err(|e| json!({"error": "task_not_found", "message": e.to_string()}))?
-                .parent_id;
-        }
-        debug_assert_eq!(
-            lineage.first(),
-            Some(&card.id),
-            "a lineage starts at its own card"
-        );
-        Ok(lineage)
     }
 
     /// Start card `card_id`'s run as its assignment does (P25 Stage 3, see

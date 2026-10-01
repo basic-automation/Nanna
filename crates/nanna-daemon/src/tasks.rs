@@ -537,14 +537,15 @@ fn task_next_service(
                         .list(&scope, scope_id.as_deref(), true)
                         .await
                         .map_err(err_str)?;
-                    let parents: HashMap<i64, i64> = all
+                    let member = all
                         .iter()
-                        .filter_map(|t| t.parent_id.map(|p| (t.id, p)))
-                        .collect();
+                        .find(|t| t.id == card_id)
+                        .and_then(|t| t.assignee.clone());
+                    let tree = CardTree::of(&all);
                     storage
                         .tasks()
                         .next_admitted(&scope, scope_id.as_deref(), |t| {
-                            subtree_admits(&parents, card_id, t.id)
+                            tree.serves(card_id, member.as_deref(), t.id)
                         })
                         .await
                         .map_err(err_str)?
@@ -578,6 +579,25 @@ fn task_next_service(
 //            acceptance?, project?, assignee?, description?}
 //
 // `due_at` defers the card, `deadline_at` bounds it (P25 decision 10).
+/// Who a `tasks.add` call creates its task as: the caller-named `actor` (the
+/// same one `tasks.update` records), else — from a card run — the member
+/// working the card, which is what lets a sub-card it hands on start a run of
+/// its own ([`crate::card_run_trigger::is_board_creator`]).
+async fn task_creator(storage: &Storage, params: &Value) -> Result<Option<String>, String> {
+    if let Some(actor) = opt_string(params, "actor") {
+        return Ok(Some(actor));
+    }
+    let Some(card_id) = calling_card(params) else {
+        return Ok(None);
+    };
+    let card = storage
+        .tasks()
+        .get(card_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(card.assignee)
+}
+
 fn task_add_service(
     storage: &Arc<Storage>,
     workspace_id: &Arc<RwLock<Option<String>>>,
@@ -726,8 +746,7 @@ fn task_add_service(
                 acceptance: canonical_acceptance(&params)?.or(parent_acceptance),
                 assignee: opt_string(&params, "assignee"),
                 sort_order,
-                // The same caller-named actor `tasks.update` records.
-                created_by: opt_string(&params, "actor"),
+                created_by: task_creator(&storage, &params).await?,
             };
             // Decomposition damping — a returned note, never a
             // refusal. The item is created regardless; the note rides
@@ -1302,19 +1321,17 @@ pub(crate) async fn subtree_has_work(storage: &Storage, card: &Task) -> Result<b
         .list(&card.scope, card.scope_id.as_deref(), true)
         .await
         .map_err(|e| e.to_string())?;
-    let parents: HashMap<i64, i64> = all
-        .iter()
-        .filter_map(|t| t.parent_id.map(|p| (t.id, p)))
-        .collect();
+    let tree = CardTree::of(&all);
+    let member = card.assignee.as_deref();
     let next = repo
         .next_admitted(&card.scope, card.scope_id.as_deref(), |task| {
-            subtree_admits(&parents, card.id, task.id)
+            tree.serves(card.id, member, task.id)
         })
         .await
         .map_err(|e| e.to_string())?;
     debug_assert!(
         next.as_ref()
-            .is_none_or(|t| subtree_admits(&parents, card.id, t.id)),
+            .is_none_or(|t| tree.serves(card.id, member, t.id)),
         "only the card's own subtree is served"
     );
     Ok(next.is_some())
@@ -1409,32 +1426,64 @@ pub const RUN_ENDED_ACTION: &str = "run_ended";
 /// router unfinished. The router's worker counts them to bound retries.
 pub const HANDED_BACK_ACTION: &str = "handed_back";
 
-/// Whether card `id` is `root` or one of its descendants, given the scope's
-/// child → parent links.
-///
-/// Bounded: the store refuses hierarchies deeper than
-/// [`nanna_storage::TASK_DEPTH_MAX`], so a walk that has not met `root` after
-/// that many links never will — and a corrupt cycle cannot spin.
-#[must_use]
-pub fn subtree_admits<S: std::hash::BuildHasher>(
-    parent_of: &HashMap<i64, i64, S>,
-    root: i64,
-    id: i64,
-) -> bool {
-    let mut cursor = id;
-    for _ in 0..=nanna_storage::TASK_DEPTH_MAX {
-        if cursor == root {
-            return true;
-        }
-        let Some(&parent) = parent_of.get(&cursor) else {
-            return false;
-        };
-        debug_assert!(parent != cursor, "a card is never its own parent");
-        cursor = parent;
-    }
-    false
+/// A board scope's hierarchy, as a card run sees it: who each card's parent
+/// is and who each card is assigned to.
+#[derive(Debug, Default)]
+pub struct CardTree {
+    parent_of: HashMap<i64, i64>,
+    assignee_of: HashMap<i64, String>,
 }
 
+impl CardTree {
+    /// The tree of `tasks` — the whole scope, closed cards included: a closed
+    /// card between a root and an open descendant must not cut the chain.
+    #[must_use]
+    pub fn of(tasks: &[Task]) -> Self {
+        Self {
+            parent_of: tasks
+                .iter()
+                .filter_map(|t| t.parent_id.map(|p| (t.id, p)))
+                .collect(),
+            assignee_of: tasks
+                .iter()
+                .filter_map(|t| t.assignee.clone().map(|a| (t.id, a)))
+                .collect(),
+        }
+    }
+
+    /// Whether `member`'s run on card `root` may be served card `id`: `id` is
+    /// `root` or below it, and no card on the way up (`id` included, `root`
+    /// not) is assigned to anyone else. A sub-card handed to another member is
+    /// that member's work, with its own run — and so is everything under it.
+    /// `member` `None` (a run nobody holds) skips the second test.
+    ///
+    /// Bounded: the store refuses hierarchies deeper than
+    /// [`nanna_storage::TASK_DEPTH_MAX`], so a walk that has not met `root`
+    /// after that many links never will — and a corrupt cycle cannot spin.
+    #[must_use]
+    pub fn serves(&self, root: i64, member: Option<&str>, id: i64) -> bool {
+        let mut cursor = id;
+        for _ in 0..=nanna_storage::TASK_DEPTH_MAX {
+            if cursor == root {
+                return true;
+            }
+            let delegated = self
+                .assignee_of
+                .get(&cursor)
+                .zip(member)
+                .is_some_and(|(assignee, member)| assignee != member);
+            if delegated {
+                return false;
+            }
+            let Some(&parent) = self.parent_of.get(&cursor) else {
+                return false;
+            };
+            debug_assert!(parent != cursor, "a card is never its own parent");
+            cursor = parent;
+        }
+        false
+    }
+}
 /// The thread post a member's run leaves when it closes a card: what the
 /// acceptance check said, or that none ran.
 #[must_use]
@@ -1591,7 +1640,7 @@ impl TursoTaskSource {
 
     /// Serve only card `root` and its descendants — a card run never works a
     /// card the human put on the board beside it mid-run (see
-    /// [`subtree_admits`]).
+    /// [`CardTree::serves`]).
     #[must_use]
     pub const fn within_subtree(mut self, root: i64) -> Self {
         self.subtree_root = Some(root);
@@ -1606,19 +1655,15 @@ impl TursoTaskSource {
         self
     }
 
-    /// The parent links of the whole scope, closed cards included — a closed
-    /// card between the root and an open descendant must not cut the chain.
-    async fn scope_parents(&self) -> Result<HashMap<i64, i64>, String> {
+    /// The whole scope's [`CardTree`].
+    async fn scope_tree(&self) -> Result<CardTree, String> {
         let all = self
             .storage
             .tasks()
             .list(&self.scope, self.scope_id.as_deref(), true)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(all
-            .into_iter()
-            .filter_map(|t| t.parent_id.map(|p| (t.id, p)))
-            .collect())
+        Ok(CardTree::of(&all))
     }
 
     /// Append `content` to card `id`'s thread as this source's member, when it
@@ -1640,40 +1685,52 @@ impl TursoTaskSource {
     }
 
     /// A card run's member claiming a card done on its word alone while the
-    /// card still waits on another (the question it just asked, decision 6):
-    /// the claim is not a verdict, so the card stays open, the thread says
-    /// why, and `true` tells the caller to skip the completion. The run then
-    /// finds nothing to serve and ends; the answer resumes it. A *verified*
-    /// completion is the environment's verdict and always stands.
+    /// card still waits on other cards — the question it asked (decision 6),
+    /// or a sub-card it handed to another member: the claim is not a verdict,
+    /// so the card stays open, the thread says why, and `true` tells the
+    /// caller to skip the completion. The run then finds nothing to serve and
+    /// ends; the answer, or the other member's verdict, resumes it. A
+    /// *verified* completion is the environment's verdict and always stands.
     async fn waits_on_an_answer(&self, id: i64, detail: &Value) -> bool {
         if self.member_id.is_none() || detail.get("verified").and_then(Value::as_bool) == Some(true)
         {
             return false;
         }
-        let Ok(task) = self.storage.tasks().get(id).await else {
+        let repo = self.storage.tasks();
+        let Ok(task) = repo.get(id).await else {
             return false;
         };
-        if !task.blocked {
+        let mut waits_on: Vec<i64> = if task.blocked {
+            task.depends_on.clone()
+        } else {
+            Vec::new()
+        };
+        if let Ok(open) = repo
+            .list(&task.scope, task.scope_id.as_deref(), false)
+            .await
+        {
+            waits_on.extend(
+                open.iter()
+                    .filter(|t| t.parent_id == Some(id))
+                    .map(|t| t.id),
+            );
+        }
+        if waits_on.is_empty() {
             return false;
         }
-        let waits_on: Vec<String> = task.depends_on.iter().map(|d| format!("#{d}")).collect();
+        let named: Vec<String> = waits_on.iter().map(|d| format!("#{d}")).collect();
         self.post_as_member(
             id,
             nanna_storage::TaskNoteKind::Progress,
             &format!(
                 "Not closing this on my word while it waits on {}; it resumes once that is done.",
-                waits_on.join(", ")
+                named.join(", ")
             ),
         )
         .await;
-        self.emit(
-            id,
-            "completion_deferred",
-            json!({ "waits_on": task.depends_on }),
-        );
+        self.emit(id, "completion_deferred", json!({ "waits_on": waits_on }));
         true
     }
-
     /// What the human answered on the clarifications `task` waited on, as
     /// notes for the step working it — a card run only. The question was
     /// asked on another card (decision 6), so the card's own notes never
@@ -1904,8 +1961,8 @@ impl TaskSource for TursoTaskSource {
         if self.handed_back.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(None);
         }
-        let parents = match self.subtree_root {
-            Some(_) => Some(self.scope_parents().await?),
+        let tree = match self.subtree_root {
+            Some(_) => Some(self.scope_tree().await?),
             None => None,
         };
         for _ in 0..TASK_NEXT_SKIP_MAX {
@@ -1914,9 +1971,9 @@ impl TaskSource for TursoTaskSource {
                 .next_admitted(&self.scope, self.scope_id.as_deref(), |task| {
                     admission.is_none_or(|admission| admission.admits(task.id))
                         && self.subtree_root.is_none_or(|root| {
-                            parents
-                                .as_ref()
-                                .is_some_and(|parents| subtree_admits(parents, root, task.id))
+                            tree.as_ref().is_some_and(|tree| {
+                                tree.serves(root, self.member_id.as_deref(), task.id)
+                            })
                         })
                 })
                 .await
@@ -8015,19 +8072,17 @@ async fn set_member_status(storage: &Storage, member_id: Option<&str>, status: M
 pub struct CardClaim {
     pub card_id: i64,
     pub member_id: String,
-    /// The card and its ancestors, nearest first. Two runs whose lineages
-    /// meet would serve the same cards: the deeper card is inside the other's
-    /// subtree.
-    pub lineage: Vec<i64>,
 }
 
 /// Why a new run may not start beside `runs`, or `None` when it may.
 ///
 /// The invariant: **no card is ever served by two runs**, because two runners
-/// over one plan race `next()`. So, per scope: a scope run (which serves the
-/// whole scope) excludes every other run in that scope; a card run excludes a
-/// card run on any card above or below it. And a member works one card at a
-/// time — P25 decision 3's "busy" is a member's single state, not a count.
+/// over one plan race `next()`. A scope run serves its whole scope, so it
+/// excludes every other run there. Two card runs never share a card: one
+/// member's run is never served a card assigned to another
+/// ([`CardTree::serves`]), and a member works one card at a time — P25
+/// decision 3's "busy" is a member's single state, not a count. So a card
+/// handed down to another member runs beside its parent's run.
 #[must_use]
 fn run_conflict(
     runs: &HashMap<String, ActiveRun>,
@@ -8048,19 +8103,13 @@ fn run_conflict(
                 "card #{} is being worked in scope {scope_key}; a scope run would serve it too",
                 held.card_id
             )),
+            (Some(held), Some(wanted)) if held.card_id == wanted.card_id => {
+                Some(format!("card #{} is already being worked", held.card_id))
+            }
             (Some(held), Some(wanted)) if held.member_id == wanted.member_id => Some(format!(
                 "member {} is already working card #{}",
                 held.member_id, held.card_id
             )),
-            (Some(held), Some(wanted))
-                if held.lineage.contains(&wanted.card_id)
-                    || wanted.lineage.contains(&held.card_id) =>
-            {
-                Some(format!(
-                    "card #{} is being worked and shares cards with #{}",
-                    held.card_id, wanted.card_id
-                ))
-            }
             (Some(_), Some(_)) => None,
         };
         if reason.is_some() {
@@ -8172,18 +8221,17 @@ impl TaskRunManager {
     /// live run (see [`run_conflict`]).
     ///
     /// # Panics
-    /// When `claim.lineage` does not start at `claim.card_id` — a caller bug
-    /// that would let two runs share cards unnoticed.
+    /// When the claim names no card or no member — a caller bug that would
+    /// key a run nobody can find again.
     pub async fn start_card(
         self: &Arc<Self>,
         spec: TaskRunSpec,
         claim: CardClaim,
         event_tx: tokio::sync::broadcast::Sender<Event>,
     ) -> Result<(), String> {
-        assert_eq!(
-            claim.lineage.first(),
-            Some(&claim.card_id),
-            "a lineage starts at its own card"
+        assert!(
+            claim.card_id > 0 && !claim.member_id.is_empty(),
+            "a claim names a card and a member"
         );
         debug_assert_eq!(
             spec.source.subtree_root,
@@ -9807,8 +9855,7 @@ mod model_fallback_tests {
 #[cfg(test)]
 mod card_run_tests {
     use super::{
-        ActiveRun, CardClaim, TursoTaskSource, run_conflict, subtree_admits, truncate_post,
-        verdict_post,
+        ActiveRun, CardClaim, CardTree, TursoTaskSource, run_conflict, truncate_post, verdict_post,
     };
     use nanna_agent::CancelToken;
     use nanna_agent::harness::TaskSource;
@@ -9821,11 +9868,10 @@ mod card_run_tests {
 
     const AGENT: &str = "agent:builder";
 
-    fn claim(card_id: i64, member: &str, lineage: &[i64]) -> CardClaim {
+    fn claim(card_id: i64, member: &str) -> CardClaim {
         CardClaim {
             card_id,
             member_id: member.to_string(),
-            lineage: lineage.to_vec(),
         }
     }
 
@@ -9839,36 +9885,79 @@ mod card_run_tests {
         }
     }
 
+    fn tree_card(id: i64, parent_id: Option<i64>, assignee: Option<&str>) -> nanna_storage::Task {
+        nanna_storage::Task {
+            id,
+            parent_id,
+            scope: "global".to_string(),
+            scope_id: None,
+            project: None,
+            title: format!("card {id}"),
+            description: None,
+            status: "pending".to_string(),
+            priority: 3,
+            labels: Vec::new(),
+            tool_scope: Vec::new(),
+            due_at: None,
+            deadline_at: None,
+            recurrence: None,
+            depends_on: Vec::new(),
+            acceptance: None,
+            assignee: assignee.map(str::to_string),
+            sort_order: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+            completed_at: None,
+            blocked: false,
+            due_announced_at: None,
+            overdue_announced_at: None,
+        }
+    }
+
     #[test]
-    fn a_subtree_is_the_card_and_everything_under_it() {
-        // 1 ─ 2 ─ 3, and 4 beside 1; 5 ↔ 6 is a corrupt cycle.
-        let parents: HashMap<i64, i64> = [(2, 1), (3, 2), (5, 6), (6, 5)].into_iter().collect();
-        assert!(subtree_admits(&parents, 1, 1), "the card itself");
-        assert!(subtree_admits(&parents, 1, 3), "a grandchild");
-        assert!(!subtree_admits(&parents, 2, 1), "never an ancestor");
-        assert!(!subtree_admits(&parents, 1, 4), "never a card beside it");
-        assert!(!subtree_admits(&parents, 1, 5), "a cycle ends, refused");
+    fn a_card_run_is_served_its_subtree_minus_what_was_handed_on() {
+        // 1 ─ 2 ─ 3, 1 ─ 6 (handed to agent:other) ─ 7, and 4 beside 1.
+        let tree = CardTree::of(&[
+            tree_card(1, None, Some(AGENT)),
+            tree_card(2, Some(1), None),
+            tree_card(3, Some(2), Some(AGENT)),
+            tree_card(4, None, Some(AGENT)),
+            tree_card(6, Some(1), Some("agent:other")),
+            tree_card(7, Some(6), None),
+        ]);
+        let mine = Some(AGENT);
+        assert!(tree.serves(1, mine, 1), "the card itself");
+        assert!(tree.serves(1, mine, 3), "a grandchild");
+        assert!(!tree.serves(2, mine, 1), "never an ancestor");
+        assert!(!tree.serves(1, mine, 4), "never a card beside it");
+        assert!(
+            !tree.serves(1, mine, 6),
+            "a sub-card handed to another member"
+        );
+        assert!(!tree.serves(1, mine, 7), "nor anything under it");
+        assert!(
+            tree.serves(6, Some("agent:other"), 7),
+            "that member's run takes it"
+        );
+        assert!(
+            tree.serves(1, None, 7),
+            "a run with no member sees the whole subtree"
+        );
+        let cycle = CardTree::of(&[tree_card(5, Some(8), None), tree_card(8, Some(5), None)]);
+        assert!(!cycle.serves(1, mine, 5), "a cycle ends, refused");
     }
 
     #[test]
     fn a_card_is_worked_by_one_run_and_a_member_works_one_card() {
         let mut runs = HashMap::new();
-        runs.insert(
-            "card:2".to_string(),
-            run("global:", Some(claim(2, AGENT, &[2, 1]))),
-        );
+        runs.insert("card:2".to_string(), run("global:", Some(claim(2, AGENT))));
 
-        let child = claim(3, "agent:other", &[3, 2, 1]);
+        let same_card = claim(2, "agent:other");
         assert!(
-            run_conflict(&runs, "global:", Some(&child)).is_some(),
-            "inside a worked card"
+            run_conflict(&runs, "global:", Some(&same_card)).is_some(),
+            "one run per card"
         );
-        let parent = claim(1, "agent:other", &[1]);
-        assert!(
-            run_conflict(&runs, "global:", Some(&parent)).is_some(),
-            "above a worked card"
-        );
-        let same_member = claim(9, AGENT, &[9]);
+        let same_member = claim(9, AGENT);
         let reason = run_conflict(&runs, "workspace:w", Some(&same_member));
         assert!(
             reason.is_some_and(|r| r.contains("already working")),
@@ -9879,12 +9968,10 @@ mod card_run_tests {
             "a scope run would serve card 2"
         );
 
-        let beside = claim(4, "agent:other", &[4]);
-        assert_eq!(
-            run_conflict(&runs, "global:", Some(&beside)),
-            None,
-            "disjoint cards run together"
-        );
+        // A sub-card handed to another member runs beside its parent's run:
+        // neither run is ever served the other's cards (CardTree::serves).
+        let handed_on = claim(3, "agent:other");
+        assert_eq!(run_conflict(&runs, "global:", Some(&handed_on)), None);
         assert_eq!(
             run_conflict(&runs, "session:s", None),
             None,

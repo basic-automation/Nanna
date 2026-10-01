@@ -3902,3 +3902,78 @@ async fn a_card_runs_todo_adds_sub_cards_under_its_card() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// P25 Stage 3 on the real daemon: a member hands part of its card to
+/// another member with the real `todo` tool. The sub-card is that member's —
+/// it gets its own run beside the first one, never served to the first — and
+/// its verdict closes the parent card.
+#[tokio::test]
+async fn a_member_hands_a_sub_card_to_another_member() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"{"decision":"assign","member":"agent:builder","reason":"it builds"}"#.to_string(),
+        r#"CALL todo {"action":"add","title":"Review the parser","assignee":"agent:reviewer"}"#
+            .to_string(),
+        "Reviewed: it holds up.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    for name in ["Builder", "Reviewer"] {
+        let created = client
+            .request(nanna_client::Action::Member(
+                nanna_client::MemberAction::Create {
+                    name: name.to_string(),
+                    workspace_id: None,
+                    personal: false,
+                    avatar: None,
+                    profile: None,
+                },
+            ))
+            .await
+            .expect("member.create answers");
+        assert!(created.get("error").is_none(), "{created}");
+    }
+
+    let id = create_global_card(&client, "Ship the parser").await;
+    let card = card_when(&client, id, "closed", |card| {
+        card["task"]["status"] == "done"
+    })
+    .await;
+    let board = client
+        .request(nanna_client::Action::Task(
+            nanna_client::TaskAction::Query {
+                filter: "subtask".to_string(),
+                scope: Some("global".to_string()),
+                session_id: None,
+            },
+        ))
+        .await
+        .expect("task.query answers");
+    let handed_on = board["tasks"]
+        .as_array()
+        .and_then(|t| t.iter().find(|t| t["title"] == "Review the parser"))
+        .cloned()
+        .unwrap_or_else(|| panic!("the handed-on sub-card: {board} / {card}"));
+    assert_eq!(handed_on["parent_id"], id, "{handed_on}");
+    assert_eq!(handed_on["assignee"], "agent:reviewer", "{handed_on}");
+    let sub_id = handed_on["id"].as_i64().expect("id");
+    let sub = card_when(&client, sub_id, "closed by its member", |c| {
+        c["task"]["status"] == "done"
+    })
+    .await;
+    let notes = sub["notes"].as_array().cloned().unwrap_or_default();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n["author_member_id"] == "agent:reviewer" && n["kind"] == "verdict"),
+        "the reviewer's own run closed it: {sub}"
+    );
+    client.disconnect().await;
+    daemon.stop();
+}
