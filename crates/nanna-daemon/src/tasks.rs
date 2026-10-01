@@ -4800,7 +4800,7 @@ pub(crate) async fn reopen_for_next_round(
 
 /// Parse a stored timestamp: RFC3339 first, then turso's
 /// `datetime('now')` format (`YYYY-MM-DD HH:MM:SS`, UTC).
-fn parse_db_time(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+pub(crate) fn parse_db_time(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .ok()
@@ -7768,6 +7768,9 @@ pub struct TaskRunSpec {
 pub struct TaskRunManager {
     runs: RwLock<HashMap<String, ActiveRun>>,
     reports: RwLock<HashMap<String, (LongHorizonReport, usize)>>,
+    /// Told each time a card run ends, so the member's next waiting card can
+    /// start (P25 decision 3: one card at a time, never a visible queue).
+    member_free: Option<tokio::sync::mpsc::Sender<crate::card_run_trigger::RunWake>>,
 }
 
 impl TaskRunManager {
@@ -7814,6 +7817,16 @@ impl TaskRunManager {
         interjector: Option<Arc<SessionInterjector>>,
     ) -> Result<(), String> {
         self.launch(spec, event_tx, interjector, None).await
+    }
+
+    /// Tell `queue` whenever a card run ends and its member is free again.
+    #[must_use]
+    pub fn with_member_free(
+        mut self,
+        queue: tokio::sync::mpsc::Sender<crate::card_run_trigger::RunWake>,
+    ) -> Self {
+        self.member_free = Some(queue);
+        self
     }
 
     fn card_key(card_id: i64) -> String {
@@ -7984,8 +7997,28 @@ impl TaskRunManager {
             set_member_status(&source.storage, busy_member.as_deref(), MemberStatus::Idle).await;
             manager.runs.write().await.remove(&key);
             manager.reports.write().await.insert(key, (report, resumes));
+            // After the slot is free, or the member's next card would be
+            // refused as "already working".
+            manager.announce_member_free(busy_member);
         });
         Ok(())
+    }
+
+    /// Hand a freed member to the card-run worker. Never waits: a full queue
+    /// is logged, and the member's waiting cards still start on their next
+    /// assignment or date.
+    fn announce_member_free(&self, member_id: Option<String>) {
+        let (Some(queue), Some(member_id)) = (self.member_free.as_ref(), member_id) else {
+            return;
+        };
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(wake)) =
+            queue.try_send(crate::card_run_trigger::RunWake::MemberFree(member_id))
+        {
+            tracing::warn!(
+                ?wake,
+                "card run queue is full; a freed member's next card waits"
+            );
+        }
     }
 
     /// Request cancellation of card `card_id`'s run. Returns false when no
@@ -9708,5 +9741,22 @@ mod card_run_tests {
             source.next().await.expect("next").is_none(),
             "no longer this run's card"
         );
+    }
+
+    /// A card run's end frees its member for the next card (P25 decision 3);
+    /// a scope run has no member and announces nothing.
+    #[tokio::test]
+    async fn a_finished_card_run_announces_its_member_free() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let manager = super::TaskRunManager::new().with_member_free(tx);
+        manager.announce_member_free(None);
+        manager.announce_member_free(Some(AGENT.to_string()));
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(crate::card_run_trigger::RunWake::MemberFree(
+                AGENT.to_string()
+            ))
+        );
+        assert!(rx.try_recv().is_err(), "nothing for a run without a member");
     }
 }

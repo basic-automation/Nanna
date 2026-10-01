@@ -945,6 +945,53 @@ impl TaskRepository {
         Ok(cards)
     }
 
+    /// Up to `limit` open, not-yet-started board cards assigned to
+    /// `member_id` (any scope but `session`), best first: priority, then the
+    /// oldest — what that member works next when it is free. `blocked` is not
+    /// derived here; read a card with [`Self::get`] before acting on it.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a row does not
+    /// decode.
+    ///
+    /// # Panics
+    /// Panics if `limit` is 0.
+    pub async fn open_board_cards_assigned_to(
+        &self,
+        member_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Task>, StorageError> {
+        assert!(
+            limit > 0,
+            "a scan for waiting cards is bounded and non-empty"
+        );
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT {TASK_COLUMNS} FROM tasks \
+                     WHERE assignee = ?1 AND status = 'pending' AND scope != 'session' \
+                     ORDER BY priority, id LIMIT ?2"
+                ),
+                turso::params![member_id, limit],
+            )
+            .await?;
+        let mut cards = Vec::new();
+        while let Some(row) = rows.next().await? {
+            cards.push(decode_task_row(&row)?);
+        }
+        drop(rows);
+        drop(conn);
+        debug_assert!(
+            cards
+                .iter()
+                .all(|t| t.assignee.as_deref() == Some(member_id)),
+            "every card is the member's"
+        );
+        Ok(cards)
+    }
+
     /// Who created card `task_id`: the actor on its `created` activity row.
     ///
     /// `None` when the creator was not recorded (a writer that named no

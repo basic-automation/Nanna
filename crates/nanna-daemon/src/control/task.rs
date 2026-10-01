@@ -660,6 +660,16 @@ impl ControlPlane {
         Ok(lineage)
     }
 
+    /// Start card `card_id`'s run as its assignment does (P25 Stage 3, see
+    /// [`crate::card_run_trigger`]): no explicit workdir, the default bounds.
+    pub(crate) async fn start_assigned_card(&self, card_id: i64) -> Value {
+        let Some(storage) = self.storage.clone() else {
+            return json!({"error": "storage_unavailable", "message": "no task store"});
+        };
+        self.start_card_run(&storage, card_id, None, (None, None))
+            .await
+    }
+
     /// `TaskAction::StartRun {card_id}`: the card's assignee works the card's
     /// subtree in the background (P25 Stage 3). Its notes and closings become
     /// posts on the card threads, and it shows as busy until the run ends.

@@ -24,6 +24,9 @@ pub struct TaskEventBridge {
     /// Cards the route queue refused because it was full — same contract as
     /// `write_through_dropped`.
     routes_dropped: AtomicU64,
+    runs: Option<mpsc::Sender<crate::card_run_trigger::RunWake>>,
+    /// Wakes the card-run queue refused because it was full.
+    runs_dropped: AtomicU64,
 }
 
 impl TaskEventBridge {
@@ -35,6 +38,8 @@ impl TaskEventBridge {
             write_through_dropped: AtomicU64::new(0),
             routes: None,
             routes_dropped: AtomicU64::new(0),
+            runs: None,
+            runs_dropped: AtomicU64::new(0),
         }
     }
 
@@ -66,6 +71,33 @@ impl TaskEventBridge {
             tracing::warn!(
                 "board router queue is full; card #{} was not routed ({dropped} dropped so \
                  far) — the card itself is unaffected and can be assigned by hand",
+                event.task_id
+            );
+        }
+    }
+
+    /// Also queue the cards that may have become workable for
+    /// [`crate::card_run_trigger::run`].
+    #[must_use]
+    pub fn with_run_queue(mut self, queue: mpsc::Sender<crate::card_run_trigger::RunWake>) -> Self {
+        self.runs = Some(queue);
+        self
+    }
+
+    /// Queue `event`'s card for the card-run worker if it may now be
+    /// workable. Never waits, for the same reason as [`Self::queue_copy`].
+    fn queue_run(&self, event: &StoreTaskEvent) {
+        let Some(queue) = self.runs.as_ref() else {
+            return;
+        };
+        let Some(wake) = crate::card_run_trigger::run_wake_for(event) else {
+            return;
+        };
+        if let Err(mpsc::error::TrySendError::Full(_)) = queue.try_send(wake) {
+            let dropped = self.runs_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::warn!(
+                "card run queue is full; card #{} was not started ({dropped} dropped so far) \
+                 — it starts when its member next frees, or by task.start_run",
                 event.task_id
             );
         }
@@ -112,6 +144,7 @@ impl TaskEventSink for TaskEventBridge {
     fn publish(&self, event: StoreTaskEvent) {
         self.queue_copy(&event);
         self.queue_route(&event);
+        self.queue_run(&event);
         let _ = self.events.send(Event::TaskEvent {
             kind: event.kind,
             task_id: event.task_id,

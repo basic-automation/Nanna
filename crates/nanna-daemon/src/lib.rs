@@ -27,6 +27,7 @@
 // below because the daemon is where it is stamped.
 pub mod board_router;
 pub mod board_router_trigger;
+pub mod card_run_trigger;
 pub mod agent_service;
 pub mod channels;
 pub mod control;

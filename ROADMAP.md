@@ -8164,9 +8164,9 @@ as its turn (`TurnAdmission`, scope default `session`).
       the scheduler's chat-turn path are removed.
 
 **Stage 3 — runs started by assignment.**
-- [ ] `assigned` → start a harness run for that member on that card (reuse `AgentStepRunner` and
+- [x] `assigned` → start a harness run for that member on that card (reuse `AgentStepRunner` and
       `TaskRunManager`); progress → `progress` posts; completion → the acceptance check → a
-      `verdict` post. No streaming to the UI.
+      `verdict` post. No streaming to the UI. *(2026-10-01 — landed in three steps below.)*
       - [x] *(2026-10-01)* **The card run itself, started over IPC.** The two blockers recorded
             on 09-29 are gone. *Subtree admission:* `TursoTaskSource::within_subtree(card)` serves
             only the card and its descendants (`subtree_admits`, walked over the scope's parent
@@ -8182,10 +8182,23 @@ as its turn (`TurnAdmission`, scope default `session`).
             router; board scope only; open), `run_status`/`cancel_run {card_id}`; the run walks the
             member's `profile.model_priority`, else the chat models, and works in the card's own
             workspace. e2e `an_assigned_card_is_worked_by_its_member_and_closed_with_a_verdict_post`
-            (router assigns → start → verdict post → member idle). **Still open:** the
-            automatic start on `assigned` — wire it like the router's wake (gui-created cards
-            only while chat lives). Its prerequisite, a bounded way for a run to fail, landed
-            the same day (the hand-back, see Triggers).
+            (router assigns → start → verdict post → member idle).
+      - [x] *(2026-10-01, later)* **Assignment starts the run.** `nanna_daemon::card_run_trigger`:
+            the task event sink queues (bounded, `RUN_QUEUE_MAX` = `TASKS_PER_SCOPE_MAX`, drops
+            counted) every board card assigned to an `agent:` member and every card whose date
+            arrives (`due` — decision 10, a date defers a card); one worker starts the run if
+            the card is pending, unblocked, not deferred and board-client-created (the router's
+            rule while chat lives). A member busy on another card refuses the start; when a
+            card run ends the run manager hands the freed member back to the worker
+            (`RunWake::MemberFree`), which starts its best waiting card
+            (`TaskRepository::open_board_cards_assigned_to`, priority then age, ≤ 64 read). So
+            a card assigned to an agent is worked with no further call, one card per member,
+            and a failing card is bounded by the hand-back rule (Triggers). e2e: the assigned
+            and the cannot-finish cards now run with no `start_run`, and
+            `a_member_given_two_cards_works_them_one_after_the_other`. **Known gap:** a card
+            the router *re-assigns to the same member* after a clarification emits no
+            `assigned` (nothing changed), so it starts only when that member next frees or by
+            `task.start_run` — wire `unblocked` too if that shows up in use.
       - [ ] *(research 2026-10-01)* **Borrow Hermes Kanban's failure and stall rules** when the
             auto-start lands ([docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban)):
             its dispatcher auto-blocks a card after `failure_limit` (default 2) consecutive failed
