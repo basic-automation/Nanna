@@ -58,6 +58,10 @@ next start.
 - Dependencies: the Tauri 2.12.1 patch line, tiptap 3.31.4, Lucide 1.49, Vitest 5.0.3. `libc`
   stays at 0.2.186 and `malachite-bigint` at 0.9.2 until RustPython releases past 0.5.0. Turso
   0.8.1 is out and is the next storage migration.
+- `brace-expansion` 2.1.7 / 5.0.12 (pulled in through `minimatch`), fixing three denial-of-service
+  advisories ([GHSA-qhr7-859c-m2p7](https://github.com/advisories/GHSA-qhr7-859c-m2p7),
+  [GHSA-6j4f-fj2g-mc7p](https://github.com/advisories/GHSA-6j4f-fj2g-mc7p),
+  [GHSA-q2hr-2g5m-vwhr](https://github.com/advisories/GHSA-q2hr-2g5m-vwhr)).
 
 ## Still open
 
