@@ -8314,8 +8314,8 @@ as its turn (`TurnAdmission`, scope default `session`).
             the board re-reads its own scope's cards, coalesced to one read per 250 ms burst.
             New commands `quick_add_card`, `get_card`, `post_on_card`, `list_members`. The
             arrangement rules live in `app/lib/board.ts` with 15 unit tests.
-            **Not yet:** label/due/priority filters, editing a card's other
-            fields, member profile pages, and the Figma `Board` page's visual pass (the Figma
+            **Not yet:** label/due/priority filters, member profile *threads* (decision 15's
+            capability changes post there), and the Figma `Board` page's visual pass (the Figma
             connector was unauthenticated this run; built on the `nui` tokens instead).
       - [ ] *(research 2026-10-02)* **Todoist's own tokens are not decision 1's — owner call
             before habits form.** Todoist's Quick Add
@@ -8349,6 +8349,20 @@ as its turn (`TurnAdmission`, scope default `session`).
             (they span boards). The card chip is now `BoardCardChip.vue`, shared by all three
             views. Tests: store `a_members_open_cards_are_read_across_every_board`, control
             plane `a_members_cards_are_read_across_boards_over_ipc`, 2 vitest.
+      - [x] *(2026-10-02)* **Members, and editing a card.** A fourth view, *Members*
+            (`BoardMembers.vue`): the board's roster with kind (human / agent / your agent /
+            router) and busy state; *Add an agent* (name, models best-first →
+            `profile.model_priority`, capabilities → `profile.capabilities`, notes for the router,
+            "personal — follows you to every board"); edit an agent's name and profile, or the
+            router's model list; remove an agent. Writes go through new commands `create_member`,
+            `update_member`, `delete_member` and re-read on `members-changed`. The profile form
+            owns three keys and keeps every other one (`profileFromForm` merges; an emptied field
+            is removed, lists are trimmed, de-duplicated and bounded at `PROFILE_LIST_MAX` = 32).
+            The card view now edits priority, date, deadline and labels in place; a closed card's
+            fields are read-only. Daemon: in a `task.update` patch an **empty string clears**
+            `due_at`/`deadline_at` (`null` still skips, as for every field) — there was no way to
+            remove a date. Tests: 4 vitest, control plane
+            `an_empty_date_in_a_patch_clears_it_and_null_skips_it`.
       - [ ] **The Board view is only addressable while its workspace is active.**
             `task.list/quick_add` resolve `workspace` scope to the daemon's *active* workspace, so
             the board shows the workspace the top bar selected and nothing else. Fine while the

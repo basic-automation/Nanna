@@ -87,3 +87,59 @@ pub async fn list_assigned_cards(
         .task_assigned(member_id.as_deref())
         .await
 }
+
+/// Add an agent to a board's roster: the open workspace's (`workspace_id`),
+/// the global board's (`None`), or the human's own (`personal`).
+///
+/// # Errors
+///
+/// Fails as [`quick_add_card`] does.
+#[tauri::command]
+pub async fn create_member(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    name: String,
+    workspace_id: Option<String>,
+    personal: Option<bool>,
+    profile: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    backend_handle(&state)
+        .await
+        .member_create(
+            &name,
+            workspace_id.as_deref(),
+            personal.unwrap_or(false),
+            profile,
+        )
+        .await
+}
+
+/// Change a member's name or profile.
+///
+/// # Errors
+///
+/// Fails as [`quick_add_card`] does.
+#[tauri::command]
+pub async fn update_member(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    id: String,
+    name: Option<String>,
+    profile: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    backend_handle(&state)
+        .await
+        .member_update(&id, name.as_deref(), profile)
+        .await
+}
+
+/// Remove an agent from the roster.
+///
+/// # Errors
+///
+/// Fails as [`quick_add_card`] does.
+#[tauri::command]
+pub async fn delete_member(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    id: String,
+) -> Result<serde_json::Value, String> {
+    backend_handle(&state).await.member_delete(&id).await
+}

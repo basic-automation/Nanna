@@ -364,6 +364,9 @@ macro_rules! command_handler {
             commands::board::post_on_card,
             commands::board::list_members,
             commands::board::list_assigned_cards,
+            commands::board::create_member,
+            commands::board::update_member,
+            commands::board::delete_member,
         ]
     };
 }

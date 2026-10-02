@@ -966,6 +966,12 @@ daemon_proxies! {
     member_list(workspace_id: Option<&str>);
     /// A member's open cards on every board
     task_assigned(member_id: Option<&str>);
+    /// Add an agent to a roster
+    member_create(name: &str, workspace_id: Option<&str>, personal: bool, profile: Option<Value>);
+    /// Change a member's name or profile
+    member_update(id: &str, name: Option<&str>, profile: Option<Value>);
+    /// Remove an agent from the roster
+    member_delete(id: &str);
 }
 
 impl Default for Backend {

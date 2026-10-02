@@ -14,11 +14,11 @@
             :aria-pressed="view === tab.id"
             @click="view = tab.id"
           >
-            {{ tab.label }}<span v-if="tab.id !== 'board'" class="ml-1 opacity-70">{{ tab.id === 'inbox' ? split.inbox.length : upcomingCount }}</span>
+            {{ tab.label }}<span v-if="tab.id !== 'board'" class="ml-1 opacity-70">{{ tab.id === 'inbox' ? split.inbox.length : tab.id === 'upcoming' ? upcomingCount : roster.length }}</span>
           </button>
         </nav>
         <h1 class="text-sm font-semibold text-nui-fg">
-          <span class="text-nui-muted">{{ view === 'board' ? boardName : view === 'inbox' ? '— assigned to you, startable now' : '— assigned to you, by date' }}</span>
+          <span class="text-nui-muted">{{ VIEW_SUBTITLE[view] ?? boardName }}</span>
         </h1>
         <span class="min-w-0 flex-1" />
         <label v-if="view === 'board'" class="flex items-center gap-2 text-xs text-nui-muted">
@@ -76,7 +76,7 @@
 
       <!-- Inbox / Upcoming: one member's cards across every board (decision 11) -->
       <div
-        v-if="view !== 'board'"
+        v-if="view === 'inbox' || view === 'upcoming'"
         class="nui-scroll flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto"
         :data-testid="`board-${view}`"
       >
@@ -112,6 +112,14 @@
           <p v-if="split.upcoming.length === 0" class="text-xs text-nui-muted">Nothing assigned to you is dated later.</p>
         </template>
       </div>
+
+      <!-- Members: who is on this board, and adding agents (decision 3) -->
+      <BoardMembers
+        v-else-if="view === 'members'"
+        :roster="roster"
+        :workspace-id="board.workspaceId"
+        @changed="loadRoster"
+      />
 
       <!-- Columns -->
       <div v-else class="nui-scroll grid min-h-0 flex-1 grid-cols-4 gap-4 overflow-x-auto" data-testid="board-columns">
@@ -162,8 +170,8 @@
           <select
             :value="selected.assignee ?? ''"
             data-testid="card-assignee"
-            class="w-full rounded border border-white/10 bg-nui-bg px-2 py-0.5 text-xs text-nui-fg outline-none [color-scheme:dark]"
-            :disabled="saving || columnOf(selected) === 'done'"
+            :class="FIELD"
+            :disabled="!editable"
             @change="assign(($event.target as HTMLSelectElement).value)"
           >
             <option value="" disabled>Unassigned — the router will pick</option>
@@ -173,19 +181,100 @@
           </select>
         </dd>
         <dt class="text-nui-muted">Priority</dt>
-        <dd class="text-nui-fg">p{{ selected.priority }}</dd>
-        <template v-if="dayOf(selected.due_at)">
-          <dt class="text-nui-muted">Date</dt>
-          <dd class="text-nui-fg">{{ dayOf(selected.due_at) }}</dd>
-        </template>
-        <template v-if="dayOf(selected.deadline_at)">
-          <dt class="text-nui-muted">Deadline</dt>
-          <dd :class="isOverdue(selected, today) ? 'text-nui-pink' : 'text-nui-fg'">{{ dayOf(selected.deadline_at) }}</dd>
-        </template>
-        <template v-if="selected.labels.length">
-          <dt class="text-nui-muted">Labels</dt>
-          <dd class="text-nui-info">{{ selected.labels.map(l => '#' + l).join(' ') }}</dd>
-        </template>
+        <dd>
+          <select
+            :value="selected.priority"
+            data-testid="card-priority"
+            :class="FIELD"
+            :disabled="!editable"
+            @change="patchCard({ priority: Number(($event.target as HTMLSelectElement).value) })"
+          >
+            <option v-for="p in [1, 2, 3, 4]" :key="p" :value="p">p{{ p }}</option>
+          </select>
+        </dd>
+        <dt class="text-nui-muted">Date</dt>
+        <dd class="flex items-center gap-2">
+          <!-- WebKitGTK draws an empty date input with today's date as its
+               placeholder, which reads as a date that is set: show a
+               button until there is one. -->
+          <input
+            v-if="dayOf(selected.due_at) || openDates.due_at"
+            type="date"
+            :value="dayOf(selected.due_at) ?? ''"
+            data-testid="card-date"
+            :class="FIELD"
+            :disabled="!editable"
+            title="Defers the card: it stays out of the inbox until this day"
+            @change="patchCard({ due_at: ($event.target as HTMLInputElement).value })"
+          >
+          <button
+            v-else
+            type="button"
+            class="text-xs text-nui-muted hover:text-nui-fg disabled:opacity-60"
+            :data-testid="`card-date-set`"
+            :disabled="!editable"
+            @click="openDates.due_at = true"
+          >
+            None — set
+          </button>
+          <button
+            v-if="dayOf(selected.due_at) && editable"
+            type="button"
+            class="shrink-0 text-xs text-nui-muted hover:text-nui-pink"
+            :data-testid="`card-date-clear`"
+            title="Clear"
+            @click="openDates.due_at = false; patchCard({ due_at: '' })"
+          >
+            ×
+          </button>
+        </dd>
+        <dt class="text-nui-muted">Deadline</dt>
+        <dd class="flex items-center gap-2">
+          <!-- WebKitGTK draws an empty date input with today's date as its
+               placeholder, which reads as a date that is set: show a
+               button until there is one. -->
+          <input
+            v-if="dayOf(selected.deadline_at) || openDates.deadline_at"
+            type="date"
+            :value="dayOf(selected.deadline_at) ?? ''"
+            data-testid="card-deadline"
+            :class="[FIELD, isOverdue(selected, today) && '!text-nui-pink']"
+            :disabled="!editable"
+            title="Must be done by; overdue is measured against this"
+            @change="patchCard({ deadline_at: ($event.target as HTMLInputElement).value })"
+          >
+          <button
+            v-else
+            type="button"
+            class="text-xs text-nui-muted hover:text-nui-fg disabled:opacity-60"
+            :data-testid="`card-deadline-set`"
+            :disabled="!editable"
+            @click="openDates.deadline_at = true"
+          >
+            None — set
+          </button>
+          <button
+            v-if="dayOf(selected.deadline_at) && editable"
+            type="button"
+            class="shrink-0 text-xs text-nui-muted hover:text-nui-pink"
+            :data-testid="`card-deadline-clear`"
+            title="Clear"
+            @click="openDates.deadline_at = false; patchCard({ deadline_at: '' })"
+          >
+            ×
+          </button>
+        </dd>
+        <dt class="text-nui-muted">Labels</dt>
+        <dd>
+          <input
+            :value="selected.labels.join(', ')"
+            data-testid="card-labels"
+            :class="FIELD"
+            :disabled="!editable"
+            placeholder="comma, separated"
+            @change="patchCard({ labels: splitList(($event.target as HTMLInputElement).value).map(l => l.replace(/^#/, '')) })"
+          >
+        </dd>
       </dl>
       <p v-if="selected.description" class="whitespace-pre-wrap break-words text-xs text-nui-fg">{{ selected.description }}</p>
       <div class="flex items-center gap-2">
@@ -245,12 +334,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, inject, onMounted, onUnmounted, ref, watch, type Ref } from 'vue'
+import { computed, inject, onMounted, onUnmounted, reactive, ref, watch, type Ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   arrangeColumns, assignable, boardLabel, childCounts, columnOf, dayOf, eventIsForBoard,
-  isDeferred, isOverdue, memberName, postKindLabel, splitAssigned, todayUtc,
+  isDeferred, isOverdue, memberName, postKindLabel, splitAssigned, splitList, todayUtc,
   type BoardCard, type BoardMember, type CardPost,
 } from '~/lib/board'
 
@@ -266,13 +355,18 @@ const boardName = computed(() => activeWorkspace.value
   ? `— ${activeWorkspace.value.name || activeWorkspace.value.path}`
   : '— Global')
 
-type View = 'board' | 'inbox' | 'upcoming'
+type View = 'board' | 'inbox' | 'upcoming' | 'members'
 const VIEWS: ReadonlyArray<{ id: View, label: string }> = [
   { id: 'board', label: 'Board' },
   { id: 'inbox', label: 'Inbox' },
   { id: 'upcoming', label: 'Upcoming' },
+  { id: 'members', label: 'Members' },
 ]
 const view = ref<View>('board')
+const VIEW_SUBTITLE: Partial<Record<View, string>> = {
+  inbox: '— assigned to you, startable now',
+  upcoming: '— assigned to you, by date',
+}
 
 const cards = ref<BoardCard[]>([])
 const roster = ref<BoardMember[]>([])
@@ -417,8 +511,13 @@ async function loadCard(id: number) {
   }
 }
 
+/** Date inputs the human opened on a card that had no date yet. */
+const openDates = reactive({ due_at: false, deadline_at: false })
+
 function selectCard(id: number) {
   selectedId.value = id
+  openDates.due_at = false
+  openDates.deadline_at = false
   cardMessage.value = ''
   posts.value = []
   selectedDetail.value = null
@@ -452,6 +551,27 @@ async function assign(memberId: string) {
   saving.value = true
   try {
     const reply = await invoke('update_task', { id, patch: { assignee: memberId } })
+    cardMessage.value = refusal(reply) ?? ''
+    await Promise.all([loadCards(), loadAssigned(), loadCard(id)])
+  } catch (e) {
+    cardMessage.value = String(e)
+  } finally {
+    saving.value = false
+  }
+}
+
+const FIELD = 'w-full rounded border border-white/10 bg-nui-bg px-2 py-0.5 text-xs text-nui-fg outline-none [color-scheme:dark] disabled:opacity-60'
+
+/** A closed card is history; its fields are shown, not edited. */
+const editable = computed(() => !saving.value && selected.value !== null && columnOf(selected.value) !== 'done')
+
+/** Apply one field change; the daemon validates it (a deadline before the date is refused). */
+async function patchCard(patch: Record<string, unknown>) {
+  const id = selectedId.value
+  if (id === null) return
+  saving.value = true
+  try {
+    const reply = await invoke('update_task', { id, patch })
     cardMessage.value = refusal(reply) ?? ''
     await Promise.all([loadCards(), loadAssigned(), loadCard(id)])
   } catch (e) {

@@ -35,6 +35,10 @@ export interface BoardMember {
   avatar: string | null
   kind: 'human' | 'agent'
   status: string
+  /** `workspace` or `human` (a personal agent, decision 13). */
+  owner_kind?: string
+  /** Free JSON the router reads whole (model_priority, capabilities, notes…). */
+  profile?: unknown
 }
 
 /** One post on a card's thread. */
@@ -222,4 +226,70 @@ export function boardLabel(card: BoardCard, workspaces: ReadonlyArray<{ id: stri
   if (card.scope !== 'workspace') return 'Global'
   const ws = workspaces.find(w => w.id === card.scope_id)
   return ws ? (ws.name || ws.path) : (card.scope_id ?? 'Workspace')
+}
+
+/** The member-profile fields the board edits; the router reads the whole profile. */
+export interface ProfileForm {
+  /** Comma- or newline-separated model ids, best first (`model_priority`). */
+  models: string
+  /** Comma-separated free-text capability tags (decision 15). */
+  capabilities: string
+  /** Free text the router sees: what this member is for. */
+  notes: string
+}
+
+/**
+ * How many entries one list field of a profile keeps.
+ *
+ * Bound: the router previews each profile in its prompt and the daemon caps
+ * a profile at 8 KiB; 32 model ids or tags is far past any real priority
+ * list and keeps the field readable in one line of the roster.
+ */
+export const PROFILE_LIST_MAX = 32
+
+/** Split a free-text list on commas/newlines: trimmed, de-duplicated, bounded. */
+export function splitList(text: string): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const raw of text.split(/[,\n]/)) {
+    const item = raw.trim()
+    if (!item || seen.has(item.toLowerCase())) continue
+    seen.add(item.toLowerCase())
+    out.push(item)
+    if (out.length >= PROFILE_LIST_MAX) break
+  }
+  return out
+}
+
+/** The form's view of a stored profile. */
+export function formFromProfile(profile: unknown): ProfileForm {
+  const p = (profile && typeof profile === 'object' ? profile : {}) as Record<string, unknown>
+  const list = (v: unknown) => Array.isArray(v) ? v.filter(x => typeof x === 'string').join(', ') : ''
+  return {
+    models: list(p.model_priority),
+    capabilities: list(p.capabilities),
+    notes: typeof p.notes === 'string' ? p.notes : '',
+  }
+}
+
+/**
+ * Write the form back over `existing`, keeping every key the form does not
+ * own (a profile may carry fields set elsewhere, e.g. the router's `role`).
+ * An emptied field is removed rather than stored empty.
+ */
+export function profileFromForm(form: ProfileForm, existing: unknown = {}): Record<string, unknown> {
+  const base = existing && typeof existing === 'object' && !Array.isArray(existing)
+    ? { ...(existing as Record<string, unknown>) }
+    : {}
+  const set = (key: string, value: unknown, empty: boolean) => {
+    if (empty) delete base[key]
+    else base[key] = value
+  }
+  const models = splitList(form.models)
+  const capabilities = splitList(form.capabilities)
+  const notes = form.notes.trim()
+  set('model_priority', models, models.length === 0)
+  set('capabilities', capabilities, capabilities.length === 0)
+  set('notes', notes, notes === '')
+  return base
 }

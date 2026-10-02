@@ -3,6 +3,10 @@ import {
   arrangeColumns,
   boardLabel,
   splitAssigned,
+  splitList,
+  formFromProfile,
+  profileFromForm,
+  PROFILE_LIST_MAX,
   assignable,
   childCounts,
   columnOf,
@@ -188,5 +192,30 @@ describe('splitAssigned', () => {
     expect(boardLabel(card({ scope: 'workspace', scope_id: 'ws-1' }), workspaces)).toBe('Nanna')
     expect(boardLabel(card({ scope: 'workspace', scope_id: 'ws-2' }), workspaces)).toBe('/src/x')
     expect(boardLabel(card({ scope: 'workspace', scope_id: 'gone' }), workspaces)).toBe('gone')
+  })
+})
+
+describe('member profiles', () => {
+  it('splits a list on commas and newlines, trimmed, deduplicated and bounded', () => {
+    expect(splitList(' qwen3.5:9b, claude-sonnet-5\n qwen3.5:9b ,, ')).toEqual(['qwen3.5:9b', 'claude-sonnet-5'])
+    expect(splitList('Rust, rust, RUST')).toEqual(['Rust'])
+    expect(splitList(Array.from({ length: 40 }, (_, i) => `m${i}`).join(','))).toHaveLength(PROFILE_LIST_MAX)
+  })
+
+  it('round-trips the fields it owns and keeps the ones it does not', () => {
+    const stored = { role: 'router', model_priority: ['a', 'b'], capabilities: ['rust'], notes: 'hi', cost: 3 }
+    const form = formFromProfile(stored)
+    expect(form).toEqual({ models: 'a, b', capabilities: 'rust', notes: 'hi' })
+    const written = profileFromForm({ ...form, models: 'c' }, stored)
+    expect(written).toEqual({ role: 'router', model_priority: ['c'], capabilities: ['rust'], notes: 'hi', cost: 3 })
+  })
+
+  it('removes an emptied field instead of storing it empty', () => {
+    expect(profileFromForm({ models: ' ', capabilities: '', notes: '' }, { model_priority: ['a'], notes: 'x' })).toEqual({})
+  })
+
+  it('reads a missing or malformed profile as an empty form', () => {
+    expect(formFromProfile(null)).toEqual({ models: '', capabilities: '', notes: '' })
+    expect(formFromProfile({ model_priority: 'not a list', notes: 3 })).toEqual({ models: '', capabilities: '', notes: '' })
   })
 })

@@ -1987,6 +1987,59 @@ impl DaemonClient {
         })).await
     }
 
+    /// Add an agent to a board's roster (`member.create`). `workspace_id`
+    /// `None` is the global board; `personal` makes it the human's own agent,
+    /// which travels between boards.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does; a refused create (a duplicate
+    /// name, a profile that is not an object) comes back inside `Ok`.
+    pub async fn member_create(
+        &self,
+        name: &str,
+        workspace_id: Option<&str>,
+        personal: bool,
+        profile: Option<Value>,
+    ) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "member",
+            "action": "create",
+            "name": name,
+            "workspace_id": workspace_id,
+            "personal": personal,
+            "profile": profile
+        })).await
+    }
+
+    /// Change a member's name or profile (`member.update`); `None` keeps it.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn member_update(&self, id: &str, name: Option<&str>, profile: Option<Value>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "member",
+            "action": "update",
+            "id": id,
+            "name": name,
+            "profile": profile
+        })).await
+    }
+
+    /// Remove an agent from the roster (`member.delete`).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn member_delete(&self, id: &str) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "member",
+            "action": "delete",
+            "id": id
+        })).await
+    }
+
     /// The roster of one board: `workspace_id` `None` is the global board.
     ///
     /// # Errors

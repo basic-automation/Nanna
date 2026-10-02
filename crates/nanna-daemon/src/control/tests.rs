@@ -2626,3 +2626,44 @@ async fn a_members_cards_are_read_across_boards_over_ipc() {
     let refused = ask(serde_json::json!({ "type": "task", "action": "assigned", "limit": 0 })).await;
     assert_eq!(refused["error"], "bad_limit", "{refused}");
 }
+
+#[tokio::test]
+async fn an_empty_date_in_a_patch_clears_it_and_null_skips_it() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let card = storage
+        .tasks()
+        .create(nanna_storage::NewTask {
+            title: "dated".to_string(),
+            scope: "global".to_string(),
+            priority: 3,
+            due_at: Some("2026-11-01".to_string()),
+            deadline_at: Some("2026-11-30".to_string()),
+            ..nanna_storage::NewTask::default()
+        })
+        .await
+        .expect("card");
+    let skipped = ask(serde_json::json!({
+        "type": "task", "action": "update", "id": card.id,
+        "patch": { "due_at": null, "priority": 2 },
+    }))
+    .await;
+    assert_eq!(skipped["task"]["due_at"], "2026-11-01", "null leaves the date: {skipped}");
+    let cleared = ask(serde_json::json!({
+        "type": "task", "action": "update", "id": card.id,
+        "patch": { "due_at": "", "deadline_at": " " },
+    }))
+    .await;
+    assert!(cleared["task"]["due_at"].is_null(), "{cleared}");
+    assert!(cleared["task"]["deadline_at"].is_null(), "{cleared}");
+    assert_eq!(cleared["task"]["priority"], 2, "{cleared}");
+}

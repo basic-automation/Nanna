@@ -390,14 +390,17 @@ impl ControlPlane {
                 .filter(|v| v.is_array())
                 .map(&string_vec),
             tool_scope: patch.get("tools").filter(|v| v.is_array()).map(&string_vec),
+            // `null` skips a field like everywhere else in a patch, so an
+            // empty string is how a client clears a date (the board's date
+            // inputs send "" when emptied).
             due_at: patch
                 .get("due_at")
                 .and_then(Value::as_str)
-                .map(|s| Some(s.to_string())),
+                .map(clearable),
             deadline_at: patch
                 .get("deadline_at")
                 .and_then(Value::as_str)
-                .map(|s| Some(s.to_string())),
+                .map(clearable),
             recurrence: patch
                 .get("recurrence")
                 .and_then(Value::as_str)
@@ -795,6 +798,12 @@ impl ControlPlane {
         let cancelled = task_runs.cancel(&scope, scope_id.as_deref()).await;
         json!({"cancelled": cancelled})
     }
+}
+
+/// A patch's string for an optional field: `""` clears it, anything else sets it.
+fn clearable(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// The fields of a `TaskAction::Create` (and of the card a
