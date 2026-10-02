@@ -338,3 +338,48 @@ export function boardLabels(cards: readonly BoardCard[]): string[] {
   }
   return [...seen.values()].sort((a, b) => a.localeCompare(b))
 }
+
+/** A `board-event` as the GUI receives it. */
+export interface BoardEvent {
+  kind: string
+  task_id: number
+  scope?: string
+  scope_id?: string | null
+  actor?: string | null
+}
+
+/** What to tell the human about a board event, or `null` for nothing. */
+export interface BoardNotice {
+  type: 'info' | 'warning'
+  title: string
+  summary: string
+}
+
+/**
+ * Whether — and how — a card change reaches `me` as a notification. Only
+ * cards assigned to `me` and only what nobody else will tell them: the date
+ * arrived (`due`), the deadline passed (`overdue`), or someone else — the
+ * router, an agent — put a card in their hands, which is how a clarification
+ * question arrives (decision 6). Their own writes (`gui`) never notify. The
+ * store announces `due`/`overdue` once per crossing, so neither repeats.
+ */
+export function boardNoticeFor(event: BoardEvent, card: BoardCard, me = 'human'): BoardNotice | null {
+  if (card.assignee !== me || columnOf(card) === 'done') return null
+  if (event.actor === 'gui' || event.actor === me) return null
+  switch (event.kind) {
+    case 'due':
+      return { type: 'info', title: `Ready to start: ${card.title}`, summary: 'Its date has arrived — it is in your Inbox.' }
+    case 'overdue':
+      return { type: 'warning', title: `Overdue: ${card.title}`, summary: `The deadline ${dayOf(card.deadline_at) ?? ''} has passed.`.replace(' .', '.') }
+    case 'created':
+    case 'assigned': {
+      const from = event.actor ? ` from ${event.actor}` : ''
+      const question = card.labels.some(l => l.toLowerCase() === 'clarification')
+      return question
+        ? { type: 'info', title: `A question for you${from}`, summary: card.title }
+        : { type: 'info', title: `New card for you${from}`, summary: card.title }
+    }
+    default:
+      return null
+  }
+}

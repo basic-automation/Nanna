@@ -5,6 +5,7 @@ import {
   splitAssigned,
   splitList,
   applyFilters,
+  boardNoticeFor,
   boardLabels,
   filtering,
   NO_FILTERS,
@@ -257,5 +258,29 @@ describe('board filters', () => {
 
   it('lists the board\'s labels once each, sorted', () => {
     expect(boardLabels(cards)).toEqual(['docs', 'Rust'])
+  })
+})
+
+describe('boardNoticeFor', () => {
+  const mine = (fields: Partial<BoardCard> = {}) => card({ assignee: 'human', title: 'Fix the build', ...fields })
+
+  it('tells me when my card\'s date arrives or its deadline passes', () => {
+    expect(boardNoticeFor({ kind: 'due', task_id: 1, actor: 'sweep' }, mine())?.title).toBe('Ready to start: Fix the build')
+    const overdue = boardNoticeFor({ kind: 'overdue', task_id: 1, actor: 'sweep' }, mine({ deadline_at: '2026-10-01' }))
+    expect(overdue).toEqual({ type: 'warning', title: 'Overdue: Fix the build', summary: 'The deadline 2026-10-01 has passed.' })
+  })
+
+  it('tells me when someone else puts a card — or a question — in my hands', () => {
+    expect(boardNoticeFor({ kind: 'created', task_id: 1, actor: 'router:global' }, mine())?.title)
+      .toBe('New card for you from router:global')
+    expect(boardNoticeFor({ kind: 'created', task_id: 1, actor: 'agent:builder' }, mine({ labels: ['clarification'] }))?.title)
+      .toBe('A question for you from agent:builder')
+  })
+
+  it('stays quiet about my own writes, others\' cards, closed cards and other kinds', () => {
+    expect(boardNoticeFor({ kind: 'created', task_id: 1, actor: 'gui' }, mine())).toBeNull()
+    expect(boardNoticeFor({ kind: 'due', task_id: 1 }, mine({ assignee: 'agent:builder' }))).toBeNull()
+    expect(boardNoticeFor({ kind: 'overdue', task_id: 1 }, mine({ status: 'done' }))).toBeNull()
+    expect(boardNoticeFor({ kind: 'posted', task_id: 1, actor: 'agent:builder' }, mine())).toBeNull()
   })
 })

@@ -123,6 +123,7 @@ import { statusBarLabel } from '~/lib/backendLabels'
 import { seedChatModel } from '~/composables/useSessionState'
 import { useAppUpdater } from '~/composables/useAppUpdater'
 import { useStartupGate } from '~/composables/useStartupGate'
+import { startBoardNotifications } from '~/composables/useBoardNotifications'
 import type { PaletteAction } from '~/lib/commandPalette'
 import { NAV_ACTIONS, QUICK_ACTIONS } from '~/lib/commandPalette'
 import type { NuiRailItem } from '~/components/nui/NuiMainMenu.vue'
@@ -258,6 +259,7 @@ const isMaximized = ref(false)
 let unlistenSessionsCleared: UnlistenFn | null = null
 let unlistenSessionRenamed: UnlistenFn | null = null
 let unlistenWorkspacesChanged: UnlistenFn | null = null
+let unlistenBoardNotices: UnlistenFn | null = null
 
 function isNavActive(path: string) {
   return route.path === path || (path !== '/' && route.path.startsWith(path))
@@ -544,6 +546,10 @@ onMounted(async () => {
   // The daemon owns workspace registration, so anything registered while this
   // window is open — by a script, a harness, or another client — must show up
   // in the select without a restart.
+  // Due / overdue / handed-to-you cards reach the Notification Center from
+  // any page, not only while the Board is open.
+  unlistenBoardNotices = await startBoardNotifications()
+
   unlistenWorkspacesChanged = await listen('workspaces-changed', () => {
     void loadOpenWorkspaces()
   })
@@ -572,6 +578,7 @@ onUnmounted(() => {
   unlistenSessionsCleared?.()
   unlistenSessionRenamed?.()
   unlistenWorkspacesChanged?.()
+  unlistenBoardNotices?.()
 })
 
 // The backend attaches a daemon that answers late (a slow boot, one started

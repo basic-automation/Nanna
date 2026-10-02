@@ -7736,13 +7736,25 @@ as its turn (`TurnAdmission`, scope default `session`).
       on-disk paths make a card non-portable, content-addressed storage needs a GC story that
       "threads are permanent" already complicates. Whichever wins, the memory copy of a post
       (Stage 1's write-through) must carry a reference, not the bytes.
-- [ ] **A task→reminder binding** (`deadline_at` → a scheduled nudge). P25 decision 10 says
+- [x] **A task→reminder binding** (`deadline_at` → a scheduled nudge). P25 decision 10 says
       "reminders hang off the deadline by default", but nothing binds the two today:
       `reminder_service` only schedules session-scoped one-shots a human or the model asked for
       explicitly, and it reads no task field. Needs a decision first — who is reminded (the
       assignee's member inbox, not a session, once Stage 4 lands), and whether a deadline nudge is
       a *reminder* or simply the `due`/`overdue` bus event Stage 1 already lists. Do not build it
       before the event list exists, or it will be a second notification path.
+      *(2026-10-02)* **It is the bus event — no second path.** The store already announces `due`
+      (the date arrived) and `overdue` (the deadline passed) once per crossing, and the GUI now
+      parses them (`board-event`). `useBoardNotifications`, mounted by the layout so it hears
+      them on every page, turns them into Notification Center entries (with a toast) **for cards
+      assigned to the human**, and does the same when someone *else* — the router, an agent —
+      creates or assigns a card to them, which is how a clarification question reaches them
+      (decision 6: "A question for you from agent:builder"). The human's own writes (`gui`)
+      never notify; closed cards never do. Rule: `boardNoticeFor` in `lib/board.ts`, 3 vitest;
+      checked live by emitting an `overdue` for a real card from the chat page. Still open:
+      notifying *agents* is meaningless (they are woken by the run trigger instead), and a nudge
+      *before* the deadline (Todoist's default reminder) would need a lead-time setting — owner
+      call.
 - [ ] Default `scope = 'workspace'`; migration promotes `session`-scoped rows (tasks + memories) to
       the session's `workspace_id`, else `global`, and stamps label `promoted`. Delete
       `TurnAdmission` (`crates/nanna-daemon/src/tasks.rs:1210`) and its call sites in
