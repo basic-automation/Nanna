@@ -1199,6 +1199,9 @@ impl NannaBridge {
     ///
     /// `max_entries` makes this a bounded query: at most that many entries are
     /// collected and the walk stops immediately once the bound is reached.
+    /// A bounded *flat* listing is the first `max_entries` names in name
+    /// order (see `list_dir_sorted_prefix`), so the same tree lists the same
+    /// way on every filesystem; a recursive walk stops in walk order.
     /// This is NOT silent truncation — the caller asked for a bound and is
     /// responsible for announcing it (the convention is to request `budget + 1`
     /// so an overflow-length return proves more entries exist). The bound
@@ -1260,6 +1263,8 @@ impl NannaBridge {
                     entries.push(de);
                 }
             }
+        } else if let Some(cap) = max_entries {
+            entries = list_dir_sorted_prefix(&path, cap).await?;
         } else {
             let mut read_dir = tokio::fs::read_dir(&path)
                 .await
@@ -1270,26 +1275,9 @@ impl NannaBridge {
                 .await
                 .map_err(|e| ScriptError::Bridge(format!("Failed to read entry: {e}")))?
             {
-                if entries.len() >= cap {
-                    break;
-                }
                 let name = entry.file_name().to_string_lossy().to_string();
                 let metadata = entry.metadata().await.ok();
-                let entry_type = metadata.as_ref().map_or("unknown", |m| {
-                    if m.is_dir() { "dir" } else if m.is_symlink() { "link" } else { "file" }
-                }).to_string();
-                let size = metadata.as_ref().map_or(0, std::fs::Metadata::len);
-                let modified = metadata
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs());
-
-                entries.push(DirEntry {
-                    name,
-                    entry_type,
-                    size,
-                    modified,
-                });
+                entries.push(dir_entry_from_metadata(name, metadata.as_ref()));
             }
         }
 
@@ -1414,6 +1402,71 @@ pub struct FileStat {
     pub is_file: bool,
     pub is_dir: bool,
     pub modified: Option<u64>,
+}
+
+/// How many names a bounded flat listing reads before choosing its prefix.
+///
+/// Bound justification: names alone are cheap (no `stat`, ~30 B each, so 2^18
+/// of them is ~8 MiB); it is marshalling *entries* into the script engine
+/// that the caller's cap protects against. Up to this many names the chosen
+/// prefix is exactly the first `cap` in name order on every filesystem; past
+/// it, the prefix is chosen among the first 2^18 the filesystem returned.
+const LIST_DIR_NAME_SCAN_MAX: usize = 1 << 18;
+
+/// The first `cap` entries of `path` in name order (byte order of the lossy
+/// UTF-8 name), each `lstat`ed. A capped listing used to keep the first `cap`
+/// in *readdir* order — reverse creation on tmpfs, creation order on btrfs —
+/// so which entries a budget kept depended on the host, not the tree.
+async fn list_dir_sorted_prefix(path: &std::path::Path, cap: usize) -> Result<Vec<DirEntry>> {
+    let mut read_dir = tokio::fs::read_dir(path)
+        .await
+        .map_err(|e| ScriptError::Bridge(format!("Failed to read directory: {e}")))?;
+    let mut names = Vec::new();
+    while names.len() < LIST_DIR_NAME_SCAN_MAX
+        && let Some(entry) = read_dir
+            .next_entry()
+            .await
+            .map_err(|e| ScriptError::Bridge(format!("Failed to read entry: {e}")))?
+    {
+        names.push(entry.file_name().to_string_lossy().to_string());
+    }
+    names.sort_unstable();
+    names.truncate(cap);
+    let mut entries = Vec::with_capacity(names.len());
+    for name in names {
+        let metadata = tokio::fs::symlink_metadata(path.join(&name)).await.ok();
+        entries.push(dir_entry_from_metadata(name, metadata.as_ref()));
+    }
+    debug_assert!(entries.len() <= cap, "the cap is honoured");
+    debug_assert!(entries.windows(2).all(|w| w[0].name <= w[1].name), "name order");
+    Ok(entries)
+}
+
+/// A flat listing's entry from its (`lstat`) metadata; `unknown` when the
+/// entry vanished or could not be read between the listing and the stat.
+fn dir_entry_from_metadata(name: String, metadata: Option<&std::fs::Metadata>) -> DirEntry {
+    let entry_type = metadata
+        .map_or("unknown", |m| {
+            if m.is_dir() {
+                "dir"
+            } else if m.is_symlink() {
+                "link"
+            } else {
+                "file"
+            }
+        })
+        .to_string();
+    let size = metadata.map_or(0, std::fs::Metadata::len);
+    let modified = metadata
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    DirEntry {
+        name,
+        entry_type,
+        size,
+        modified,
+    }
 }
 
 /// Convert a walkdir entry to our `DirEntry`
@@ -2500,6 +2553,29 @@ mod tests {
             .await
             .expect("probe listing");
         assert_eq!(probe.len(), 11, "10 files + sub/ fit under a 12-entry bound");
+    }
+
+    /// The bounded prefix is the first names in name order, whatever order
+    /// the filesystem hands them out in — tmpfs returns newest first, btrfs
+    /// and ext4 oldest first, so creating the alphabetically-first entry
+    /// LAST makes a readdir-order prefix miss it on one of the two.
+    #[tokio::test]
+    async fn a_bounded_flat_listing_keeps_the_first_names_on_every_filesystem() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["m.txt", "z.txt", "c.txt", "q.txt"] {
+            std::fs::write(dir.path().join(name), "x").expect("seed");
+        }
+        std::fs::create_dir(dir.path().join("a_dir")).expect("seed dir");
+        let bridge = read_bridge(dir.path());
+
+        let bounded = bridge
+            .list_dir(&dir.path().to_string_lossy(), false, Some(3))
+            .await
+            .expect("bounded flat listing");
+        let names: Vec<&str> = bounded.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["a_dir", "c.txt", "m.txt"]);
+        assert_eq!(bounded[0].entry_type, "dir", "entries are still stat'ed");
+        assert_eq!(bounded[1].size, 1);
     }
 
     #[tokio::test]
