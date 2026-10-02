@@ -972,6 +972,12 @@ daemon_proxies! {
     member_update(id: &str, name: Option<&str>, profile: Option<Value>);
     /// Remove an agent from the roster
     member_delete(id: &str);
+    /// Start or resume a card's run
+    card_run_start(card_id: i64);
+    /// Whether a run works a card now
+    card_run_status(card_id: i64);
+    /// Stop a card's run (the card pauses)
+    card_run_cancel(card_id: i64);
 }
 
 impl Default for Backend {

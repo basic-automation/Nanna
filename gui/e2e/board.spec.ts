@@ -58,3 +58,26 @@ test('Inbox lists cards assigned to me; Members adds an agent', async ({ page, m
   const builder = page.getByTestId('member-agent:builder')
   await expect(builder).toContainText('qwen3.5:9b, claude-sonnet-5')
 })
+
+test('an agent\'s card can be started, stopped and resumed from the card view', async ({ page, mock }) => {
+  await mock.gotoWithMock('/board')
+  await expect(page.getByTestId('board-quick-add')).toBeVisible({ timeout: 25_000 })
+  await page.getByTestId('board-view-members').click()
+  await page.getByTestId('member-new-name').fill('Builder')
+  await page.getByTestId('member-add').click()
+  await expect(page.getByTestId('member-agent:builder')).toBeVisible()
+  await page.getByTestId('board-view-board').click()
+
+  const quickAdd = page.getByTestId('board-quick-add')
+  await quickAdd.fill('Bump the deps @builder')
+  await quickAdd.press('Enter')
+  await page.getByTestId('board-column-todo').getByText('Bump the deps').click()
+
+  const run = page.getByTestId('card-run')
+  await expect(run).toHaveText('Start now')
+  await run.click()
+  await expect(run).toHaveText('Stop')
+  await expect(page.getByTestId('board-column-in_progress').getByText('Bump the deps')).toBeVisible()
+  await run.click()
+  await expect(run).toHaveText('Resume')
+})

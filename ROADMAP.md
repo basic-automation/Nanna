@@ -8387,6 +8387,17 @@ as its turn (`TurnAdmission`, scope default `session`).
             is editable; in a patch an empty string now clears `description` as it does the
             dates. Tests: control plane `a_quick_add_line_with_a_parent_becomes_its_sub_card`,
             the Playwright board spec adds a sub-card; checked live.
+      - [x] *(2026-10-02)* **Run controls and markdown posts.** An agent's card shows *Start
+            now* (open, unblocked, its date come — start instead of waiting for the member's
+            turn), *Stop* while a run works it (the card pauses with its member — "Stop = stop",
+            nothing restarts it by itself) and *Resume* on a paused card; humans' and the
+            router's cards show none (`runActionFor`, 2 vitest). Commands `start_card_run`,
+            `card_run_status`, `stop_card_run` over the existing `task.start_run/run_status/
+            cancel_run {card_id}`. Thread posts render as markdown through the sanitizing
+            `renderMarkdown` (verdicts quote commands and output). Playwright: start → stop →
+            resume on the mock; live: a markdown post rendered, `card_run_status` answered.
+            **Not verified live:** a real run start/stop — this host has no model to run one
+            (see *No embedder on this host*).
       - [ ] **The Board view is only addressable while its workspace is active.**
             `task.list/quick_add` resolve `workspace` scope to the daemon's *active* workspace, so
             the board shows the workspace the top bar selected and nothing else. Fine while the

@@ -131,6 +131,7 @@ function installInPage(options = {}) {
     // Board (P25 Stage 4): cards and the global board's roster.
     cards: [],
     nextCardId: 1,
+    runningCards: [],
     members: [
       { id: 'human', name: 'You', avatar: null, kind: 'human', owner_kind: 'human', status: 'idle', profile: {} },
       { id: 'router:global', name: 'Task Router', avatar: null, kind: 'agent', owner_kind: 'workspace', status: 'idle', profile: { role: 'router' } },
@@ -631,6 +632,20 @@ function installInPage(options = {}) {
         card.status = 'done';
         card.updated_at = nowIso();
         return { done: true, already_done: false, auto_completed: [] };
+      }
+      case 'card_run_status':
+        return { running: state.runningCards.includes(args.cardId), resumes: 0 };
+      case 'start_card_run': {
+        const card = state.cards.find((c) => c.id === args.cardId);
+        if (!card || !String(card.assignee || '').startsWith('agent:')) return { error: 'not_an_agent', message: 'card #' + args.cardId + ' is not assigned to an agent' };
+        card.status = 'in_progress';
+        if (!state.runningCards.includes(card.id)) state.runningCards.push(card.id);
+        return { started: true, card_id: card.id, member_id: card.assignee };
+      }
+      case 'stop_card_run': {
+        const was = state.runningCards.includes(args.cardId);
+        state.runningCards = state.runningCards.filter((id) => id !== args.cardId);
+        return { cancelled: was };
       }
       case 'list_members':
         return { members: state.members.map((m) => ({ ...m })) };

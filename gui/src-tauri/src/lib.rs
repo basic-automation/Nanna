@@ -367,6 +367,9 @@ macro_rules! command_handler {
             commands::board::create_member,
             commands::board::update_member,
             commands::board::delete_member,
+            commands::board::start_card_run,
+            commands::board::card_run_status,
+            commands::board::stop_card_run,
         ]
     };
 }

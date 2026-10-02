@@ -352,6 +352,18 @@
       </section>
       <div class="flex items-center gap-2">
         <button
+          v-if="runAction"
+          type="button"
+          data-testid="card-run"
+          class="rounded-lg px-3 py-1 text-xs disabled:opacity-50"
+          :class="runAction === 'stop' ? 'bg-nui-pink text-nui-bg' : 'bg-white/10 text-nui-fg hover:bg-white/15'"
+          :disabled="saving"
+          :title="RUN_TITLE[runAction]"
+          @click="toggleRun"
+        >
+          {{ RUN_LABEL[runAction] }}
+        </button>
+        <button
           v-if="columnOf(selected) !== 'done'"
           type="button"
           data-testid="card-done"
@@ -379,7 +391,9 @@
             <span class="min-w-0 flex-1" />
             <span>{{ post.created_at.slice(0, 16) }}</span>
           </p>
-          <p class="whitespace-pre-wrap break-words text-xs text-nui-fg">{{ post.content }}</p>
+          <!-- Members post markdown (verdicts quote commands and output);
+               renderMarkdown sanitizes, as it does for chat. -->
+          <div class="board-post break-words text-xs text-nui-fg" v-html="renderMarkdown(post.content)" />
         </article>
         <p v-if="posts.length === 0" class="text-xs text-nui-muted">No posts yet.</p>
         <form class="flex flex-col gap-2" @submit.prevent="submitPost">
@@ -410,10 +424,11 @@
 import { computed, inject, onMounted, onUnmounted, reactive, ref, watch, type Ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { renderMarkdown } from '~/lib/markdown'
 import {
   applyFilters, arrangeColumns, assignable, boardLabel, boardLabels, childCounts, filtering, NO_FILTERS, columnOf, dayOf, eventIsForBoard,
-  isDeferred, isOverdue, memberName, postKindLabel, splitAssigned, splitList, todayUtc,
-  type BoardCard, type BoardFilters, type BoardMember, type CardPost,
+  isDeferred, isOverdue, memberName, postKindLabel, runActionFor, splitAssigned, splitList, todayUtc,
+  type BoardCard, type BoardFilters, type BoardMember, type CardPost, type RunAction,
 } from '~/lib/board'
 
 interface WorkspaceInfo { id: string, name: string, path: string }
@@ -579,6 +594,7 @@ async function loadCard(id: number) {
     if (refusal(reply) || selectedId.value !== id) return
     selectedDetail.value = reply.task ?? null
     posts.value = reply.notes ?? []
+    void loadRunState(id)
   } catch (e) {
     console.error('Failed to load card:', e)
   }
@@ -593,6 +609,7 @@ function selectCard(id: number) {
   openDates.deadline_at = false
   cardMessage.value = ''
   posts.value = []
+  running.value = false
   selectedDetail.value = null
   void loadCard(id)
 }
@@ -664,6 +681,41 @@ async function addSubCard() {
     cardMessage.value = refusal(reply) ?? ''
     if (!refusal(reply)) subCardText.value = ''
     await Promise.all([loadCards(), loadAssigned()])
+  } catch (e) {
+    cardMessage.value = String(e)
+  } finally {
+    saving.value = false
+  }
+}
+
+// ═══ The card's run (agent cards only) ═══
+const running = ref(false)
+const runAction = computed(() => selected.value ? runActionFor(selected.value, running.value, today.value) : null)
+const RUN_LABEL: Record<NonNullable<RunAction>, string> = { start: 'Start now', resume: 'Resume', stop: 'Stop' }
+const RUN_TITLE: Record<NonNullable<RunAction>, string> = {
+  start: 'Its member starts on it now instead of waiting for its turn',
+  resume: 'Its member picks the paused card back up',
+  stop: 'Stop the run; the card stays with its member, paused, until resumed',
+}
+
+async function loadRunState(id: number) {
+  try {
+    const reply = await invoke<{ running?: boolean }>('card_run_status', { cardId: id })
+    if (selectedId.value === id) running.value = reply?.running === true
+  } catch (e) {
+    console.error('Failed to read the card run:', e)
+  }
+}
+
+async function toggleRun() {
+  const id = selectedId.value
+  const action = runAction.value
+  if (id === null || !action) return
+  saving.value = true
+  try {
+    const reply = await invoke(action === 'stop' ? 'stop_card_run' : 'start_card_run', { cardId: id })
+    cardMessage.value = refusal(reply) ?? ''
+    await Promise.all([loadCards(), loadCard(id), loadRoster()])
   } catch (e) {
     cardMessage.value = String(e)
   } finally {
@@ -758,3 +810,12 @@ onUnmounted(() => {
   for (const unlisten of unlisteners) unlisten()
 })
 </script>
+
+<style scoped>
+/* Thread posts are markdown: keep its blocks tight inside a post. */
+.board-post :deep(p) { margin: 0 0 0.25rem; }
+.board-post :deep(pre) { margin: 0.25rem 0; padding: 0.5rem; border-radius: 6px; background: rgb(255 255 255 / 0.05); overflow-x: auto; white-space: pre; }
+.board-post :deep(code) { font-family: var(--font-nui); }
+.board-post :deep(ul), .board-post :deep(ol) { margin: 0.25rem 0; padding-left: 1.25rem; }
+.board-post :deep(a) { color: var(--color-nui-info); text-decoration: underline; }
+</style>

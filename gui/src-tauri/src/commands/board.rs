@@ -145,3 +145,42 @@ pub async fn delete_member(
 ) -> Result<serde_json::Value, String> {
     backend_handle(&state).await.member_delete(&id).await
 }
+
+/// Start — or resume, for a paused card — the assignee's run on a card.
+///
+/// # Errors
+///
+/// Fails as [`quick_add_card`] does.
+#[tauri::command]
+pub async fn start_card_run(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    card_id: i64,
+) -> Result<serde_json::Value, String> {
+    backend_handle(&state).await.card_run_start(card_id).await
+}
+
+/// Whether a run works a card now (`{running, …}`).
+///
+/// # Errors
+///
+/// Fails as [`quick_add_card`] does.
+#[tauri::command]
+pub async fn card_run_status(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    card_id: i64,
+) -> Result<serde_json::Value, String> {
+    backend_handle(&state).await.card_run_status(card_id).await
+}
+
+/// Stop the run working a card; the card stays with its member, paused.
+///
+/// # Errors
+///
+/// Fails as [`quick_add_card`] does.
+#[tauri::command]
+pub async fn stop_card_run(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    card_id: i64,
+) -> Result<serde_json::Value, String> {
+    backend_handle(&state).await.card_run_cancel(card_id).await
+}

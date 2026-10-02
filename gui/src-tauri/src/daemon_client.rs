@@ -2041,6 +2041,48 @@ impl DaemonClient {
         })).await
     }
 
+    /// Start — or resume, for a paused card — its assignee's run on card
+    /// `card_id` (`task.start_run {card_id}`).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does; a refused start (no agent
+    /// assigned, the member busy elsewhere) comes back inside `Ok`.
+    pub async fn card_run_start(&self, card_id: i64) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "start_run",
+            "card_id": card_id
+        })).await
+    }
+
+    /// Whether a run is working card `card_id` now (`task.run_status`).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn card_run_status(&self, card_id: i64) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "run_status",
+            "card_id": card_id
+        })).await
+    }
+
+    /// Stop the run working card `card_id`; the card stays with its member,
+    /// paused (`task.cancel_run`).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn card_run_cancel(&self, card_id: i64) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "cancel_run",
+            "card_id": card_id
+        })).await
+    }
+
     /// The roster of one board: `workspace_id` `None` is the global board.
     ///
     /// # Errors

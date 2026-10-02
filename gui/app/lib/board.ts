@@ -383,3 +383,22 @@ export function boardNoticeFor(event: BoardEvent, card: BoardCard, me = 'human')
       return null
   }
 }
+
+/** What the card view offers for a card's run. */
+export type RunAction = 'start' | 'resume' | 'stop' | null
+
+/**
+ * The run control a card shows. Only a card assigned to an agent (never the
+ * router, never a human) has a run. A live run can be stopped — the card then
+ * pauses with its member ("Stop = stop": nothing restarts it by itself); a
+ * paused card (in progress, no run) can be resumed; an open, unblocked card
+ * whose date has come can be started now rather than waiting for its turn.
+ */
+export function runActionFor(card: BoardCard, running: boolean, today: string): RunAction {
+  const agent = card.assignee?.startsWith('agent:') ?? false
+  if (!agent || columnOf(card) === 'done') return null
+  if (running) return 'stop'
+  if (card.status === 'in_progress') return 'resume'
+  if (card.blocked || isDeferred(card, today)) return null
+  return 'start'
+}

@@ -5,6 +5,7 @@ import {
   splitAssigned,
   splitList,
   applyFilters,
+  runActionFor,
   boardNoticeFor,
   boardLabels,
   filtering,
@@ -282,5 +283,25 @@ describe('boardNoticeFor', () => {
     expect(boardNoticeFor({ kind: 'due', task_id: 1 }, mine({ assignee: 'agent:builder' }))).toBeNull()
     expect(boardNoticeFor({ kind: 'overdue', task_id: 1 }, mine({ status: 'done' }))).toBeNull()
     expect(boardNoticeFor({ kind: 'posted', task_id: 1, actor: 'agent:builder' }, mine())).toBeNull()
+  })
+})
+
+describe('runActionFor', () => {
+  const today = '2026-10-07'
+  const agentCard = (fields: Partial<BoardCard> = {}) => card({ assignee: 'agent:builder', ...fields })
+
+  it('offers stop while a run works the card, resume when it is paused, start when it waits its turn', () => {
+    expect(runActionFor(agentCard({ status: 'in_progress' }), true, today)).toBe('stop')
+    expect(runActionFor(agentCard({ status: 'in_progress' }), false, today)).toBe('resume')
+    expect(runActionFor(agentCard(), false, today)).toBe('start')
+  })
+
+  it('offers nothing for humans, the router, closed, blocked or deferred cards', () => {
+    expect(runActionFor(card({ assignee: 'human' }), false, today)).toBeNull()
+    expect(runActionFor(card({ assignee: 'router:global' }), false, today)).toBeNull()
+    expect(runActionFor(card(), false, today)).toBeNull()
+    expect(runActionFor(agentCard({ status: 'done' }), false, today)).toBeNull()
+    expect(runActionFor(agentCard({ blocked: true }), false, today)).toBeNull()
+    expect(runActionFor(agentCard({ due_at: '2026-10-09' }), false, today)).toBeNull()
   })
 })
