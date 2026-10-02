@@ -2667,3 +2667,59 @@ async fn an_empty_date_in_a_patch_clears_it_and_null_skips_it() {
     assert!(cleared["task"]["deadline_at"].is_null(), "{cleared}");
     assert_eq!(cleared["task"]["priority"], 2, "{cleared}");
 }
+
+#[tokio::test]
+async fn a_quick_add_line_with_a_parent_becomes_its_sub_card() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let parent = storage
+        .tasks()
+        .create(nanna_storage::NewTask {
+            title: "release".to_string(),
+            scope: "workspace".to_string(),
+            scope_id: Some("ws-x".to_string()),
+            priority: 3,
+            ..nanna_storage::NewTask::default()
+        })
+        .await
+        .expect("parent");
+    // `scope: global` is ignored: a sub-card lives on its parent's board.
+    let child = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "tag it #ops",
+        "scope": "global", "parent_id": parent.id,
+    }))
+    .await;
+    assert_eq!(child["task"]["parent_id"], parent.id, "{child}");
+    assert_eq!(child["task"]["scope"], "workspace", "{child}");
+    assert_eq!(child["task"]["scope_id"], "ws-x", "{child}");
+    let session_parent = storage
+        .tasks()
+        .create(nanna_storage::NewTask {
+            title: "chat plan".to_string(),
+            scope: "session".to_string(),
+            scope_id: Some("s1".to_string()),
+            priority: 3,
+            ..nanna_storage::NewTask::default()
+        })
+        .await
+        .expect("session card");
+    let refused = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "nope", "parent_id": session_parent.id,
+    }))
+    .await;
+    assert_eq!(refused["error"], "bad_scope", "{refused}");
+    let missing = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "nope", "parent_id": 9_999,
+    }))
+    .await;
+    assert_eq!(missing["error"], "task_not_found", "{missing}");
+}

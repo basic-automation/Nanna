@@ -957,7 +957,7 @@ daemon_proxies! {
 
     // --- Board (P25 Stage 4) ---
     /// One quick-add line becomes one card
-    task_quick_add(text: &str, scope: Option<&str>);
+    task_quick_add(text: &str, scope: Option<&str>, parent_id: Option<i64>);
     /// One card with its thread
     task_get(id: i64);
     /// The human posts on a card's thread

@@ -1931,18 +1931,19 @@ impl DaemonClient {
 
     /// One quick-add line → one board card (`task.quick_add`, P25 decision 1).
     /// `scope` is `workspace` or `global`; `None` lets the daemon choose the
-    /// active board.
+    /// active board. With `parent_id` the card is that card's sub-card.
     ///
     /// # Errors
     ///
     /// Fails only as [`Self::request`] does. A line the daemon refuses (an
     /// unknown `@member`, a bad `{deadline}`) comes back inside the `Ok` reply.
-    pub async fn task_quick_add(&self, text: &str, scope: Option<&str>) -> Result<Value, String> {
+    pub async fn task_quick_add(&self, text: &str, scope: Option<&str>, parent_id: Option<i64>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "task",
             "action": "quick_add",
             "text": text,
-            "scope": scope
+            "scope": scope,
+            "parent_id": parent_id
         })).await
     }
 

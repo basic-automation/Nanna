@@ -10,7 +10,8 @@ use std::sync::Arc;
 use tauri::State;
 use tokio::sync::RwLock;
 
-/// Turn one quick-add line into a card (`#label p1 @member friday {deadline}`).
+/// Turn one quick-add line into a card (`#label p1 @member friday {deadline}`);
+/// with `parent_id`, a sub-card of that card.
 ///
 /// # Errors
 ///
@@ -21,10 +22,11 @@ pub async fn quick_add_card(
     state: State<'_, Arc<RwLock<AppState>>>,
     text: String,
     scope: Option<String>,
+    parent_id: Option<i64>,
 ) -> Result<serde_json::Value, String> {
     backend_handle(&state)
         .await
-        .task_quick_add(&text, scope.as_deref())
+        .task_quick_add(&text, scope.as_deref(), parent_id)
         .await
 }
 

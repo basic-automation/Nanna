@@ -29,6 +29,13 @@ test('quick-add makes a card, the thread takes a post, done moves it', async ({ 
   await view.getByRole('button', { name: 'Post' }).click()
   await expect(page.getByTestId('card-thread')).toContainText('Draft is in CHANGELOG.md')
 
+  await page.getByTestId('card-sub-card-add').fill('Collect the PR titles p1')
+  await page.getByTestId('card-sub-card-add').press('Enter')
+  await expect(page.getByTestId('card-sub-cards')).toContainText('Collect the PR titles')
+  await expect(page.getByTestId('card-sub-cards')).toContainText('1/1 open')
+  // Sub-cards sit inside their parent by default: the board shows the count.
+  await expect(todo.getByText('↳ 1/1')).toBeVisible()
+
   await page.getByTestId('card-done').click()
   await expect(page.getByTestId('board-column-done').getByText('Write the changelog')).toBeVisible()
 })

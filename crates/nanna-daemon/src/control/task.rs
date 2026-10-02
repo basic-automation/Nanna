@@ -79,7 +79,9 @@ impl ControlPlane {
                 self.task_create(&repo, request).await
             }
 
-            TaskAction::QuickAdd { text, scope } => self.task_quick_add(&repo, &text, scope).await,
+            TaskAction::QuickAdd { text, scope, parent_id } => {
+                self.task_quick_add(&repo, &text, scope, parent_id).await
+            }
 
             TaskAction::Assigned { member_id, limit } => {
                 Self::task_assigned(&repo, member_id, limit).await
@@ -94,24 +96,7 @@ impl ControlPlane {
                 Err(e) => json!({"error": "task_delete_failed", "message": e.to_string()}),
             },
 
-            TaskAction::Note { id, content } => {
-                // A note from the GUI is the human posting on the card's
-                // thread, so it names the human member (P25 decision 2). The
-                // legacy `author` string stays "gui" until Stage 4 drops it.
-                match repo
-                    .post(
-                        id,
-                        Some("gui"),
-                        Some(nanna_storage::HUMAN_MEMBER_ID),
-                        nanna_storage::TaskNoteKind::Comment,
-                        &content,
-                    )
-                    .await
-                {
-                    Ok(note) => json!({"note": note}),
-                    Err(e) => json!({"error": "task_note_failed", "message": e.to_string()}),
-                }
-            }
+            TaskAction::Note { id, content } => Self::task_note(&repo, id, &content).await,
 
             TaskAction::Query { filter, scope, session_id } => {
                 self.task_query(&repo, &filter, scope, session_id).await
@@ -164,6 +149,25 @@ impl ControlPlane {
             } => self.cancel_task_run(scope, session_id).await,
 
             TaskAction::Verdicts { window } => Self::task_verdicts(&repo, window).await,
+        }
+    }
+
+    /// `TaskAction::Note`: a note from the GUI is the human posting on the
+    /// card's thread, so it names the human member (P25 decision 2). The
+    /// legacy `author` string stays "gui" until Stage 4 drops it.
+    async fn task_note(repo: &TaskRepository, id: i64, content: &str) -> Value {
+        match repo
+            .post(
+                id,
+                Some("gui"),
+                Some(nanna_storage::HUMAN_MEMBER_ID),
+                nanna_storage::TaskNoteKind::Comment,
+                content,
+            )
+            .await
+        {
+            Ok(note) => json!({"note": note}),
+            Err(e) => json!({"error": "task_note_failed", "message": e.to_string()}),
         }
     }
 
@@ -379,7 +383,7 @@ impl ControlPlane {
             description: patch
                 .get("description")
                 .and_then(Value::as_str)
-                .map(|s| Some(s.to_string())),
+                .map(clearable),
             status: patch
                 .get("status")
                 .and_then(Value::as_str)
@@ -391,8 +395,8 @@ impl ControlPlane {
                 .map(&string_vec),
             tool_scope: patch.get("tools").filter(|v| v.is_array()).map(&string_vec),
             // `null` skips a field like everywhere else in a patch, so an
-            // empty string is how a client clears a date (the board's date
-            // inputs send "" when emptied).
+            // empty string is how a client clears a date or a description
+            // (the board's inputs send "" when emptied).
             due_at: patch
                 .get("due_at")
                 .and_then(Value::as_str)

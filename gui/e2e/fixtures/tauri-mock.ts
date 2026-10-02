@@ -591,6 +591,12 @@ function installInPage(options = {}) {
           } else title.push(word);
         }
         card.title = title.join(' ');
+        if (args.parentId) {
+          const parent = state.cards.find((c) => c.id === args.parentId);
+          if (!parent) return { error: 'task_not_found', message: 'no card #' + args.parentId };
+          card.parent_id = parent.id;
+          card.scope = parent.scope;
+        }
         if (!card.title) return { error: 'bad_quick_add', message: 'a card needs a title — every word was a token' };
         state.nextCardId += 1;
         state.cards.push(card);

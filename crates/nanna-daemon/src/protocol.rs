@@ -216,11 +216,16 @@ pub enum TaskAction {    /// List tasks in a scope
     /// `p1`..`p4`, `@member`, a date phrase (the defer date) and `{date
     /// phrase}` (the deadline) fill fields, the rest is the title. `scope`
     /// is `workspace` (the active board, the default when one is open) or
-    /// `global`. The reply is `{task, parsed}`.
+    /// `global`; with `parent_id` the card is a sub-card on the parent's board.
+    /// The reply is `{task, parsed}`.
     QuickAdd {
         text: String,
         #[serde(default)]
         scope: Option<String>,
+        /// Make the card a sub-card of this one; it then lives on the
+        /// parent's board and `scope` is ignored.
+        #[serde(default)]
+        parent_id: Option<i64>,
     },
     /// Every open board card assigned to `member_id` (default: the human),
     /// across every board — the read behind Inbox and Upcoming (P25 decision

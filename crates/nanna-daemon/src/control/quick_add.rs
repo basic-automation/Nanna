@@ -27,22 +27,16 @@ impl ControlPlane {
         repo: &TaskRepository,
         text: &str,
         scope: Option<String>,
+        parent_id: Option<i64>,
     ) -> Value {
         let today = chrono::Utc::now().date_naive();
         let parsed = match nanna_storage::quick_add::parse(text, today) {
             Ok(parsed) => parsed,
             Err(e) => return json!({"error": "bad_quick_add", "message": e.to_string()}),
         };
-        let has_active = self.workspaces.read().await.active().is_some();
-        let scope =
-            scope.unwrap_or_else(|| if has_active { "workspace" } else { "global" }.to_string());
-        if scope.eq_ignore_ascii_case("session") {
-            return json!({"error": "bad_scope", "message":
-                "quick-add creates board cards — use scope \"workspace\" or \"global\""});
-        }
-        let (scope, scope_id) = match self.resolve_task_scope(Some(&scope), None).await {
-            Ok(resolved) => resolved,
-            Err(message) => return json!({"error": "bad_scope", "message": message}),
+        let (scope, scope_id) = match self.quick_add_board(repo, scope, parent_id).await {
+            Ok(board) => board,
+            Err(reply) => return reply,
         };
         debug_assert!(scope != "session", "refused above");
         let assignee = match parsed.assignee.as_deref() {
@@ -56,7 +50,7 @@ impl ControlPlane {
             title: parsed.title.clone(),
             scope: Some(scope),
             session_id: None,
-            parent_id: None,
+            parent_id,
             description: None,
             priority: parsed.priority,
             labels: Some(parsed.labels.clone()),
@@ -74,6 +68,42 @@ impl ControlPlane {
             object.insert("parsed".to_string(), json!(parsed));
         }
         reply
+    }
+
+    /// The board a quick-add line lands on: the parent card's (a sub-card),
+    /// else `scope` — default the open workspace's board, else global. A
+    /// session card is on no board, so neither it nor a session parent is
+    /// accepted; every refusal is the IPC reply.
+    async fn quick_add_board(
+        &self,
+        repo: &TaskRepository,
+        scope: Option<String>,
+        parent_id: Option<i64>,
+    ) -> Result<(String, Option<String>), Value> {
+        const NOT_A_BOARD: &str =
+            "quick-add creates board cards — use scope \"workspace\" or \"global\"";
+        if let Some(parent_id) = parent_id {
+            let parent = repo
+                .get(parent_id)
+                .await
+                .map_err(|e| json!({"error": "task_not_found", "message": e.to_string()}))?;
+            if parent.scope == "session" {
+                return Err(json!({"error": "bad_scope", "message": NOT_A_BOARD}));
+            }
+            return Ok((parent.scope, parent.scope_id));
+        }
+        let has_active = self.workspaces.read().await.active().is_some();
+        let scope =
+            scope.unwrap_or_else(|| if has_active { "workspace" } else { "global" }.to_string());
+        if scope.eq_ignore_ascii_case("session") {
+            return Err(json!({"error": "bad_scope", "message": NOT_A_BOARD}));
+        }
+        let board = self
+            .resolve_task_scope(Some(&scope), None)
+            .await
+            .map_err(|message| json!({"error": "bad_scope", "message": message}))?;
+        debug_assert!(board.0 != "session", "refused above");
+        Ok(board)
     }
 
     /// The id of the member `@handle` names on the board `workspace_id`

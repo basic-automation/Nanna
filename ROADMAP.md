@@ -8378,6 +8378,15 @@ as its turn (`TurnAdmission`, scope default `session`).
             `due_at`/`deadline_at` (`null` still skips, as for every field) — there was no way to
             remove a date. Tests: 4 vitest, control plane
             `an_empty_date_in_a_patch_clears_it_and_null_skips_it`.
+      - [x] *(2026-10-02)* **The card view explains where a card sits.** *Part of #N* (its
+            parent), *Waiting on* (each dependency with its assignee, struck through once
+            closed — so a card in the Waiting column leads straight to the clarification that
+            holds it), its sub-cards (`open/total`) and an *Add a sub-card* line with the
+            quick-add tokens: `task.quick_add` takes `parent_id` and puts the card on the
+            parent's board whatever `scope` says (a session parent is refused). The description
+            is editable; in a patch an empty string now clears `description` as it does the
+            dates. Tests: control plane `a_quick_add_line_with_a_parent_becomes_its_sub_card`,
+            the Playwright board spec adds a sub-card; checked live.
       - [ ] **The Board view is only addressable while its workspace is active.**
             `task.list/quick_add` resolve `workspace` scope to the daemon's *active* workspace, so
             the board shows the workspace the top bar selected and nothing else. Fine while the

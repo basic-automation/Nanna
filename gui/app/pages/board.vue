@@ -295,7 +295,61 @@
           >
         </dd>
       </dl>
-      <p v-if="selected.description" class="whitespace-pre-wrap break-words text-xs text-nui-fg">{{ selected.description }}</p>
+      <textarea
+        :value="selected.description ?? ''"
+        data-testid="card-description"
+        rows="3"
+        :class="[FIELD, 'resize-y']"
+        :disabled="!editable"
+        placeholder="Description — what done looks like, links, context"
+        @change="patchCard({ description: ($event.target as HTMLTextAreaElement).value })"
+      />
+
+      <!-- Where the card sits: its parent, what it waits on, its sub-cards -->
+      <section class="flex flex-col gap-2 text-xs" data-testid="card-relations">
+        <p v-if="parentCard" class="text-nui-muted">
+          Part of
+          <button type="button" class="text-nui-accent hover:underline" @click="selectCard(parentCard.id)">
+            #{{ parentCard.id }} {{ parentCard.title }}
+          </button>
+        </p>
+        <div v-if="waitingOn.length" class="flex flex-col gap-1" data-testid="card-waiting-on">
+          <p class="text-nui-yellow">Waiting on</p>
+          <button
+            v-for="dep in waitingOn"
+            :key="dep.id"
+            type="button"
+            class="text-left text-nui-fg hover:underline"
+            :class="dep.card && columnOf(dep.card) === 'done' && 'text-nui-muted line-through'"
+            @click="selectCard(dep.id)"
+          >
+            #{{ dep.id }} {{ dep.card?.title ?? '(not on this board)' }}
+            <span v-if="dep.card" class="text-nui-muted">— {{ memberName(dep.card.assignee, roster) }}</span>
+          </button>
+        </div>
+        <div class="flex flex-col gap-1" data-testid="card-sub-cards">
+          <p class="text-nui-muted">Sub-cards<span v-if="subCards.length">{{ ` · ${subCards.filter(c => columnOf(c) !== 'done').length}/${subCards.length} open` }}</span></p>
+          <button
+            v-for="sub in subCards"
+            :key="sub.id"
+            type="button"
+            class="text-left text-nui-fg hover:underline"
+            :class="columnOf(sub) === 'done' && 'text-nui-muted line-through'"
+            @click="selectCard(sub.id)"
+          >
+            p{{ sub.priority }} {{ sub.title }} <span class="text-nui-muted">— {{ memberName(sub.assignee, roster) }}</span>
+          </button>
+          <form v-if="editable" class="flex gap-2" @submit.prevent="addSubCard">
+            <input
+              v-model="subCardText"
+              data-testid="card-sub-card-add"
+              :class="FIELD"
+              placeholder="Add a sub-card — same tokens as quick-add"
+              :disabled="saving"
+            >
+          </form>
+        </div>
+      </section>
       <div class="flex items-center gap-2">
         <button
           v-if="columnOf(selected) !== 'done'"
@@ -580,6 +634,42 @@ async function assign(memberId: string) {
 }
 
 const FIELD = 'w-full rounded border border-white/10 bg-nui-bg px-2 py-0.5 text-xs text-nui-fg outline-none [color-scheme:dark] disabled:opacity-60'
+
+/** The selected card's parent, if it has one on this board. */
+const parentCard = computed(() => {
+  const parentId = selected.value?.parent_id
+  return parentId == null ? null : cards.value.find(card => card.id === parentId) ?? null
+})
+
+/** What the selected card waits on (its dependencies, scope-local by the store's rule). */
+const waitingOn = computed(() => (selected.value?.depends_on ?? []).map(id => ({
+  id,
+  card: cards.value.find(card => card.id === id) ?? null,
+})))
+
+const subCards = computed(() => {
+  const id = selected.value?.id
+  return id == null ? [] : cards.value.filter(card => card.parent_id === id).sort((a, b) => a.priority - b.priority || a.id - b.id)
+})
+
+const subCardText = ref('')
+
+async function addSubCard() {
+  const parentId = selectedId.value
+  const text = subCardText.value.trim()
+  if (parentId === null || !text) return
+  saving.value = true
+  try {
+    const reply = await invoke('quick_add_card', { text, scope: null, parentId })
+    cardMessage.value = refusal(reply) ?? ''
+    if (!refusal(reply)) subCardText.value = ''
+    await Promise.all([loadCards(), loadAssigned()])
+  } catch (e) {
+    cardMessage.value = String(e)
+  } finally {
+    saving.value = false
+  }
+}
 
 /** A closed card is history; its fields are shown, not edited. */
 const editable = computed(() => !saving.value && selected.value !== null && columnOf(selected.value) !== 'done')
