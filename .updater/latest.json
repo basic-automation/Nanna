@@ -1,15 +1,15 @@
 {
-  "version": "0.3.34",
-  "notes": "Agents work their cards: assigning a board card to an agent starts the work, and a card it cannot finish goes back to the router.",
-  "pub_date": "2026-10-01T14:45:15.068Z",
+  "version": "0.3.35",
+  "notes": "The board gets a screen: one-line quick-add, Inbox and Upcoming, Members, and starting or stopping an agent's card.",
+  "pub_date": "2026-10-02T14:43:21Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWtLSlM4dWI0TVBoT21LcHlKMVRzaWdQcW1uTFhUYm0xMTIveXo5empuOG5YbC83YWZJM2hVdFFKTURjODB5UU9kNDhjMmI4M290dDBQSEtub1pMaWdjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwODY1NTc2CWZpbGU6TmFubmFfMC4zLjM0X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMzQKT2J3M0MyVldJUU8zQUJMNExra3ZvdUhkV1RqVE4wZmJOc0J1RzlDODBmOG93S0gzdnp1OFVhc0RzZGdoTTJpWVErdFRaTUQ0MlJxNFFvQm1SNUR6QWc9PQo=",
-      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.34-beta.43/Nanna_0.3.34_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWlSUVQ0TlNIRk1LL0pxbW9iS2FxNlRYbUdBSENabUpjZG1ya1pkTWJ0NTJIbDd2WE5veUJMSm9MTjVwSHI1cTRJNEp1cmVKVVkrK2s1YXRjdkZST3c0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwOTUyMTcyCWZpbGU6TmFubmFfMC4zLjM1X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMzUKbFpGZFhDQXhDajFSdzNFRlE0NVl2eGRDZElUNXFoWHFEWGlqZThibkhXYkR1OTk1bGtJVHpzMkZ4Q1R3MDJnZ20wdHg0bmRuUDREQ3ZzUU1MT0pIQ3c9PQo=",
+      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.35-beta.44/Nanna_0.3.35_x64-setup.exe"
     },
     "linux-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWk4VnNpbVVaMERvTVBKWFZXQVhMbS9LRG40ckdtMjlIR0VhK0RmcUdZRUtaUERGSDlqWlRra1VZc0Jhd09nb0hjQ2NyNGd6MTl4OWFDSzdTUGp1SEF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwODYzMDQ4CWZpbGU6TmFubmFfMC4zLjM0X2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjM0Ck00eWcwZ3FweEVOWmd5VUdGMko5a1NmcFVMVUFqQytwMEdIZ0dkdEd6QU1ySTdhZnYvU2t6THJCUkZmdkkyNUdxVDJNMjQ4WVk1bm44bTFIZlNMNERBPT0K",
-      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.34-beta.43/Nanna_0.3.34_amd64.AppImage"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWdjTTUreW1xanZkUzFIZmpXays4cFdBbkt4NWo1U0JMWFJhMDJCOHJ3Vk5Rb0VIYkxnN3NRVTZ0b3hSVDlqZGc5S0h2Y25QMyt3cXRCb0pnUHFwM3d3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwOTUwMjA5CWZpbGU6TmFubmFfMC4zLjM1X2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjM1CkJvTnhPMGIrMk5ZZk9GZ3VmUXZLZk9SakQyRWtEYkRlV1FRT1VBNzZ3b2FkRmZCVVBVQU8rNEJ2S3FuaGFVUmN3c3dwMFpzbFlzckdvWGF4SWZkOUF3PT0K",
+      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.35-beta.44/Nanna_0.3.35_amd64.AppImage"
     }
   }
 }
