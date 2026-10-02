@@ -88,6 +88,12 @@ A fully local run needs none.
 
 ## What Works Today
 
+- **The board (early)** — each workspace has a card board (To do, Waiting, In progress, Done). One
+  line adds a card: `Ship the fix #release p2 @builder tomorrow {friday}` sets the label, priority,
+  assignee, date and deadline, and the rest is the title. The board's router completes what you
+  left out, an agent assigned a card works it in the background, and the card's thread shows its
+  progress, questions and verdict as they are posted. You can post on the thread, reassign, and
+  mark a card done (it stays open if its acceptance check fails, and says why).
 - **Long-horizon autonomy** — Mission mode drives multi-hour builds from a single prompt with automatic recovery from failures
 - **Headless daemon + GUI** — Runs as a Windows service with WebSocket IPC; the Tauri GUI attaches as a client
 - **Streaming chat** — Real-time responses with tool calling, thinking visualization, and context compression.

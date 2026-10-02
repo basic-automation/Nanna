@@ -1,5 +1,6 @@
 //! Tauri command handlers, grouped by feature area.
 
+pub mod board;
 pub mod channels;
 pub mod chat;
 pub mod memory;

@@ -8285,6 +8285,58 @@ as its turn (`TurnAdmission`, scope default `session`).
 - [ ] Board per workspace (columns = states; filters: assignee, label, due, priority; flat/nested
       toggle), Inbox, Upcoming, quick-add with the token parser (reuse `task_filter`; add
       `@member`), card view with thread and profile pages for members.
+      - [x] *(2026-10-02)* **Quick-add, end to end.** `nanna_storage::quick_add::parse` reads
+            decision 1's tokens — `#label`, `p1`..`p4`, `@member`, a defer-date phrase (`today`,
+            `tomorrow`, a weekday = the next one strictly after today, `next week`, `in N
+            days|weeks`, ISO) and Todoist's `{phrase}` for the deadline. A single-valued token
+            given twice keeps the last and gives the earlier one back to the title word for word;
+            a brace group that is not a date is refused rather than guessed. Bounds: 4 KiB of
+            input (a title and 32 labels at their store limits fit), offsets 0..=3 660 days.
+            It is its own parser, not `task_filter`'s: the filter is the *other* Todoist dialect
+            (there `@` is a label, `#` a project). IPC `task.quick_add {text, scope?}` (default:
+            the open workspace's board, else global; session scope refused) resolves `@handle`
+            against that board's roster — id, id without `agent:`, the name's slug, or the name;
+            `me` is the human; a router is refused (decision 4); an unknown handle lists up to 12
+            members — then creates through `task.create`, so the card is `gui`-made and the
+            router completes it. 12 parser tests, 6 resolver tests, control-plane test
+            `a_quick_add_line_becomes_a_board_card`.
+      - [x] *(2026-10-02)* **The board client's first slice** (`gui/app/pages/board.vue`, rail
+            entry "Board", palette entry). One board — the open workspace's, else global — in
+            four columns: *To do*, *Waiting* (derived `blocked`, whatever the stored status),
+            *In progress*, *Done* (newest first, the latest 50 — `DONE_SHOWN_MAX`). Sub-cards sit
+            inside their parent (`↳ open/total`) or on the board (the decision-8 toggle);
+            assignee filter; priority, labels, date (yellow while deferred), deadline (pink when
+            overdue) and a busy dot from the roster. The card view is the thread (posts with
+            member names and kinds), a post box (`task.note` → the human's comment), assign to a
+            member, and *Mark done* — which shows the verdict when the acceptance check fails.
+            Live: the daemon's `Event::TaskEvent` and `MembersChanged` now parse in the GUI
+            (they fell into `Unknown` before) and forward as `board-event` / `members-changed`;
+            the board re-reads its own scope's cards, coalesced to one read per 250 ms burst.
+            New commands `quick_add_card`, `get_card`, `post_on_card`, `list_members`. The
+            arrangement rules live in `app/lib/board.ts` with 15 unit tests.
+            **Not yet:** Inbox / Upcoming, label/due/priority filters, editing a card's other
+            fields, member profile pages, and the Figma `Board` page's visual pass (the Figma
+            connector was unauthenticated this run; built on the `nui` tokens instead).
+      - [ ] *(research 2026-10-02)* **Todoist's own tokens are not decision 1's — owner call
+            before habits form.** Todoist's Quick Add
+            ([help](https://www.todoist.com/help/articles/use-task-quick-add-in-todoist-va4Lhpzz))
+            uses `#` for a *project*, `%label` for labels (`@label` "will be retired by end of
+            2026"), `+person` for the assignee, `/section`, and `!time` for reminders. Decision 1
+            says `#label` and `@member`; it is shipped that way. Either keep it (our boards have
+            no projects, so `#` is free) or accept `+member`/`%label` as aliases so a Todoist
+            user's muscle memory works — aliases cost nothing in the parser. Do not silently
+            change decision 1.
+      - [ ] *(research 2026-10-02)* **Brace deadlines take any date phrase in Todoist** —
+            `{march 30}`, `{next friday}`
+            ([deadlines](https://www.todoist.com/help/articles/introduction-to-deadlines-uMqbSLM6U)).
+            Ours refuses both (month names and `next <weekday>` are not phrases yet), with a
+            message naming what works. Add `<month> <day>` (next occurrence, this year or next)
+            and `next <weekday>` (the weekday of next week) to `date_phrase`; both are small and
+            bounded.
+      - [ ] **A board is only addressable while its workspace is active.** `task.list/quick_add`
+            resolve `workspace` scope to the daemon's *active* workspace, so the board shows the
+            workspace the top bar selected and nothing else. Inbox/Upcoming read across every
+            workspace, so they need `scope_id` on these verbs — add it before building them.
 - [ ] Delete: session table + `SessionManager`, `ChatAction::*`, `chat_harness.rs` continuation
       loop, empty-bubble gating, per-session pinned model, GUI chat pages and commands, channel
       adapters + `channel_secrets` + per-channel pinned models, `scheduler.target_channel/
@@ -9224,6 +9276,19 @@ keep the phases readable; promote individual items into a phase when they become
       - `claude setup-token` mints a **one-year** token and only PRINTS it (confirmed in the official
         docs this run), so the practical workaround — and what the doctor's remedy says — is to
         re-mint rather than to rely on refresh.
+
+### `project_structure`'s budget cut depends on readdir order (found 2026-10-02)
+
+- [ ] **Which entries survive a budgeted listing is the filesystem's choice, not the tool's.**
+      `default-skills/project_structure/tool.ts` asks `Nanna.listDir(path, false, budget + 1)`
+      and sorts what comes back, so on a directory larger than the entry budget the *first N in
+      readdir order* are shown — reverse-creation order on tmpfs, creation order on btrfs/ext4.
+      Found when `directories_the_budget_never_reached_are_marked` failed under
+      `TMPDIR=/var/tmp` (btrfs: `aaa_sub/`, created last, was never listed, so it could not be
+      marked "not walked") and passed on `/tmp`. Fix in the bridge, not the test: have
+      `listDir` return a sorted prefix (read the directory's names — cheap — sort, then stat
+      only the first N), so the same tree lists the same way on every host and the test's
+      alphabetical expectation is the product's. Bound stays `MAX_ENTRIES`.
 
 ### The workspace is not rustfmt-formatted, and nothing checks (found 2026-09-24)
 

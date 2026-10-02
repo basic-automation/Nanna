@@ -203,6 +203,19 @@ pub enum DaemonEvent {
     /// The daemon's config was mutated and committed. Payload-free by design:
     /// each view re-fetches the slice it renders.
     ConfigChanged,
+    /// A card changed on a board (P25 Stage 1's lifecycle events). Mirrors
+    /// `nanna_daemon::protocol::Event::TaskEvent`; `kind` stays a string here
+    /// so a kind this build does not know still reaches the board, which only
+    /// needs to know *that* a card changed.
+    TaskEvent {
+        kind: String,
+        task_id: i64,
+        scope: String,
+        #[serde(default)] scope_id: Option<String>,
+        #[serde(default)] actor: Option<String>,
+    },
+    /// The board roster changed. Payload-free, like `WorkspacesChanged`.
+    MembersChanged,
     /// A well-formed daemon event this build has no variant for.
     ///
     /// The daemon and the GUI ship separately, so the daemon's event set is
@@ -1913,6 +1926,63 @@ impl DaemonClient {
             "action": "update",
             "id": id,
             "patch": { "priority": new_priority }
+        })).await
+    }
+
+    /// One quick-add line → one board card (`task.quick_add`, P25 decision 1).
+    /// `scope` is `workspace` or `global`; `None` lets the daemon choose the
+    /// active board.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. A line the daemon refuses (an
+    /// unknown `@member`, a bad `{deadline}`) comes back inside the `Ok` reply.
+    pub async fn task_quick_add(&self, text: &str, scope: Option<&str>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "quick_add",
+            "text": text,
+            "scope": scope
+        })).await
+    }
+
+    /// One card with its thread (`notes`) and activity.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn task_get(&self, id: i64) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "get",
+            "id": id
+        })).await
+    }
+
+    /// The human posts `content` on card `id`'s thread (`task.note`).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn task_note(&self, id: i64, content: &str) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "note",
+            "id": id,
+            "content": content
+        })).await
+    }
+
+    /// The roster of one board: `workspace_id` `None` is the global board.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn member_list(&self, workspace_id: Option<&str>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "member",
+            "action": "list",
+            "workspace_id": workspace_id
         })).await
     }
 }

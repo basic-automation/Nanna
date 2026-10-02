@@ -131,6 +131,7 @@ import type { NuiRailItem } from '~/components/nui/NuiMainMenu.vue'
 const { unreadCount, isOpen: notifOpen } = useNotificationCenter()
 
 const railItems = computed<NuiRailItem[]>(() => [
+  { id: '/board', icon: 'tasks', label: 'Board' },
   { id: 'chat', icon: 'chat', label: 'Chats' },
   { id: 'notifications', icon: 'notifications', label: 'Notifications', badge: unreadCount.value },
   { id: '/memory', icon: 'memory', label: 'Memory' },
