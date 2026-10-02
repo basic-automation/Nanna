@@ -13,6 +13,7 @@
 mod members;
 mod migrations;
 mod models;
+pub mod quick_add;
 mod recovery;
 mod repositories;
 pub mod routing;

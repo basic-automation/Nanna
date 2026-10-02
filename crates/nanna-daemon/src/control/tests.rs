@@ -2517,3 +2517,73 @@ async fn a_card_run_is_claimed_only_for_an_agent_on_an_open_board_card() {
         "card_closed"
     );
 }
+
+#[tokio::test]
+async fn a_quick_add_line_becomes_a_board_card() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let created = ask(serde_json::json!({
+        "type": "member", "action": "create", "name": "Builder",
+    }))
+    .await;
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+
+    // No workspace is open, so the line lands on the global board.
+    let added = ask(serde_json::json!({
+        "type": "task", "action": "quick_add",
+        "text": "Ship the fix #release p2 @builder tomorrow {in 9 days}",
+    }))
+    .await;
+    let card = &added["task"];
+    assert_eq!(card["title"], "Ship the fix", "{added}");
+    assert_eq!(card["scope"], "global", "{added}");
+    assert_eq!(card["labels"], serde_json::json!(["release"]), "{added}");
+    assert_eq!(card["priority"], 2, "{added}");
+    assert_eq!(card["assignee"], "agent:builder", "{added}");
+    let tomorrow = (chrono::Utc::now().date_naive() + chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_eq!(card["due_at"], tomorrow.as_str(), "{added}");
+    assert!(card["deadline_at"].is_string(), "{added}");
+    assert_eq!(added["parsed"]["assignee"], "builder", "the raw handle is echoed: {added}");
+    let id = card["id"].as_i64().expect("id");
+    assert_eq!(
+        storage.tasks().created_by(id).await.expect("created_by").as_deref(),
+        Some("gui"),
+        "a quick-add card is the board client's, so its router takes it up"
+    );
+
+    // Refusals name what to fix, and write nothing.
+    let unknown = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "Paint @nobody",
+    }))
+    .await;
+    assert_eq!(unknown["error"], "unknown_member", "{unknown}");
+    assert!(unknown["message"].as_str().is_some_and(|m| m.contains("@builder")), "{unknown}");
+    let router = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "Paint @router:global",
+    }))
+    .await;
+    assert_eq!(router["error"], "unknown_member", "{router}");
+    let braces = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "Paint {soon}",
+    }))
+    .await;
+    assert_eq!(braces["error"], "bad_quick_add", "{braces}");
+    let session = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "Paint", "scope": "session",
+    }))
+    .await;
+    assert_eq!(session["error"], "bad_scope", "{session}");
+    let all = storage.tasks().list("global", None, true).await.expect("list");
+    assert_eq!(all.len(), 1, "only the good line made a card: {all:?}");
+}

@@ -212,6 +212,16 @@ pub enum TaskAction {    /// List tasks in a scope
         #[serde(default)]
         assignee: Option<String>,
     },
+    /// One line of text → one board card (P25 decision 1): `#label`,
+    /// `p1`..`p4`, `@member`, a date phrase (the defer date) and `{date
+    /// phrase}` (the deadline) fill fields, the rest is the title. `scope`
+    /// is `workspace` (the active board, the default when one is open) or
+    /// `global`. The reply is `{task, parsed}`.
+    QuickAdd {
+        text: String,
+        #[serde(default)]
+        scope: Option<String>,
+    },
     /// Partial update (status accepts `pending|in_progress|cancelled`)
     Update {
         id: i64,

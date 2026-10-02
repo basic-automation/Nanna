@@ -12,7 +12,7 @@ impl ControlPlane {
     /// Control-plane clients have no session of their own to fall back on
     /// (unlike a tool call, where the bridge supplies the running session), so
     /// the error names the field to send and the scopes that need no id.
-    async fn resolve_task_scope(
+    pub(super) async fn resolve_task_scope(
         &self,
         scope: Option<&str>,
         session_id: Option<&str>,
@@ -78,6 +78,8 @@ impl ControlPlane {
                 };
                 self.task_create(&repo, request).await
             }
+
+            TaskAction::QuickAdd { text, scope } => self.task_quick_add(&repo, &text, scope).await,
 
             TaskAction::Update { id, patch } => Self::task_update(&repo, id, &patch).await,
 
@@ -230,7 +232,7 @@ impl ControlPlane {
 
     /// `TaskAction::Create`: place the task (a subtask in its parent's scope),
     /// canonicalize its acceptance, and create it.
-    async fn task_create(&self, repo: &TaskRepository, request: CreateTask) -> Value {
+    pub(super) async fn task_create(&self, repo: &TaskRepository, request: CreateTask) -> Value {
         let CreateTask {
             title, scope, session_id, parent_id, description, priority, labels, tools,
             due_at, deadline_at, recurrence, depends_on, acceptance, project, assignee,
@@ -766,24 +768,25 @@ impl ControlPlane {
     }
 }
 
-/// The fields of a `TaskAction::Create`.
-struct CreateTask {
-    title: String,
-    scope: Option<String>,
-    session_id: Option<String>,
-    parent_id: Option<i64>,
-    description: Option<String>,
-    priority: Option<i64>,
-    labels: Option<Vec<String>>,
-    tools: Option<Vec<String>>,
-    due_at: Option<String>,
-    deadline_at: Option<String>,
-    recurrence: Option<String>,
-    depends_on: Option<Vec<i64>>,
+/// The fields of a `TaskAction::Create` (and of the card a
+/// `TaskAction::QuickAdd` line becomes).
+pub(super) struct CreateTask {
+    pub(super) title: String,
+    pub(super) scope: Option<String>,
+    pub(super) session_id: Option<String>,
+    pub(super) parent_id: Option<i64>,
+    pub(super) description: Option<String>,
+    pub(super) priority: Option<i64>,
+    pub(super) labels: Option<Vec<String>>,
+    pub(super) tools: Option<Vec<String>>,
+    pub(super) due_at: Option<String>,
+    pub(super) deadline_at: Option<String>,
+    pub(super) recurrence: Option<String>,
+    pub(super) depends_on: Option<Vec<i64>>,
     /// Boxed to match `TaskAction::Create`, whose field it is moved from; see
     /// the note there. Unboxed again by `task_create` before it reaches
     /// `NewTask`, which stores the canonicalized value inline.
-    acceptance: Option<Box<Value>>,
-    project: Option<String>,
-    assignee: Option<String>,
+    pub(super) acceptance: Option<Box<Value>>,
+    pub(super) project: Option<String>,
+    pub(super) assignee: Option<String>,
 }
