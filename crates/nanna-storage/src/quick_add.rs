@@ -9,8 +9,9 @@
 //!   board's roster ([`QuickAdd::assignee`] is the raw handle, never an id)
 //! - a date phrase — the **defer** date (`due_at`, decision 10): `today`,
 //!   `tomorrow`, a weekday (`friday`, `fri` — the next one strictly after
-//!   today), `next week` (the next Monday), `in N days` / `in N weeks`, or an
-//!   ISO `YYYY-MM-DD`
+//!   today), `next <weekday>` (that day of next week), `next week` (the next
+//!   Monday), `in N days` / `in N weeks`, `<month> <day>` / `<day> <month>`
+//!   (the next such date, today included), or an ISO `YYYY-MM-DD`
 //! - `{date phrase}` — the **deadline** (`deadline_at`), Todoist's brace
 //!   syntax, same phrases inside
 //!
@@ -215,7 +216,11 @@ fn date_phrase(
         ("today", _) => Some((today, 1)),
         ("tomorrow", _) => today.succ_opt().map(|d| (d, 1)),
         ("next", Some("week")) => Some((next_weekday(today, Weekday::Mon), 2)),
+        ("next", Some(day)) => weekday_of(day).map(|day| (in_next_week(today, day), 2)),
         ("in", Some(_)) => in_offset(words, today)?,
+        (word, Some(other)) if month_day(word, other, today).is_some() => {
+            month_day(word, other, today).map(|d| (d, 2))
+        }
         (word, _) => weekday_of(word)
             .map(|day| (next_weekday(today, day), 1))
             .or_else(|| {
@@ -255,6 +260,78 @@ fn in_offset(
     Ok(today
         .checked_add_signed(Duration::days(days))
         .map(|d| (d, 3)))
+}
+
+/// `day` in the week after this one (weeks start on Monday): said on a
+/// Wednesday, `next friday` is nine days out and `next monday` five.
+fn in_next_week(today: NaiveDate, day: Weekday) -> NaiveDate {
+    let monday = next_weekday(today, Weekday::Mon);
+    let date = monday + Duration::days(i64::from(day.num_days_from_monday()));
+    debug_assert!(
+        date > today && date - today <= Duration::days(13),
+        "within next week"
+    );
+    date
+}
+
+/// Years `month_day` looks ahead for a date that exists: the longest gap
+/// between two Feb 29ths is 8 years (1896 → 1904).
+const LEAP_DAY_YEARS_MAX: i32 = 8;
+
+/// `march 30` or `30 march` (month full or three letters, day 1..=31, an
+/// ordinal suffix allowed): the next such date on or after `today` — this
+/// year's if it has not passed, else next year's. `None` for anything else,
+/// a date no year has (`feb 30`) included, so those words stay in the title.
+fn month_day(first: &str, second: &str, today: NaiveDate) -> Option<NaiveDate> {
+    let (month, day) = month_of(first)
+        .zip(day_of_month(second))
+        .or_else(|| month_of(second).zip(day_of_month(first)))?;
+    // Bounded: Feb 29 recurs within 8 years (leap years skip at most one
+    // century year), and every other valid month/day within 2.
+    let date = (0..=LEAP_DAY_YEARS_MAX)
+        .filter_map(|ahead| NaiveDate::from_ymd_opt(today.year() + ahead, month, day))
+        .find(|date| *date >= today);
+    debug_assert!(date.is_none_or(|d| d >= today), "never in the past");
+    date
+}
+
+/// A month name, full or three letters (`sept` too), as 1..=12.
+fn month_of(word: &str) -> Option<u32> {
+    const MONTHS: [&str; 12] = [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ];
+    let word = word.to_ascii_lowercase();
+    if word.len() < 3 {
+        return None;
+    }
+    let index = MONTHS
+        .iter()
+        .position(|m| *m == word || (word.len() <= 4 && m.starts_with(word.as_str())))?;
+    u32::try_from(index + 1).ok()
+}
+
+/// `1`..=`31`, optionally with `st`/`nd`/`rd`/`th`.
+fn day_of_month(word: &str) -> Option<u32> {
+    let digits = word.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let suffix = &word[digits.len()..];
+    if !matches!(
+        suffix.to_ascii_lowercase().as_str(),
+        "" | "st" | "nd" | "rd" | "th"
+    ) {
+        return None;
+    }
+    digits.parse::<u32>().ok().filter(|d| (1..=31).contains(d))
 }
 
 /// A weekday name, full or three letters.
@@ -405,6 +482,55 @@ mod tests {
             quick("a {in 10 days}").deadline_at.as_deref(),
             Some("2026-10-17")
         );
+    }
+
+    #[test]
+    fn next_weekday_is_that_day_of_next_week() {
+        assert_eq!(quick("a next friday").due_at.as_deref(), Some("2026-10-16"));
+        assert_eq!(quick("a next monday").due_at.as_deref(), Some("2026-10-12"));
+        assert_eq!(quick("a next wed").due_at.as_deref(), Some("2026-10-14"));
+        assert_eq!(
+            quick("a {next sunday}").deadline_at.as_deref(),
+            Some("2026-10-18")
+        );
+        assert_eq!(quick("the next big thing").title, "the next big thing");
+    }
+
+    #[test]
+    fn month_and_day_name_the_next_such_date() {
+        assert_eq!(
+            quick("a march 30").due_at.as_deref(),
+            Some("2027-03-30"),
+            "passed this year"
+        );
+        assert_eq!(quick("a 30 March").due_at.as_deref(), Some("2027-03-30"));
+        assert_eq!(
+            quick("a oct 7").due_at.as_deref(),
+            Some("2026-10-07"),
+            "today counts"
+        );
+        assert_eq!(quick("a Dec 25th").due_at.as_deref(), Some("2026-12-25"));
+        assert_eq!(
+            quick("a {sept 1}").deadline_at.as_deref(),
+            Some("2027-09-01")
+        );
+        assert_eq!(
+            quick("a feb 29").due_at.as_deref(),
+            Some("2028-02-29"),
+            "the next leap day"
+        );
+        assert_eq!(
+            quick("May 4 be with you").due_at.as_deref(),
+            Some("2027-05-04")
+        );
+        let q = quick("buy feb 30 tickets for 2 may");
+        assert_eq!(q.title, "buy feb 30 tickets for");
+        assert_eq!(
+            q.due_at.as_deref(),
+            Some("2027-05-02"),
+            "an impossible date stays text"
+        );
+        assert_eq!(quick("ma 3 things").title, "ma 3 things");
     }
 
     #[test]
