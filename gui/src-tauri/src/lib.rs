@@ -358,6 +358,18 @@ macro_rules! command_handler {
             commands::tasks::complete_task,
             commands::tasks::delete_task,
             commands::tasks::reorder_task,
+            // Board (P25 Stage 4)
+            commands::board::quick_add_card,
+            commands::board::get_card,
+            commands::board::post_on_card,
+            commands::board::list_members,
+            commands::board::list_assigned_cards,
+            commands::board::create_member,
+            commands::board::update_member,
+            commands::board::delete_member,
+            commands::board::start_card_run,
+            commands::board::card_run_status,
+            commands::board::stop_card_run,
         ]
     };
 }

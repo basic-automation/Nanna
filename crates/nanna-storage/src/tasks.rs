@@ -93,6 +93,14 @@ pub const VERDICT_WINDOW_MAX: usize = 100_000;
 /// stuck in a task-creation loop long before the store degrades.
 pub const TASKS_PER_SCOPE_MAX: usize = 10_000;
 
+/// Most cards one member's Inbox/Upcoming read returns.
+///
+/// Bound justification: it is one person's (or agent's) open work across
+/// every board; 1 000 cards is months of a busy board and still a few hundred
+/// KiB on the wire, while a member with more is better served by a board
+/// filter than by one list.
+pub const ASSIGNED_CARDS_MAX: usize = 1_000;
+
 const TASK_COLUMNS: &str = "id, parent_id, scope, scope_id, project, title, description, status, \
      priority, labels, tool_scope, due_at, recurrence, depends_on, acceptance, assignee, \
      sort_order, created_at, updated_at, completed_at, deadline_at, due_announced_at, \
@@ -988,6 +996,62 @@ impl TaskRepository {
                 .iter()
                 .all(|t| t.assignee.as_deref() == Some(member_id)),
             "every card is the member's"
+        );
+        Ok(cards)
+    }
+
+    /// Every open board card assigned to `member_id`, on every board (any
+    /// scope but `session`), with `blocked` derived — the read behind a
+    /// member's Inbox and Upcoming (P25 decision 11), which span workspaces.
+    ///
+    /// Ordered by defer date (undated first — no date means now), then
+    /// priority, then id; at most `limit` cards.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if a query fails or a row does not
+    /// decode.
+    ///
+    /// # Panics
+    /// Panics if `limit` is 0 or above [`ASSIGNED_CARDS_MAX`].
+    pub async fn assigned_open(
+        &self,
+        member_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Task>, StorageError> {
+        assert!(
+            (1..=ASSIGNED_CARDS_MAX).contains(&limit),
+            "an assigned-cards read is bounded and non-empty"
+        );
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT {TASK_COLUMNS} FROM tasks \
+                     WHERE assignee = ?1 AND status IN ('pending', 'in_progress') \
+                       AND scope != 'session' \
+                     ORDER BY due_at IS NOT NULL, substr(due_at, 1, 10), priority, id \
+                     LIMIT ?2"
+                ),
+                turso::params![member_id, limit],
+            )
+            .await?;
+        let mut cards = Vec::new();
+        while let Some(row) = rows.next().await? {
+            cards.push(decode_task_row(&row)?);
+        }
+        drop(rows);
+        let open = open_ids_among(&conn, cards.iter().flat_map(|c| c.depends_on.iter().copied()))
+            .await?;
+        drop(conn);
+        for card in &mut cards {
+            card.blocked = card.depends_on.iter().any(|dep| open.contains(dep));
+        }
+        debug_assert!(
+            cards
+                .iter()
+                .all(|t| t.assignee.as_deref() == Some(member_id) && t.scope != "session"),
+            "every card is the member's, on a board"
         );
         Ok(cards)
     }
@@ -2926,6 +2990,53 @@ fn day_of(at: &str) -> String {
 /// from this predicate on every read, so a copy that drifts does not produce a
 /// visibly wrong field — it produces a task that is blocked to one reader and
 /// actionable to another. Adding a third closed status is now one edit.
+/// How many ids one `IN (…)` status lookup names.
+///
+/// Bound justification: keeps each statement's parameter list far below
+/// SQLite's default 32 766-variable limit while making the worst case — every
+/// one of [`ASSIGNED_CARDS_MAX`] cards at [`TASK_DEPS_MAX`] dependencies —
+/// a few hundred small queries, not one unbounded one.
+const STATUS_LOOKUP_IDS_MAX: usize = 256;
+
+/// Which of `ids` name a task that is still open (not done or cancelled).
+/// A missing id is not open: a deleted dependency blocks nothing.
+async fn open_ids_among(
+    conn: &Connection,
+    ids: impl Iterator<Item = i64>,
+) -> Result<std::collections::HashSet<i64>, StorageError> {
+    let mut wanted: Vec<i64> = ids.collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let mut open = std::collections::HashSet::new();
+    for chunk in wanted.chunks(STATUS_LOOKUP_IDS_MAX) {
+        debug_assert!(!chunk.is_empty() && chunk.len() <= STATUS_LOOKUP_IDS_MAX);
+        // Ids are integers we formatted ourselves, so inlining them is safe.
+        let list = chunk
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT id FROM tasks WHERE id IN ({list}) \
+                     AND status NOT IN ('done', 'cancelled')"
+                ),
+                (),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            open.insert(id);
+        }
+        // Gone before the next statement: an open cursor on the shared
+        // connection swallows later writes.
+        drop(rows);
+    }
+    debug_assert!(open.iter().all(|id| wanted.binary_search(id).is_ok()));
+    Ok(open)
+}
+
 fn is_closed_status(status: &str) -> bool {
     matches!(status, "done" | "cancelled")
 }
@@ -3306,6 +3417,60 @@ mod tests {
             priority: 3,
             ..NewTask::default()
         }
+    }
+
+    #[tokio::test]
+    async fn a_members_open_cards_are_read_across_every_board() {
+        let (_s, repo) = repo().await;
+        let card = |title: &str, scope: &str, scope_id: Option<&str>, due: Option<&str>| NewTask {
+            scope: scope.to_string(),
+            scope_id: scope_id.map(str::to_string),
+            title: title.to_string(),
+            priority: 3,
+            due_at: due.map(str::to_string),
+            assignee: Some(crate::HUMAN_MEMBER_ID.to_string()),
+            ..NewTask::default()
+        };
+        let later = repo
+            .create(card("later", "workspace", Some("ws1"), Some("2026-12-01")))
+            .await
+            .unwrap();
+        let soon = repo
+            .create(card("soon", "global", None, Some("2026-10-05T09:00:00Z")))
+            .await
+            .unwrap();
+        let undated = repo.create(card("undated", "workspace", Some("ws2"), None)).await.unwrap();
+        let chat = repo.create(card("chat's own", "session", Some("s1"), None)).await.unwrap();
+        let finished = repo.create(card("finished", "workspace", Some("ws2"), None)).await.unwrap();
+        repo.complete(finished.id, Some("test"), None).await.unwrap();
+        let unassigned = repo
+            .create(NewTask { assignee: None, ..card("nobody's", "global", None, None) })
+            .await
+            .unwrap();
+        // `soon` waits on an open card; `undated` on a closed one.
+        repo.update(
+            soon.id,
+            TaskPatch { depends_on: Some(vec![unassigned.id]), ..TaskPatch::default() },
+            Some("test"),
+        )
+        .await
+        .unwrap();
+        repo.update(
+            undated.id,
+            TaskPatch { depends_on: Some(vec![finished.id]), ..TaskPatch::default() },
+            Some("test"),
+        )
+        .await
+        .unwrap();
+
+        let mine = repo.assigned_open(crate::HUMAN_MEMBER_ID, 10).await.unwrap();
+        let ids: Vec<i64> = mine.iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![undated.id, soon.id, later.id], "undated first, then by date");
+        assert!(!ids.contains(&chat.id), "a session card is on no board");
+        assert!(mine.iter().find(|t| t.id == soon.id).unwrap().blocked);
+        assert!(!mine.iter().find(|t| t.id == undated.id).unwrap().blocked, "a done dependency blocks nothing");
+        assert_eq!(repo.assigned_open(crate::HUMAN_MEMBER_ID, 1).await.unwrap().len(), 1, "bounded");
+        assert!(repo.assigned_open("agent:nobody", 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]

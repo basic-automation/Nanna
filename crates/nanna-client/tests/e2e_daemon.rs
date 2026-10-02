@@ -3806,10 +3806,16 @@ async fn a_card_runs_question_becomes_a_clarification_card() {
     assert_eq!(created["member"]["id"], "agent:builder", "{created}");
 
     let id = create_global_card(&client, "Merge the release branch").await;
+    // `ask_on_card` writes the dependency before it posts the question, so
+    // wait for the post too — a poll landing between the two writes saw the
+    // card blocked with no question on it yet.
     let card = card_when(&client, id, "waiting on a question", |card| {
         card["task"]["depends_on"]
             .as_array()
             .is_some_and(|d| !d.is_empty())
+            && card["notes"]
+                .as_array()
+                .is_some_and(|notes| notes.iter().any(|n| n["kind"] == "question"))
     })
     .await;
     assert_eq!(card["task"]["blocked"], true, "{card}");

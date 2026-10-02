@@ -8,7 +8,7 @@ description = "JavaScript/TypeScript scripting engine for Nanna tools"
 default = ["boa"]
 boa = ["boa_engine"]
 deno = ["deno_core", "deno_ast", "deno_error"]
-python = ["rustpython-vm", "rustpython-stdlib", "rustpython-pylib", "malachite-bigint"]
+python = ["rustpython-vm", "rustpython-stdlib", "rustpython-pylib"]
 full = ["boa", "deno"]
 
 [dependencies]
@@ -48,26 +48,9 @@ deno_error = { version = "0.7", optional = true }
 # the Deno path comes from deno_ast's own bundled swc.
 
 # RustPython - Embedded Python interpreter (no system Python needed)
-rustpython-vm = { version = "0.5", default-features = false, features = ["compiler", "encodings", "freeze-stdlib"], optional = true }
-rustpython-stdlib = { version = "0.5", optional = true }
-rustpython-pylib = { version = "0.5", features = ["freeze-stdlib"], optional = true }
-
-# Transitive-version pin (not imported directly) — same lever as `aegis` in
-# nanna-storage. `rustpython-stdlib` reaches malachite-bigint by two paths that
-# must agree: `rustpython-common` holds it at 0.9, while `pymath 0.2` accepts
-# 0.10. When plain `cargo update` takes 0.10 for pymath the graph carries TWO
-# malachite-bigint versions, so `malachite_bigint::{BigInt,BigUint}` names two
-# distinct types inside one crate and rustpython-stdlib stops compiling.
-#
-# This has been rediscovered and hand-repaired on three consecutive dependency
-# sweeps (2026-08-22/23/24) because a lockfile pin is exactly what `cargo
-# update` is entitled to move. A manifest constraint is not, so the repair is
-# stated here once instead of being re-derived every run. Drop it when
-# rustpython ships a release whose paths agree on one malachite (track
-# `rustpython-common`'s requirement, not pymath's).
-# Optional so it never enters a build that has no Python; the version
-# constraint still binds the lockfile either way, which is the point.
-malachite-bigint = { version = "=0.9.2", optional = true }
+rustpython-vm = { version = "0.6", default-features = false, features = ["compiler", "encodings", "freeze-stdlib"], optional = true }
+rustpython-stdlib = { version = "0.6", optional = true }
+rustpython-pylib = { version = "0.6", features = ["freeze-stdlib"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

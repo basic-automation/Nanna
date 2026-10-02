@@ -214,7 +214,7 @@ const fn json_kind(value: &Value) -> &'static str {
 /// Derived from the name so the id reads as who it is on every card and in the
 /// router's prompt; two agents with the same slug are a refused create
 /// ("already exists"), never a merge.
-fn agent_member_id(name: &str) -> String {
+pub(super) fn agent_member_id(name: &str) -> String {
     let mut slug = String::with_capacity(AGENT_SLUG_MAX_BYTES);
     for ch in name.chars() {
         if slug.len() >= AGENT_SLUG_MAX_BYTES {

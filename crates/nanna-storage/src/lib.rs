@@ -13,6 +13,7 @@
 mod members;
 mod migrations;
 mod models;
+pub mod quick_add;
 mod recovery;
 mod repositories;
 pub mod routing;
@@ -543,436 +544,6 @@ const fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
         end -= 1;
     }
     end
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The cutoff is compared in `created_at`'s own format. An RFC 3339 cutoff
-    /// sorted `' '` below `'T'`, so a row one second inside the window, on the
-    /// cutoff DAY, was deleted with the rest of that day.
-    #[tokio::test]
-    async fn the_tool_log_prune_keeps_everything_inside_the_window() {
-        let storage = Storage::in_memory().await.expect("storage");
-        let conn = storage.conn().lock().await;
-        for (tool, age) in [
-            ("stale", "-31 days"),
-            ("edge", "-30 days"),
-            ("fresh", "-1 hours"),
-        ] {
-            conn.execute(
-                "INSERT INTO tool_call_log \
-                 (tool_name, success, duration_ms, error_message, session_id, created_at) \
-                 VALUES (?1, 1, 5, '', '', datetime('now', ?2, '+2 seconds'))",
-                turso::params![tool, age],
-            )
-            .await
-            .expect("insert");
-        }
-        drop(conn);
-
-        let deleted = storage.prune_tool_call_log(30).await.expect("prune");
-        let left: Vec<String> = storage
-            .get_tool_call_log(None, 10)
-            .await
-            .expect("log")
-            .into_iter()
-            .map(|e| e.tool_name)
-            .collect();
-        assert_eq!(deleted, 1, "the real count, not a placeholder 0");
-        assert!(
-            left.contains(&"edge".to_string()),
-            "inside the window by 2 s: {left:?}"
-        );
-        assert!(!left.contains(&"stale".to_string()), "{left:?}");
-    }
-
-    /// A short-circuited call never ran. The hourly aggregate knew that; the
-    /// daily one counted it as a success, so the two disagreed.
-    #[tokio::test]
-    async fn both_aggregates_agree_on_a_short_circuited_call() {
-        let storage = Storage::in_memory().await.expect("storage");
-        for short_circuited in [true, false] {
-            storage
-                .log_tool_call(&NewToolCall {
-                    tool_name: "exec",
-                    success: true,
-                    short_circuited,
-                    duration_ms: 3,
-                    output_size: 0,
-                    error_message: None,
-                    session_id: None,
-                })
-                .await
-                .expect("log");
-        }
-        let hourly = storage
-            .get_tool_stats_hourly(Some("exec"), 2)
-            .await
-            .expect("hourly");
-        let daily = storage
-            .get_tool_stats_daily(Some("exec"), 2)
-            .await
-            .expect("daily");
-        let counts = |b: &ToolStatsTimeBucket| (b.call_count, b.success_count, b.failure_count);
-        assert_eq!(counts(&hourly[0]), (2, 1, 0), "{hourly:?}");
-        assert_eq!(counts(&daily[0]), counts(&hourly[0]), "{daily:?}");
-    }
-
-    /// Session metadata is serialized, not formatted: a quote in the name used
-    /// to produce a string that was not JSON.
-    #[tokio::test]
-    async fn a_session_name_with_quotes_is_stored_as_json() {
-        let storage = Storage::in_memory().await.expect("storage");
-        let name = r#"the "big" plan \ v2"#;
-        let session = storage
-            .create_gui_session_with_workspace(name, None)
-            .await
-            .expect("create");
-        assert_eq!(
-            session.metadata.as_ref().and_then(|m| m["name"].as_str()),
-            Some(name),
-            "{session:?}"
-        );
-    }
-
-    async fn table_names(conn: &Connection) -> Vec<String> {
-        let mut rows = conn
-            .query(
-                "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name",
-                (),
-            )
-            .await
-            .expect("schema");
-        let mut names = Vec::new();
-        while let Some(row) = rows.next().await.expect("row") {
-            names.push(row.get::<String>(0).expect("name"));
-        }
-        names
-    }
-
-    async fn recorded(conn: &Connection, name: &str) -> bool {
-        let mut rows = conn
-            .query(
-                "SELECT 1 FROM _migrations WHERE name = ?1",
-                turso::params![name],
-            )
-            .await
-            .expect("query");
-        rows.next().await.expect("row").is_some()
-    }
-
-    /// A migration that fails part-way used to leave its first statements
-    /// applied and itself unrecorded, so every later boot re-ran it and died on
-    /// what had already landed. Now it commits whole or not at all.
-    #[tokio::test]
-    async fn a_failing_migration_leaves_no_trace() {
-        let storage = Storage::in_memory().await.expect("storage");
-        let conn = storage.conn().lock().await;
-        let broken: &[(&str, &str)] = &[(
-            "900_broken",
-            "CREATE TABLE half_done (id INTEGER); ALTER TABLE half_done ADD COLUMN x TEXT; \
-             INSERT INTO no_such_table VALUES (1);",
-        )];
-        assert!(apply_migrations(&conn, broken).await.is_err());
-        assert!(
-            !table_names(&conn).await.contains(&"half_done".to_string()),
-            "rolled back"
-        );
-        assert!(!recorded(&conn, "900_broken").await);
-
-        // The same name, fixed, applies cleanly on the next boot.
-        let fixed: &[(&str, &str)] = &[(
-            "900_broken",
-            "CREATE TABLE half_done (id INTEGER); ALTER TABLE half_done ADD COLUMN x TEXT;",
-        )];
-        apply_migrations(&conn, fixed)
-            .await
-            .expect("the fixed migration applies");
-        let is_recorded = recorded(&conn, "900_broken").await;
-        drop(conn);
-        assert!(is_recorded);
-    }
-
-    /// A database half-migrated before migrations ran in a transaction: the
-    /// column landed, the record did not. The ADD COLUMN probe lets the rerun
-    /// through instead of wedging every boot on `duplicate column name`.
-    #[tokio::test]
-    async fn a_half_applied_add_column_is_not_fatal() {
-        let storage = Storage::in_memory().await.expect("storage");
-        let conn = storage.conn().lock().await;
-        conn.execute("CREATE TABLE legacy (id INTEGER)", ())
-            .await
-            .expect("create");
-        conn.execute("ALTER TABLE legacy ADD COLUMN landed TEXT", ())
-            .await
-            .expect("the half that landed");
-        let rerun: &[(&str, &str)] = &[(
-            "901_partial",
-            "ALTER TABLE legacy ADD COLUMN landed TEXT; ALTER TABLE legacy ADD COLUMN missing TEXT;",
-        )];
-        apply_migrations(&conn, rerun)
-            .await
-            .expect("the rerun completes");
-        let is_recorded = recorded(&conn, "901_partial").await;
-        let missing_added = column_exists(&conn, "legacy", "missing")
-            .await
-            .expect("probe");
-        let landed_seen = column_exists(&conn, "LEGACY", "Landed")
-            .await
-            .expect("probe");
-        drop(conn);
-        assert!(is_recorded);
-        assert!(missing_added, "the half that had not landed is applied");
-        assert!(landed_seen, "the probe is case-insensitive");
-    }
-
-    /// Usage rolls up per day and per month, prices from the 1-hour column, and
-    /// ignores what falls outside the window.
-    #[tokio::test]
-    async fn model_usage_rolls_up_by_day_and_month() {
-        let storage = Storage::in_memory().await.expect("storage");
-        for (model, input, writes, writes_1h) in [
-            ("claude-opus-5", 100, 40, 10),
-            ("claude-opus-5", 50, 0, 0),
-            ("ollama/qwen3.5:9b", 7, 0, 0),
-            ("claude-opus-5", 1, 0, 0),
-        ] {
-            storage
-                .log_model_request(&NewModelRequest {
-                    model,
-                    success: true,
-                    latency_ms: 10,
-                    input_tokens: input,
-                    output_tokens: 5,
-                    cache_read_tokens: 0,
-                    cache_creation_tokens: writes,
-                    cache_creation_1h_tokens: writes_1h,
-                    tier: None,
-                    escalated: false,
-                    session_id: Some("s"),
-                })
-                .await
-                .expect("log");
-        }
-        // Row 3 happened three days ago; row 4 is older than any window asked for.
-        let conn = storage.conn.lock().await;
-        let three_days_ago = (chrono::Utc::now() - chrono::Duration::days(3))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-        conn.execute(
-            "UPDATE model_request_log SET created_at = ?1 WHERE id = 3",
-            turso::params![three_days_ago.as_str()],
-        )
-        .await
-        .expect("backdate");
-        conn.execute(
-            "UPDATE model_request_log SET created_at = '2001-01-01 00:00:00' WHERE id = 4",
-            (),
-        )
-        .await
-        .expect("backdate");
-        drop(conn);
-
-        let by_day = storage.model_usage_buckets(7, false).await.expect("rollup");
-        assert_eq!(by_day.len(), 2, "{by_day:?}");
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let opus = by_day
-            .iter()
-            .find(|b| b.model == "claude-opus-5")
-            .expect("opus");
-        assert_eq!(opus.period, today);
-        assert_eq!(
-            (
-                opus.requests,
-                opus.input_tokens,
-                opus.cache_write_tokens,
-                opus.cache_write_1h_tokens
-            ),
-            (2, 150, 40, 10)
-        );
-        let local = by_day
-            .iter()
-            .find(|b| b.model == "ollama/qwen3.5:9b")
-            .expect("local");
-        assert_eq!(local.period, three_days_ago[..10]);
-        assert!(by_day[0].period <= by_day[1].period, "oldest first");
-
-        let by_month = storage.model_usage_buckets(7, true).await.expect("rollup");
-        assert!(by_month.iter().all(|b| b.period.len() == 7), "{by_month:?}");
-        assert!(
-            by_month.iter().all(|b| b.period != "2001-01"),
-            "outside the window"
-        );
-        let by_session = storage
-            .model_usage_by(7, UsagePeriod::Session)
-            .await
-            .expect("rollup");
-        assert!(
-            by_session.iter().all(|b| b.period == "s"),
-            "every logged row named session s: {by_session:?}"
-        );
-        let everything = storage
-            .model_usage_buckets(u32::MAX, true)
-            .await
-            .expect("clamped");
-        assert!(
-            everything.iter().all(|b| b.period != "2001-01"),
-            "clamped to a year"
-        );
-    }
-    #[tokio::test]
-    async fn test_storage_creation() {
-        let storage = Storage::in_memory().await.unwrap();
-
-        let session = storage
-            .sessions()
-            .create("test-session", "cli", None)
-            .await
-            .unwrap();
-
-        assert_eq!(session.session_id, "test-session");
-    }
-
-    #[tokio::test]
-    async fn test_persistence_across_restarts() {
-        // Create a temp file path
-        let temp_dir = std::env::temp_dir();
-        let db_path = temp_dir.join(format!("nanna_test_{}.db", std::process::id()));
-        let db_path_str = db_path.to_string_lossy().to_string();
-
-        // Clean up any existing test db
-        let _ = std::fs::remove_file(&db_path);
-
-        // Create storage, write data, then drop it
-        {
-            let config = StorageConfig { path: db_path_str.clone() };
-            let storage = Storage::new(&config).await.unwrap();
-            
-            storage
-                .sessions()
-                .create("persistent-session", "cli", None)
-                .await
-                .unwrap();
-        }
-
-        // Reopen storage and verify data persisted
-        {
-            let config = StorageConfig { path: db_path_str.clone() };
-            let storage = Storage::new(&config).await.unwrap();
-            
-            // get() returns Result<Session> - throws NotFound if missing
-            let session = storage
-                .sessions()
-                .get("persistent-session")
-                .await
-                .expect("Session should persist across restarts");
-            
-            assert_eq!(session.session_id, "persistent-session");
-        }
-
-        // Cleanup
-        let _ = std::fs::remove_file(&db_path);
-    }
-
-    fn sample_session(session_id: &str) -> Session {
-        Session {
-            id: 1,
-            session_id: session_id.into(),
-            channel: "cli".into(),
-            user_id: None,
-            created_at: String::new(),
-            updated_at: String::new(),
-            metadata: None,
-            workspace_id: None,
-            name: None,
-        }
-    }
-
-    #[test]
-    fn get_session_name_survives_multibyte_session_id() {
-        // `nanna chat --session <ID>` stores the flag verbatim and writes
-        // neither a name nor metadata, so the generated fallback is the only
-        // reachable branch for such a session. Byte 8 of this id lands inside
-        // the em dash (bytes 6..9) — the same cut that killed the daemon.
-        assert_eq!(
-            Storage::get_session_name(&sample_session("abcdef—ghij")),
-            "Session abcdef"
-        );
-
-        // The same defect from the other side: an id shorter than the limit
-        // puts the index out of range before boundaries even matter.
-        assert_eq!(
-            Storage::get_session_name(&sample_session("abc")),
-            "Session abc"
-        );
-
-        // An ASCII id still keeps exactly the eight bytes it always did.
-        assert_eq!(
-            Storage::get_session_name(&sample_session("0123456789abcdef")),
-            "Session 01234567"
-        );
-    }
-
-    fn sample_new_memory(id: &str, content: &str) -> NewMemory {
-        NewMemory {
-            memory_id: id.into(),
-            content: content.into(),
-            embedding: Some(vec![0.1, 0.2, 0.3]),
-            embedding_model: Some("test".into()),
-            session_id: None,
-            metadata: None,
-            tags: vec![],
-            workspace_id: None,
-            fsrs_stability: 1.0,
-            fsrs_difficulty: 5.0,
-            fsrs_last_access: 0,
-            fsrs_access_count: 0,
-            fsrs_importance: 1.0,
-            fsrs_storage_strength: 1.0,
-            fsrs_generation: 0,
-        }
-    }
-
-    #[test]
-    fn is_corruption_error_matches_corruption_messages() {
-        // The classifier's contract is a case-insensitive substring match on the
-        // rendered message (the form it takes once it crosses into
-        // `MemoryError::Persistence(String)`). NotFound is just a convenient
-        // String-carrying variant to exercise that contract.
-        assert!(is_corruption_error(&StorageError::NotFound(
-            "inconsistent overflow chain observed during payload read".into()
-        )));
-        assert!(is_corruption_error(&StorageError::NotFound(
-            "database disk image is CORRUPT".into()
-        )));
-        assert!(is_corruption_error(&StorageError::NotFound("malformed database page".into())));
-        assert!(!is_corruption_error(&StorageError::NotFound("session xyz missing".into())));
-    }
-
-    #[tokio::test]
-    async fn bulk_load_salvage_matches_bulk_load_on_clean_db() {
-        let storage = Storage::in_memory().await.unwrap();
-        let repo = storage.memories();
-        for i in 0..5 {
-            repo.create(sample_new_memory(&format!("m{i}"), &format!("content {i}")))
-                .await
-                .unwrap();
-        }
-        let bulk = repo.bulk_load().await.unwrap();
-        let report = repo.bulk_load_salvage().await.unwrap();
-
-        assert_eq!(report.expected, 5);
-        assert_eq!(report.corrupt_ids, [] as [i64; 0]);
-        assert_eq!(report.memories.len(), bulk.len());
-        // Same memory_ids in the same order (both ORDER BY id ASC) — the per-id
-        // reconstruction is lossless on a clean DB.
-        let bulk_ids: Vec<_> = bulk.iter().map(|m| m.memory_id.clone()).collect();
-        let salv_ids: Vec<_> = report.memories.iter().map(|m| m.memory_id.clone()).collect();
-        assert_eq!(bulk_ids, salv_ids);
-        assert_eq!(report.memories[0].embedding, bulk[0].embedding);
-    }
 }
 
 // =============================================================================
@@ -2018,4 +1589,434 @@ pub struct ToolCallLogEntry {
     pub error_message: Option<String>,
     pub session_id: Option<String>,
     pub created_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cutoff is compared in `created_at`'s own format. An RFC 3339 cutoff
+    /// sorted `' '` below `'T'`, so a row one second inside the window, on the
+    /// cutoff DAY, was deleted with the rest of that day.
+    #[tokio::test]
+    async fn the_tool_log_prune_keeps_everything_inside_the_window() {
+        let storage = Storage::in_memory().await.expect("storage");
+        let conn = storage.conn().lock().await;
+        for (tool, age) in [
+            ("stale", "-31 days"),
+            ("edge", "-30 days"),
+            ("fresh", "-1 hours"),
+        ] {
+            conn.execute(
+                "INSERT INTO tool_call_log \
+                 (tool_name, success, duration_ms, error_message, session_id, created_at) \
+                 VALUES (?1, 1, 5, '', '', datetime('now', ?2, '+2 seconds'))",
+                turso::params![tool, age],
+            )
+            .await
+            .expect("insert");
+        }
+        drop(conn);
+
+        let deleted = storage.prune_tool_call_log(30).await.expect("prune");
+        let left: Vec<String> = storage
+            .get_tool_call_log(None, 10)
+            .await
+            .expect("log")
+            .into_iter()
+            .map(|e| e.tool_name)
+            .collect();
+        assert_eq!(deleted, 1, "the real count, not a placeholder 0");
+        assert!(
+            left.contains(&"edge".to_string()),
+            "inside the window by 2 s: {left:?}"
+        );
+        assert!(!left.contains(&"stale".to_string()), "{left:?}");
+    }
+
+    /// A short-circuited call never ran. The hourly aggregate knew that; the
+    /// daily one counted it as a success, so the two disagreed.
+    #[tokio::test]
+    async fn both_aggregates_agree_on_a_short_circuited_call() {
+        let storage = Storage::in_memory().await.expect("storage");
+        for short_circuited in [true, false] {
+            storage
+                .log_tool_call(&NewToolCall {
+                    tool_name: "exec",
+                    success: true,
+                    short_circuited,
+                    duration_ms: 3,
+                    output_size: 0,
+                    error_message: None,
+                    session_id: None,
+                })
+                .await
+                .expect("log");
+        }
+        let hourly = storage
+            .get_tool_stats_hourly(Some("exec"), 2)
+            .await
+            .expect("hourly");
+        let daily = storage
+            .get_tool_stats_daily(Some("exec"), 2)
+            .await
+            .expect("daily");
+        let counts = |b: &ToolStatsTimeBucket| (b.call_count, b.success_count, b.failure_count);
+        assert_eq!(counts(&hourly[0]), (2, 1, 0), "{hourly:?}");
+        assert_eq!(counts(&daily[0]), counts(&hourly[0]), "{daily:?}");
+    }
+
+    /// Session metadata is serialized, not formatted: a quote in the name used
+    /// to produce a string that was not JSON.
+    #[tokio::test]
+    async fn a_session_name_with_quotes_is_stored_as_json() {
+        let storage = Storage::in_memory().await.expect("storage");
+        let name = r#"the "big" plan \ v2"#;
+        let session = storage
+            .create_gui_session_with_workspace(name, None)
+            .await
+            .expect("create");
+        assert_eq!(
+            session.metadata.as_ref().and_then(|m| m["name"].as_str()),
+            Some(name),
+            "{session:?}"
+        );
+    }
+
+    async fn table_names(conn: &Connection) -> Vec<String> {
+        let mut rows = conn
+            .query(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name",
+                (),
+            )
+            .await
+            .expect("schema");
+        let mut names = Vec::new();
+        while let Some(row) = rows.next().await.expect("row") {
+            names.push(row.get::<String>(0).expect("name"));
+        }
+        names
+    }
+
+    async fn recorded(conn: &Connection, name: &str) -> bool {
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM _migrations WHERE name = ?1",
+                turso::params![name],
+            )
+            .await
+            .expect("query");
+        rows.next().await.expect("row").is_some()
+    }
+
+    /// A migration that fails part-way used to leave its first statements
+    /// applied and itself unrecorded, so every later boot re-ran it and died on
+    /// what had already landed. Now it commits whole or not at all.
+    #[tokio::test]
+    async fn a_failing_migration_leaves_no_trace() {
+        let storage = Storage::in_memory().await.expect("storage");
+        let conn = storage.conn().lock().await;
+        let broken: &[(&str, &str)] = &[(
+            "900_broken",
+            "CREATE TABLE half_done (id INTEGER); ALTER TABLE half_done ADD COLUMN x TEXT; \
+             INSERT INTO no_such_table VALUES (1);",
+        )];
+        assert!(apply_migrations(&conn, broken).await.is_err());
+        assert!(
+            !table_names(&conn).await.contains(&"half_done".to_string()),
+            "rolled back"
+        );
+        assert!(!recorded(&conn, "900_broken").await);
+
+        // The same name, fixed, applies cleanly on the next boot.
+        let fixed: &[(&str, &str)] = &[(
+            "900_broken",
+            "CREATE TABLE half_done (id INTEGER); ALTER TABLE half_done ADD COLUMN x TEXT;",
+        )];
+        apply_migrations(&conn, fixed)
+            .await
+            .expect("the fixed migration applies");
+        let is_recorded = recorded(&conn, "900_broken").await;
+        drop(conn);
+        assert!(is_recorded);
+    }
+
+    /// A database half-migrated before migrations ran in a transaction: the
+    /// column landed, the record did not. The ADD COLUMN probe lets the rerun
+    /// through instead of wedging every boot on `duplicate column name`.
+    #[tokio::test]
+    async fn a_half_applied_add_column_is_not_fatal() {
+        let storage = Storage::in_memory().await.expect("storage");
+        let conn = storage.conn().lock().await;
+        conn.execute("CREATE TABLE legacy (id INTEGER)", ())
+            .await
+            .expect("create");
+        conn.execute("ALTER TABLE legacy ADD COLUMN landed TEXT", ())
+            .await
+            .expect("the half that landed");
+        let rerun: &[(&str, &str)] = &[(
+            "901_partial",
+            "ALTER TABLE legacy ADD COLUMN landed TEXT; ALTER TABLE legacy ADD COLUMN missing TEXT;",
+        )];
+        apply_migrations(&conn, rerun)
+            .await
+            .expect("the rerun completes");
+        let is_recorded = recorded(&conn, "901_partial").await;
+        let missing_added = column_exists(&conn, "legacy", "missing")
+            .await
+            .expect("probe");
+        let landed_seen = column_exists(&conn, "LEGACY", "Landed")
+            .await
+            .expect("probe");
+        drop(conn);
+        assert!(is_recorded);
+        assert!(missing_added, "the half that had not landed is applied");
+        assert!(landed_seen, "the probe is case-insensitive");
+    }
+
+    /// Usage rolls up per day and per month, prices from the 1-hour column, and
+    /// ignores what falls outside the window.
+    #[tokio::test]
+    async fn model_usage_rolls_up_by_day_and_month() {
+        let storage = Storage::in_memory().await.expect("storage");
+        for (model, input, writes, writes_1h) in [
+            ("claude-opus-5", 100, 40, 10),
+            ("claude-opus-5", 50, 0, 0),
+            ("ollama/qwen3.5:9b", 7, 0, 0),
+            ("claude-opus-5", 1, 0, 0),
+        ] {
+            storage
+                .log_model_request(&NewModelRequest {
+                    model,
+                    success: true,
+                    latency_ms: 10,
+                    input_tokens: input,
+                    output_tokens: 5,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: writes,
+                    cache_creation_1h_tokens: writes_1h,
+                    tier: None,
+                    escalated: false,
+                    session_id: Some("s"),
+                })
+                .await
+                .expect("log");
+        }
+        // Row 3 happened three days ago; row 4 is older than any window asked for.
+        let conn = storage.conn.lock().await;
+        let three_days_ago = (chrono::Utc::now() - chrono::Duration::days(3))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        conn.execute(
+            "UPDATE model_request_log SET created_at = ?1 WHERE id = 3",
+            turso::params![three_days_ago.as_str()],
+        )
+        .await
+        .expect("backdate");
+        conn.execute(
+            "UPDATE model_request_log SET created_at = '2001-01-01 00:00:00' WHERE id = 4",
+            (),
+        )
+        .await
+        .expect("backdate");
+        drop(conn);
+
+        let by_day = storage.model_usage_buckets(7, false).await.expect("rollup");
+        assert_eq!(by_day.len(), 2, "{by_day:?}");
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let opus = by_day
+            .iter()
+            .find(|b| b.model == "claude-opus-5")
+            .expect("opus");
+        assert_eq!(opus.period, today);
+        assert_eq!(
+            (
+                opus.requests,
+                opus.input_tokens,
+                opus.cache_write_tokens,
+                opus.cache_write_1h_tokens
+            ),
+            (2, 150, 40, 10)
+        );
+        let local = by_day
+            .iter()
+            .find(|b| b.model == "ollama/qwen3.5:9b")
+            .expect("local");
+        assert_eq!(local.period, three_days_ago[..10]);
+        assert!(by_day[0].period <= by_day[1].period, "oldest first");
+
+        let by_month = storage.model_usage_buckets(7, true).await.expect("rollup");
+        assert!(by_month.iter().all(|b| b.period.len() == 7), "{by_month:?}");
+        assert!(
+            by_month.iter().all(|b| b.period != "2001-01"),
+            "outside the window"
+        );
+        let by_session = storage
+            .model_usage_by(7, UsagePeriod::Session)
+            .await
+            .expect("rollup");
+        assert!(
+            by_session.iter().all(|b| b.period == "s"),
+            "every logged row named session s: {by_session:?}"
+        );
+        let everything = storage
+            .model_usage_buckets(u32::MAX, true)
+            .await
+            .expect("clamped");
+        assert!(
+            everything.iter().all(|b| b.period != "2001-01"),
+            "clamped to a year"
+        );
+    }
+    #[tokio::test]
+    async fn test_storage_creation() {
+        let storage = Storage::in_memory().await.unwrap();
+
+        let session = storage
+            .sessions()
+            .create("test-session", "cli", None)
+            .await
+            .unwrap();
+
+        assert_eq!(session.session_id, "test-session");
+    }
+
+    #[tokio::test]
+    async fn test_persistence_across_restarts() {
+        // Create a temp file path
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("nanna_test_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        // Clean up any existing test db
+        let _ = std::fs::remove_file(&db_path);
+
+        // Create storage, write data, then drop it
+        {
+            let config = StorageConfig { path: db_path_str.clone() };
+            let storage = Storage::new(&config).await.unwrap();
+            
+            storage
+                .sessions()
+                .create("persistent-session", "cli", None)
+                .await
+                .unwrap();
+        }
+
+        // Reopen storage and verify data persisted
+        {
+            let config = StorageConfig { path: db_path_str.clone() };
+            let storage = Storage::new(&config).await.unwrap();
+            
+            // get() returns Result<Session> - throws NotFound if missing
+            let session = storage
+                .sessions()
+                .get("persistent-session")
+                .await
+                .expect("Session should persist across restarts");
+            
+            assert_eq!(session.session_id, "persistent-session");
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    fn sample_session(session_id: &str) -> Session {
+        Session {
+            id: 1,
+            session_id: session_id.into(),
+            channel: "cli".into(),
+            user_id: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            metadata: None,
+            workspace_id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn get_session_name_survives_multibyte_session_id() {
+        // `nanna chat --session <ID>` stores the flag verbatim and writes
+        // neither a name nor metadata, so the generated fallback is the only
+        // reachable branch for such a session. Byte 8 of this id lands inside
+        // the em dash (bytes 6..9) — the same cut that killed the daemon.
+        assert_eq!(
+            Storage::get_session_name(&sample_session("abcdef—ghij")),
+            "Session abcdef"
+        );
+
+        // The same defect from the other side: an id shorter than the limit
+        // puts the index out of range before boundaries even matter.
+        assert_eq!(
+            Storage::get_session_name(&sample_session("abc")),
+            "Session abc"
+        );
+
+        // An ASCII id still keeps exactly the eight bytes it always did.
+        assert_eq!(
+            Storage::get_session_name(&sample_session("0123456789abcdef")),
+            "Session 01234567"
+        );
+    }
+
+    fn sample_new_memory(id: &str, content: &str) -> NewMemory {
+        NewMemory {
+            memory_id: id.into(),
+            content: content.into(),
+            embedding: Some(vec![0.1, 0.2, 0.3]),
+            embedding_model: Some("test".into()),
+            session_id: None,
+            metadata: None,
+            tags: vec![],
+            workspace_id: None,
+            fsrs_stability: 1.0,
+            fsrs_difficulty: 5.0,
+            fsrs_last_access: 0,
+            fsrs_access_count: 0,
+            fsrs_importance: 1.0,
+            fsrs_storage_strength: 1.0,
+            fsrs_generation: 0,
+        }
+    }
+
+    #[test]
+    fn is_corruption_error_matches_corruption_messages() {
+        // The classifier's contract is a case-insensitive substring match on the
+        // rendered message (the form it takes once it crosses into
+        // `MemoryError::Persistence(String)`). NotFound is just a convenient
+        // String-carrying variant to exercise that contract.
+        assert!(is_corruption_error(&StorageError::NotFound(
+            "inconsistent overflow chain observed during payload read".into()
+        )));
+        assert!(is_corruption_error(&StorageError::NotFound(
+            "database disk image is CORRUPT".into()
+        )));
+        assert!(is_corruption_error(&StorageError::NotFound("malformed database page".into())));
+        assert!(!is_corruption_error(&StorageError::NotFound("session xyz missing".into())));
+    }
+
+    #[tokio::test]
+    async fn bulk_load_salvage_matches_bulk_load_on_clean_db() {
+        let storage = Storage::in_memory().await.unwrap();
+        let repo = storage.memories();
+        for i in 0..5 {
+            repo.create(sample_new_memory(&format!("m{i}"), &format!("content {i}")))
+                .await
+                .unwrap();
+        }
+        let bulk = repo.bulk_load().await.unwrap();
+        let report = repo.bulk_load_salvage().await.unwrap();
+
+        assert_eq!(report.expected, 5);
+        assert_eq!(report.corrupt_ids, [] as [i64; 0]);
+        assert_eq!(report.memories.len(), bulk.len());
+        // Same memory_ids in the same order (both ORDER BY id ASC) — the per-id
+        // reconstruction is lossless on a clean DB.
+        let bulk_ids: Vec<_> = bulk.iter().map(|m| m.memory_id.clone()).collect();
+        let salv_ids: Vec<_> = report.memories.iter().map(|m| m.memory_id.clone()).collect();
+        assert_eq!(bulk_ids, salv_ids);
+        assert_eq!(report.memories[0].embedding, bulk[0].embedding);
+    }
 }

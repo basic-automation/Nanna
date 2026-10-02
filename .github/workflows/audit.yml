@@ -16,6 +16,14 @@ name: Dependency audit
 #   *vendored* copy (esm/vs/base/browser/dompurify/), which no pnpm override
 #   could reach. `monaco-editor 0.57.0` vendors DOMPurify 3.4.15 and the audit
 #   is clean at every level, so the exemption that justified `high` is gone.
+# - One advisory is exempted by id, in gui/package.json `pnpm.auditConfig.
+#   ignoreGhsas`, and only because no fix exists: GHSA-86w9-cpqp-85rv (high,
+#   node-forge <=1.4.0 RSA PKCS#1 v1.5 signature verification). node-forge
+#   1.4.0 is its latest release and the advisory lists no patched version. It
+#   arrives through nuxt -> listhen, the *dev server's* self-signed-cert helper;
+#   the shipped app is Nuxt's static output inside Tauri, which runs no listhen
+#   and verifies no RSA signatures with node-forge. Drop the entry the day
+#   node-forge publishes a fix (ROADMAP P0.3).
 #
 # Triggered by the files that can change the answer, plus weekly: an advisory
 # can be published against a lockfile nobody touched.

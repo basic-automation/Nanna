@@ -34,6 +34,7 @@ mod config;
 mod config_watch;
 mod member;
 mod memory;
+mod quick_add;
 mod scheduler;
 mod session;
 mod system;

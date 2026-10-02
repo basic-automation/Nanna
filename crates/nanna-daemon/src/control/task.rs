@@ -12,7 +12,7 @@ impl ControlPlane {
     /// Control-plane clients have no session of their own to fall back on
     /// (unlike a tool call, where the bridge supplies the running session), so
     /// the error names the field to send and the scopes that need no id.
-    async fn resolve_task_scope(
+    pub(super) async fn resolve_task_scope(
         &self,
         scope: Option<&str>,
         session_id: Option<&str>,
@@ -79,6 +79,14 @@ impl ControlPlane {
                 self.task_create(&repo, request).await
             }
 
+            TaskAction::QuickAdd { text, scope, parent_id } => {
+                self.task_quick_add(&repo, &text, scope, parent_id).await
+            }
+
+            TaskAction::Assigned { member_id, limit } => {
+                Self::task_assigned(&repo, member_id, limit).await
+            }
+
             TaskAction::Update { id, patch } => Self::task_update(&repo, id, &patch).await,
 
             TaskAction::Done { id, workdir } => self.task_done(&repo, id, workdir).await,
@@ -88,24 +96,7 @@ impl ControlPlane {
                 Err(e) => json!({"error": "task_delete_failed", "message": e.to_string()}),
             },
 
-            TaskAction::Note { id, content } => {
-                // A note from the GUI is the human posting on the card's
-                // thread, so it names the human member (P25 decision 2). The
-                // legacy `author` string stays "gui" until Stage 4 drops it.
-                match repo
-                    .post(
-                        id,
-                        Some("gui"),
-                        Some(nanna_storage::HUMAN_MEMBER_ID),
-                        nanna_storage::TaskNoteKind::Comment,
-                        &content,
-                    )
-                    .await
-                {
-                    Ok(note) => json!({"note": note}),
-                    Err(e) => json!({"error": "task_note_failed", "message": e.to_string()}),
-                }
-            }
+            TaskAction::Note { id, content } => Self::task_note(&repo, id, &content).await,
 
             TaskAction::Query { filter, scope, session_id } => {
                 self.task_query(&repo, &filter, scope, session_id).await
@@ -158,6 +149,50 @@ impl ControlPlane {
             } => self.cancel_task_run(scope, session_id).await,
 
             TaskAction::Verdicts { window } => Self::task_verdicts(&repo, window).await,
+        }
+    }
+
+    /// `TaskAction::Note`: a note from the GUI is the human posting on the
+    /// card's thread, so it names the human member (P25 decision 2). The
+    /// legacy `author` string stays "gui" until Stage 4 drops it.
+    async fn task_note(repo: &TaskRepository, id: i64, content: &str) -> Value {
+        match repo
+            .post(
+                id,
+                Some("gui"),
+                Some(nanna_storage::HUMAN_MEMBER_ID),
+                nanna_storage::TaskNoteKind::Comment,
+                content,
+            )
+            .await
+        {
+            Ok(note) => json!({"note": note}),
+            Err(e) => json!({"error": "task_note_failed", "message": e.to_string()}),
+        }
+    }
+
+    /// `TaskAction::Assigned`: a member's open cards on every board.
+    async fn task_assigned(
+        repo: &TaskRepository,
+        member_id: Option<String>,
+        limit: Option<usize>,
+    ) -> Value {
+        let limit = limit.unwrap_or(nanna_storage::ASSIGNED_CARDS_MAX);
+        if limit == 0 || limit > nanna_storage::ASSIGNED_CARDS_MAX {
+            return json!({
+                "error": "bad_limit",
+                "message": format!(
+                    "limit must be in 1..={}, got {limit}",
+                    nanna_storage::ASSIGNED_CARDS_MAX
+                ),
+            });
+        }
+        let member_id =
+            member_id.unwrap_or_else(|| nanna_storage::HUMAN_MEMBER_ID.to_string());
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        match repo.assigned_open(&member_id, limit).await {
+            Ok(cards) => json!({ "member_id": member_id, "today": today, "cards": cards }),
+            Err(e) => json!({"error": "task_assigned_failed", "message": e.to_string()}),
         }
     }
 
@@ -230,7 +265,7 @@ impl ControlPlane {
 
     /// `TaskAction::Create`: place the task (a subtask in its parent's scope),
     /// canonicalize its acceptance, and create it.
-    async fn task_create(&self, repo: &TaskRepository, request: CreateTask) -> Value {
+    pub(super) async fn task_create(&self, repo: &TaskRepository, request: CreateTask) -> Value {
         let CreateTask {
             title, scope, session_id, parent_id, description, priority, labels, tools,
             due_at, deadline_at, recurrence, depends_on, acceptance, project, assignee,
@@ -348,7 +383,7 @@ impl ControlPlane {
             description: patch
                 .get("description")
                 .and_then(Value::as_str)
-                .map(|s| Some(s.to_string())),
+                .map(clearable),
             status: patch
                 .get("status")
                 .and_then(Value::as_str)
@@ -357,16 +392,19 @@ impl ControlPlane {
             labels: patch
                 .get("labels")
                 .filter(|v| v.is_array())
-                .map(&string_vec),
-            tool_scope: patch.get("tools").filter(|v| v.is_array()).map(&string_vec),
+                .map(string_vec),
+            tool_scope: patch.get("tools").filter(|v| v.is_array()).map(string_vec),
+            // `null` skips a field like everywhere else in a patch, so an
+            // empty string is how a client clears a date or a description
+            // (the board's inputs send "" when emptied).
             due_at: patch
                 .get("due_at")
                 .and_then(Value::as_str)
-                .map(|s| Some(s.to_string())),
+                .map(clearable),
             deadline_at: patch
                 .get("deadline_at")
                 .and_then(Value::as_str)
-                .map(|s| Some(s.to_string())),
+                .map(clearable),
             recurrence: patch
                 .get("recurrence")
                 .and_then(Value::as_str)
@@ -766,24 +804,31 @@ impl ControlPlane {
     }
 }
 
-/// The fields of a `TaskAction::Create`.
-struct CreateTask {
-    title: String,
-    scope: Option<String>,
-    session_id: Option<String>,
-    parent_id: Option<i64>,
-    description: Option<String>,
-    priority: Option<i64>,
-    labels: Option<Vec<String>>,
-    tools: Option<Vec<String>>,
-    due_at: Option<String>,
-    deadline_at: Option<String>,
-    recurrence: Option<String>,
-    depends_on: Option<Vec<i64>>,
+/// A patch's string for an optional field: `""` clears it, anything else sets it.
+fn clearable(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// The fields of a `TaskAction::Create` (and of the card a
+/// `TaskAction::QuickAdd` line becomes).
+pub(super) struct CreateTask {
+    pub(super) title: String,
+    pub(super) scope: Option<String>,
+    pub(super) session_id: Option<String>,
+    pub(super) parent_id: Option<i64>,
+    pub(super) description: Option<String>,
+    pub(super) priority: Option<i64>,
+    pub(super) labels: Option<Vec<String>>,
+    pub(super) tools: Option<Vec<String>>,
+    pub(super) due_at: Option<String>,
+    pub(super) deadline_at: Option<String>,
+    pub(super) recurrence: Option<String>,
+    pub(super) depends_on: Option<Vec<i64>>,
     /// Boxed to match `TaskAction::Create`, whose field it is moved from; see
     /// the note there. Unboxed again by `task_create` before it reaches
     /// `NewTask`, which stores the canonicalized value inline.
-    acceptance: Option<Box<Value>>,
-    project: Option<String>,
-    assignee: Option<String>,
+    pub(super) acceptance: Option<Box<Value>>,
+    pub(super) project: Option<String>,
+    pub(super) assignee: Option<String>,
 }

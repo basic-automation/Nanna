@@ -212,6 +212,32 @@ pub enum TaskAction {    /// List tasks in a scope
         #[serde(default)]
         assignee: Option<String>,
     },
+    /// One line of text → one board card (P25 decision 1): `#label`,
+    /// `p1`..`p4`, `@member`, a date phrase (the defer date) and `{date
+    /// phrase}` (the deadline) fill fields, the rest is the title. `scope`
+    /// is `workspace` (the active board, the default when one is open) or
+    /// `global`; with `parent_id` the card is a sub-card on the parent's board.
+    /// The reply is `{task, parsed}`.
+    QuickAdd {
+        text: String,
+        #[serde(default)]
+        scope: Option<String>,
+        /// Make the card a sub-card of this one; it then lives on the
+        /// parent's board and `scope` is ignored.
+        #[serde(default)]
+        parent_id: Option<i64>,
+    },
+    /// Every open board card assigned to `member_id` (default: the human),
+    /// across every board — the read behind Inbox and Upcoming (P25 decision
+    /// 11). The reply is `{cards, today}`, `today` being the store's UTC day,
+    /// so a client splits "date today or past, or none" from "later" on the
+    /// same clock the store uses.
+    Assigned {
+        #[serde(default)]
+        member_id: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     /// Partial update (status accepts `pending|in_progress|cancelled`)
     Update {
         id: i64,

@@ -203,6 +203,19 @@ pub enum DaemonEvent {
     /// The daemon's config was mutated and committed. Payload-free by design:
     /// each view re-fetches the slice it renders.
     ConfigChanged,
+    /// A card changed on a board (P25 Stage 1's lifecycle events). Mirrors
+    /// `nanna_daemon::protocol::Event::TaskEvent`; `kind` stays a string here
+    /// so a kind this build does not know still reaches the board, which only
+    /// needs to know *that* a card changed.
+    TaskEvent {
+        kind: String,
+        task_id: i64,
+        scope: String,
+        #[serde(default)] scope_id: Option<String>,
+        #[serde(default)] actor: Option<String>,
+    },
+    /// The board roster changed. Payload-free, like `WorkspacesChanged`.
+    MembersChanged,
     /// A well-formed daemon event this build has no variant for.
     ///
     /// The daemon and the GUI ship separately, so the daemon's event set is
@@ -1913,6 +1926,173 @@ impl DaemonClient {
             "action": "update",
             "id": id,
             "patch": { "priority": new_priority }
+        })).await
+    }
+
+    /// One quick-add line → one board card (`task.quick_add`, P25 decision 1).
+    /// `scope` is `workspace` or `global`; `None` lets the daemon choose the
+    /// active board. With `parent_id` the card is that card's sub-card.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. A line the daemon refuses (an
+    /// unknown `@member`, a bad `{deadline}`) comes back inside the `Ok` reply.
+    pub async fn task_quick_add(&self, text: &str, scope: Option<&str>, parent_id: Option<i64>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "quick_add",
+            "text": text,
+            "scope": scope,
+            "parent_id": parent_id
+        })).await
+    }
+
+    /// One card with its thread (`notes`) and activity.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn task_get(&self, id: i64) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "get",
+            "id": id
+        })).await
+    }
+
+    /// The human posts `content` on card `id`'s thread (`task.note`).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn task_note(&self, id: i64, content: &str) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "note",
+            "id": id,
+            "content": content
+        })).await
+    }
+
+    /// Every open board card assigned to `member_id` (default: the human),
+    /// on every board — Inbox and Upcoming (`task.assigned`).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn task_assigned(&self, member_id: Option<&str>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "assigned",
+            "member_id": member_id
+        })).await
+    }
+
+    /// Add an agent to a board's roster (`member.create`). `workspace_id`
+    /// `None` is the global board; `personal` makes it the human's own agent,
+    /// which travels between boards.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does; a refused create (a duplicate
+    /// name, a profile that is not an object) comes back inside `Ok`.
+    pub async fn member_create(
+        &self,
+        name: &str,
+        workspace_id: Option<&str>,
+        personal: bool,
+        profile: Option<Value>,
+    ) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "member",
+            "action": "create",
+            "name": name,
+            "workspace_id": workspace_id,
+            "personal": personal,
+            "profile": profile
+        })).await
+    }
+
+    /// Change a member's name or profile (`member.update`); `None` keeps it.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn member_update(&self, id: &str, name: Option<&str>, profile: Option<Value>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "member",
+            "action": "update",
+            "id": id,
+            "name": name,
+            "profile": profile
+        })).await
+    }
+
+    /// Remove an agent from the roster (`member.delete`).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn member_delete(&self, id: &str) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "member",
+            "action": "delete",
+            "id": id
+        })).await
+    }
+
+    /// Start — or resume, for a paused card — its assignee's run on card
+    /// `card_id` (`task.start_run {card_id}`).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does; a refused start (no agent
+    /// assigned, the member busy elsewhere) comes back inside `Ok`.
+    pub async fn card_run_start(&self, card_id: i64) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "start_run",
+            "card_id": card_id
+        })).await
+    }
+
+    /// Whether a run is working card `card_id` now (`task.run_status`).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn card_run_status(&self, card_id: i64) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "run_status",
+            "card_id": card_id
+        })).await
+    }
+
+    /// Stop the run working card `card_id`; the card stays with its member,
+    /// paused (`task.cancel_run`).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn card_run_cancel(&self, card_id: i64) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "cancel_run",
+            "card_id": card_id
+        })).await
+    }
+
+    /// The roster of one board: `workspace_id` `None` is the global board.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn member_list(&self, workspace_id: Option<&str>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "member",
+            "action": "list",
+            "workspace_id": workspace_id
         })).await
     }
 }

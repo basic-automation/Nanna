@@ -2517,3 +2517,209 @@ async fn a_card_run_is_claimed_only_for_an_agent_on_an_open_board_card() {
         "card_closed"
     );
 }
+
+#[tokio::test]
+async fn a_quick_add_line_becomes_a_board_card() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let created = ask(serde_json::json!({
+        "type": "member", "action": "create", "name": "Builder",
+    }))
+    .await;
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+
+    // No workspace is open, so the line lands on the global board.
+    let added = ask(serde_json::json!({
+        "type": "task", "action": "quick_add",
+        "text": "Ship the fix #release p2 @builder tomorrow {in 9 days}",
+    }))
+    .await;
+    let card = &added["task"];
+    assert_eq!(card["title"], "Ship the fix", "{added}");
+    assert_eq!(card["scope"], "global", "{added}");
+    assert_eq!(card["labels"], serde_json::json!(["release"]), "{added}");
+    assert_eq!(card["priority"], 2, "{added}");
+    assert_eq!(card["assignee"], "agent:builder", "{added}");
+    let tomorrow = (chrono::Utc::now().date_naive() + chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_eq!(card["due_at"], tomorrow.as_str(), "{added}");
+    assert!(card["deadline_at"].is_string(), "{added}");
+    assert_eq!(added["parsed"]["assignee"], "builder", "the raw handle is echoed: {added}");
+    let id = card["id"].as_i64().expect("id");
+    assert_eq!(
+        storage.tasks().created_by(id).await.expect("created_by").as_deref(),
+        Some("gui"),
+        "a quick-add card is the board client's, so its router takes it up"
+    );
+
+    // Refusals name what to fix, and write nothing.
+    let unknown = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "Paint @nobody",
+    }))
+    .await;
+    assert_eq!(unknown["error"], "unknown_member", "{unknown}");
+    assert!(unknown["message"].as_str().is_some_and(|m| m.contains("@builder")), "{unknown}");
+    let router = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "Paint @router:global",
+    }))
+    .await;
+    assert_eq!(router["error"], "unknown_member", "{router}");
+    let braces = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "Paint {soon}",
+    }))
+    .await;
+    assert_eq!(braces["error"], "bad_quick_add", "{braces}");
+    let session = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "Paint", "scope": "session",
+    }))
+    .await;
+    assert_eq!(session["error"], "bad_scope", "{session}");
+    let all = storage.tasks().list("global", None, true).await.expect("list");
+    assert_eq!(all.len(), 1, "only the good line made a card: {all:?}");
+}
+
+#[tokio::test]
+async fn a_members_cards_are_read_across_boards_over_ipc() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    for (title, scope, scope_id) in [("one", "global", None), ("two", "workspace", Some("ws-a"))] {
+        storage
+            .tasks()
+            .create(nanna_storage::NewTask {
+                title: title.to_string(),
+                scope: scope.to_string(),
+                scope_id: scope_id.map(str::to_string),
+                priority: 3,
+                assignee: Some("human".to_string()),
+                ..nanna_storage::NewTask::default()
+            })
+            .await
+            .expect("card");
+    }
+    let mine = ask(serde_json::json!({ "type": "task", "action": "assigned" })).await;
+    assert_eq!(mine["member_id"], "human", "the human by default: {mine}");
+    assert_eq!(mine["cards"].as_array().map(Vec::len), Some(2), "both boards: {mine}");
+    assert_eq!(
+        mine["today"].as_str().map(str::len),
+        Some(10),
+        "the store's day comes with it: {mine}"
+    );
+    let refused = ask(serde_json::json!({ "type": "task", "action": "assigned", "limit": 0 })).await;
+    assert_eq!(refused["error"], "bad_limit", "{refused}");
+}
+
+#[tokio::test]
+async fn an_empty_date_in_a_patch_clears_it_and_null_skips_it() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let card = storage
+        .tasks()
+        .create(nanna_storage::NewTask {
+            title: "dated".to_string(),
+            scope: "global".to_string(),
+            priority: 3,
+            due_at: Some("2026-11-01".to_string()),
+            deadline_at: Some("2026-11-30".to_string()),
+            ..nanna_storage::NewTask::default()
+        })
+        .await
+        .expect("card");
+    let skipped = ask(serde_json::json!({
+        "type": "task", "action": "update", "id": card.id,
+        "patch": { "due_at": null, "priority": 2 },
+    }))
+    .await;
+    assert_eq!(skipped["task"]["due_at"], "2026-11-01", "null leaves the date: {skipped}");
+    let cleared = ask(serde_json::json!({
+        "type": "task", "action": "update", "id": card.id,
+        "patch": { "due_at": "", "deadline_at": " " },
+    }))
+    .await;
+    assert!(cleared["task"]["due_at"].is_null(), "{cleared}");
+    assert!(cleared["task"]["deadline_at"].is_null(), "{cleared}");
+    assert_eq!(cleared["task"]["priority"], 2, "{cleared}");
+}
+
+#[tokio::test]
+async fn a_quick_add_line_with_a_parent_becomes_its_sub_card() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let parent = storage
+        .tasks()
+        .create(nanna_storage::NewTask {
+            title: "release".to_string(),
+            scope: "workspace".to_string(),
+            scope_id: Some("ws-x".to_string()),
+            priority: 3,
+            ..nanna_storage::NewTask::default()
+        })
+        .await
+        .expect("parent");
+    // `scope: global` is ignored: a sub-card lives on its parent's board.
+    let child = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "tag it #ops",
+        "scope": "global", "parent_id": parent.id,
+    }))
+    .await;
+    assert_eq!(child["task"]["parent_id"], parent.id, "{child}");
+    assert_eq!(child["task"]["scope"], "workspace", "{child}");
+    assert_eq!(child["task"]["scope_id"], "ws-x", "{child}");
+    let session_parent = storage
+        .tasks()
+        .create(nanna_storage::NewTask {
+            title: "chat plan".to_string(),
+            scope: "session".to_string(),
+            scope_id: Some("s1".to_string()),
+            priority: 3,
+            ..nanna_storage::NewTask::default()
+        })
+        .await
+        .expect("session card");
+    let refused = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "nope", "parent_id": session_parent.id,
+    }))
+    .await;
+    assert_eq!(refused["error"], "bad_scope", "{refused}");
+    let missing = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "nope", "parent_id": 9_999,
+    }))
+    .await;
+    assert_eq!(missing["error"], "task_not_found", "{missing}");
+}

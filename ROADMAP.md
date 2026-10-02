@@ -513,6 +513,15 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
             inside `pop()`), patched in ≥ 0.18.2** — reached only via `tantivy 0.26` under turso's
             exact `=0.7.2` pin, so it moves when turso does. Not reachable in shipped builds: it
             needs unwinding plus `catch_unwind`, and the release profile is `panic = "abort"`.
+      - [ ] *(2026-10-02)* **`node-forge` GHSA-86w9-cpqp-85rv (high) is exempted, not fixed.** No
+            release fixes it (1.4.0 is the latest; the advisory lists no patched version); it
+            comes through `nuxt → listhen`, the dev server's cert helper, which the shipped static
+            bundle never runs. Exempted by id in `gui/package.json` `pnpm.auditConfig.ignoreGhsas`
+            (reasoning in `audit.yml`'s header). **Remove the entry as soon as node-forge ships a
+            fix.** Same night: `devalue 5.9.1 → 5.9.4` (six advisories, three high, through Nuxt's
+            payload serializer) — these were published after the 2026-10-01 merge, so master's
+            gate was red against today's database too. DOMPurify 3.4.16 (one *low*) cannot be
+            taken: `monaco-editor 0.57.0` pins 3.4.15 exactly.
       - [x] *(2026-09-26 — `monaco-editor 0.57.0` vendors DOMPurify 3.4.15; `pnpm audit` reports
             nothing at any level, and the gate is now `--audit-level=moderate`.)*
             **Monaco vendors DOMPurify 3.4.8** (`monaco-editor/esm/vs/base/browser/dompurify/`) —
@@ -7736,13 +7745,25 @@ as its turn (`TurnAdmission`, scope default `session`).
       on-disk paths make a card non-portable, content-addressed storage needs a GC story that
       "threads are permanent" already complicates. Whichever wins, the memory copy of a post
       (Stage 1's write-through) must carry a reference, not the bytes.
-- [ ] **A task→reminder binding** (`deadline_at` → a scheduled nudge). P25 decision 10 says
+- [x] **A task→reminder binding** (`deadline_at` → a scheduled nudge). P25 decision 10 says
       "reminders hang off the deadline by default", but nothing binds the two today:
       `reminder_service` only schedules session-scoped one-shots a human or the model asked for
       explicitly, and it reads no task field. Needs a decision first — who is reminded (the
       assignee's member inbox, not a session, once Stage 4 lands), and whether a deadline nudge is
       a *reminder* or simply the `due`/`overdue` bus event Stage 1 already lists. Do not build it
       before the event list exists, or it will be a second notification path.
+      *(2026-10-02)* **It is the bus event — no second path.** The store already announces `due`
+      (the date arrived) and `overdue` (the deadline passed) once per crossing, and the GUI now
+      parses them (`board-event`). `useBoardNotifications`, mounted by the layout so it hears
+      them on every page, turns them into Notification Center entries (with a toast) **for cards
+      assigned to the human**, and does the same when someone *else* — the router, an agent —
+      creates or assigns a card to them, which is how a clarification question reaches them
+      (decision 6: "A question for you from agent:builder"). The human's own writes (`gui`)
+      never notify; closed cards never do. Rule: `boardNoticeFor` in `lib/board.ts`, 3 vitest;
+      checked live by emitting an `overdue` for a real card from the chat page. Still open:
+      notifying *agents* is meaningless (they are woken by the run trigger instead), and a nudge
+      *before* the deadline (Todoist's default reminder) would need a lead-time setting — owner
+      call.
 - [ ] Default `scope = 'workspace'`; migration promotes `session`-scoped rows (tasks + memories) to
       the session's `workspace_id`, else `global`, and stamps label `promoted`. Delete
       `TurnAdmission` (`crates/nanna-daemon/src/tasks.rs:1210`) and its call sites in
@@ -8285,6 +8306,112 @@ as its turn (`TurnAdmission`, scope default `session`).
 - [ ] Board per workspace (columns = states; filters: assignee, label, due, priority; flat/nested
       toggle), Inbox, Upcoming, quick-add with the token parser (reuse `task_filter`; add
       `@member`), card view with thread and profile pages for members.
+      - [x] *(2026-10-02)* **Quick-add, end to end.** `nanna_storage::quick_add::parse` reads
+            decision 1's tokens — `#label`, `p1`..`p4`, `@member`, a defer-date phrase (`today`,
+            `tomorrow`, a weekday = the next one strictly after today, `next week`, `in N
+            days|weeks`, ISO) and Todoist's `{phrase}` for the deadline. A single-valued token
+            given twice keeps the last and gives the earlier one back to the title word for word;
+            a brace group that is not a date is refused rather than guessed. Bounds: 4 KiB of
+            input (a title and 32 labels at their store limits fit), offsets 0..=3 660 days.
+            It is its own parser, not `task_filter`'s: the filter is the *other* Todoist dialect
+            (there `@` is a label, `#` a project). IPC `task.quick_add {text, scope?}` (default:
+            the open workspace's board, else global; session scope refused) resolves `@handle`
+            against that board's roster — id, id without `agent:`, the name's slug, or the name;
+            `me` is the human; a router is refused (decision 4); an unknown handle lists up to 12
+            members — then creates through `task.create`, so the card is `gui`-made and the
+            router completes it. 12 parser tests, 6 resolver tests, control-plane test
+            `a_quick_add_line_becomes_a_board_card`.
+      - [x] *(2026-10-02)* **The board client's first slice** (`gui/app/pages/board.vue`, rail
+            entry "Board", palette entry). One board — the open workspace's, else global — in
+            four columns: *To do*, *Waiting* (derived `blocked`, whatever the stored status),
+            *In progress*, *Done* (newest first, the latest 50 — `DONE_SHOWN_MAX`). Sub-cards sit
+            inside their parent (`↳ open/total`) or on the board (the decision-8 toggle);
+            assignee filter; priority, labels, date (yellow while deferred), deadline (pink when
+            overdue) and a busy dot from the roster. The card view is the thread (posts with
+            member names and kinds), a post box (`task.note` → the human's comment), assign to a
+            member, and *Mark done* — which shows the verdict when the acceptance check fails.
+            Live: the daemon's `Event::TaskEvent` and `MembersChanged` now parse in the GUI
+            (they fell into `Unknown` before) and forward as `board-event` / `members-changed`;
+            the board re-reads its own scope's cards, coalesced to one read per 250 ms burst.
+            New commands `quick_add_card`, `get_card`, `post_on_card`, `list_members`. The
+            arrangement rules live in `app/lib/board.ts` with 15 unit tests.
+            *(later the same day)* Filters: assignee, label (the board's own, listed once
+            each), priority, and dates (startable now / deferred / overdue / no deadline), with a
+            Clear; `applyFilters` in `lib/board.ts`, 4 vitest, checked live.
+            **Not yet:** member profile *threads* (decision 15's
+            capability changes post there), and the Figma `Board` page's visual pass (the Figma
+            connector was unauthenticated this run; built on the `nui` tokens instead).
+      - [ ] *(research 2026-10-02)* **Todoist's own tokens are not decision 1's — owner call
+            before habits form.** Todoist's Quick Add
+            ([help](https://www.todoist.com/help/articles/use-task-quick-add-in-todoist-va4Lhpzz))
+            uses `#` for a *project*, `%label` for labels (`@label` "will be retired by end of
+            2026"), `+person` for the assignee, `/section`, and `!time` for reminders. Decision 1
+            says `#label` and `@member`; it is shipped that way. Either keep it (our boards have
+            no projects, so `#` is free) or accept `+member`/`%label` as aliases so a Todoist
+            user's muscle memory works — aliases cost nothing in the parser. Do not silently
+            change decision 1.
+      - [x] *(research 2026-10-02)* **Brace deadlines take any date phrase in Todoist** —
+            `{march 30}`, `{next friday}`
+            ([deadlines](https://www.todoist.com/help/articles/introduction-to-deadlines-uMqbSLM6U)).
+            Ours refuses both (month names and `next <weekday>` are not phrases yet), with a
+            message naming what works. Add `<month> <day>` (next occurrence, this year or next)
+            and `next <weekday>` (the weekday of next week) to `date_phrase`; both are small and
+            bounded.
+            *(2026-10-02, same run)* Both added, in and out of braces: `next friday` is that day
+            of next week (weeks start Monday); `march 30` / `30 march` / `Dec 25th` / `sept 1` is
+            the next such date, today included, looking ahead at most 8 years so `feb 29` finds
+            the next leap day and `feb 30` stays title text. 14 parser tests.
+      - [x] *(2026-10-02)* **Inbox and Upcoming** (decision 11), as two more views of the Board
+            page. `TaskRepository::assigned_open(member, limit)` reads a member's open cards on
+            **every** board (any scope but `session`), undated first, then by date, priority, id,
+            with `blocked` derived through bounded `IN (…)` status lookups (256 ids a statement —
+            dependencies are scope-local, but loading each board whole would cost up to 10 000
+            rows a board). Bound `ASSIGNED_CARDS_MAX` = 1 000. IPC `task.assigned {member_id?
+            (default the human), limit?}` → `{cards, today}`; `today` is the store's UTC day, so
+            the client splits on the store's clock: Inbox = no date or date ≤ today, Upcoming =
+            later, grouped by day. Each entry names its board. Any `board-event` refreshes them
+            (they span boards). The card chip is now `BoardCardChip.vue`, shared by all three
+            views. Tests: store `a_members_open_cards_are_read_across_every_board`, control
+            plane `a_members_cards_are_read_across_boards_over_ipc`, 2 vitest.
+      - [x] *(2026-10-02)* **Members, and editing a card.** A fourth view, *Members*
+            (`BoardMembers.vue`): the board's roster with kind (human / agent / your agent /
+            router) and busy state; *Add an agent* (name, models best-first →
+            `profile.model_priority`, capabilities → `profile.capabilities`, notes for the router,
+            "personal — follows you to every board"); edit an agent's name and profile, or the
+            router's model list; remove an agent. Writes go through new commands `create_member`,
+            `update_member`, `delete_member` and re-read on `members-changed`. The profile form
+            owns three keys and keeps every other one (`profileFromForm` merges; an emptied field
+            is removed, lists are trimmed, de-duplicated and bounded at `PROFILE_LIST_MAX` = 32).
+            The card view now edits priority, date, deadline and labels in place; a closed card's
+            fields are read-only. Daemon: in a `task.update` patch an **empty string clears**
+            `due_at`/`deadline_at` (`null` still skips, as for every field) — there was no way to
+            remove a date. Tests: 4 vitest, control plane
+            `an_empty_date_in_a_patch_clears_it_and_null_skips_it`.
+      - [x] *(2026-10-02)* **The card view explains where a card sits.** *Part of #N* (its
+            parent), *Waiting on* (each dependency with its assignee, struck through once
+            closed — so a card in the Waiting column leads straight to the clarification that
+            holds it), its sub-cards (`open/total`) and an *Add a sub-card* line with the
+            quick-add tokens: `task.quick_add` takes `parent_id` and puts the card on the
+            parent's board whatever `scope` says (a session parent is refused). The description
+            is editable; in a patch an empty string now clears `description` as it does the
+            dates. Tests: control plane `a_quick_add_line_with_a_parent_becomes_its_sub_card`,
+            the Playwright board spec adds a sub-card; checked live.
+      - [x] *(2026-10-02)* **Run controls and markdown posts.** An agent's card shows *Start
+            now* (open, unblocked, its date come — start instead of waiting for the member's
+            turn), *Stop* while a run works it (the card pauses with its member — "Stop = stop",
+            nothing restarts it by itself) and *Resume* on a paused card; humans' and the
+            router's cards show none (`runActionFor`, 2 vitest). Commands `start_card_run`,
+            `card_run_status`, `stop_card_run` over the existing `task.start_run/run_status/
+            cancel_run {card_id}`. Thread posts render as markdown through the sanitizing
+            `renderMarkdown` (verdicts quote commands and output). Playwright: start → stop →
+            resume on the mock; live: a markdown post rendered, `card_run_status` answered.
+            **Not verified live:** a real run start/stop — this host has no model to run one
+            (see *No embedder on this host*).
+      - [ ] **The Board view is only addressable while its workspace is active.**
+            `task.list/quick_add` resolve `workspace` scope to the daemon's *active* workspace, so
+            the board shows the workspace the top bar selected and nothing else. Fine while the
+            top bar drives it; a second window or a link to another board needs `scope_id` on
+            these verbs. (Inbox/Upcoming did not need it — `task.assigned` is cross-board.)
 - [ ] Delete: session table + `SessionManager`, `ChatAction::*`, `chat_harness.rs` continuation
       loop, empty-bubble gating, per-session pinned model, GUI chat pages and commands, channel
       adapters + `channel_secrets` + per-channel pinned models, `scheduler.target_channel/
@@ -9225,6 +9352,25 @@ keep the phases readable; promote individual items into a phase when they become
         docs this run), so the practical workaround — and what the doctor's remedy says — is to
         re-mint rather than to rely on refresh.
 
+### `project_structure`'s budget cut depends on readdir order (found 2026-10-02)
+
+- [x] **Which entries survive a budgeted listing is the filesystem's choice, not the tool's.**
+      `default-skills/project_structure/tool.ts` asks `Nanna.listDir(path, false, budget + 1)`
+      and sorts what comes back, so on a directory larger than the entry budget the *first N in
+      readdir order* are shown — reverse-creation order on tmpfs, creation order on btrfs/ext4.
+      Found when `directories_the_budget_never_reached_are_marked` failed under
+      `TMPDIR=/var/tmp` (btrfs: `aaa_sub/`, created last, was never listed, so it could not be
+      marked "not walked") and passed on `/tmp`. Fix in the bridge, not the test: have
+      `listDir` return a sorted prefix (read the directory's names — cheap — sort, then stat
+      only the first N), so the same tree lists the same way on every host and the test's
+      alphabetical expectation is the product's. Bound stays `MAX_ENTRIES`.
+      *(2026-10-02, same run)* Fixed in `NannaBridge::list_dir`: a capped flat listing reads names
+      only (bounded by `LIST_DIR_NAME_SCAN_MAX` = 2^18, ~8 MiB), sorts them, keeps the first
+      `cap` and `lstat`s just those. Past 2^18 names the prefix is chosen among the first 2^18
+      the filesystem returned — stated in the doc, not hidden. Test
+      `a_bounded_flat_listing_keeps_the_first_names_on_every_filesystem` (alphabetically-first
+      entry created last); the `project_structure` suite now passes on btrfs and tmpfs alike.
+
 ### The workspace is not rustfmt-formatted, and nothing checks (found 2026-09-24)
 
 - [ ] **`cargo fmt --check` reports 3407 hunks across 212 files on a clean `origin/master`**, and
@@ -9906,9 +10052,14 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            removed on purpose rather than passing forever. **Verified it catches the real
            regression**: re-running `cargo update -p malachite-bigint` makes it report
            `resolved to 2 versions ["0.9.2", "0.10.0"]` plus the pin-back command.
-     - [ ] Drop the `malachite-bigint` lock pin once `rustpython-codegen` accepts 0.10.
+     - [x] Drop the `malachite-bigint` lock pin once `rustpython-codegen` accepts 0.10.
            *(re-checked 2026-08-27: `rustpython-{codegen,stdlib}` still 0.5.0 and `pymath` still
            0.2.0 — unchanged since 2026-08-25, so the pin stays.)*
+           *(2026-10-02)* **Dropped.** `rustpython 0.6.0` is out and every one of its paths
+           resolves `malachite-bigint 0.12.0`, the version `pymath` takes too — one copy in the
+           graph with no pin. The `=0.9.2` req in `nanna-scripting` is deleted; the
+           unification guard stays (it now keeps 0.12.0) because the split returns the day
+           malachite publishes a 0.13 that `pymath`'s `"0"` req accepts.
      - [ ] `criterion 0.8 → "0.7"`: `cargo upgrade --incompatible` reports this every run and it is a
            **downgrade** — 0.8.2 is what resolves and builds. Do not take it.
      - [ ] `lopdf 0.45 → "0.42"`: **same trap, first seen 2026-09-09.** `cargo upgrade
@@ -9984,8 +10135,11 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            condition that retires the pin. Verified it fires: re-running
            `cargo update -p libc --precise 0.2.189` makes it report
            `libc resolved to 0.2.189 but must stay at or below 0.2.186`. Runs in 0.00s.
-     - [ ] Drop the `libc` ceiling the moment rustpython publishes anything after 0.5.0 — the fix is
+     - [x] Drop the `libc` ceiling the moment rustpython publishes anything after 0.5.0 — the fix is
            already upstream, so this is a release-watch, not a migration.
+           *(2026-10-02)* **Lifted.** rustpython 0.6.0 compiles against `libc 0.2.189` (the
+           `nanna-scripting --all-features` check, the workspace tests and `cargo build --release -p
+           nanna-daemon` are green); `CEILING_CRATES` is empty, the mechanism kept.
    - *(2026-07-16 sweep)* `cargo update` → 12 compatible bumps (`tokio 1.52.4`, `uuid 1.24.0`,
      `keyring 4.1.5`, `regex 1.13.1`, `clap 4.6.2`, `syn 2.0.119`, `bitflags 2.13.1`, `bstr 1.13.0`,
      `regex-automata 0.4.16`, `simd-adler32 0.3.10`, `which 8.0.5`). `cargo upgrade --incompatible` →
@@ -10090,7 +10244,8 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      errors about `malachite_bigint::BigUint`/`BigInt` ("there are multiple different versions of crate
      `malachite_bigint`"). Pinned back with
      `cargo update -p malachite-bigint@0.10.0 --precise 0.9.2`.
-     - [ ] Drop that pin when `rustpython 0.6` (or any release that moves to malachite 0.10) lands.
+     - [x] Drop that pin when `rustpython 0.6` (or any release that moves to malachite 0.10) lands.
+           *(2026-10-02 — dropped; see the `malachite-bigint` item above.)*
      **Verification:** workspace (excl. `nanna-gui`) builds green, **1555 tests pass / 0 failures**,
      `cargo clippy -p nanna-memory --all-targets` **0 errors**, and — closing the gate hole logged
      below — a **`cargo build --release -p nanna-daemon` was run and is green** on the pinned
@@ -10326,6 +10481,29 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            **(b) A slow run cannot be cut short safely**, because killing a `cargo` mid-flight
            risks corrupting the shared target dir. It has to be waited out.
            Fix: stagger the schedules, or have each routine take a shared cross-repo lock and defer.
+   - *(2026-10-02, toolchain)* **Pin moved `nightly-2026-09-28 → nightly-2026-10-02`** (rustc
+     1.101.0-nightly c36f14571). Cold `cargo build --release -p nanna-daemon` 9m43s, green; two
+     lints newly fire on old code and were fixed on both channels — `items_after_test_module`
+     (`nanna-storage/src/lib.rs` had ~1 000 lines of items after its test module; the module moved
+     to the end, a pure move) and `needless_borrows_for_generic_args` (`.map(&string_vec)` on a
+     capture-free closure). Full gate under it: clippy 0/0 (workspace and `nanna-gui`), **2 789
+     tests passed, 0 failed**. CI mirrors (`budget-gate`, `release-check`, `test-compile`) moved
+     with it.
+   - *(2026-10-02 sweep)* **`rustpython 0.5 → 0.6` (vm/stdlib/pylib), and both of its pins retire.**
+     `cargo upgrade --incompatible` offered it (plus `rten 0.26 → 0.27`, refused: `ocrs 0.13.1`
+     still requires `rten 0.26`, the unification guard's case). 0.6 compiled with **no source
+     change** (`nanna-scripting --all-features --all-targets` check, 50 s), resolves every path to
+     `malachite-bigint 0.12.0` and builds against `libc 0.2.189`, so the `=0.9.2` manifest pin and
+     the libc ceiling are deleted (see the items above) — the first sweep since 2026-08-22 with no
+     pin-back step. `cargo update` otherwise: `cfg-expr 0.20.10`, `libc 0.2.189`. GUI: Tauri npm
+     packages to the patch level the Rust crates already had (`@tauri-apps/api`/`cli` 2.12.1,
+     `plugin-dialog` 2.8.1, `plugin-notification` 2.5.1, `plugin-updater` 2.13.1) and `vue-tsc
+     3.3.12`; `typescript 7.0.2` still declined (blocked, above). Gate: clippy `-D warnings` green,
+     `cargo build --release -p nanna-daemon` green (10 min — the build that used to catch the
+     malachite split), typecheck 0 errors, 403/403 vitest. The workspace test run surfaced one
+     real flake, fixed: `a_card_runs_question_becomes_a_clarification_card` polled for the
+     card's new dependency, but `ask_on_card` writes it *before* posting the question, so a poll
+     between the two writes failed; it now waits for both.
    - *(2026-09-17 sweep)* `cargo update` -> 19 compatible bumps (`aegis 0.9.16`, `syn 3.0.6`,
      `unicode-ident 1.0.26`, `rustix 1.1.5`, `zlib-rs 0.6.8`, `derive-where 1.7.0`, ...; `synstructure`
      dropped out of the tree). `cargo upgrade --incompatible` offered **one real row** -
