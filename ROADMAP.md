@@ -8314,7 +8314,10 @@ as its turn (`TurnAdmission`, scope default `session`).
             the board re-reads its own scope's cards, coalesced to one read per 250 ms burst.
             New commands `quick_add_card`, `get_card`, `post_on_card`, `list_members`. The
             arrangement rules live in `app/lib/board.ts` with 15 unit tests.
-            **Not yet:** label/due/priority filters, member profile *threads* (decision 15's
+            *(later the same day)* Filters: assignee, label (the board's own, listed once
+            each), priority, and dates (startable now / deferred / overdue / no deadline), with a
+            Clear; `applyFilters` in `lib/board.ts`, 4 vitest, checked live.
+            **Not yet:** member profile *threads* (decision 15's
             capability changes post there), and the Figma `Board` page's visual pass (the Figma
             connector was unauthenticated this run; built on the `nui` tokens instead).
       - [ ] *(research 2026-10-02)* **Todoist's own tokens are not decision 1's — owner call

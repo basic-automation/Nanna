@@ -4,6 +4,11 @@ import {
   boardLabel,
   splitAssigned,
   splitList,
+  applyFilters,
+  boardLabels,
+  filtering,
+  NO_FILTERS,
+  type BoardFilters,
   formFromProfile,
   profileFromForm,
   PROFILE_LIST_MAX,
@@ -217,5 +222,40 @@ describe('member profiles', () => {
   it('reads a missing or malformed profile as an empty form', () => {
     expect(formFromProfile(null)).toEqual({ models: '', capabilities: '', notes: '' })
     expect(formFromProfile({ model_priority: 'not a list', notes: 3 })).toEqual({ models: '', capabilities: '', notes: '' })
+  })
+})
+
+describe('board filters', () => {
+  const today = '2026-10-07'
+  const cards = [
+    card({ id: 1, assignee: 'human', labels: ['Rust'], priority: 1, deadline_at: '2026-10-01' }),
+    card({ id: 2, assignee: 'agent:builder', labels: ['docs'], due_at: '2026-10-20' }),
+    card({ id: 3, labels: ['rust', 'docs'], priority: 1 }),
+  ]
+  const ids = (filters: Partial<BoardFilters>) =>
+    applyFilters(cards, { ...NO_FILTERS, ...filters }, today).map(c => c.id)
+
+  it('passes everything with no filter set', () => {
+    expect(ids({})).toEqual([1, 2, 3])
+    expect(filtering({ ...NO_FILTERS })).toBe(false)
+    expect(filtering({ ...NO_FILTERS, label: 'x' })).toBe(true)
+  })
+
+  it('narrows by each field, and they combine', () => {
+    expect(ids({ assignee: 'human' })).toEqual([1])
+    expect(ids({ label: 'RUST' })).toEqual([1, 3])
+    expect(ids({ priority: '1' })).toEqual([1, 3])
+    expect(ids({ label: 'docs', priority: '1' })).toEqual([3])
+  })
+
+  it('date filters read the deadline for overdue and the date for deferral', () => {
+    expect(ids({ date: 'overdue' })).toEqual([1])
+    expect(ids({ date: 'deferred' })).toEqual([2])
+    expect(ids({ date: 'startable' })).toEqual([1, 3])
+    expect(ids({ date: 'no_deadline' })).toEqual([2, 3])
+  })
+
+  it('lists the board\'s labels once each, sorted', () => {
+    expect(boardLabels(cards)).toEqual(['docs', 'Rust'])
   })
 })

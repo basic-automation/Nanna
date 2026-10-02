@@ -293,3 +293,48 @@ export function profileFromForm(form: ProfileForm, existing: unknown = {}): Reco
   set('notes', notes, notes === '')
   return base
 }
+
+/** The board's filters; an empty string means "any". */
+export interface BoardFilters {
+  assignee: string
+  label: string
+  /** '1'..'4' or ''. */
+  priority: string
+  /** '' | 'overdue' | 'startable' (no date or date ≤ today) | 'deferred' | 'no_deadline'. */
+  date: '' | 'overdue' | 'startable' | 'deferred' | 'no_deadline'
+}
+
+export const NO_FILTERS: Readonly<BoardFilters> = { assignee: '', label: '', priority: '', date: '' }
+
+/** Whether any filter narrows the board. */
+export function filtering(filters: BoardFilters): boolean {
+  return Object.values(filters).some(value => value !== '')
+}
+
+/** Cards that pass every set filter. Labels compare case-insensitively. */
+export function applyFilters(cards: readonly BoardCard[], filters: BoardFilters, today: string): BoardCard[] {
+  const label = filters.label.toLowerCase()
+  return cards.filter((card) => {
+    if (filters.assignee && card.assignee !== filters.assignee) return false
+    if (label && !card.labels.some(l => l.toLowerCase() === label)) return false
+    if (filters.priority && card.priority !== Number(filters.priority)) return false
+    switch (filters.date) {
+      case 'overdue': return isOverdue(card, today)
+      case 'startable': return !isDeferred(card, today)
+      case 'deferred': return isDeferred(card, today)
+      case 'no_deadline': return dayOf(card.deadline_at) === null
+      default: return true
+    }
+  })
+}
+
+/** Every label on the board, once each (first spelling), sorted. */
+export function boardLabels(cards: readonly BoardCard[]): string[] {
+  const seen = new Map<string, string>()
+  for (const card of cards) {
+    for (const label of card.labels) {
+      if (!seen.has(label.toLowerCase())) seen.set(label.toLowerCase(), label)
+    }
+  }
+  return [...seen.values()].sort((a, b) => a.localeCompare(b))
+}

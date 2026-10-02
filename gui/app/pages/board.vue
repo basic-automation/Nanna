@@ -21,19 +21,38 @@
           <span class="text-nui-muted">{{ VIEW_SUBTITLE[view] ?? boardName }}</span>
         </h1>
         <span class="min-w-0 flex-1" />
-        <label v-if="view === 'board'" class="flex items-center gap-2 text-xs text-nui-muted">
-          <span>Assignee</span>
-          <select
-            v-model="assigneeFilter"
-            data-testid="board-assignee-filter"
-            class="rounded-lg border border-white/10 bg-nui-bg px-2 py-1 text-xs text-nui-fg outline-none [color-scheme:dark] focus:ring-1 focus:ring-nui-accent"
-          >
-            <option value="">Everyone</option>
+        <template v-if="view === 'board'">
+          <select v-model="filters.assignee" data-testid="board-assignee-filter" :class="FILTER" aria-label="Assignee">
+            <option value="">Anyone</option>
             <option v-for="member in assignableMembers" :key="member.id" :value="member.id">
               {{ member.name }}
             </option>
           </select>
-        </label>
+          <select v-model="filters.label" data-testid="board-label-filter" :class="FILTER" aria-label="Label">
+            <option value="">Any label</option>
+            <option v-for="label in labels" :key="label" :value="label">#{{ label }}</option>
+          </select>
+          <select v-model="filters.priority" data-testid="board-priority-filter" :class="FILTER" aria-label="Priority">
+            <option value="">Any priority</option>
+            <option v-for="p in ['1', '2', '3', '4']" :key="p" :value="p">p{{ p }}</option>
+          </select>
+          <select v-model="filters.date" data-testid="board-date-filter" :class="FILTER" aria-label="Dates">
+            <option value="">Any date</option>
+            <option value="startable">Startable now</option>
+            <option value="deferred">Deferred</option>
+            <option value="overdue">Overdue</option>
+            <option value="no_deadline">No deadline</option>
+          </select>
+          <button
+            v-if="filtering(filters)"
+            type="button"
+            class="text-xs text-nui-muted hover:text-nui-fg"
+            data-testid="board-clear-filters"
+            @click="Object.assign(filters, NO_FILTERS)"
+          >
+            Clear
+          </button>
+        </template>
         <button
           v-if="view === 'board'"
           type="button"
@@ -338,9 +357,9 @@ import { computed, inject, onMounted, onUnmounted, reactive, ref, watch, type Re
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
-  arrangeColumns, assignable, boardLabel, childCounts, columnOf, dayOf, eventIsForBoard,
+  applyFilters, arrangeColumns, assignable, boardLabel, boardLabels, childCounts, filtering, NO_FILTERS, columnOf, dayOf, eventIsForBoard,
   isDeferred, isOverdue, memberName, postKindLabel, splitAssigned, splitList, todayUtc,
-  type BoardCard, type BoardMember, type CardPost,
+  type BoardCard, type BoardFilters, type BoardMember, type CardPost,
 } from '~/lib/board'
 
 interface WorkspaceInfo { id: string, name: string, path: string }
@@ -373,13 +392,13 @@ const roster = ref<BoardMember[]>([])
 const loading = ref(false)
 const loadError = ref('')
 const nested = ref(true)
-const assigneeFilter = ref('')
+const filters = reactive<BoardFilters>({ ...NO_FILTERS })
+const FILTER = 'rounded-lg border border-white/10 bg-nui-bg px-2 py-1 text-xs text-nui-fg outline-none [color-scheme:dark] focus:ring-1 focus:ring-nui-accent'
 const today = ref(todayUtc())
 
 const assignableMembers = computed(() => assignable(roster.value))
-const filtered = computed(() => assigneeFilter.value
-  ? cards.value.filter(card => card.assignee === assigneeFilter.value)
-  : cards.value)
+const filtered = computed(() => applyFilters(cards.value, filters, today.value))
+const labels = computed(() => boardLabels(cards.value))
 const columns = computed(() => arrangeColumns(filtered.value, nested.value))
 const children = computed(() => childCounts(cards.value))
 
@@ -617,7 +636,7 @@ function scheduleRefresh() {
 
 watch(board, () => {
   selectedId.value = null
-  assigneeFilter.value = ''
+  Object.assign(filters, NO_FILTERS)
   void loadCards()
   void loadRoster()
 })
