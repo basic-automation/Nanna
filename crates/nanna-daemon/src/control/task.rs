@@ -392,8 +392,8 @@ impl ControlPlane {
             labels: patch
                 .get("labels")
                 .filter(|v| v.is_array())
-                .map(&string_vec),
-            tool_scope: patch.get("tools").filter(|v| v.is_array()).map(&string_vec),
+                .map(string_vec),
+            tool_scope: patch.get("tools").filter(|v| v.is_array()).map(string_vec),
             // `null` skips a field like everywhere else in a patch, so an
             // empty string is how a client clears a date or a description
             // (the board's inputs send "" when emptied).

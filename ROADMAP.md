@@ -10472,6 +10472,14 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            **(b) A slow run cannot be cut short safely**, because killing a `cargo` mid-flight
            risks corrupting the shared target dir. It has to be waited out.
            Fix: stagger the schedules, or have each routine take a shared cross-repo lock and defer.
+   - *(2026-10-02, toolchain)* **Pin moved `nightly-2026-09-28 → nightly-2026-10-02`** (rustc
+     1.101.0-nightly c36f14571). Cold `cargo build --release -p nanna-daemon` 9m43s, green; two
+     lints newly fire on old code and were fixed on both channels — `items_after_test_module`
+     (`nanna-storage/src/lib.rs` had ~1 000 lines of items after its test module; the module moved
+     to the end, a pure move) and `needless_borrows_for_generic_args` (`.map(&string_vec)` on a
+     capture-free closure). Full gate under it: clippy 0/0 (workspace and `nanna-gui`), **2 789
+     tests passed, 0 failed**. CI mirrors (`budget-gate`, `release-check`, `test-compile`) moved
+     with it.
    - *(2026-10-02 sweep)* **`rustpython 0.5 → 0.6` (vm/stdlib/pylib), and both of its pins retire.**
      `cargo upgrade --incompatible` offered it (plus `rten 0.26 → 0.27`, refused: `ocrs 0.13.1`
      still requires `rten 0.26`, the unification guard's case). 0.6 compiled with **no source
