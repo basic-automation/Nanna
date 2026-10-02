@@ -70,3 +70,20 @@ pub async fn list_members(
         .member_list(workspace_id.as_deref())
         .await
 }
+
+/// Every open card assigned to `member_id` (default: the human) across every
+/// board, with the store's `today` — the Inbox and Upcoming lists.
+///
+/// # Errors
+///
+/// Fails as [`quick_add_card`] does.
+#[tauri::command]
+pub async fn list_assigned_cards(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    member_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    backend_handle(&state)
+        .await
+        .task_assigned(member_id.as_deref())
+        .await
+}

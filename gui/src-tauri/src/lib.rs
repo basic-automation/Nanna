@@ -363,6 +363,7 @@ macro_rules! command_handler {
             commands::board::get_card,
             commands::board::post_on_card,
             commands::board::list_members,
+            commands::board::list_assigned_cards,
         ]
     };
 }

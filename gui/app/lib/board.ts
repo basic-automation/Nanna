@@ -184,3 +184,42 @@ export function eventIsForBoard(
 export function postKindLabel(kind: string): string {
   return ({ comment: 'commented', progress: 'progress', question: 'asked', verdict: 'verdict' } as Record<string, string>)[kind] ?? kind
 }
+
+/** One day of the Upcoming list. */
+export interface UpcomingDay {
+  day: string
+  cards: BoardCard[]
+}
+
+/**
+ * Split a member's open cards (from `list_assigned_cards`) into the Inbox —
+ * no date, or a date today or past (P25 decision 11: no date means now) —
+ * and Upcoming, grouped by date ascending. `today` is the store's UTC day,
+ * which the daemon sends with the cards.
+ */
+export function splitAssigned(cards: readonly BoardCard[], today: string): { inbox: BoardCard[], upcoming: UpcomingDay[] } {
+  const inbox: BoardCard[] = []
+  const byDay = new Map<string, BoardCard[]>()
+  for (const card of cards) {
+    const day = dayOf(card.due_at)
+    if (day === null || day <= today) {
+      inbox.push(card)
+      continue
+    }
+    const list = byDay.get(day) ?? []
+    list.push(card)
+    byDay.set(day, list)
+  }
+  inbox.sort(compareOpen)
+  const upcoming = [...byDay.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([day, list]) => ({ day, cards: list.sort(compareOpen) }))
+  return { inbox, upcoming }
+}
+
+/** The board a card is on, by name: its workspace's, else "Global". */
+export function boardLabel(card: BoardCard, workspaces: ReadonlyArray<{ id: string, name: string, path: string }>): string {
+  if (card.scope !== 'workspace') return 'Global'
+  const ws = workspaces.find(w => w.id === card.scope_id)
+  return ws ? (ws.name || ws.path) : (card.scope_id ?? 'Workspace')
+}

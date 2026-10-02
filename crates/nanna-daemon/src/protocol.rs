@@ -222,6 +222,17 @@ pub enum TaskAction {    /// List tasks in a scope
         #[serde(default)]
         scope: Option<String>,
     },
+    /// Every open board card assigned to `member_id` (default: the human),
+    /// across every board — the read behind Inbox and Upcoming (P25 decision
+    /// 11). The reply is `{cards, today}`, `today` being the store's UTC day,
+    /// so a client splits "date today or past, or none" from "later" on the
+    /// same clock the store uses.
+    Assigned {
+        #[serde(default)]
+        member_id: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     /// Partial update (status accepts `pending|in_progress|cancelled`)
     Update {
         id: i64,

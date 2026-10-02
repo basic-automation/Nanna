@@ -8314,7 +8314,7 @@ as its turn (`TurnAdmission`, scope default `session`).
             the board re-reads its own scope's cards, coalesced to one read per 250 ms burst.
             New commands `quick_add_card`, `get_card`, `post_on_card`, `list_members`. The
             arrangement rules live in `app/lib/board.ts` with 15 unit tests.
-            **Not yet:** Inbox / Upcoming, label/due/priority filters, editing a card's other
+            **Not yet:** label/due/priority filters, editing a card's other
             fields, member profile pages, and the Figma `Board` page's visual pass (the Figma
             connector was unauthenticated this run; built on the `nui` tokens instead).
       - [ ] *(research 2026-10-02)* **Todoist's own tokens are not decision 1's — owner call
@@ -8326,17 +8326,34 @@ as its turn (`TurnAdmission`, scope default `session`).
             no projects, so `#` is free) or accept `+member`/`%label` as aliases so a Todoist
             user's muscle memory works — aliases cost nothing in the parser. Do not silently
             change decision 1.
-      - [ ] *(research 2026-10-02)* **Brace deadlines take any date phrase in Todoist** —
+      - [x] *(research 2026-10-02)* **Brace deadlines take any date phrase in Todoist** —
             `{march 30}`, `{next friday}`
             ([deadlines](https://www.todoist.com/help/articles/introduction-to-deadlines-uMqbSLM6U)).
             Ours refuses both (month names and `next <weekday>` are not phrases yet), with a
             message naming what works. Add `<month> <day>` (next occurrence, this year or next)
             and `next <weekday>` (the weekday of next week) to `date_phrase`; both are small and
             bounded.
-      - [ ] **A board is only addressable while its workspace is active.** `task.list/quick_add`
-            resolve `workspace` scope to the daemon's *active* workspace, so the board shows the
-            workspace the top bar selected and nothing else. Inbox/Upcoming read across every
-            workspace, so they need `scope_id` on these verbs — add it before building them.
+            *(2026-10-02, same run)* Both added, in and out of braces: `next friday` is that day
+            of next week (weeks start Monday); `march 30` / `30 march` / `Dec 25th` / `sept 1` is
+            the next such date, today included, looking ahead at most 8 years so `feb 29` finds
+            the next leap day and `feb 30` stays title text. 14 parser tests.
+      - [x] *(2026-10-02)* **Inbox and Upcoming** (decision 11), as two more views of the Board
+            page. `TaskRepository::assigned_open(member, limit)` reads a member's open cards on
+            **every** board (any scope but `session`), undated first, then by date, priority, id,
+            with `blocked` derived through bounded `IN (…)` status lookups (256 ids a statement —
+            dependencies are scope-local, but loading each board whole would cost up to 10 000
+            rows a board). Bound `ASSIGNED_CARDS_MAX` = 1 000. IPC `task.assigned {member_id?
+            (default the human), limit?}` → `{cards, today}`; `today` is the store's UTC day, so
+            the client splits on the store's clock: Inbox = no date or date ≤ today, Upcoming =
+            later, grouped by day. Each entry names its board. Any `board-event` refreshes them
+            (they span boards). The card chip is now `BoardCardChip.vue`, shared by all three
+            views. Tests: store `a_members_open_cards_are_read_across_every_board`, control
+            plane `a_members_cards_are_read_across_boards_over_ipc`, 2 vitest.
+      - [ ] **The Board view is only addressable while its workspace is active.**
+            `task.list/quick_add` resolve `workspace` scope to the daemon's *active* workspace, so
+            the board shows the workspace the top bar selected and nothing else. Fine while the
+            top bar drives it; a second window or a link to another board needs `scope_id` on
+            these verbs. (Inbox/Upcoming did not need it — `task.assigned` is cross-board.)
 - [ ] Delete: session table + `SessionManager`, `ChatAction::*`, `chat_harness.rs` continuation
       loop, empty-bubble gating, per-session pinned model, GUI chat pages and commands, channel
       adapters + `channel_secrets` + per-channel pinned models, `scheduler.target_channel/
@@ -9279,7 +9296,7 @@ keep the phases readable; promote individual items into a phase when they become
 
 ### `project_structure`'s budget cut depends on readdir order (found 2026-10-02)
 
-- [ ] **Which entries survive a budgeted listing is the filesystem's choice, not the tool's.**
+- [x] **Which entries survive a budgeted listing is the filesystem's choice, not the tool's.**
       `default-skills/project_structure/tool.ts` asks `Nanna.listDir(path, false, budget + 1)`
       and sorts what comes back, so on a directory larger than the entry budget the *first N in
       readdir order* are shown — reverse-creation order on tmpfs, creation order on btrfs/ext4.
@@ -9289,6 +9306,12 @@ keep the phases readable; promote individual items into a phase when they become
       `listDir` return a sorted prefix (read the directory's names — cheap — sort, then stat
       only the first N), so the same tree lists the same way on every host and the test's
       alphabetical expectation is the product's. Bound stays `MAX_ENTRIES`.
+      *(2026-10-02, same run)* Fixed in `NannaBridge::list_dir`: a capped flat listing reads names
+      only (bounded by `LIST_DIR_NAME_SCAN_MAX` = 2^18, ~8 MiB), sorts them, keeps the first
+      `cap` and `lstat`s just those. Past 2^18 names the prefix is chosen among the first 2^18
+      the filesystem returned — stated in the doc, not hidden. Test
+      `a_bounded_flat_listing_keeps_the_first_names_on_every_filesystem` (alphabetically-first
+      entry created last); the `project_structure` suite now passes on btrfs and tmpfs alike.
 
 ### The workspace is not rustfmt-formatted, and nothing checks (found 2026-09-24)
 

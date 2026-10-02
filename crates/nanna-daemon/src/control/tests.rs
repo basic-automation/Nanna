@@ -2587,3 +2587,42 @@ async fn a_quick_add_line_becomes_a_board_card() {
     let all = storage.tasks().list("global", None, true).await.expect("list");
     assert_eq!(all.len(), 1, "only the good line made a card: {all:?}");
 }
+
+#[tokio::test]
+async fn a_members_cards_are_read_across_boards_over_ipc() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    for (title, scope, scope_id) in [("one", "global", None), ("two", "workspace", Some("ws-a"))] {
+        storage
+            .tasks()
+            .create(nanna_storage::NewTask {
+                title: title.to_string(),
+                scope: scope.to_string(),
+                scope_id: scope_id.map(str::to_string),
+                priority: 3,
+                assignee: Some("human".to_string()),
+                ..nanna_storage::NewTask::default()
+            })
+            .await
+            .expect("card");
+    }
+    let mine = ask(serde_json::json!({ "type": "task", "action": "assigned" })).await;
+    assert_eq!(mine["member_id"], "human", "the human by default: {mine}");
+    assert_eq!(mine["cards"].as_array().map(Vec::len), Some(2), "both boards: {mine}");
+    assert_eq!(
+        mine["today"].as_str().map(str::len),
+        Some(10),
+        "the store's day comes with it: {mine}"
+    );
+    let refused = ask(serde_json::json!({ "type": "task", "action": "assigned", "limit": 0 })).await;
+    assert_eq!(refused["error"], "bad_limit", "{refused}");
+}

@@ -3,12 +3,25 @@
     <!-- ═══ Board ═══ -->
     <section class="flex min-h-0 min-w-0 flex-1 flex-col gap-4">
       <header class="flex shrink-0 flex-wrap items-center gap-4">
+        <nav class="flex items-center gap-1" aria-label="Board views">
+          <button
+            v-for="tab in VIEWS"
+            :key="tab.id"
+            type="button"
+            class="rounded-lg px-3 py-1 text-xs"
+            :class="view === tab.id ? 'bg-nui-accent text-nui-fg' : 'text-nui-muted hover:bg-white/5'"
+            :data-testid="`board-view-${tab.id}`"
+            :aria-pressed="view === tab.id"
+            @click="view = tab.id"
+          >
+            {{ tab.label }}<span v-if="tab.id !== 'board'" class="ml-1 opacity-70">{{ tab.id === 'inbox' ? split.inbox.length : upcomingCount }}</span>
+          </button>
+        </nav>
         <h1 class="text-sm font-semibold text-nui-fg">
-          Board
-          <span class="text-nui-muted">{{ ' ' + boardName }}</span>
+          <span class="text-nui-muted">{{ view === 'board' ? boardName : view === 'inbox' ? '— assigned to you, startable now' : '— assigned to you, by date' }}</span>
         </h1>
         <span class="min-w-0 flex-1" />
-        <label class="flex items-center gap-2 text-xs text-nui-muted">
+        <label v-if="view === 'board'" class="flex items-center gap-2 text-xs text-nui-muted">
           <span>Assignee</span>
           <select
             v-model="assigneeFilter"
@@ -22,6 +35,7 @@
           </select>
         </label>
         <button
+          v-if="view === 'board'"
           type="button"
           data-testid="board-nested-toggle"
           class="rounded-lg bg-white/5 px-3 py-1 text-xs text-nui-fg hover:bg-white/10"
@@ -60,8 +74,47 @@
 
       <p v-if="loadError" class="text-xs text-nui-pink">{{ loadError }}</p>
 
+      <!-- Inbox / Upcoming: one member's cards across every board (decision 11) -->
+      <div
+        v-if="view !== 'board'"
+        class="nui-scroll flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto"
+        :data-testid="`board-${view}`"
+      >
+        <template v-if="view === 'inbox'">
+          <div class="flex max-w-3xl flex-col gap-2">
+            <BoardCardChip
+              v-for="card in split.inbox"
+              :key="card.id"
+              :card="card"
+              :roster="roster"
+              :today="assignedToday"
+              :selected="selectedId === card.id"
+              :board-name="boardLabel(card, workspaces)"
+              @select="selectCard"
+            />
+          </div>
+          <p v-if="split.inbox.length === 0" class="text-xs text-nui-muted">Nothing assigned to you is startable now.</p>
+        </template>
+        <template v-else>
+          <section v-for="group in split.upcoming" :key="group.day" class="flex max-w-3xl flex-col gap-2">
+            <p class="text-xs font-semibold text-nui-fg">{{ group.day }}</p>
+            <BoardCardChip
+              v-for="card in group.cards"
+              :key="card.id"
+              :card="card"
+              :roster="roster"
+              :today="assignedToday"
+              :selected="selectedId === card.id"
+              :board-name="boardLabel(card, workspaces)"
+              @select="selectCard"
+            />
+          </section>
+          <p v-if="split.upcoming.length === 0" class="text-xs text-nui-muted">Nothing assigned to you is dated later.</p>
+        </template>
+      </div>
+
       <!-- Columns -->
-      <div class="nui-scroll grid min-h-0 flex-1 grid-cols-4 gap-4 overflow-x-auto" data-testid="board-columns">
+      <div v-else class="nui-scroll grid min-h-0 flex-1 grid-cols-4 gap-4 overflow-x-auto" data-testid="board-columns">
         <div
           v-for="column in columns"
           :key="column.id"
@@ -73,53 +126,16 @@
             <span>{{ column.cards.length }}</span>
           </p>
           <div class="nui-scroll flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto">
-            <button
+            <BoardCardChip
               v-for="card in column.cards"
               :key="card.id"
-              type="button"
-              class="flex w-full flex-col gap-2 rounded-lg bg-white/5 p-3 text-left hover:bg-white/10"
-              :class="selectedId === card.id && 'ring-1 ring-nui-accent'"
-              :data-testid="`board-card-${card.id}`"
-              @click="selectCard(card.id)"
-            >
-              <div class="flex items-start gap-2">
-                <span
-                  class="mt-0.5 shrink-0 text-xs font-semibold"
-                  :class="priorityClass(card.priority)"
-                  :title="`Priority ${card.priority}`"
-                >p{{ card.priority }}</span>
-                <span
-                  class="min-w-0 flex-1 break-words text-xs text-nui-fg"
-                  :class="card.status === 'cancelled' && 'line-through text-nui-muted'"
-                >{{ card.title }}</span>
-              </div>
-              <div v-if="card.labels.length" class="flex flex-wrap gap-1">
-                <span
-                  v-for="label in card.labels"
-                  :key="label"
-                  class="rounded bg-nui-info/15 px-1.5 text-[11px] text-nui-info"
-                >#{{ label }}</span>
-              </div>
-              <div class="flex flex-wrap items-center gap-2 text-[11px] text-nui-muted">
-                <span class="flex items-center gap-1">
-                  <span
-                    class="flex size-5 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold text-nui-bg"
-                    :class="avatarClass(card.assignee)"
-                  >{{ initials(memberName(card.assignee, roster)) }}</span>
-                  <span>{{ memberName(card.assignee, roster) }}</span>
-                  <span v-if="isBusy(card)" class="text-nui-green" title="Working on it">●</span>
-                </span>
-                <span v-if="dayOf(card.due_at)" :class="isDeferred(card, today) && 'text-nui-yellow'" title="Date">
-                  {{ dayOf(card.due_at) }}
-                </span>
-                <span v-if="dayOf(card.deadline_at)" :class="isOverdue(card, today) ? 'text-nui-pink' : ''" title="Deadline">
-                  ⚑ {{ dayOf(card.deadline_at) }}
-                </span>
-                <span v-if="nested && children.get(card.id)" title="Open / all sub-cards">
-                  ↳ {{ children.get(card.id)?.open }}/{{ children.get(card.id)?.total }}
-                </span>
-              </div>
-            </button>
+              :card="card"
+              :roster="roster"
+              :today="today"
+              :selected="selectedId === card.id"
+              :children="nested ? children.get(card.id) : undefined"
+              @select="selectCard"
+            />
             <p v-if="column.cards.length === 0" class="px-2 py-4 text-center text-xs text-nui-muted">
               {{ column.id === 'todo' && cards.length === 0 && !loading ? 'No cards yet — add one above' : 'Nothing here' }}
             </p>
@@ -233,8 +249,8 @@ import { computed, inject, onMounted, onUnmounted, ref, watch, type Ref } from '
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
-  arrangeColumns, assignable, childCounts, columnOf, dayOf, eventIsForBoard, initials,
-  isDeferred, isOverdue, memberName, postKindLabel, todayUtc, ROUTER_PREFIX,
+  arrangeColumns, assignable, boardLabel, childCounts, columnOf, dayOf, eventIsForBoard,
+  isDeferred, isOverdue, memberName, postKindLabel, splitAssigned, todayUtc,
   type BoardCard, type BoardMember, type CardPost,
 } from '~/lib/board'
 
@@ -249,6 +265,14 @@ const board = computed(() => activeWorkspace.value
 const boardName = computed(() => activeWorkspace.value
   ? `— ${activeWorkspace.value.name || activeWorkspace.value.path}`
   : '— Global')
+
+type View = 'board' | 'inbox' | 'upcoming'
+const VIEWS: ReadonlyArray<{ id: View, label: string }> = [
+  { id: 'board', label: 'Board' },
+  { id: 'inbox', label: 'Inbox' },
+  { id: 'upcoming', label: 'Upcoming' },
+]
+const view = ref<View>('board')
 
 const cards = ref<BoardCard[]>([])
 const roster = ref<BoardMember[]>([])
@@ -288,6 +312,32 @@ async function loadCards() {
   }
 }
 
+// ═══ Inbox / Upcoming ═══
+const assigned = ref<BoardCard[]>([])
+const assignedToday = ref(todayUtc())
+const workspaces = ref<WorkspaceInfo[]>([])
+const split = computed(() => splitAssigned(assigned.value, assignedToday.value))
+const upcomingCount = computed(() => split.value.upcoming.reduce((n, day) => n + day.cards.length, 0))
+
+async function loadAssigned() {
+  try {
+    const reply = await invoke<{ cards?: BoardCard[], today?: string }>('list_assigned_cards', { memberId: null })
+    if (refusal(reply)) return
+    assigned.value = reply.cards ?? []
+    if (reply.today) assignedToday.value = reply.today
+  } catch (e) {
+    console.error('Failed to load assigned cards:', e)
+  }
+}
+
+async function loadWorkspaces() {
+  try {
+    workspaces.value = await invoke<WorkspaceInfo[]>('list_workspaces')
+  } catch (e) {
+    console.error('Failed to load workspaces:', e)
+  }
+}
+
 async function loadRoster() {
   try {
     const reply = await invoke<{ members?: BoardMember[] }>('list_members', {
@@ -297,17 +347,6 @@ async function loadRoster() {
   } catch (e) {
     console.error('Failed to load the board roster:', e)
   }
-}
-
-function priorityClass(priority: number): string {
-  return ['text-nui-pink', 'text-nui-yellow', 'text-nui-info', 'text-nui-muted'][priority - 1] ?? 'text-nui-muted'
-}
-
-function avatarClass(id: string | null): string {
-  if (!id) return 'bg-nui-muted'
-  if (id === 'human') return 'bg-nui-accent'
-  if (id.startsWith(ROUTER_PREFIX)) return 'bg-nui-yellow'
-  return 'bg-nui-pink'
 }
 
 /** A member is busy on this card: it is in progress and its member works. */
@@ -342,7 +381,7 @@ async function submitQuickAdd() {
       return
     }
     quickAddText.value = ''
-    await loadCards()
+    await Promise.all([loadCards(), loadAssigned()])
   } catch (e) {
     quickAddError.value = String(e)
   } finally {
@@ -414,7 +453,7 @@ async function assign(memberId: string) {
   try {
     const reply = await invoke('update_task', { id, patch: { assignee: memberId } })
     cardMessage.value = refusal(reply) ?? ''
-    await Promise.all([loadCards(), loadCard(id)])
+    await Promise.all([loadCards(), loadAssigned(), loadCard(id)])
   } catch (e) {
     cardMessage.value = String(e)
   } finally {
@@ -430,7 +469,7 @@ async function markDone() {
     const reply = await invoke<{ done?: boolean, verdict?: string }>('complete_task', { id, workdir: null })
     // Done is a verdict (P15): a failed acceptance check leaves the card open.
     cardMessage.value = refusal(reply) ?? (reply.done === false ? `Not done: ${reply.verdict ?? 'the check failed'}` : '')
-    await Promise.all([loadCards(), loadCard(id)])
+    await Promise.all([loadCards(), loadAssigned(), loadCard(id)])
   } catch (e) {
     cardMessage.value = String(e)
   } finally {
@@ -448,6 +487,7 @@ function scheduleRefresh() {
   refreshTimer = setTimeout(() => {
     refreshTimer = null
     void loadCards()
+    void loadAssigned()
     // A member's busy/idle flips with its run, which moves cards but is not
     // itself a roster change — read both.
     void loadRoster()
@@ -462,12 +502,21 @@ watch(board, () => {
   void loadRoster()
 })
 
+watch(view, (next) => {
+  if (next !== 'board') {
+    void loadAssigned()
+    void loadWorkspaces()
+  }
+})
+
 onMounted(async () => {
   void loadCards()
   void loadRoster()
+  void loadAssigned()
   try {
     unlisteners.push(await listen<{ scope?: string, scope_id?: string | null }>('board-event', (event) => {
-      if (eventIsForBoard(event.payload ?? {}, board.value)) scheduleRefresh()
+      // Inbox and Upcoming span every board, so any card change may move them.
+      if (view.value !== 'board' || eventIsForBoard(event.payload ?? {}, board.value)) scheduleRefresh()
     }))
     unlisteners.push(await listen('members-changed', () => { void loadRoster() }))
   } catch (e) {

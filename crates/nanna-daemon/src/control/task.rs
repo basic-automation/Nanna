@@ -81,6 +81,10 @@ impl ControlPlane {
 
             TaskAction::QuickAdd { text, scope } => self.task_quick_add(&repo, &text, scope).await,
 
+            TaskAction::Assigned { member_id, limit } => {
+                Self::task_assigned(&repo, member_id, limit).await
+            }
+
             TaskAction::Update { id, patch } => Self::task_update(&repo, id, &patch).await,
 
             TaskAction::Done { id, workdir } => self.task_done(&repo, id, workdir).await,
@@ -160,6 +164,31 @@ impl ControlPlane {
             } => self.cancel_task_run(scope, session_id).await,
 
             TaskAction::Verdicts { window } => Self::task_verdicts(&repo, window).await,
+        }
+    }
+
+    /// `TaskAction::Assigned`: a member's open cards on every board.
+    async fn task_assigned(
+        repo: &TaskRepository,
+        member_id: Option<String>,
+        limit: Option<usize>,
+    ) -> Value {
+        let limit = limit.unwrap_or(nanna_storage::ASSIGNED_CARDS_MAX);
+        if limit == 0 || limit > nanna_storage::ASSIGNED_CARDS_MAX {
+            return json!({
+                "error": "bad_limit",
+                "message": format!(
+                    "limit must be in 1..={}, got {limit}",
+                    nanna_storage::ASSIGNED_CARDS_MAX
+                ),
+            });
+        }
+        let member_id =
+            member_id.unwrap_or_else(|| nanna_storage::HUMAN_MEMBER_ID.to_string());
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        match repo.assigned_open(&member_id, limit).await {
+            Ok(cards) => json!({ "member_id": member_id, "today": today, "cards": cards }),
+            Err(e) => json!({"error": "task_assigned_failed", "message": e.to_string()}),
         }
     }
 

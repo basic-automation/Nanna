@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   arrangeColumns,
+  boardLabel,
+  splitAssigned,
   assignable,
   childCounts,
   columnOf,
@@ -159,5 +161,32 @@ describe('eventIsForBoard', () => {
     expect(eventIsForBoard({ scope: 'global' }, ws)).toBe(false)
     expect(eventIsForBoard({ scope: 'global', scope_id: null }, global)).toBe(true)
     expect(eventIsForBoard({ scope: 'session', scope_id: 's' }, global)).toBe(false)
+  })
+})
+
+describe('splitAssigned', () => {
+  const today = '2026-10-07'
+
+  it('puts undated and due-today-or-past cards in the inbox, later ones by day', () => {
+    const cards = [
+      card({ id: 1, due_at: '2026-10-09' }),
+      card({ id: 2 }),
+      card({ id: 3, due_at: '2026-10-07T09:00:00Z', priority: 1 }),
+      card({ id: 4, due_at: '2026-10-01' }),
+      card({ id: 5, due_at: '2026-10-08' }),
+      card({ id: 6, due_at: '2026-10-09', priority: 1 }),
+    ]
+    const { inbox, upcoming } = splitAssigned(cards, today)
+    expect(inbox.map(c => c.id)).toEqual([3, 2, 4])
+    expect(upcoming.map(d => d.day)).toEqual(['2026-10-08', '2026-10-09'])
+    expect(upcoming[1]?.cards.map(c => c.id)).toEqual([6, 1])
+  })
+
+  it('names the board a card is on', () => {
+    const workspaces = [{ id: 'ws-1', name: 'Nanna', path: '/src/nanna' }, { id: 'ws-2', name: '', path: '/src/x' }]
+    expect(boardLabel(card({ scope: 'global' }), workspaces)).toBe('Global')
+    expect(boardLabel(card({ scope: 'workspace', scope_id: 'ws-1' }), workspaces)).toBe('Nanna')
+    expect(boardLabel(card({ scope: 'workspace', scope_id: 'ws-2' }), workspaces)).toBe('/src/x')
+    expect(boardLabel(card({ scope: 'workspace', scope_id: 'gone' }), workspaces)).toBe('gone')
   })
 })

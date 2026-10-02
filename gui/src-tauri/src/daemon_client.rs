@@ -1973,6 +1973,20 @@ impl DaemonClient {
         })).await
     }
 
+    /// Every open board card assigned to `member_id` (default: the human),
+    /// on every board — Inbox and Upcoming (`task.assigned`).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn task_assigned(&self, member_id: Option<&str>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "assigned",
+            "member_id": member_id
+        })).await
+    }
+
     /// The roster of one board: `workspace_id` `None` is the global board.
     ///
     /// # Errors

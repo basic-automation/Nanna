@@ -964,6 +964,8 @@ daemon_proxies! {
     task_note(id: i64, content: &str);
     /// One board's roster
     member_list(workspace_id: Option<&str>);
+    /// A member's open cards on every board
+    task_assigned(member_id: Option<&str>);
 }
 
 impl Default for Backend {
