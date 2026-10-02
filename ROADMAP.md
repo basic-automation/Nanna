@@ -9906,9 +9906,14 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            removed on purpose rather than passing forever. **Verified it catches the real
            regression**: re-running `cargo update -p malachite-bigint` makes it report
            `resolved to 2 versions ["0.9.2", "0.10.0"]` plus the pin-back command.
-     - [ ] Drop the `malachite-bigint` lock pin once `rustpython-codegen` accepts 0.10.
+     - [x] Drop the `malachite-bigint` lock pin once `rustpython-codegen` accepts 0.10.
            *(re-checked 2026-08-27: `rustpython-{codegen,stdlib}` still 0.5.0 and `pymath` still
            0.2.0 — unchanged since 2026-08-25, so the pin stays.)*
+           *(2026-10-02)* **Dropped.** `rustpython 0.6.0` is out and every one of its paths
+           resolves `malachite-bigint 0.12.0`, the version `pymath` takes too — one copy in the
+           graph with no pin. The `=0.9.2` req in `nanna-scripting` is deleted; the
+           unification guard stays (it now keeps 0.12.0) because the split returns the day
+           malachite publishes a 0.13 that `pymath`'s `"0"` req accepts.
      - [ ] `criterion 0.8 → "0.7"`: `cargo upgrade --incompatible` reports this every run and it is a
            **downgrade** — 0.8.2 is what resolves and builds. Do not take it.
      - [ ] `lopdf 0.45 → "0.42"`: **same trap, first seen 2026-09-09.** `cargo upgrade
@@ -9984,8 +9989,11 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            condition that retires the pin. Verified it fires: re-running
            `cargo update -p libc --precise 0.2.189` makes it report
            `libc resolved to 0.2.189 but must stay at or below 0.2.186`. Runs in 0.00s.
-     - [ ] Drop the `libc` ceiling the moment rustpython publishes anything after 0.5.0 — the fix is
+     - [x] Drop the `libc` ceiling the moment rustpython publishes anything after 0.5.0 — the fix is
            already upstream, so this is a release-watch, not a migration.
+           *(2026-10-02)* **Lifted.** rustpython 0.6.0 compiles against `libc 0.2.189` (the
+           `nanna-scripting --all-features` check, the workspace tests and `cargo build --release -p
+           nanna-daemon` are green); `CEILING_CRATES` is empty, the mechanism kept.
    - *(2026-07-16 sweep)* `cargo update` → 12 compatible bumps (`tokio 1.52.4`, `uuid 1.24.0`,
      `keyring 4.1.5`, `regex 1.13.1`, `clap 4.6.2`, `syn 2.0.119`, `bitflags 2.13.1`, `bstr 1.13.0`,
      `regex-automata 0.4.16`, `simd-adler32 0.3.10`, `which 8.0.5`). `cargo upgrade --incompatible` →
@@ -10090,7 +10098,8 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      errors about `malachite_bigint::BigUint`/`BigInt` ("there are multiple different versions of crate
      `malachite_bigint`"). Pinned back with
      `cargo update -p malachite-bigint@0.10.0 --precise 0.9.2`.
-     - [ ] Drop that pin when `rustpython 0.6` (or any release that moves to malachite 0.10) lands.
+     - [x] Drop that pin when `rustpython 0.6` (or any release that moves to malachite 0.10) lands.
+           *(2026-10-02 — dropped; see the `malachite-bigint` item above.)*
      **Verification:** workspace (excl. `nanna-gui`) builds green, **1555 tests pass / 0 failures**,
      `cargo clippy -p nanna-memory --all-targets` **0 errors**, and — closing the gate hole logged
      below — a **`cargo build --release -p nanna-daemon` was run and is green** on the pinned
@@ -10326,6 +10335,21 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            **(b) A slow run cannot be cut short safely**, because killing a `cargo` mid-flight
            risks corrupting the shared target dir. It has to be waited out.
            Fix: stagger the schedules, or have each routine take a shared cross-repo lock and defer.
+   - *(2026-10-02 sweep)* **`rustpython 0.5 → 0.6` (vm/stdlib/pylib), and both of its pins retire.**
+     `cargo upgrade --incompatible` offered it (plus `rten 0.26 → 0.27`, refused: `ocrs 0.13.1`
+     still requires `rten 0.26`, the unification guard's case). 0.6 compiled with **no source
+     change** (`nanna-scripting --all-features --all-targets` check, 50 s), resolves every path to
+     `malachite-bigint 0.12.0` and builds against `libc 0.2.189`, so the `=0.9.2` manifest pin and
+     the libc ceiling are deleted (see the items above) — the first sweep since 2026-08-22 with no
+     pin-back step. `cargo update` otherwise: `cfg-expr 0.20.10`, `libc 0.2.189`. GUI: Tauri npm
+     packages to the patch level the Rust crates already had (`@tauri-apps/api`/`cli` 2.12.1,
+     `plugin-dialog` 2.8.1, `plugin-notification` 2.5.1, `plugin-updater` 2.13.1) and `vue-tsc
+     3.3.12`; `typescript 7.0.2` still declined (blocked, above). Gate: clippy `-D warnings` green,
+     `cargo build --release -p nanna-daemon` green (10 min — the build that used to catch the
+     malachite split), typecheck 0 errors, 403/403 vitest. The workspace test run surfaced one
+     real flake, fixed: `a_card_runs_question_becomes_a_clarification_card` polled for the
+     card's new dependency, but `ask_on_card` writes it *before* posting the question, so a poll
+     between the two writes failed; it now waits for both.
    - *(2026-09-17 sweep)* `cargo update` -> 19 compatible bumps (`aegis 0.9.16`, `syn 3.0.6`,
      `unicode-ident 1.0.26`, `rustix 1.1.5`, `zlib-rs 0.6.8`, `derive-where 1.7.0`, ...; `synstructure`
      dropped out of the tree). `cargo upgrade --incompatible` offered **one real row** -

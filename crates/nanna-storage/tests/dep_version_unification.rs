@@ -85,11 +85,12 @@ const UNIFIED_CRATES: &[UnifiedCrate] = &[
         name: "malachite-bigint",
         reason: "`pymath` requires `malachite-bigint = \"0\"` — any 0.x, so a \
                  bare `cargo update` always takes the newest — while `rustpython-common` \
-                 resolves 0.9, and `rustpython-stdlib`, which depends on both, then fails to \
-                 compile with 17 E0277/E0308 errors about `malachite_bigint::{BigInt, \
-                 BigUint}`. The `=0.9.2` req in crates/nanna-scripting/Cargo.toml pins only \
-                 OUR edge and does not constrain `pymath`, so the split recurs every sweep",
-        remedy: Remedy::PinBackTo("0.9.2"),
+                 holds one exact minor, and `rustpython-stdlib`, which depends on both, then \
+                 fails to compile with 17 E0277/E0308 errors about `malachite_bigint::{BigInt, \
+                 BigUint}`. rustpython 0.6 moved every one of its paths to 0.12 (until then a \
+                 `=0.9.2` req in crates/nanna-scripting held 0.9), so the graph agrees today and \
+                 splits again the day malachite publishes a 0.13 that `pymath` takes",
+        remedy: Remedy::PinBackTo("0.12.0"),
     },
     UnifiedCrate {
         name: "rten",
@@ -134,22 +135,12 @@ struct CeilingCrate {
 /// As with `UNIFIED_CRATES`, an entry earns its place by having broken a real
 /// build. A ceiling is a liability — it holds back security fixes — so each one
 /// carries the condition that retires it.
-const CEILING_CRATES: &[CeilingCrate] = &[CeilingCrate {
-    name: "libc",
-    version_max: "0.2.186",
-    reason: "libc 0.2.187 corrected `POSIX_SPAWN_SETSID` from `c_int` to `c_short` on linux-gnu \
-             (glibc really does store spawn flags in a `short`). `rustpython-vm 0.5.0` passes that \
-             constant straight into `nix::spawn::PosixSpawnFlags::from_bits_retain`, which nix \
-             types as `c_int` — E0308 at rustpython-vm-0.5.0/src/stdlib/posix.rs:1812. That kills \
-             the `python` feature, and with it the `nanna` binary, on Linux only. Note \
-             `rustpython-stdlib 0.5.0` requires `libc ^0.2.183`, so the buildable window is the \
-             four releases 0.2.183..=0.2.186 — narrow enough that a bare `cargo update` always \
-             lands outside it",
-    remedy: "cargo update -p libc --precise 0.2.186",
-    lift_when: "rustpython publishes any release after 0.5.0 — the fix is upstream already \
-                (RustPython PR #8343 `Fix building against new libc`, merged 2026-07-22), it has \
-                simply never been released",
-}];
+// Empty since 2026-10-02. Its one entry held `libc` at 0.2.186, because libc
+// 0.2.187 retyped `POSIX_SPAWN_SETSID` and `rustpython-vm 0.5.0` stopped
+// compiling against it (E0308 at `stdlib/posix.rs:1812`, Linux only). rustpython
+// 0.6.0 shipped the upstream fix (RustPython PR #8343), so the ceiling was
+// lifted as its entry said to. The mechanism stays for the next one.
+const CEILING_CRATES: &[CeilingCrate] = &[];
 
 /// Compare two dotted numeric versions positionally.
 ///
