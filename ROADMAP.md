@@ -513,6 +513,15 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
             inside `pop()`), patched in ≥ 0.18.2** — reached only via `tantivy 0.26` under turso's
             exact `=0.7.2` pin, so it moves when turso does. Not reachable in shipped builds: it
             needs unwinding plus `catch_unwind`, and the release profile is `panic = "abort"`.
+      - [ ] *(2026-10-02)* **`node-forge` GHSA-86w9-cpqp-85rv (high) is exempted, not fixed.** No
+            release fixes it (1.4.0 is the latest; the advisory lists no patched version); it
+            comes through `nuxt → listhen`, the dev server's cert helper, which the shipped static
+            bundle never runs. Exempted by id in `gui/package.json` `pnpm.auditConfig.ignoreGhsas`
+            (reasoning in `audit.yml`'s header). **Remove the entry as soon as node-forge ships a
+            fix.** Same night: `devalue 5.9.1 → 5.9.4` (six advisories, three high, through Nuxt's
+            payload serializer) — these were published after the 2026-10-01 merge, so master's
+            gate was red against today's database too. DOMPurify 3.4.16 (one *low*) cannot be
+            taken: `monaco-editor 0.57.0` pins 3.4.15 exactly.
       - [x] *(2026-09-26 — `monaco-editor 0.57.0` vendors DOMPurify 3.4.15; `pnpm audit` reports
             nothing at any level, and the gate is now `--audit-level=moderate`.)*
             **Monaco vendors DOMPurify 3.4.8** (`monaco-editor/esm/vs/base/browser/dompurify/`) —
