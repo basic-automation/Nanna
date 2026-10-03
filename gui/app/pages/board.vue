@@ -480,8 +480,11 @@ function refusal(reply: unknown): string | null {
 async function loadCards() {
   loading.value = true
   try {
+    // The board this page shows, named by id: the daemon's own "active
+    // workspace" is whatever any client last chose.
     const reply = await invoke<{ tasks?: BoardCard[] }>('list_tasks', {
       scope: board.value.scope, sessionId: null, includeClosed: true,
+      workspaceId: board.value.workspaceId,
     })
     const why = refusal(reply)
     loadError.value = why ?? ''
@@ -556,7 +559,9 @@ async function submitQuickAdd() {
   adding.value = true
   quickAddError.value = ''
   try {
-    const reply = await invoke('quick_add_card', { text, scope: board.value.scope })
+    const reply = await invoke('quick_add_card', {
+      text, scope: board.value.scope, workspaceId: board.value.workspaceId,
+    })
     const why = refusal(reply)
     if (why) {
       quickAddError.value = why

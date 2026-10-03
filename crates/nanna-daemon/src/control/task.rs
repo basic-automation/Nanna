@@ -52,8 +52,18 @@ impl ControlPlane {
         let repo = storage.tasks();
 
         match action {
-            TaskAction::List { scope, session_id, include_closed } => {
-                self.task_list(&repo, scope, session_id, include_closed).await
+            TaskAction::List {
+                scope,
+                session_id,
+                include_closed,
+                workspace_id,
+            } => {
+                let board = BoardScope {
+                    scope,
+                    session_id,
+                    workspace_id,
+                };
+                self.task_list(&repo, board, include_closed).await
             }
 
             TaskAction::Get { id } => {
@@ -75,12 +85,13 @@ impl ControlPlane {
                 let request = CreateTask {
                     title, scope, session_id, parent_id, description, priority, labels, tools,
                     due_at, deadline_at, recurrence, depends_on, acceptance, project, assignee,
+                    workspace_id: None,
                 };
                 self.task_create(&repo, request).await
             }
 
-            TaskAction::QuickAdd { text, scope, parent_id } => {
-                self.task_quick_add(&repo, &text, scope, parent_id).await
+            TaskAction::QuickAdd { text, scope, parent_id, workspace_id } => {
+                self.task_quick_add(&repo, &text, scope, parent_id, workspace_id).await
             }
 
             TaskAction::Assigned { member_id, limit } => {
@@ -225,17 +236,58 @@ impl ControlPlane {
             .map_err(|message| json!({"error": "bad_scope", "message": message}))
     }
 
+    /// [`Self::resolve_task_scope`], except that a `workspace` scope with an
+    /// explicit `workspace_id` names that registered workspace's board instead
+    /// of the daemon's active one. A client shows its own board; resolving
+    /// "workspace" to whatever another client last activated would list, and
+    /// put cards on, a board it is not showing.
+    ///
+    /// # Errors
+    /// The reason, worded for the client: an unknown scope, a missing session
+    /// id or active workspace, or a `workspace_id` that is not registered.
+    pub(super) async fn resolve_board_scope(
+        &self,
+        scope: Option<&str>,
+        session_id: Option<&str>,
+        workspace_id: Option<&str>,
+    ) -> Result<(String, Option<String>), String> {
+        let explicit = workspace_id.map(str::trim).filter(|id| !id.is_empty());
+        let wants_workspace = scope.is_some_and(|s| s.eq_ignore_ascii_case("workspace"));
+        let Some(id) = explicit.filter(|_| wants_workspace) else {
+            return self.resolve_task_scope(scope, session_id).await;
+        };
+        if self.workspaces.read().await.get(id).is_none() {
+            return Err(format!(
+                "workspace '{id}' is not registered — open it first, or leave workspace_id out \
+                 for the active workspace's board"
+            ));
+        }
+        debug_assert!(!id.is_empty(), "filtered above");
+        Ok(("workspace".to_string(), Some(id.to_string())))
+    }
+
     /// `TaskAction::List`.
     async fn task_list(
         &self,
         repo: &TaskRepository,
-        scope: Option<String>,
-        session_id: Option<String>,
+        board: BoardScope,
         include_closed: Option<bool>,
     ) -> Value {
-        let (scope, scope_id) = match self.task_scope_or_reply(scope, session_id).await {
+        let BoardScope {
+            scope,
+            session_id,
+            workspace_id,
+        } = board;
+        let resolved = self
+            .resolve_board_scope(
+                scope.as_deref(),
+                session_id.as_deref(),
+                workspace_id.as_deref(),
+            )
+            .await;
+        let (scope, scope_id) = match resolved {
             Ok(resolved) => resolved,
-            Err(reply) => return reply,
+            Err(message) => return json!({"error": "bad_scope", "message": message}),
         };
         match repo
             .list(&scope, scope_id.as_deref(), include_closed.unwrap_or(true))
@@ -269,6 +321,7 @@ impl ControlPlane {
         let CreateTask {
             title, scope, session_id, parent_id, description, priority, labels, tools,
             due_at, deadline_at, recurrence, depends_on, acceptance, project, assignee,
+            workspace_id,
         } = request;
         // A subtask always lives in its parent's scope and inherits
         // its ladder position; a new root task appends after
@@ -282,7 +335,11 @@ impl ControlPlane {
             }
         } else {
             let (scope, scope_id) = match self
-                .resolve_task_scope(scope.as_deref(), session_id.as_deref())
+                .resolve_board_scope(
+                    scope.as_deref(),
+                    session_id.as_deref(),
+                    workspace_id.as_deref(),
+                )
                 .await
             {
                 Ok(resolved) => resolved,
@@ -831,4 +888,14 @@ pub(super) struct CreateTask {
     pub(super) acceptance: Option<Box<Value>>,
     pub(super) project: Option<String>,
     pub(super) assignee: Option<String>,
+    /// With `scope: "workspace"`, this registered workspace's board rather
+    /// than the daemon's active one (see `ControlPlane::resolve_board_scope`).
+    pub(super) workspace_id: Option<String>,
+}
+
+/// Which board a request names: `scope` plus whichever id it needs.
+pub(super) struct BoardScope {
+    pub(super) scope: Option<String>,
+    pub(super) session_id: Option<String>,
+    pub(super) workspace_id: Option<String>,
 }

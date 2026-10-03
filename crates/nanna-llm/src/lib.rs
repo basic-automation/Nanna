@@ -956,8 +956,10 @@ impl LlmError {
     /// into "wait exactly as long as they asked".
     ///
     /// Returns `None` when nothing usable is present, which keeps the caller's
-    /// own backoff as the fallback.
-    fn parse_retry_after(message: &str) -> Option<u64> {
+    /// own backoff as the fallback. Public so a caller holding only the
+    /// rendered error text (a step runner's error string) reads the same wait.
+    #[must_use]
+    pub fn parse_retry_after(message: &str) -> Option<u64> {
         /// A reset further out than this is a misread, not a real wait.
         const MAX_PLAUSIBLE_WAIT_SECS: u64 = 3_600;
 

@@ -20,7 +20,10 @@
 //!   silently to whoever held it last time;
 //! - [`WakeReason::HandedBack`] — an agent's run gave the card back
 //!   unfinished (decision 7's failed verdict); past [`HAND_BACKS_MAX`] in a
-//!   row the router asks the human instead of routing it again.
+//!   row the router asks the human instead of routing it again;
+//! - [`WakeReason::Stalled`] — the stall sweep took back an agent's card
+//!   that nothing was working ([`crate::card_run_trigger::release_stalled`]);
+//!   it counts toward the same bound.
 //!
 //! **Only cards the board client created are routed, for now.** While the
 //! chat harness lives, its model writes workspace-scoped cards of its own
@@ -30,8 +33,10 @@
 //! (`TaskAction::Create`) stamps: checked on the event itself for `created`,
 //! and against the card's `created` activity row for every later wake. The
 //! router's own splits and clarifications carry the router's id, so they never
-//! wake it. The remaining wakes (stalled, heartbeat) are separate roadmap
-//! items.
+//! wake it. A stalled card is board work by any board creator
+//! ([`crate::card_run_trigger::is_board_creator`]) — the sweep only ever takes
+//! back board work, and a released card nobody routes would sit unowned. The
+//! remaining wake (heartbeat) is a separate roadmap item.
 
 use crate::agent_service::AgentServiceConfig;
 use crate::board_router::{RouterComplete, answered_clarifications, route_card, router_for};
@@ -48,6 +53,11 @@ pub const BOARD_CLIENT_ACTOR: &str = "gui";
 /// The actor the recurrence sweep reopens a card as
 /// (`crate::tasks::sweep_recurrences`).
 pub const RECURRENCE_ACTOR: &str = "recurrence";
+
+/// The actor the stall sweep releases a card as
+/// (`crate::card_run_trigger::release_stalled`); a release by it is a
+/// [`WakeReason::Stalled`].
+pub const STALL_ACTOR: &str = "stall";
 
 /// The id prefix of every agent member (`agent:<slug>`), the actor a
 /// member's card run writes as.
@@ -105,6 +115,9 @@ pub enum WakeReason {
     /// verdict). Queued for every agent that clears its own assignment; the
     /// worker routes it only when the card's activity says it was handed back.
     HandedBack,
+    /// The stall sweep took the card back from a member that was not working
+    /// it (P25 decision 7's `stalled`).
+    Stalled,
 }
 
 /// One queued wake: route card `task_id` because of `reason`.
@@ -131,6 +144,12 @@ pub fn wake_for(event: &TaskEvent) -> Option<Wake> {
                 && event.detail.get("reopened") == Some(&serde_json::Value::Bool(true)) =>
         {
             WakeReason::RecurringReopened
+        }
+        TaskEventKind::Assigned
+            if event.actor.as_deref() == Some(STALL_ACTOR)
+                && event.detail.get("assignee") == Some(&serde_json::Value::Null) =>
+        {
+            WakeReason::Stalled
         }
         TaskEventKind::Assigned
             if event
@@ -208,7 +227,7 @@ pub async fn run(
         let Some(card) = card_to_route(&storage, wake).await else {
             continue;
         };
-        if wake.reason == WakeReason::HandedBack {
+        if matches!(wake.reason, WakeReason::HandedBack | WakeReason::Stalled) {
             match hand_backs_in_a_row(&storage.tasks(), card.id).await {
                 Ok((0, _)) => {
                     debug!(
@@ -267,6 +286,24 @@ pub async fn card_to_route(storage: &Storage, wake: Wake) -> Option<Task> {
     if wake.reason == WakeReason::Created {
         return Some(card);
     }
+    if wake.reason == WakeReason::Stalled {
+        return match tasks.created_by(task_id).await {
+            Ok(creator) if crate::card_run_trigger::is_board_creator(creator.as_deref()) => {
+                Some(card)
+            }
+            Ok(_) => {
+                debug!(
+                    task_id,
+                    "board router: stalled card is not board work; skipped"
+                );
+                None
+            }
+            Err(e) => {
+                warn!(task_id, error = %e, "board router: creator unreadable; not routed");
+                None
+            }
+        };
+    }
     match created_by_board_client(&tasks, task_id).await {
         Ok(true) => {}
         Ok(false) => {
@@ -301,9 +338,11 @@ pub async fn card_to_route(storage: &Storage, wake: Wake) -> Option<Task> {
     }
 }
 
-/// How many times in a row card `task_id` was handed back — counted newest
-/// first until the last time the human was asked about it — and the newest
-/// hand-back's reason.
+/// How many times in a row card `task_id` came back unfinished, and why.
+///
+/// A card comes back when its member's run hands it back or the stall sweep
+/// takes it back. Counted newest first until the last time the human was
+/// asked about it; the reason is the newest one's.
 ///
 /// # Errors
 /// The store failure reading the card's activity.
@@ -319,7 +358,9 @@ pub async fn hand_backs_in_a_row(
         if row.action == HAND_BACK_LIMIT_ACTION {
             break;
         }
-        if row.action == crate::tasks::HANDED_BACK_ACTION {
+        if row.action == crate::tasks::HANDED_BACK_ACTION
+            || row.action == crate::tasks::STALLED_ACTION
+        {
             count += 1;
             if latest.is_none() {
                 latest = row
@@ -350,7 +391,7 @@ async fn ask_the_human(storage: &Storage, card: &Task, count: usize, latest: &st
     let latest: String = latest.chars().take(HAND_BACK_REASON_CHARS_MAX).collect();
     let decision = nanna_storage::routing::RouterDecision::Clarify {
         question: format!(
-            "Card #{task_id} was handed back unfinished {count} times in a row. The last \
+            "Card #{task_id} came back unfinished {count} times in a row. The last \
              run said: {latest}\nWhat should change — the card, its acceptance check, or \
              who does it?"
         ),
@@ -502,6 +543,32 @@ mod tests {
         assert_eq!(wake_for(&moved), None);
         reopened.scope = "session".to_string();
         assert_eq!(wake_for(&reopened), None);
+    }
+
+    #[test]
+    fn the_stall_sweeps_release_wakes_it_and_its_other_writes_do_not() {
+        let mut released = event(TaskEventKind::Assigned, "global", Some(STALL_ACTOR));
+        released.detail = json!({"assignee": null});
+        assert_eq!(
+            wake_for(&released).map(|w| w.reason),
+            Some(WakeReason::Stalled)
+        );
+        // Only a release: the sweep never assigns, and nobody else's release
+        // is a stall.
+        let mut assigned = released.clone();
+        assigned.detail = json!({"assignee": "agent:builder"});
+        assert_eq!(wake_for(&assigned), None);
+        let mut by_hand = released.clone();
+        by_hand.actor = Some(BOARD_CLIENT_ACTOR.to_string());
+        assert_eq!(wake_for(&by_hand), None);
+        let status = event(TaskEventKind::StatusChanged, "global", Some(STALL_ACTOR));
+        assert_eq!(
+            wake_for(&status),
+            None,
+            "the release's status half is not a second wake"
+        );
+        released.scope = "session".to_string();
+        assert_eq!(wake_for(&released), None);
     }
 
     #[test]

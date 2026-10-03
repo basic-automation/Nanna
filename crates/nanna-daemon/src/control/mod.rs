@@ -430,6 +430,12 @@ impl ControlPlane {
         self
     }
 
+    /// The long-horizon task run manager, when one is attached.
+    #[must_use]
+    pub const fn task_runs(&self) -> Option<&Arc<crate::tasks::TaskRunManager>> {
+        self.task_runs.as_ref()
+    }
+
     /// Record that the memory store was rebuilt after corruption at startup,
     /// so `SystemAction::Status` surfaces it for the daemon's lifetime.
     #[must_use]

@@ -205,6 +205,10 @@ impl ControlPlane {
                 None => json!([]),
             },
             "config_path": self.config_path,
+            // The folder this daemon opened its store in — read at boot, so a
+            // client can tell a saved `[general] data_dir` that waits for a
+            // restart from the one in use.
+            "data_dir": self.data_dir.as_ref().map(|dir| dir.display().to_string()),
         })
     }
 

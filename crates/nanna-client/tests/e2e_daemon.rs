@@ -1032,6 +1032,13 @@ impl ScriptedOllama {
                     };
                     seen.lock().await.push(body);
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    // `STATUS <code> <body>` answers with that HTTP status —
+                    // a provider refusing the request.
+                    if let Some(refusal) = line.strip_prefix("STATUS ") {
+                        let (code, body) = refusal.split_once(' ').unwrap_or((refusal, "{}"));
+                        respond_status(&mut socket, &format!("{code} Refused"), body).await;
+                        return;
+                    }
                     // One NDJSON line serves both shapes: a streamed request
                     // reads it as its only (final) chunk.
                     respond(&mut socket, &format!("{line}\n")).await;
@@ -1048,6 +1055,10 @@ impl ScriptedOllama {
 /// One scripted model message as an Ollama NDJSON line. `CALL <tool> <json>`
 /// is a tool call with those arguments; anything else is reply text.
 fn scripted_reply(script: &str) -> String {
+    if script.starts_with("STATUS ") {
+        // Not a model message: the server answers with that status instead.
+        return script.to_string();
+    }
     let message = script.strip_prefix("CALL ").map_or_else(
         || serde_json::json!({ "role": "assistant", "content": script }),
         |call| {
@@ -2346,6 +2357,7 @@ async fn open_tasks(client: &Client, session: &str) -> Vec<serde_json::Value> {
             scope: Some("session".to_string()),
             session_id: Some(session.to_string()),
             include_closed: Some(false),
+            workspace_id: None,
         }))
         .await
         .expect("tasks.list answers");
@@ -3629,6 +3641,136 @@ async fn a_card_its_member_cannot_finish_goes_back_to_the_router() {
         );
         tokio::time::sleep(READY_POLL_INTERVAL).await;
     }
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// A card run the provider refuses outright (a bad key: HTTP 401) is not
+/// resumed and not handed back to the router: the member asks the human to fix
+/// the setup at once, and the card waits on that question with its member.
+/// Before, the run manager resumed it eight times with a 15 s pause each and
+/// then handed it to the router, which would route it to a member on the same
+/// broken provider.
+#[tokio::test]
+async fn a_card_run_the_provider_refuses_asks_the_human_at_once() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"{"decision":"assign","member":"agent:builder","reason":"it builds things"}"#.to_string(),
+        r#"STATUS 401 {"error":"unauthorized"}"#.to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let created = client
+        .request(nanna_client::Action::Member(
+            nanna_client::MemberAction::Create {
+                name: "Builder".to_string(),
+                workspace_id: None,
+                personal: false,
+                avatar: None,
+                profile: None,
+            },
+        ))
+        .await
+        .expect("member.create answers");
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+
+    let started = std::time::Instant::now();
+    let id = create_global_card(&client, "Build the thing").await;
+    let card = card_when(&client, id, "waiting on the human", |card| {
+        card["task"]["depends_on"]
+            .as_array()
+            .is_some_and(|deps| !deps.is_empty())
+            && card["task"]["status"] == "pending"
+    })
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "asked at once, not after the resume loop: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        card["task"]["assignee"], "agent:builder",
+        "kept by its member: {card}"
+    );
+    let activity = card["activity"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !activity.iter().any(|row| row["action"] == "handed_back"),
+        "not a hand-back: {card}"
+    );
+    let question_id = card["task"]["depends_on"][0].as_i64().expect("a card id");
+    let question = card_when(&client, question_id, "the question", |_| true).await;
+    assert_eq!(question["task"]["assignee"], "human", "{question}");
+    assert!(
+        question["task"]["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("401")),
+        "the question names the refusal: {question}"
+    );
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// A card run the provider rate-limits (HTTP 429) waits it out with its
+/// member: no hand-back to the router, no question to the human, and a
+/// `rate_limited` row saying when it is tried again.
+#[tokio::test]
+async fn a_rate_limited_card_run_waits_with_its_member() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"{"decision":"assign","member":"agent:builder","reason":"it builds things"}"#.to_string(),
+        r#"STATUS 429 {"error":"rate limit exceeded"}"#.to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let created = client
+        .request(nanna_client::Action::Member(
+            nanna_client::MemberAction::Create {
+                name: "Builder".to_string(),
+                workspace_id: None,
+                personal: false,
+                avatar: None,
+                profile: None,
+            },
+        ))
+        .await
+        .expect("member.create answers");
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+
+    let id = create_global_card(&client, "Build the thing").await;
+    let card = card_when(&client, id, "waiting out the limit", |card| {
+        card["activity"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|row| row["action"] == "rate_limited"))
+            && card["task"]["status"] == "pending"
+    })
+    .await;
+    assert_eq!(
+        card["task"]["assignee"], "agent:builder",
+        "kept by its member: {card}"
+    );
+    let activity = card["activity"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !activity.iter().any(|row| row["action"] == "handed_back"),
+        "not a hand-back: {card}"
+    );
+    assert!(
+        card["task"]["depends_on"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "nobody is asked: {card}"
+    );
     client.disconnect().await;
     daemon.stop();
 }

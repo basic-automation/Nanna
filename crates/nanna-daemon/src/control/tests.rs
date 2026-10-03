@@ -2518,6 +2518,101 @@ async fn a_card_run_is_claimed_only_for_an_agent_on_an_open_board_card() {
     );
 }
 
+/// A client shows its own board: a `workspace_id` on `task.list` /
+/// `task.quick_add` names that board whichever workspace the daemon has
+/// active, and an unregistered one is refused rather than guessed.
+#[tokio::test]
+async fn a_board_named_by_workspace_id_is_used_whatever_is_active() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let (dir_a, dir_b) = (
+        tempfile::tempdir().expect("a"),
+        tempfile::tempdir().expect("b"),
+    );
+    let mut ids = Vec::new();
+    for dir in [&dir_a, &dir_b] {
+        let opened = ask(serde_json::json!({
+            "type": "workspace", "action": "open", "path": dir.path().display().to_string(),
+        }))
+        .await;
+        ids.push(opened["id"].as_str().expect("an id").to_string());
+    }
+    let (id_a, id_b) = (ids[0].clone(), ids[1].clone());
+    let active =
+        ask(serde_json::json!({"type": "workspace", "action": "set_active", "id": id_a})).await;
+    assert!(active.get("error").is_none(), "{active}");
+
+    let on_b = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "On B", "workspace_id": id_b,
+    }))
+    .await;
+    assert_eq!(
+        on_b["task"]["scope_id"],
+        id_b.as_str(),
+        "the named board: {on_b}"
+    );
+    let on_a =
+        ask(serde_json::json!({"type": "task", "action": "quick_add", "text": "On A"})).await;
+    assert_eq!(
+        on_a["task"]["scope_id"],
+        id_a.as_str(),
+        "the active board by default: {on_a}"
+    );
+
+    let titles = |reply: &Value| -> Vec<String> {
+        reply["tasks"]
+            .as_array()
+            .map(|tasks| {
+                tasks
+                    .iter()
+                    .filter_map(|t| t["title"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let listed_b = ask(serde_json::json!({
+        "type": "task", "action": "list", "scope": "workspace", "workspace_id": id_b,
+    }))
+    .await;
+    assert_eq!(titles(&listed_b), vec!["On B".to_string()], "{listed_b}");
+    let listed_active = ask(serde_json::json!({
+        "type": "task", "action": "list", "scope": "workspace",
+    }))
+    .await;
+    assert_eq!(
+        titles(&listed_active),
+        vec!["On A".to_string()],
+        "{listed_active}"
+    );
+
+    let unknown = ask(serde_json::json!({
+        "type": "task", "action": "list", "scope": "workspace", "workspace_id": "nope",
+    }))
+    .await;
+    assert_eq!(unknown["error"], "bad_scope", "{unknown}");
+    assert!(
+        unknown["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("not registered")),
+        "{unknown}"
+    );
+    // A workspace id says nothing about the global board.
+    let global = ask(serde_json::json!({
+        "type": "task", "action": "list", "scope": "global", "workspace_id": id_b,
+    }))
+    .await;
+    assert_eq!(titles(&global), Vec::<String>::new(), "{global}");
+}
+
 #[tokio::test]
 async fn a_quick_add_line_becomes_a_board_card() {
     let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));

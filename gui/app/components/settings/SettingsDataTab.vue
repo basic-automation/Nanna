@@ -32,6 +32,53 @@
     </SettingsSection>
 
     <SettingsSection
+      title="Data location"
+      description="The folder where the daemon keeps its database, memories and logs. Read when the daemon starts."
+    >
+      <template #icon>
+        <FolderOpen class="w-4 h-4 text-nanna-primary" />
+      </template>
+
+      <code
+        class="block text-xs glass-well text-nanna-accent p-2 rounded font-mono break-all"
+        data-testid="data-dir-path"
+      >
+        {{ dataDir?.effective ?? dataDirError ?? 'Loading…' }}
+      </code>
+      <p v-if="dataDir" class="text-xs text-nanna-text-dim" data-testid="data-dir-kind">
+        {{ dataDirSummary(dataDir) }}
+      </p>
+      <div class="flex gap-2">
+        <UiButton
+          @click="chooseDataDir"
+          :disabled="!dataDir || savingDataDir"
+          variant="secondary"
+          size="sm"
+          class="flex-1"
+          data-testid="data-dir-choose"
+        >
+          <FolderOpen class="w-4 h-4 mr-1" />
+          Choose folder…
+        </UiButton>
+        <UiButton
+          v-if="dataDir?.is_custom"
+          @click="resetDataDir"
+          :disabled="savingDataDir"
+          variant="secondary"
+          size="sm"
+          class="flex-1"
+          data-testid="data-dir-reset"
+        >
+          <RotateCcw class="w-4 h-4 mr-1" />
+          Use the default
+        </UiButton>
+      </div>
+      <p v-if="restartNotice" class="text-xs text-nanna-warning" data-testid="data-dir-notice">
+        {{ restartNotice }}
+      </p>
+    </SettingsSection>
+
+    <SettingsSection
       title="Configuration"
       description="Export or import your config file."
     >
@@ -93,9 +140,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { Database, Trash2, FileDown, FileUp, Moon } from '@lucide/vue'
+import { open } from '@tauri-apps/plugin-dialog'
+import { Database, Trash2, FileDown, FileUp, Moon, FolderOpen, RotateCcw } from '@lucide/vue'
 import { useConfirm } from '~/composables/useConfirm'
 import { useSettingsPage } from '~/composables/useSettingsPage'
+import { dataDirConfirmMessage, dataDirRestartNotice, dataDirSummary, type DataDirInfo } from '~/lib/dataDir'
 
 const store = useSettingsPage()
 const { memoryStats, loadMemoryStats, loadSettings, showToast } = store
@@ -114,9 +163,63 @@ const configPath = computed(() => {
   }
 })
 
+// Where data lives: the saved setting, and the folder the running daemon
+// reports — it reads the setting only at boot, so the two differ until it
+// restarts.
+const dataDir = ref<DataDirInfo | null>(null)
+const dataDirError = ref<string | null>(null)
+const savingDataDir = ref(false)
+const restartNotice = computed(() => dataDir.value && dataDirRestartNotice(dataDir.value))
+
 onMounted(async () => {
-  await loadSessions()
+  await Promise.all([loadSessions(), loadDataDir()])
 })
+
+async function loadDataDir() {
+  try {
+    dataDir.value = await invoke<DataDirInfo>('get_data_dir')
+  } catch (e: any) {
+    dataDirError.value = `Could not read the data location: ${e.message || e}`
+  }
+}
+
+async function saveDataDir(path: string | null) {
+  savingDataDir.value = true
+  try {
+    dataDir.value = await invoke<DataDirInfo>('set_data_dir', { path })
+    showToast('Data location saved — it applies when the daemon restarts', 'success')
+  } catch (e: any) {
+    showToast(`Could not use that folder: ${e.message || e}`, 'error')
+  } finally {
+    savingDataDir.value = false
+  }
+}
+
+async function chooseDataDir() {
+  const current = dataDir.value?.effective
+  if (!current) return
+  const chosen = await open({ directory: true, multiple: false, defaultPath: current })
+  if (typeof chosen !== 'string' || chosen === current) return
+  const confirmed = await confirm({
+    title: 'Change data location',
+    message: dataDirConfirmMessage(current, chosen),
+    confirmLabel: 'Use this folder',
+  })
+  if (!confirmed) return
+  await saveDataDir(chosen)
+}
+
+async function resetDataDir() {
+  const current = dataDir.value
+  if (!current?.is_custom) return
+  const confirmed = await confirm({
+    title: 'Use the default data location',
+    message: dataDirConfirmMessage(current.effective, current.default),
+    confirmLabel: 'Use the default',
+  })
+  if (!confirmed) return
+  await saveDataDir(null)
+}
 
 async function loadSessions() {
   try {

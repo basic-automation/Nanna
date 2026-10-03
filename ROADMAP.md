@@ -329,6 +329,22 @@ Remaining: capture real screenshots to replace the README placeholders.
       `no_configured_data_dir_means_the_platform_default`,
       `a_configured_data_dir_wins_over_the_platform_default`, `a_blank_data_dir_is_treated_as_unset`,
       `a_data_dir_survives_a_save_load_round_trip`.
+      *(2026-10-03)* **The "place to choose it" did not exist until now** — `get_data_dir` /
+      `set_data_dir` were registered and nothing in the app called them (found by the dead-command
+      triage, P4). Settings → Data now has a **Data location** section: the folder, "Platform
+      default" / "Custom location", *Choose folder…* (native folder picker, then a confirm naming
+      both folders and saying nothing is moved) and *Use the default*. It tells the truth about
+      timing by asking the daemon rather than remembering: `system.status` now reports the
+      `data_dir` the daemon opened its store in, and both commands return it as `in_use`, so the
+      notice "Nanna keeps using X until the daemon restarts, then uses Y. Existing data is not
+      moved" shows exactly while a saved change waits — including one saved earlier, which a
+      page-open snapshot (the first draft) got wrong. Wording in `app/lib/dataDir.ts`, 4 vitest;
+      Playwright mock answers both commands. **Verified in the real app over WebDriver**
+      (isolated HOME/config, daemon on :51990): the section renders the live folder; a relative
+      path is refused with the validator's reason; a saved folder shows "Custom location" and the
+      notice after the page is reopened; *Use the default* opens the in-app confirm and saves;
+      then `restart_daemon` brings up a new daemon that opens `nanna.db` **in the chosen
+      folder**, `in_use` equals the setting and the notice is gone.
 - [ ] Model/backend status dashboard.
 - [~] Cost tracking for cloud models.
       *(See P6)* Core shipped — `CostTracker` with per-model pricing table, `estimate_cost_usd`,
@@ -509,10 +525,20 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       none fixable from this tree; npm: 4 low/moderate. The gate was checked to have eyes: the
       same pnpm audit at `moderate` exits 1. Thresholds are deliberate: failing on warnings would
       leave the job permanently red, i.e. ignored.
-      - [ ] **`lru 0.16.4` is unsound (RUSTSEC-2026-0253, use-after-free when a key's `Drop` panics
+      - [x] **`lru 0.16.4` is unsound (RUSTSEC-2026-0253, use-after-free when a key's `Drop` panics
             inside `pop()`), patched in ≥ 0.18.2** — reached only via `tantivy 0.26` under turso's
             exact `=0.7.2` pin, so it moves when turso does. Not reachable in shipped builds: it
             needs unwinding plus `catch_unwind`, and the release profile is `panic = "abort"`.
+            *(2026-10-03)* **Gone from the graph** — the turso 0.8.1 move turns off turso's `fts`
+            feature, which was the only path to `tantivy`, so `lru` left the lockfile with it.
+      - [ ] *(2026-10-03)* **`braces` GHSA-vfj7-8cjw-p6xm (high, stack-exhaustion DoS) is exempted,
+            not fixed** — it turned the npm audit job red on the nightly PR with no lockfile change of
+            ours (master carries the same `braces 3.0.3`; the advisory is new). No fix exists:
+            `braces` 3.0.3 is the latest and the patched range is empty. Path: `nuxt →
+            @nuxt/nitro-server → nitropack → globby → micromatch → braces`, i.e. Nitro's build-time
+            globbing; the shipped static bundle contains no braces code (the word appears only in
+            Monaco/TypeScript message strings). Exempted by id beside node-forge, reasoning in
+            `audit.yml`'s header. **Remove the entry when `braces` or `micromatch` ships a fix.**
       - [ ] *(2026-10-02)* **`node-forge` GHSA-86w9-cpqp-85rv (high) is exempted, not fixed.** No
             release fixes it (1.4.0 is the latest; the advisory lists no patched version); it
             comes through `nuxt → listhen`, the dev server's cert helper, which the shipped static
@@ -530,9 +556,16 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
             the package-level `dompurify` it would bump is not the code monaco runs. Re-check on the
             next monaco release; exposure is monaco's own hover/markdown rendering of local content.
 
-- [ ] No GitHub secret scanning enabled.
+- [x] No GitHub secret scanning enabled.
       *(2026-07-24)* Dependabot shipped (see above). Secret scanning itself is still a repo-admin
       toggle on GitHub and is not something a PR can flip — left open.
+      *(2026-10-03, checked)* **On, since the move to `basic-automation/Nanna` (public).**
+      `gh api repos/basic-automation/Nanna` reports `secret_scanning`, `secret_scanning_push_protection`
+      and `dependabot_security_updates` all `enabled`, and the secret-scanning alerts list is **empty
+      (0)**. GitHub scans a public repo's whole history with its provider patterns, so that 0 also
+      covers the history for known token formats. Still off, and an owner toggle:
+      `secret_scanning_non_provider_patterns` (generic secrets such as private keys and passwords)
+      and `secret_scanning_validity_checks`.
 - [x] Store all secrets in OS keychain by default; remove secret fields from config.toml.
       *(2026-07-24)* **Done** as part of the onboarding/GUI keyring work above. `Config::save_to`
       always strips `llm.{api_key,openai_api_key,openrouter_api_key,github_token,ollama_api_key,
@@ -898,6 +931,15 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
 - [x] Unify ProjectDirs namespaces — config and credentials must use the same ("com", "nanna", "nanna") (or equivalent) namespace.
       *(2026-07-24)* Done — see the namespace-unification item above.
 - [ ] Run gitleaks detect --source . and trufflehog git file://. across full git history.
+      *(2026-10-03)* Partly answered: GitHub secret scanning (provider patterns, whole history) reports
+      0 alerts — see the item above. What is left is the **generic** patterns (keys, passwords,
+      high-entropy strings) that neither GitHub's default scan nor this host covers: neither
+      `gitleaks` nor `trufflehog` is installed here, and installing one is an owner step (a Go binary
+      or container from outside the Rust toolchain). A pattern pass over every added line in all 1776
+      commits (`git log -p --all`, grepping the Anthropic/OpenAI/OpenRouter/GitHub/AWS/Slack/Telegram
+      token shapes and PEM private-key headers) found only three test fixtures:
+      `sk-ant-from-the-environment`, `sk-ant-oat01-roundtrip-access`, `xoxb-1234567890-`. Not a
+      substitute for gitleaks' entropy rules, but nothing real in the common shapes.
 - [x] Remove or gitignore .claude/settings.local.json (committed with machine paths and broad agent permissions).
       *(2026-07-24)* **Untracked and gitignored.** It was committed in a **public** repo carrying 77 lines
       of Claude Code permission allowances — including `Bash(curl:*)`, `Bash(taskkill:*)`,
@@ -1390,6 +1432,52 @@ bugs and improvements here; do not bury them only in the backlog bullet.
             `update_skill`/`delete_skill`/`list_skills`, `test_all_channels`, `clear_rate_limit`, …).
             Each is either a feature with no UI or a leftover; triage into "wire up" vs "delete" rather
             than leaving an unaudited command surface exposed to the webview.
+            *(2026-10-03)* **Re-measured and the first cut made: 191 registered, 42 never named in
+            `app/`; 15 deleted.** Gone (no caller in the app, no Rust caller, no test): the workspace
+            file and path commands `save_workspace_file`, `read_workspace_file`,
+            `discover_workspaces_in_path`, `find_workspace_root_from_path`, `get_workspace_context`,
+            `get_active_workspace`; the skill-directory CRUD `list_skills`, `create_skill`,
+            `update_skill`, `delete_skill` (code written to disk from the webview) plus
+            `list_user_tools_cmd`, `test_user_tool`; `check_env_var` (an environment probe); and the
+            no-op `apply_memory_updates` / `save_memories`. Their helpers went with them
+            (`get_skills_path`, `validate_existing_skill_name` + its test, `registry_handle`,
+            `SkillInfo`, `SkillListResult`), and so did the GUI's **whole dependency on `nanna-tools`**
+            (its only use was skill discovery): the GUI's normal dependency graph is **862 → 740**
+            crates, and the Boa/Deno/Python scripting engines no longer link into the GUI.
+            **Kept on purpose:** the chat/session ones (`archive_and_delete_session`,
+            `set_session_workspace`, `set_session_tools`) and the sub-session / agent-registry ones go
+            with the Stage 4 chat and sub-agent deletion; `get_credential_status` /
+            `refresh_oauth_token` belong to the open OAuth item; `get_data_dir` / `set_data_dir` were
+            a built feature with **no UI** — wired the same day (Settings → Data → Data location, see
+            P0.1 "Data storage location selection").
+            *(2026-10-03, later)* **The rest triaged — 10 more deleted, 25 in all; 166 registered.**
+            Deleted: `search_memory` (a GUI-side substring search over every session's history, with
+            its char-safe snippet code and test), `get_memory_stats` (the app reads
+            `get_cognitive_memory_stats`), `get_memory`; the three notification commands (the app
+            notifies through `@tauri-apps/plugin-notification` directly); `show_window` (the tray
+            never called it); `clear_rate_limit`; `delete_cron_jobs_by_name`; and
+            `set_extraction_model` — whose config field `[memory] extraction_model` **nothing in the
+            daemon reads** (a dead field, filed below rather than removed, since dropping a config key
+            needs a migration story). What is left unused is exactly the deliberate keep-list:
+            chat/session (3), sub-session (5) and agent-registry (5) commands, which go with the Stage
+            4 cut-over and the sub-agent deletion, and the OAuth pair. Leave this item open until the
+            cut-over removes those.
+      - [x] *(found 2026-10-03)* **`[memory] extraction_model` is a dead config field.** Declared and
+            defaulted in `nanna-config` (`extraction_model: String`, "empty = use chat model"), saved
+            and loaded, and read by nothing in the daemon — its only writer, the GUI's
+            `set_extraction_model`, had no caller and is deleted. Either wire it (the extraction step
+            would run on it) or remove it with a load-time tolerance for old configs; do not build on
+            it as if it worked.
+            *(2026-10-03, same run)* **Removed.** Wiring it would have been a new feature (an
+            extraction-model choice nobody asked for, with a hard-coded 2024 model list); removing
+            it costs nothing because no `Config` struct uses `deny_unknown_fields`, so an old
+            `config.toml` carrying the key still loads — pinned by
+            `legacy_extraction_model_key_still_loads`, which also checks the stale key is not
+            written back on save. Gone with it: the GUI settings wire's `extraction_model` /
+            `available_extraction_models` (the frontend never read them; the wire-shape test now
+            pins the smaller shape). Still to triage: `search_memory`, `get_memory_stats`, `get_memory`,
+            `set_extraction_model`, the three notification commands, `show_window`,
+            `clear_rate_limit`, `delete_cron_jobs_by_name`.
       *(2026-07-24)* **Verified in the real Tauri shell over WebDriver** (`cargo tauri build` release,
       `nanna-gui.exe` 16 MB, built under the pinned toolchain): `document.title === "Nanna"`, `#__nuxt`
       attached, `typeof window.__TAURI_INTERNALS__ === "object"` (so this is the real IPC shell, not the
@@ -4217,6 +4305,15 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             set. Worth measuring before pulling in a search crate, since it keeps the "Turso-only" invariant.
             This is also the cheapest path for the **tool-description keyword search** noted in P6/P11
             (tool descriptions currently need literal keywords because there is no lexical search at all).
+            *(2026-10-03)* **Not available on the current pin without work.** turso 0.8.1's `fts` feature
+            does not compile on our nightly (`DynVec::new_in(DynAllocator)` in
+            `index_method/fts/directory.rs` needs `--cfg nightly`), so the 0.8.1 move turned it off and
+            the FTS index method is no longer built. Taking this path means either building turso with
+            `RUSTFLAGS=--cfg nightly` (turning on its whole allocator_api code path, not just FTS) or
+            waiting for the upstream fix —
+            [turso#9463](https://github.com/tursodatabase/turso/issues/9463), open since 2026-10-02,
+            reports exactly this on nightly c36f14571 (our pin) and on beta, and says stable builds
+            it — and re-weigh a small BM25 crate against it.
       - [ ] *(research 2026-08-21 — settles HOW to fuse, which was the unstated hard part)* **Use
             Reciprocal Rank Fusion, not a weighted sum of scores.** RRF has the two properties this
             problem needs and a weighted sum does not: it is **score-independent** (only ranks enter the
@@ -8126,6 +8223,33 @@ as its turn (`TurnAdmission`, scope default `session`).
       ends with its card still open for another reason (wall clock or token budget, a cancel) —
       that card is `in_progress` with no live run, i.e. the `stalled` trigger's. Still open:
       `stalled`, heartbeat.
+      *(2026-10-03)* **`stalled` landed.** The card-run worker also ticks every
+      `STALL_SWEEP_INTERVAL` = 5 min and runs `card_run_trigger::release_stalled`: an agent's
+      board card that is `in_progress`, board work (`is_board_creator`), **not paused** (its
+      newest run marker is not a `run_ended` with stop `Cancelled` — "Stop = stop"), served by
+      **no live run** (`TaskRunManager::serves_card`: its own `card:<id>` run, an ancestor's —
+      a sub-card worked inside its parent's run has none of its own — or a scope run over its
+      board) and **untouched for `STALL_AFTER` = 30 min** (newest of the row's `updated_at`,
+      its newest activity row and its newest post — new store reads `in_progress_board_cards`
+      and `touch_times`). The threshold is not Hermes' 4 h heartbeat timeout: we see run
+      liveness directly, so a quiet live run is never stalled; 30 min only covers the
+      pick-up/register race and a person moving an agent's card by hand. A stalled card gets,
+      in order: a closing `run_ended {stop: "stalled"}` if a run started and never ended (so the
+      next boot does not also "resume" it), a `stalled` activity row, its member shown idle
+      unless working elsewhere, a router post saying why, and a release to `pending` with nobody
+      on it written as the `stall` actor — **that release is the router's
+      `WakeReason::Stalled`**. Stalls **count toward `HAND_BACKS_MAX` with hand-backs**
+      (`hand_backs_in_a_row`), so a card that keeps stalling ends in a question to the human
+      rather than a reclaim loop — the bug Hermes fixed in
+      [#111446](https://github.com/NousResearch/hermes-agent/pull/111446) ("a claim that never
+      spawns a worker … reclaiming forever"). A stalled card is routed if any board creator made
+      it (the sweep only takes back board work, and a released card nobody routes would sit
+      unowned). Tests: store `the_stall_scan_reads_agents_in_progress_board_cards_and_their_last_touch`,
+      run manager `a_card_is_served_by_its_own_run_an_ancestors_or_its_boards`, wake
+      `the_stall_sweeps_release_wakes_it_and_its_other_writes_do_not`, two pure rules, and
+      `a_card_nobody_is_working_is_taken_back_for_the_router` (lost run released and counted;
+      paused, fresh and chat cards kept; idempotent). **Not proven end to end with a live
+      router:** the e2e rig cannot advance the sweep's wall clock. Still open: heartbeat.
 - [x] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
       *(2026-09-28)* `RouterDecision::Assign` gained optional `labels` and `acceptance`. Labels
@@ -8180,6 +8304,19 @@ as its turn (`TurnAdmission`, scope default `session`).
       workspaces once per boot. Test `registering_a_workspace_gives_its_board_a_router`.
       Not done: closing a workspace leaves its router row (routers are delete-protected); harmless
       until a board client lists closed boards.
+      - [ ] *(research 2026-10-03)* **The router's `assign` is a bounded choice — a contrastive
+            selector fits it better than generation.** CLM-8B (Contrastive-LM, Apache-2.0,
+            2026-09-25; frozen Qwen3-8B backbone with separate state/action projection heads)
+            embeds a state and each candidate action and *selects* the best match instead of
+            generating tokens; candidate embeddings cache independently, and it reports up to 9×
+            faster than a generative agent at matched success on tool-calling tasks
+            ([article](https://venturebeat.com/technology/stanford-and-nvidias-open-clm-8b-caches-reusable-agent-actions-and-runs-up-to-9x-faster-than-jev-in-tests),
+            [weights](https://huggingface.co/Contrastive-LM/CLM-v0.1-8B)). Our router asks a chat
+            model to *write* `{"decision":"assign","member":…}` and re-asks on a parse error; member
+            profiles change rarely, so their embeddings would cache across every card. Running the
+            model is Mummu's (a model port); the Nanna half is an `assign`-only fast path that
+            falls back to the generative router for split/clarify/park. Measure on the e2e router
+            fixtures before choosing.
 - [ ] Capability-tag adjustment at verdict time; posts the change on the agent's profile thread.
 - [ ] Heartbeat becomes a recurring card assigned to the router; the `heartbeat_prompt` config and
       the scheduler's chat-turn path are removed.
@@ -8243,7 +8380,7 @@ as its turn (`TurnAdmission`, scope default `session`).
             the marker scan in `members.rs`); **not** proven across a real restart — the e2e
             rig runs the daemon in-process, so an aborted daemon's run task outlives it and
             would hold the store.
-      - [ ] *(research 2026-10-01)* **Borrow Hermes Kanban's failure and stall rules** when the
+      - [x] *(research 2026-10-01; all three rules landed 2026-10-03 — stall in Triggers, terminal and rate-limit below)* **Borrow Hermes Kanban's failure and stall rules** when the
             auto-start lands ([docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban)):
             its dispatcher auto-blocks a card after `failure_limit` (default 2) consecutive failed
             runs, requeues a rate-limited run *without* counting a failure and blocks at once on
@@ -8254,6 +8391,41 @@ as its turn (`TurnAdmission`, scope default `session`).
             `stalled` trigger = `in_progress`, no live `card:<id>` run, no `progress` post
             within the threshold. Also per-member concurrency is a *setting* there
             (`max_in_progress_per_profile`); ours is fixed at 1 by decision 3.
+            *(2026-10-03)* **The terminal-provider half landed.** A card run the provider
+            refuses outright — HTTP 401 / 402 / 403 or no key configured
+            (`is_terminal_provider_error`, the opposite of `is_transient_llm_error`) — is **not
+            resumed** (the run manager's 8 × 15 s provider-incident loop skips it) and **not
+            handed back**: the member asks the human at once (`ask_human_to_fix` →
+            `routing::ask_on_card`, "Fix the API key, account or model list … then complete this
+            card"), the card goes back to `pending` **with its member**, derived-blocked on the
+            question, and nothing counts toward `HAND_BACKS_MAX` — another member on the same
+            provider would fail the same way. Completing the question unblocks the card and its
+            run starts again. **The e2e probe found the real path:** the refusal never reaches the
+            run's stop — the harness abandons the item after persistent runner errors and the
+            source's `abandon` handed the card back within the same second, so the rule sits in
+            `abandon` as well as in `card_after_run`. New script form `STATUS <code> <body>` in
+            the e2e `ScriptedOllama`; e2e `a_card_run_the_provider_refuses_asks_the_human_at_once`
+            (red before: handed back to the router; green: question in 3.4 s), unit
+            `a_refused_key_asks_the_human_and_keeps_the_card_with_its_member`, classifier cases in
+            `how_a_run_stopped_decides_what_its_open_card_is_owed`.
+            *(2026-10-03, later)* **The rate-limit half landed too — the Hermes item is done.** A card
+            run the provider rate-limits (HTTP 429 / `Rate limit exceeded`, `is_rate_limited_error`)
+            keeps its card: once the in-run waits are spent (the e2e shows ~70 s of them — the
+            existing per-attempt rate-limit wait, unchanged), `wait_out_rate_limit` writes a
+            `rate_limited {until, reason}` row, posts "tries again after HH:MM UTC. Not counted as a
+            failure", and puts the card back to `pending` with its member. Nothing goes to the router
+            or the human, nothing counts toward `HAND_BACKS_MAX`. `until` = the provider's own wait
+            when the error names one (`LlmError::parse_retry_after`, now public), else
+            `RATE_LIMIT_COOLDOWN_DEFAULT` = 5 min (the worker's tick — shorter would not start any
+            sooner), never past `RATE_LIMIT_COOLDOWN_MAX` = 1 h. `try_start` refuses a card still
+            cooling down (`cooling_down_until`: the newest `rate_limited`/`run_started` row is a
+            `rate_limited` whose `until` is ahead), so a freed member does not restart it into the
+            same limit; the worker's 5-minute tick restarts every card whose wait is over
+            (`restart_cooled_down`, candidates from `cards_with_unended(rate_limited, run_started)`).
+            Same two sites as the terminal rule (`abandon` and `card_after_run`). Tests: unit
+            `a_rate_limited_card_waits_with_its_member`, pure
+            `a_rate_limit_holds_a_card_back_until_its_wait_or_its_next_run`, classifier and cooldown
+            cases, e2e `a_rate_limited_card_run_waits_with_its_member` (scripted 429).
 - [ ] Sub-agent spawning is replaced by "create a sub-task assigned to another member". Delete
       `sub_agent`/`task` tool and `SubSessionInfo`.
       - [x] *(2026-10-01)* **The half that does not need chat deleted: a card run's `todo` works
@@ -8407,11 +8579,24 @@ as its turn (`TurnAdmission`, scope default `session`).
             resume on the mock; live: a markdown post rendered, `card_run_status` answered.
             **Not verified live:** a real run start/stop — this host has no model to run one
             (see *No embedder on this host*).
-      - [ ] **The Board view is only addressable while its workspace is active.**
+      - [x] **The Board view is only addressable while its workspace is active.**
             `task.list/quick_add` resolve `workspace` scope to the daemon's *active* workspace, so
             the board shows the workspace the top bar selected and nothing else. Fine while the
             top bar drives it; a second window or a link to another board needs `scope_id` on
             these verbs. (Inbox/Upcoming did not need it — `task.assigned` is cross-board.)
+            *(2026-10-03)* **It was a correctness bug, not just addressability:** the GUI's active
+            workspace is *its own* view state, while the daemon's is whatever any client last
+            chose — so with two clients a board could list, and quick-add onto, a board it was
+            not showing. `task.list` and `task.quick_add` take `workspace_id`;
+            `ControlPlane::resolve_board_scope` honours it for a `workspace` scope (refusing an
+            unregistered id with a reason) and otherwise defers to `resolve_task_scope`. Quick-add
+            hands the board it resolved through `CreateTask::workspace_id`, or `task_create` would
+            have re-resolved "workspace" to the active one. The board page passes its own
+            `workspaceId` to both. Test `a_board_named_by_workspace_id_is_used_whatever_is_active`
+            (red without it: the card landed on the active board). **Live over WebDriver:** with
+            workspace A active, `quick_add_card {workspaceId: B}` put the card on B, each
+            `list_tasks` returned only its own board's card, an unknown id was refused, and the
+            Board page showed A's card and not B's.
 - [ ] Delete: session table + `SessionManager`, `ChatAction::*`, `chat_harness.rs` continuation
       loop, empty-bubble gating, per-session pinned model, GUI chat pages and commands, channel
       adapters + `channel_secrets` + per-channel pinned models, `scheduler.target_channel/
@@ -9786,6 +9971,10 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            Compiler API, which the Go-native core does not expose until **7.1**; the tracking issue
            is [vuejs/language-tools#5381](https://github.com/vuejs/language-tools/issues/5381).
            Do NOT re-attempt until 7.1 ships or `vue-tsc` publishes a tsgo-backed release.)*
+           *(2026-10-03)* Re-tried once more because a search summary claimed "TS 7 support since
+           vue-tsc 3.3.8": **false for us** — `vue-tsc@3.3.12` + `typescript@7.0.2` dies in
+           `resolveTscPath` with the same `ERR_PACKAGE_PATH_NOT_EXPORTED`. Reverted. The rule
+           above stands; trust a release note, not a summary.
      - [ ] *(research 2026-08-27)* **Evaluate `vue-tsgo` as the TS-7 escape hatch if 7.1 slips.**
            Two independent Go/tsgo-backed Vue SFC type checkers now exist —
            [KazariEX/vue-tsgo](https://github.com/KazariEX/vue-tsgo) (by a Vue Language Tools core
@@ -9862,6 +10051,28 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            against a copy of a real `nanna.db`; check the 0.8 default features against
            [turso#7660](https://github.com/tursodatabase/turso/issues/7660) while there.
            ([lib.rs](https://lib.rs/crates/turso))
+           *(2026-10-03)* **Moved: `=0.7.2 → =0.8.1`, `default-features = false` + `mimalloc` +
+           `pure-rust-crypto`.** With turso's defaults 0.8.1 **does not compile here**:
+           `turso_core`'s FTS directory (`index_method/fts/directory.rs:345`) calls
+           `DynVec::new_in(DynAllocator)`, which only type-checks under `--cfg nightly`, and
+           without that cfg `DynVec` is a plain `Vec` (E0308). Nanna has no full-text index, so
+           `fts` is off (upstream: [turso#9463](https://github.com/tursodatabase/turso/issues/9463),
+           open) — which also removes `tantivy` and 33 other crates from the lockfile,
+           among them `zstd-sys` (C) and the unsound `lru 0.16.4`. `mimalloc` stays on because
+           it was a default before: turso installs it as the **process-wide
+           `#[global_allocator]`** (`turso/src/lib.rs:36`), so dropping it would swap the whole
+           binary's allocator — a perf change for another day, filed below. Gate: storage 239
+           tests, workspace 2789 passed / 0 failed, clippy 0 warnings, `cargo build --release -p
+           nanna-daemon` 6m52s, and a release boot against a copy of the operator's real 101 MB
+           `nanna.db` + WAL (3730 memories and 23 sessions load, "Daemon ready", no panic).
+           Unblocks the P12 `mummu` integration retry below (the turso split).
+     - [ ] *(found 2026-10-03)* **turso makes `mimalloc` (a C allocator) Nanna's global
+           allocator.** `turso` 0.7 and 0.8 both declare `#[global_allocator] static GLOBAL:
+           mimalloc::MiMalloc` under their default `mimalloc` feature, so every allocation in the
+           daemon — not only the database's — goes through C mimalloc, and nobody chose that.
+           Measure before deciding: idle RSS, the Suite 2/3 benches and a dream cycle with the
+           feature on vs off (system allocator); keep whichever wins, and state it in
+           `nanna-storage/Cargo.toml` as a decision rather than an inherited default.
      - [ ] *(P13, research 2026-09-26)* **FSRS-7 exists but is not shippable yet.** ts-fsrs merged it
            ([PR #520](https://github.com/open-spaced-repetition/ts-fsrs/pull/520), 2026-09-18,
            unreleased); `fsrs-rs` is at 6.6.2 with no FSRS-7, and no FSRS-7 default parameters are
@@ -10328,6 +10539,10 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `ocrs::OcrEngineParams`, so bumping our direct req puts two `rten` versions in one graph and
            the two `Model` types stop being the same type. Re-check when `ocrs` ships a release that
            tracks `rten 0.25`.
+           *(2026-10-03)* Same block one step later: we are now on `ocrs 0.13.1` + `rten 0.26`,
+           `rten 0.27.0` shipped 2026-10-02, and `ocrs 0.13.1` (still the latest) requires
+           `rten ^0.26.0` (and `rten-imageproc`/`rten-tensor ^0.26.0`). Not taken; re-check when
+           `ocrs` moves.
      - [ ] **The `turso_core` release build is non-deterministic under the parallel rustc frontend.**
            On the pinned `nightly-2026-08-03`, `cargo build --release -p nanna-daemon` failed once with
            `error: queries overflow the depth limit!` in `turso_core 0.6.1` and then **succeeded on an
@@ -10979,6 +11194,13 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
                        item 4 (Mummu's MiniLM embedder behind the memory `embed_fn`) buildable.
                        The 0.8.0-pre watch above is now load-bearing for P12, not just for P13's
                        indexing question.
+                       *(2026-10-03)* **Nanna's half is done** — the pin is `=0.8.1` (see the turso
+                       item in Dependencies). **Mummu's half is not:** its `origin/main` (c49de14)
+                       still pins `burn 0.22.0-pre.3`, so its lockfile still carries
+                       `cubecl-environment 0.11.0-pre.3` → `rusqlite 0.40.2` / `libsqlite3-sys
+                       0.38.2`, and `burn 0.22.0-pre.4` has been on crates.io since 2026-09-22. The
+                       next step is Mummu's burn bump (its routine's item); re-try adding `mummu`
+                       here only after its lockfile is free of `rusqlite`.
                  - [ ] **Measure before deciding, if 0.8.0 stays unstable:** add `mummu` at
                        burn 0.22-pre.4 on a scratch branch and read the resolved lockfile. If the
                        guard passes and the second turso is confined to cubecl's autotune cache,

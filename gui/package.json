@@ -1,6 +1,6 @@
 {
   "name": "nanna-gui",
-  "version": "0.3.35",
+  "version": "0.3.36",
   "type": "module",
   "private": true,
   "scripts": {
@@ -24,7 +24,7 @@
   },
   "dependencies": {
     "@guolao/vue-monaco-editor": "^1.6.0",
-    "@lucide/vue": "^1.49.0",
+    "@lucide/vue": "^1.51.0",
     "@monaco-editor/loader": "^1.7.0",
     "@tauri-apps/api": "^2.12.1",
     "@tauri-apps/plugin-dialog": "^2.8.1",
@@ -75,7 +75,8 @@
   "pnpm": {
     "auditConfig": {
       "ignoreGhsas": [
-        "GHSA-86w9-cpqp-85rv"
+        "GHSA-86w9-cpqp-85rv",
+        "GHSA-vfj7-8cjw-p6xm"
       ]
     }
   }

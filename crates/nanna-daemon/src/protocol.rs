@@ -159,6 +159,11 @@ pub enum TaskAction {    /// List tasks in a scope
         session_id: Option<String>,
         #[serde(default)]
         include_closed: Option<bool>,
+        /// With `scope: "workspace"`, the board of this registered workspace
+        /// rather than the daemon's active one — a client shows its own
+        /// board, which another client's choice must not change.
+        #[serde(default)]
+        workspace_id: Option<String>,
     },
     /// Get one task with notes + activity
     Get { id: i64 },
@@ -226,6 +231,10 @@ pub enum TaskAction {    /// List tasks in a scope
         /// parent's board and `scope` is ignored.
         #[serde(default)]
         parent_id: Option<i64>,
+        /// With `scope: "workspace"`, put the card on this registered
+        /// workspace's board rather than the daemon's active one.
+        #[serde(default)]
+        workspace_id: Option<String>,
     },
     /// Every open board card assigned to `member_id` (default: the human),
     /// across every board — the read behind Inbox and Upcoming (P25 decision

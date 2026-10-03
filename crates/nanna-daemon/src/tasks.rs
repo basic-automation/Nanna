@@ -1301,8 +1301,10 @@ pub struct TursoTaskSource {
     /// `progress` posts and closings become `verdict` posts on the card's
     /// thread, authored by this member.
     member_id: Option<String>,
-    /// Set once this run handed its card back (see [`Self::hand_back`]):
-    /// from then on the card is the router's again, so nothing is served.
+    /// Set once this run gave its card up — handed it back (see
+    /// [`Self::hand_back`]) or put it to the human because the provider
+    /// refused the run (see [`Self::ask_human_to_fix`]): from then on the
+    /// card is not this run's, so nothing is served.
     handed_back: std::sync::atomic::AtomicBool,
 }
 
@@ -1349,6 +1351,17 @@ pub enum CardAfterRun {
     /// The run had nothing left it could work (the card waits on another):
     /// pending again, for the wake that unblocks it.
     Waiting,
+    /// The provider refused the run's credentials or account (see
+    /// [`is_terminal_provider_error`]): no member and no retry can finish the
+    /// card until a person fixes the setup, so the human is asked at once and
+    /// the card waits on the answer with its member — not a failed verdict,
+    /// and not counted toward the router's retry bound.
+    AskHuman(String),
+    /// The provider rate-limited the run (see [`is_rate_limited_error`]): the
+    /// card waits out the limit with its member and is tried again — not a
+    /// failure, not the router's (Hermes Kanban requeues a rate-limited run
+    /// without counting it).
+    RateLimited(String),
 }
 
 /// Decide [`CardAfterRun`] for `card` after a run that stopped with `stop`.
@@ -1366,6 +1379,12 @@ pub fn card_after_run(card: &Task, stop: &StopReason) -> CardAfterRun {
         StopReason::TokenBudgetExhausted => CardAfterRun::HandBack(
             "the run used its whole token budget without finishing the card".to_string(),
         ),
+        StopReason::RunnerErrors { message } if is_terminal_provider_error(message) => {
+            CardAfterRun::AskHuman(message.clone())
+        }
+        StopReason::RunnerErrors { message } if is_rate_limited_error(message) => {
+            CardAfterRun::RateLimited(message.clone())
+        }
         StopReason::RunnerErrors { message } => {
             CardAfterRun::HandBack(format!("the model kept failing: {message}"))
         }
@@ -1425,6 +1444,34 @@ pub const RUN_ENDED_ACTION: &str = "run_ended";
 /// The activity row a member's run leaves when it hands its card back to the
 /// router unfinished. The router's worker counts them to bound retries.
 pub const HANDED_BACK_ACTION: &str = "handed_back";
+
+/// The activity row the stall sweep leaves when it takes a card back.
+///
+/// Written by [`crate::card_run_trigger::release_stalled`] for a card nobody
+/// was working. Counted with [`HANDED_BACK_ACTION`] toward the router's retry bound: a card
+/// that keeps stalling is as unfinished as one that keeps being handed back.
+pub const STALLED_ACTION: &str = "stalled";
+
+/// The activity row a card run leaves when the provider rate-limited it.
+///
+/// Its detail is `{"until": <rfc3339>, "reason": …}`. The card keeps its member and is
+/// not started again before `until` (see
+/// [`crate::card_run_trigger::cooling_down_until`]); it is not a failure and
+/// counts toward nothing.
+pub const RATE_LIMITED_ACTION: &str = "rate_limited";
+
+/// How long a rate-limited card waits when the provider named no wait.
+///
+/// Bound justification: the card-run worker looks for cooled-down cards on
+/// its five-minute tick, so a shorter default would not start any sooner;
+/// a provider that names its own wait is believed up to
+/// [`RATE_LIMIT_COOLDOWN_MAX`].
+pub const RATE_LIMIT_COOLDOWN_DEFAULT: std::time::Duration = std::time::Duration::from_mins(5);
+
+/// The longest wait a rate-limited card is given, whatever the provider says.
+/// Bound justification: the same hour `nanna_llm` treats as the most a
+/// provider's reset can plausibly ask for.
+pub const RATE_LIMIT_COOLDOWN_MAX: std::time::Duration = std::time::Duration::from_hours(1);
 
 /// A board scope's hierarchy, as a card run sees it: who each card's parent
 /// is and who each card is assigned to.
@@ -1830,6 +1877,8 @@ impl TursoTaskSource {
                 )
                 .await;
             }
+            CardAfterRun::AskHuman(error) => self.ask_human_to_fix(&card, &error).await,
+            CardAfterRun::RateLimited(error) => self.wait_out_rate_limit(&card, &error).await,
             CardAfterRun::Waiting => {
                 if card.status == "in_progress" {
                     let wait = TaskPatch {
@@ -1843,6 +1892,123 @@ impl TursoTaskSource {
             }
         }
     }
+    /// The run's provider refused it outright: ask the human to fix the setup
+    /// (P25 decision 6's clarification — the card waits on it, derived
+    /// `blocked`) and put the card back to `pending` with its member, so the
+    /// answer's `unblocked` restarts it. If the question cannot be asked the
+    /// card is handed back instead: never left in progress with nobody on it.
+    async fn ask_human_to_fix(&self, card: &Task, error: &str) {
+        let Some(member_id) = self.member_id.as_deref() else {
+            return;
+        };
+        debug_assert_eq!(self.subtree_root, Some(card.id), "only the run's own card");
+        let error = truncate_post(error);
+        let question = format!(
+            "The model provider refused {member_id}'s run on card #{}: {error}\nFix the API \
+             key, account or model list (Settings, or this agent's models on the Members \
+             page), then complete this card and the run starts again.",
+            card.id
+        );
+        let asked = nanna_storage::routing::ask_on_card(
+            &self.storage.tasks(),
+            member_id,
+            card,
+            &question,
+            "the provider refused the credentials or account; another try would fail the same way",
+        )
+        .await;
+        if let Err(e) = asked {
+            tracing::warn!(task_id = card.id, error = %e, "provider failure not put to the human; handing back");
+            if let Err(e) = self
+                .hand_back(
+                    card.id,
+                    &format!("the model provider refused the run: {error}"),
+                )
+                .await
+            {
+                tracing::warn!(task_id = card.id, error = %e, "card run's card not handed back");
+            }
+            return;
+        }
+        if card.status == "in_progress" {
+            let wait = TaskPatch {
+                status: Some("pending".to_string()),
+                ..TaskPatch::default()
+            };
+            if let Err(e) = self
+                .storage
+                .tasks()
+                .update(card.id, wait, Some(&self.actor))
+                .await
+            {
+                tracing::warn!(task_id = card.id, error = %e, "card run's card left in progress");
+            }
+        }
+        self.handed_back
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The provider rate-limited the run: keep the card with its member,
+    /// `pending`, and record when it may be tried again (a
+    /// [`RATE_LIMITED_ACTION`] row — the card-run worker restarts it once the
+    /// wait is over). Nothing is handed back and nothing is counted.
+    async fn wait_out_rate_limit(&self, card: &Task, error: &str) {
+        let Some(member_id) = self.member_id.as_deref() else {
+            return;
+        };
+        debug_assert_eq!(self.subtree_root, Some(card.id), "only the run's own card");
+        let wait = rate_limit_cooldown(error);
+        debug_assert!(wait <= RATE_LIMIT_COOLDOWN_MAX, "bounded wait");
+        let until = chrono::Utc::now() + chrono::Duration::from_std(wait).unwrap_or_default();
+        let error = truncate_post(error);
+        let repo = self.storage.tasks();
+        let detail = json!({ "until": until.to_rfc3339(), "reason": error });
+        if let Err(e) = repo
+            .log_activity(
+                card.id,
+                Some(&self.actor),
+                RATE_LIMITED_ACTION,
+                Some(detail),
+            )
+            .await
+        {
+            // Without the row nothing would hold the restart back: hand the
+            // card back instead of risking a hot loop against the limit.
+            tracing::warn!(task_id = card.id, error = %e, "rate limit not recorded; handing back");
+            if let Err(e) = self
+                .hand_back(
+                    card.id,
+                    &format!("the model provider rate-limited the run: {error}"),
+                )
+                .await
+            {
+                tracing::warn!(task_id = card.id, error = %e, "card run's card not handed back");
+            }
+            return;
+        }
+        self.post_as_member(
+            card.id,
+            nanna_storage::TaskNoteKind::Progress,
+            &format!(
+                "Rate-limited by the model provider; {member_id} tries again after {} UTC. \
+                 Not counted as a failure.",
+                until.format("%H:%M")
+            ),
+        )
+        .await;
+        if card.status == "in_progress" {
+            let wait = TaskPatch {
+                status: Some("pending".to_string()),
+                ..TaskPatch::default()
+            };
+            if let Err(e) = repo.update(card.id, wait, Some(&self.actor)).await {
+                tracing::warn!(task_id = card.id, error = %e, "card run's card left in progress");
+            }
+        }
+        self.handed_back
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// A member's run gave up on its card: P25 decision 7 — a failed verdict
     /// goes back to the router with the failure posted, never to `cancelled`
     /// (a card is the human's; only they close it unfinished).
@@ -2110,6 +2276,28 @@ impl TaskSource for TursoTaskSource {
 
     async fn abandon(&self, id: i64, reason: &str) -> Result<(), String> {
         if self.member_id.is_some() && self.subtree_root == Some(id) {
+            // The harness abandons an item after persistent runner errors, so
+            // a refused key surfaces here first, not as the run's stop.
+            if is_rate_limited_error(reason) {
+                let card = self
+                    .storage
+                    .tasks()
+                    .get(id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                self.wait_out_rate_limit(&card, reason).await;
+                return Ok(());
+            }
+            if is_terminal_provider_error(reason) {
+                let card = self
+                    .storage
+                    .tasks()
+                    .get(id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                self.ask_human_to_fix(&card, reason).await;
+                return Ok(());
+            }
             return self.hand_back(id, reason).await;
         }
         let repo = self.storage.tasks();
@@ -2952,6 +3140,40 @@ const STEP_RETRY_BACKOFF_SECS: [u64; 3] = [2, 5, 10];
 /// the ladder's retry-plus-runner-reset is exactly the right medicine, and a
 /// persistent wedge still surfaces through the circuit breaker). Shared by
 /// the step runner and the chat path — both heal with the same ladder.
+/// Provider failures no retry, resume or other member on the same provider
+/// can get past: the credentials or the account were refused (401 / 403),
+/// the account is out of credit (402), or no key is configured at all. The
+/// opposite of [`is_transient_llm_error`] — a run that stops on one of these
+/// is not resumed, and its card asks the human instead of going back to the
+/// router (Hermes Kanban blocks a card at once on a terminal provider error
+/// for the same reason). Matched on the rendered `LlmError` text, as the
+/// transient check is.
+pub(crate) fn is_terminal_provider_error(message: &str) -> bool {
+    message.contains("API error: 401")
+        || message.contains("API error: 402")
+        || message.contains("API error: 403")
+        || message.contains("Missing API key")
+}
+
+/// A provider saying "slow down" (HTTP 429, rendered by `nanna_llm` as
+/// `Rate limit exceeded: …`): it clears by waiting, so a card run that hits it
+/// keeps its card and tries again later rather than failing it.
+pub(crate) fn is_rate_limited_error(message: &str) -> bool {
+    message.contains("Rate limit exceeded") || message.contains("API error: 429")
+}
+
+/// How long a card rate-limited with `message` waits: the provider's own
+/// wait when the message names one, else [`RATE_LIMIT_COOLDOWN_DEFAULT`],
+/// never more than [`RATE_LIMIT_COOLDOWN_MAX`].
+pub(crate) fn rate_limit_cooldown(message: &str) -> std::time::Duration {
+    let named = nanna_llm::LlmError::parse_retry_after(message).map(std::time::Duration::from_secs);
+    let wait = named
+        .unwrap_or(RATE_LIMIT_COOLDOWN_DEFAULT)
+        .min(RATE_LIMIT_COOLDOWN_MAX);
+    debug_assert!(wait > std::time::Duration::ZERO, "a wait, not a hot loop");
+    wait
+}
+
 pub(crate) fn is_transient_llm_error(message: &str) -> bool {
     message.contains("API error: 5")
         || message.contains("timed out")
@@ -8326,7 +8548,12 @@ impl TaskRunManager {
                         interjector.as_deref().map(|i| i as &dyn Interjector),
                     )
                     .await;
-                let provider_died = matches!(report.stop, StopReason::RunnerErrors { .. });
+                // A refused key or account does not heal by resuming: the
+                // card asks the human instead (`CardAfterRun::AskHuman`).
+                let provider_died = matches!(
+                    &report.stop,
+                    StopReason::RunnerErrors { message } if !is_terminal_provider_error(message)
+                );
                 segments.push(report);
                 if !provider_died
                     || resumes >= RUN_RESUMES_MAX
@@ -8406,6 +8633,37 @@ impl TaskRunManager {
                 "card run queue is full; a freed member's next card waits"
             );
         }
+    }
+
+    /// Whether a live run serves a card of board `scope`/`scope_id` whose
+    /// lineage (the card, then its ancestors) is `lineage`: a card run on any
+    /// of them, or a scope run over the whole board. A sub-card worked inside
+    /// its parent's run has no run of its own and is still being worked.
+    pub async fn serves_card(&self, scope: &str, scope_id: Option<&str>, lineage: &[i64]) -> bool {
+        debug_assert!(!lineage.is_empty(), "a lineage starts at the card");
+        debug_assert!(
+            lineage.len() <= nanna_storage::TASK_DEPTH_MAX + 1,
+            "bounded by depth"
+        );
+        let scope_key = Self::scope_key(scope, scope_id);
+        let runs = self.runs.read().await;
+        runs.values().any(|run| {
+            run.card.as_ref().map_or_else(
+                || run.scope_key == scope_key,
+                |claim| lineage.contains(&claim.card_id),
+            )
+        })
+    }
+
+    /// Whether `member_id` is working a card right now.
+    pub async fn member_is_working(&self, member_id: &str) -> bool {
+        debug_assert!(!member_id.is_empty(), "a member has an id");
+        let runs = self.runs.read().await;
+        runs.values().any(|run| {
+            run.card
+                .as_ref()
+                .is_some_and(|claim| claim.member_id == member_id)
+        })
     }
 
     /// Request cancellation of card `card_id`'s run. Returns false when no
@@ -9985,6 +10243,58 @@ mod card_run_tests {
         );
     }
 
+    /// What the stall sweep asks of the run manager: is anything working this
+    /// card (its own run, an ancestor's run, a run over its whole board), and
+    /// is this member busy anywhere.
+    #[tokio::test]
+    async fn a_card_is_served_by_its_own_run_an_ancestors_or_its_boards() {
+        let manager = crate::tasks::TaskRunManager::new();
+        assert!(
+            !manager.serves_card("global", None, &[5]).await,
+            "nothing running"
+        );
+        manager
+            .claim_slot(
+                "card:2".to_string(),
+                "global:".to_string(),
+                "g".to_string(),
+                Some(claim(2, AGENT)),
+            )
+            .await
+            .expect("claimed");
+        assert!(
+            manager.serves_card("global", None, &[2]).await,
+            "its own run"
+        );
+        assert!(
+            manager.serves_card("global", None, &[7, 2]).await,
+            "a sub-card inside its parent's run"
+        );
+        assert!(
+            !manager.serves_card("global", None, &[7, 3]).await,
+            "a card beside it"
+        );
+        assert!(manager.member_is_working(AGENT).await);
+        assert!(!manager.member_is_working("agent:other").await);
+        manager
+            .claim_slot(
+                "workspace:w".to_string(),
+                "workspace:w".to_string(),
+                "g".to_string(),
+                None,
+            )
+            .await
+            .expect("claimed");
+        assert!(
+            manager.serves_card("workspace", Some("w"), &[11]).await,
+            "a run over its board"
+        );
+        assert!(
+            !manager.serves_card("workspace", Some("v"), &[11]).await,
+            "another board"
+        );
+    }
+
     #[test]
     fn a_closing_post_says_what_the_check_said() {
         let passed = verdict_post(&json!({"verified": true, "verdict": " exit 0 "}));
@@ -10247,6 +10557,54 @@ mod card_run_tests {
                 "{stop:?} is a failure the router hears about"
             );
         }
+        for refused in [
+            "API error: 401 - {\"type\":\"authentication_error\"}",
+            "LLM error: API error: 402 - insufficient credits",
+            "API error: 403 - forbidden",
+            "Missing API key for provider: anthropic",
+        ] {
+            let stop = StopReason::RunnerErrors {
+                message: refused.to_string(),
+            };
+            assert_eq!(
+                card_after_run(&open, &stop),
+                CardAfterRun::AskHuman(refused.to_string()),
+                "{refused}: only a person can fix it"
+            );
+        }
+        for retryable in [
+            "API error: 429 - slow down",
+            "API error: 500",
+            "timed out",
+            "API error: 400 - context length exceeded",
+        ] {
+            assert!(!super::is_terminal_provider_error(retryable), "{retryable}");
+        }
+        let limited = StopReason::RunnerErrors {
+            message: "step error: LLM error: Rate limit exceeded: slow down".to_string(),
+        };
+        assert!(
+            matches!(
+                card_after_run(&open, &limited),
+                CardAfterRun::RateLimited(_)
+            ),
+            "a rate limit waits, it does not fail"
+        );
+        let default = super::RATE_LIMIT_COOLDOWN_DEFAULT;
+        assert_eq!(
+            super::rate_limit_cooldown("Rate limit exceeded: busy"),
+            default
+        );
+        assert_eq!(
+            super::rate_limit_cooldown("Rate limit exceeded: retry-after: 120"),
+            std::time::Duration::from_secs(120),
+            "the provider's own wait"
+        );
+        assert_eq!(
+            super::rate_limit_cooldown("Rate limit exceeded: retry-after: 999999"),
+            default,
+            "an implausible wait is not believed"
+        );
         storage
             .tasks()
             .complete(id, None, None)
@@ -10292,6 +10650,92 @@ mod card_run_tests {
                 .iter()
                 .any(|n| n.content.starts_with("Stopped on request")),
             "{thread:?}"
+        );
+    }
+
+    /// A run the provider refused outright asks the human to fix the setup:
+    /// the card waits on that question with its member, and nothing is
+    /// handed back (it is not the member's failure, and not counted).
+    #[tokio::test]
+    async fn a_refused_key_asks_the_human_and_keeps_the_card_with_its_member() {
+        use nanna_agent::harness::StopReason;
+        let storage = builder_storage().await;
+        let tasks = storage.tasks();
+        let id = card(&storage, "needs a model", None, 3).await;
+        let source = card_source(&storage, id);
+        source.start(id).await.expect("picked up");
+        source
+            .settle_after_run(&StopReason::RunnerErrors {
+                message: "API error: 401 - invalid x-api-key".to_string(),
+            })
+            .await;
+
+        let waiting = tasks.get(id).await.expect("card");
+        assert_eq!(waiting.status, "pending");
+        assert_eq!(
+            waiting.assignee.as_deref(),
+            Some(AGENT),
+            "kept by its member"
+        );
+        assert!(waiting.blocked, "waits on the question");
+        let question = tasks.get(waiting.depends_on[0]).await.expect("question");
+        assert_eq!(
+            question.assignee.as_deref(),
+            Some(nanna_storage::HUMAN_MEMBER_ID)
+        );
+        assert!(
+            question
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains("invalid x-api-key")),
+            "{question:?}"
+        );
+        let activity = tasks.activity(id, 32).await.expect("activity");
+        assert!(
+            !activity
+                .iter()
+                .any(|a| a.action == super::HANDED_BACK_ACTION),
+            "not a hand-back"
+        );
+    }
+
+    /// A rate-limited run keeps its card with its member and records when it
+    /// may be tried again; nothing goes to the router or the human.
+    #[tokio::test]
+    async fn a_rate_limited_card_waits_with_its_member() {
+        use nanna_agent::harness::StopReason;
+        let storage = builder_storage().await;
+        let tasks = storage.tasks();
+        let id = card(&storage, "busy provider", None, 3).await;
+        let source = card_source(&storage, id);
+        source.start(id).await.expect("picked up");
+        let before = chrono::Utc::now();
+        source
+            .settle_after_run(&StopReason::RunnerErrors {
+                message: "Rate limit exceeded: retry-after: 90".to_string(),
+            })
+            .await;
+
+        let waiting = tasks.get(id).await.expect("card");
+        assert_eq!(waiting.status, "pending");
+        assert_eq!(waiting.assignee.as_deref(), Some(AGENT));
+        assert!(waiting.depends_on.is_empty(), "nobody is asked");
+        let activity = tasks.activity(id, 32).await.expect("activity");
+        assert!(
+            !activity
+                .iter()
+                .any(|a| a.action == super::HANDED_BACK_ACTION),
+            "not a hand-back"
+        );
+        let until = crate::card_run_trigger::cooling_down_until(&activity, before).expect("waits");
+        assert!(until >= before + chrono::Duration::seconds(89), "{until}");
+        assert!(
+            crate::card_run_trigger::cooling_down_until(
+                &activity,
+                before + chrono::Duration::seconds(91)
+            )
+            .is_none(),
+            "and not after"
         );
     }
 
