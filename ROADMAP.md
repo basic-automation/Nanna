@@ -509,10 +509,12 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       none fixable from this tree; npm: 4 low/moderate. The gate was checked to have eyes: the
       same pnpm audit at `moderate` exits 1. Thresholds are deliberate: failing on warnings would
       leave the job permanently red, i.e. ignored.
-      - [ ] **`lru 0.16.4` is unsound (RUSTSEC-2026-0253, use-after-free when a key's `Drop` panics
+      - [x] **`lru 0.16.4` is unsound (RUSTSEC-2026-0253, use-after-free when a key's `Drop` panics
             inside `pop()`), patched in ≥ 0.18.2** — reached only via `tantivy 0.26` under turso's
             exact `=0.7.2` pin, so it moves when turso does. Not reachable in shipped builds: it
             needs unwinding plus `catch_unwind`, and the release profile is `panic = "abort"`.
+            *(2026-10-03)* **Gone from the graph** — the turso 0.8.1 move turns off turso's `fts`
+            feature, which was the only path to `tantivy`, so `lru` left the lockfile with it.
       - [ ] *(2026-10-02)* **`node-forge` GHSA-86w9-cpqp-85rv (high) is exempted, not fixed.** No
             release fixes it (1.4.0 is the latest; the advisory lists no patched version); it
             comes through `nuxt → listhen`, the dev server's cert helper, which the shipped static
@@ -9862,6 +9864,27 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            against a copy of a real `nanna.db`; check the 0.8 default features against
            [turso#7660](https://github.com/tursodatabase/turso/issues/7660) while there.
            ([lib.rs](https://lib.rs/crates/turso))
+           *(2026-10-03)* **Moved: `=0.7.2 → =0.8.1`, `default-features = false` + `mimalloc` +
+           `pure-rust-crypto`.** With turso's defaults 0.8.1 **does not compile here**:
+           `turso_core`'s FTS directory (`index_method/fts/directory.rs:345`) calls
+           `DynVec::new_in(DynAllocator)`, which only type-checks under `--cfg nightly`, and
+           without that cfg `DynVec` is a plain `Vec` (E0308). Nanna has no full-text index, so
+           `fts` is off — which also removes `tantivy` and 33 other crates from the lockfile,
+           among them `zstd-sys` (C) and the unsound `lru 0.16.4`. `mimalloc` stays on because
+           it was a default before: turso installs it as the **process-wide
+           `#[global_allocator]`** (`turso/src/lib.rs:36`), so dropping it would swap the whole
+           binary's allocator — a perf change for another day, filed below. Gate: storage 239
+           tests, workspace 2789 passed / 0 failed, clippy 0 warnings, `cargo build --release -p
+           nanna-daemon` 6m52s, and a release boot against a copy of the operator's real 101 MB
+           `nanna.db` + WAL (3730 memories and 23 sessions load, "Daemon ready", no panic).
+           Unblocks the P12 `mummu` integration retry below (the turso split).
+     - [ ] *(found 2026-10-03)* **turso makes `mimalloc` (a C allocator) Nanna's global
+           allocator.** `turso` 0.7 and 0.8 both declare `#[global_allocator] static GLOBAL:
+           mimalloc::MiMalloc` under their default `mimalloc` feature, so every allocation in the
+           daemon — not only the database's — goes through C mimalloc, and nobody chose that.
+           Measure before deciding: idle RSS, the Suite 2/3 benches and a dream cycle with the
+           feature on vs off (system allocator); keep whichever wins, and state it in
+           `nanna-storage/Cargo.toml` as a decision rather than an inherited default.
      - [ ] *(P13, research 2026-09-26)* **FSRS-7 exists but is not shippable yet.** ts-fsrs merged it
            ([PR #520](https://github.com/open-spaced-repetition/ts-fsrs/pull/520), 2026-09-18,
            unreleased); `fsrs-rs` is at 6.6.2 with no FSRS-7, and no FSRS-7 default parameters are
