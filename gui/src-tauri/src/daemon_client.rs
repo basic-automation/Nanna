@@ -1833,13 +1833,20 @@ impl DaemonClient {
     ///
     /// Fails only as [`Self::request`] does. The daemon reports a refused
     /// `task.list` inside the `Ok` reply (an `error` field), not as an `Err`.
-    pub async fn task_list(&self, scope: &str, session_id: Option<&str>, include_closed: Option<bool>) -> Result<Value, String> {
+    pub async fn task_list(
+        &self,
+        scope: &str,
+        session_id: Option<&str>,
+        include_closed: Option<bool>,
+        workspace_id: Option<&str>,
+    ) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "task",
             "action": "list",
             "scope": scope,
             "session_id": session_id,
-            "include_closed": include_closed
+            "include_closed": include_closed,
+            "workspace_id": workspace_id
         })).await
     }
 
@@ -1937,13 +1944,20 @@ impl DaemonClient {
     ///
     /// Fails only as [`Self::request`] does. A line the daemon refuses (an
     /// unknown `@member`, a bad `{deadline}`) comes back inside the `Ok` reply.
-    pub async fn task_quick_add(&self, text: &str, scope: Option<&str>, parent_id: Option<i64>) -> Result<Value, String> {
+    pub async fn task_quick_add(
+        &self,
+        text: &str,
+        scope: Option<&str>,
+        parent_id: Option<i64>,
+        workspace_id: Option<&str>,
+    ) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "task",
             "action": "quick_add",
             "text": text,
             "scope": scope,
-            "parent_id": parent_id
+            "parent_id": parent_id,
+            "workspace_id": workspace_id
         })).await
     }
 

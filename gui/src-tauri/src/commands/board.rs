@@ -11,7 +11,8 @@ use tauri::State;
 use tokio::sync::RwLock;
 
 /// Turn one quick-add line into a card (`#label p1 @member friday {deadline}`);
-/// with `parent_id`, a sub-card of that card.
+/// with `parent_id`, a sub-card of that card; with `workspace_id`, on that
+/// workspace's board rather than the daemon's active one.
 ///
 /// # Errors
 ///
@@ -23,10 +24,11 @@ pub async fn quick_add_card(
     text: String,
     scope: Option<String>,
     parent_id: Option<i64>,
+    workspace_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
     backend_handle(&state)
         .await
-        .task_quick_add(&text, scope.as_deref(), parent_id)
+        .task_quick_add(&text, scope.as_deref(), parent_id, workspace_id.as_deref())
         .await
 }
 

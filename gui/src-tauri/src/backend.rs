@@ -943,7 +943,7 @@ daemon_proxies! {
 
     // --- Task store operations ---
     /// List tasks in a scope
-    task_list(scope: &str, session_id: Option<&str>, include_closed: Option<bool>);
+    task_list(scope: &str, session_id: Option<&str>, include_closed: Option<bool>, workspace_id: Option<&str>);
     /// Create a new task
     task_create(title: &str, scope: &str, session_id: Option<&str>, parent_id: Option<i64>, description: Option<&str>, priority: Option<i64>);
     /// Update a task with a partial patch
@@ -957,7 +957,7 @@ daemon_proxies! {
 
     // --- Board (P25 Stage 4) ---
     /// One quick-add line becomes one card
-    task_quick_add(text: &str, scope: Option<&str>, parent_id: Option<i64>);
+    task_quick_add(text: &str, scope: Option<&str>, parent_id: Option<i64>, workspace_id: Option<&str>);
     /// One card with its thread
     task_get(id: i64);
     /// The human posts on a card's thread

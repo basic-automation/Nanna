@@ -2357,6 +2357,7 @@ async fn open_tasks(client: &Client, session: &str) -> Vec<serde_json::Value> {
             scope: Some("session".to_string()),
             session_id: Some(session.to_string()),
             include_closed: Some(false),
+            workspace_id: None,
         }))
         .await
         .expect("tasks.list answers");

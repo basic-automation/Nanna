@@ -8563,11 +8563,24 @@ as its turn (`TurnAdmission`, scope default `session`).
             resume on the mock; live: a markdown post rendered, `card_run_status` answered.
             **Not verified live:** a real run start/stop — this host has no model to run one
             (see *No embedder on this host*).
-      - [ ] **The Board view is only addressable while its workspace is active.**
+      - [x] **The Board view is only addressable while its workspace is active.**
             `task.list/quick_add` resolve `workspace` scope to the daemon's *active* workspace, so
             the board shows the workspace the top bar selected and nothing else. Fine while the
             top bar drives it; a second window or a link to another board needs `scope_id` on
             these verbs. (Inbox/Upcoming did not need it — `task.assigned` is cross-board.)
+            *(2026-10-03)* **It was a correctness bug, not just addressability:** the GUI's active
+            workspace is *its own* view state, while the daemon's is whatever any client last
+            chose — so with two clients a board could list, and quick-add onto, a board it was
+            not showing. `task.list` and `task.quick_add` take `workspace_id`;
+            `ControlPlane::resolve_board_scope` honours it for a `workspace` scope (refusing an
+            unregistered id with a reason) and otherwise defers to `resolve_task_scope`. Quick-add
+            hands the board it resolved through `CreateTask::workspace_id`, or `task_create` would
+            have re-resolved "workspace" to the active one. The board page passes its own
+            `workspaceId` to both. Test `a_board_named_by_workspace_id_is_used_whatever_is_active`
+            (red without it: the card landed on the active board). **Live over WebDriver:** with
+            workspace A active, `quick_add_card {workspaceId: B}` put the card on B, each
+            `list_tasks` returned only its own board's card, an unknown id was refused, and the
+            Board page showed A's card and not B's.
 - [ ] Delete: session table + `SessionManager`, `ChatAction::*`, `chat_harness.rs` continuation
       loop, empty-bubble gating, per-session pinned model, GUI chat pages and commands, channel
       adapters + `channel_secrets` + per-channel pinned models, `scheduler.target_channel/

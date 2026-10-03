@@ -28,13 +28,17 @@ impl ControlPlane {
         text: &str,
         scope: Option<String>,
         parent_id: Option<i64>,
+        workspace_id: Option<String>,
     ) -> Value {
         let today = chrono::Utc::now().date_naive();
         let parsed = match nanna_storage::quick_add::parse(text, today) {
             Ok(parsed) => parsed,
             Err(e) => return json!({"error": "bad_quick_add", "message": e.to_string()}),
         };
-        let (scope, scope_id) = match self.quick_add_board(repo, scope, parent_id).await {
+        let (scope, scope_id) = match self
+            .quick_add_board(repo, scope, parent_id, workspace_id.as_deref())
+            .await
+        {
             Ok(board) => board,
             Err(reply) => return reply,
         };
@@ -46,7 +50,12 @@ impl ControlPlane {
             },
             None => None,
         };
+        // The board resolved here is the one the card goes on: hand its id
+        // through, or `task_create` would resolve "workspace" again — to the
+        // daemon's active workspace, which need not be this one.
+        let board_workspace = (scope == "workspace").then(|| scope_id.clone()).flatten();
         let request = CreateTask {
+            workspace_id: board_workspace,
             title: parsed.title.clone(),
             scope: Some(scope),
             session_id: None,
@@ -79,6 +88,7 @@ impl ControlPlane {
         repo: &TaskRepository,
         scope: Option<String>,
         parent_id: Option<i64>,
+        workspace_id: Option<&str>,
     ) -> Result<(String, Option<String>), Value> {
         const NOT_A_BOARD: &str =
             "quick-add creates board cards — use scope \"workspace\" or \"global\"";
@@ -93,13 +103,20 @@ impl ControlPlane {
             return Ok((parent.scope, parent.scope_id));
         }
         let has_active = self.workspaces.read().await.active().is_some();
-        let scope =
-            scope.unwrap_or_else(|| if has_active { "workspace" } else { "global" }.to_string());
+        let named = workspace_id.is_some_and(|id| !id.trim().is_empty());
+        let scope = scope.unwrap_or_else(|| {
+            if has_active || named {
+                "workspace"
+            } else {
+                "global"
+            }
+            .to_string()
+        });
         if scope.eq_ignore_ascii_case("session") {
             return Err(json!({"error": "bad_scope", "message": NOT_A_BOARD}));
         }
         let board = self
-            .resolve_task_scope(Some(&scope), None)
+            .resolve_board_scope(Some(&scope), None, workspace_id)
             .await
             .map_err(|message| json!({"error": "bad_scope", "message": message}))?;
         debug_assert!(board.0 != "session", "refused above");
