@@ -10328,6 +10328,10 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `ocrs::OcrEngineParams`, so bumping our direct req puts two `rten` versions in one graph and
            the two `Model` types stop being the same type. Re-check when `ocrs` ships a release that
            tracks `rten 0.25`.
+           *(2026-10-03)* Same block one step later: we are now on `ocrs 0.13.1` + `rten 0.26`,
+           `rten 0.27.0` shipped 2026-10-02, and `ocrs 0.13.1` (still the latest) requires
+           `rten ^0.26.0` (and `rten-imageproc`/`rten-tensor ^0.26.0`). Not taken; re-check when
+           `ocrs` moves.
      - [ ] **The `turso_core` release build is non-deterministic under the parallel rustc frontend.**
            On the pinned `nightly-2026-08-03`, `cargo build --release -p nanna-daemon` failed once with
            `error: queries overflow the depth limit!` in `turso_core 0.6.1` and then **succeeded on an
