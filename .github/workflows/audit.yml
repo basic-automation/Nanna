@@ -24,6 +24,15 @@ name: Dependency audit
 #   the shipped app is Nuxt's static output inside Tauri, which runs no listhen
 #   and verifies no RSA signatures with node-forge. Drop the entry the day
 #   node-forge publishes a fix (ROADMAP P0.3).
+# - A second, for the same reason (no fix exists), added 2026-10-03:
+#   GHSA-vfj7-8cjw-p6xm (high, braces <=3.0.3, stack-exhaustion DoS on deeply
+#   nested brace patterns). braces 3.0.3 is its latest release and the
+#   advisory's patched range is empty. It arrives only through nuxt ->
+#   @nuxt/nitro-server -> nitropack -> globby -> micromatch, i.e. Nitro's
+#   build-time file globbing over our own source tree; the static output the
+#   app ships contains no braces code (checked: the word appears in the
+#   bundle only inside Monaco/TypeScript message strings). Drop the entry when
+#   braces or micromatch ships a fix.
 #
 # Triggered by the files that can change the answer, plus weekly: an advisory
 # can be published against a lockfile nobody touched.

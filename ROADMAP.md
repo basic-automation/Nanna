@@ -531,6 +531,14 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
             needs unwinding plus `catch_unwind`, and the release profile is `panic = "abort"`.
             *(2026-10-03)* **Gone from the graph** — the turso 0.8.1 move turns off turso's `fts`
             feature, which was the only path to `tantivy`, so `lru` left the lockfile with it.
+      - [ ] *(2026-10-03)* **`braces` GHSA-vfj7-8cjw-p6xm (high, stack-exhaustion DoS) is exempted,
+            not fixed** — it turned the npm audit job red on the nightly PR with no lockfile change of
+            ours (master carries the same `braces 3.0.3`; the advisory is new). No fix exists:
+            `braces` 3.0.3 is the latest and the patched range is empty. Path: `nuxt →
+            @nuxt/nitro-server → nitropack → globby → micromatch → braces`, i.e. Nitro's build-time
+            globbing; the shipped static bundle contains no braces code (the word appears only in
+            Monaco/TypeScript message strings). Exempted by id beside node-forge, reasoning in
+            `audit.yml`'s header. **Remove the entry when `braces` or `micromatch` ships a fix.**
       - [ ] *(2026-10-02)* **`node-forge` GHSA-86w9-cpqp-85rv (high) is exempted, not fixed.** No
             release fixes it (1.4.0 is the latest; the advisory lists no patched version); it
             comes through `nuxt → listhen`, the dev server's cert helper, which the shipped static
