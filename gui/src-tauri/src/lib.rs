@@ -168,9 +168,6 @@ macro_rules! command_handler {
             commands::sessions::set_session_tools,
             commands::settings::get_config,
             commands::settings::set_model,
-            commands::memory::search_memory,
-            commands::memory::get_memory_stats,
-            commands::system::show_window,
             commands::system::hide_to_tray,
             commands::settings::get_extended_settings,
             commands::settings::set_provider_api_key,
@@ -195,7 +192,6 @@ macro_rules! command_handler {
             commands::scheduler::set_scheduler_enabled,
             commands::scheduler::set_heartbeat_enabled,
             commands::scheduler::set_heartbeat_interval,
-            commands::settings::set_extraction_model,
             // Embedding configuration
             commands::settings::set_embedding_config,
             commands::settings::get_ollama_models,
@@ -214,7 +210,6 @@ macro_rules! command_handler {
             // Memory persistence
             // Memory management
             commands::memory::list_memories,
-            commands::memory::get_memory,
             commands::memory::delete_memory,
             commands::memory::update_memory,
             commands::memory::clear_memories,
@@ -229,9 +224,6 @@ macro_rules! command_handler {
             commands::channels::save_channel_config,
             commands::channels::test_channel_connection,
             // Notifications
-            commands::system::send_notification,
-            commands::system::request_notification_permission,
-            commands::system::check_notification_permission,
             // System prompt & agent settings
             commands::settings::get_system_prompt,
             commands::settings::set_system_prompt,
@@ -277,7 +269,6 @@ macro_rules! command_handler {
             commands::sessions::kill_sub_session,
             commands::sessions::get_sub_session_status,
             commands::sessions::send_to_sub_session,
-            commands::system::clear_rate_limit,
             // Workspaces
             commands::workspaces::list_workspaces,
             commands::workspaces::open_workspace,
@@ -332,7 +323,6 @@ macro_rules! command_handler {
             commands::scheduler::update_cron_job,
             commands::scheduler::set_cron_job_enabled,
             commands::scheduler::delete_cron_job,
-            commands::scheduler::delete_cron_jobs_by_name,
             commands::scheduler::run_cron_job_now,
             commands::scheduler::get_cron_job_history,
             commands::scheduler::validate_cron_expression,

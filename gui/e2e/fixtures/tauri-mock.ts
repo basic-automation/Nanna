@@ -770,7 +770,6 @@ function installInPage(options = {}) {
       case 'set_data_dir':
         return { effective: args?.path || '/home/e2e/.local/share/nanna', default: '/home/e2e/.local/share/nanna', is_custom: !!args?.path, in_use: '/home/e2e/.local/share/nanna' };
       case 'get_cognitive_memory_stats':
-      case 'get_memory_stats':
         return {
           total_memories: state.memories?.length || 0,
           by_category: {},

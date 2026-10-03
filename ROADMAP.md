@@ -1441,7 +1441,25 @@ bugs and improvements here; do not bury them only in the backlog bullet.
             with the Stage 4 chat and sub-agent deletion; `get_credential_status` /
             `refresh_oauth_token` belong to the open OAuth item; `get_data_dir` / `set_data_dir` were
             a built feature with **no UI** — wired the same day (Settings → Data → Data location, see
-            P0.1 "Data storage location selection"). Still to triage: `search_memory`, `get_memory_stats`, `get_memory`,
+            P0.1 "Data storage location selection").
+            *(2026-10-03, later)* **The rest triaged — 10 more deleted, 25 in all; 166 registered.**
+            Deleted: `search_memory` (a GUI-side substring search over every session's history, with
+            its char-safe snippet code and test), `get_memory_stats` (the app reads
+            `get_cognitive_memory_stats`), `get_memory`; the three notification commands (the app
+            notifies through `@tauri-apps/plugin-notification` directly); `show_window` (the tray
+            never called it); `clear_rate_limit`; `delete_cron_jobs_by_name`; and
+            `set_extraction_model` — whose config field `[memory] extraction_model` **nothing in the
+            daemon reads** (a dead field, filed below rather than removed, since dropping a config key
+            needs a migration story). What is left unused is exactly the deliberate keep-list:
+            chat/session (3), sub-session (5) and agent-registry (5) commands, which go with the Stage
+            4 cut-over and the sub-agent deletion, and the OAuth pair. Leave this item open until the
+            cut-over removes those.
+      - [ ] *(found 2026-10-03)* **`[memory] extraction_model` is a dead config field.** Declared and
+            defaulted in `nanna-config` (`extraction_model: String`, "empty = use chat model"), saved
+            and loaded, and read by nothing in the daemon — its only writer, the GUI's
+            `set_extraction_model`, had no caller and is deleted. Either wire it (the extraction step
+            would run on it) or remove it with a load-time tolerance for old configs; do not build on
+            it as if it worked. Still to triage: `search_memory`, `get_memory_stats`, `get_memory`,
             `set_extraction_model`, the three notification commands, `show_window`,
             `clear_rate_limit`, `delete_cron_jobs_by_name`.
       *(2026-07-24)* **Verified in the real Tauri shell over WebDriver** (`cargo tauri build` release,

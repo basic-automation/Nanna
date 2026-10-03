@@ -296,40 +296,6 @@ pub async fn delete_cron_job(
     Ok(result.get("status").and_then(|v| v.as_str()) == Some("deleted"))
 }
 
-/// Delete all cron jobs with a given name (useful for cleanup).
-///
-/// # Errors
-///
-/// Fails when the daemon cannot be reached or the `scheduler.list` request, or
-/// any `scheduler.remove` that follows it, is dropped or times out. Removals
-/// made before such a failure stand.
-#[tauri::command]
-pub async fn delete_cron_jobs_by_name(
-    state: State<'_, Arc<RwLock<AppState>>>,
-    name: String,
-) -> Result<usize, String> {
-    let backend = backend_handle(&state).await;
-    // No by-name removal over IPC — list, filter, remove each.
-    let result = backend.scheduler_list().await?;
-    let ids: Vec<String> = result
-        .get("jobs")
-        .and_then(|v| v.as_array())
-        .map_or_default(|arr| {
-            arr.iter()
-                .filter(|j| j.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
-                .filter_map(|j| j.get("id").and_then(|v| v.as_str()).map(str::to_string))
-                .collect()
-        });
-    let mut removed = 0;
-    for id in &ids {
-        let result = backend.scheduler_remove(id).await?;
-        if result.get("status").and_then(|v| v.as_str()) == Some("deleted") {
-            removed += 1;
-        }
-    }
-    Ok(removed)
-}
-
 /// Run a cron job immediately.
 ///
 /// # Errors

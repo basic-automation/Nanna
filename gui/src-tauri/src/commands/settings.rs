@@ -473,38 +473,6 @@ fn build_extended_settings(
     }
 }
 
-/// Set memory extraction model (empty string = use chat model)
-///
-/// # Errors
-///
-/// Never returns `Err`: a failed `config.toml` save is logged, and the daemon
-/// reload is best-effort.
-#[tauri::command]
-pub async fn set_extraction_model(
-    state: State<'_, Arc<RwLock<AppState>>>,
-    model: String,
-) -> Result<(), String> {
-    let mut state_guard = state.write().await;
-
-    // Persist to config (the daemon reads the same file).
-    state_guard.config.memory.extraction_model.clone_from(&model);
-    if let Err(e) = state_guard.config.save() {
-        warn!("Failed to save extraction model to config: {}", e);
-    }
-    // Never hold AppState across a daemon round trip: every other
-    // command waits on this lock for as long as the reload takes.
-    let backend = Arc::clone(&state_guard.backend);
-    drop(state_guard);
-    let _ = backend.config_reload().await;
-
-    if model.is_empty() {
-        info!("Extraction model set to: (use chat model)");
-    } else {
-        info!("Extraction model set to: {}", model);
-    }
-    Ok(())
-}
-
 /// Set a specific API key
 ///
 /// # Errors
