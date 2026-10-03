@@ -162,10 +162,6 @@ pub struct ExtendedSettings {
     pub available_embedding_models: Vec<String>,
     pub embedding_enabled: bool,
 
-    // Memory extraction model (empty = use chat model)
-    pub extraction_model: String,
-    pub available_extraction_models: Vec<String>,
-
     // Ollama configuration
     pub ollama_host: String,
     /// Whether a bearer token is saved and which server it is for — never
@@ -435,16 +431,6 @@ fn build_extended_settings(
 
         ollama_host: config.memory.ollama_host.clone(),
         ollama_token,
-
-        // Memory extraction model
-        extraction_model: config.memory.extraction_model.clone(),
-        available_extraction_models: vec![
-            String::new(), // Empty = use chat model
-            "claude-3-5-haiku-20241022".to_string(),
-            "claude-3-5-sonnet-20241022".to_string(),
-            "gpt-4o-mini".to_string(),
-            "gpt-4o".to_string(),
-        ],
 
         temperature: 1.0,
         top_p: 0.95,
@@ -2847,8 +2833,6 @@ mod tests {
             available_embedding_providers: vec!["disabled".to_string()],
             available_embedding_models: vec!["all-minilm".to_string()],
             embedding_enabled: true,
-            extraction_model: String::new(),
-            available_extraction_models: vec![String::new()],
             ollama_host: "http://127.0.0.1:11434".to_string(),
             ollama_token: OllamaTokenStatus {
                 ollama_token_saved: true,
@@ -2892,7 +2876,7 @@ mod tests {
             r#""provider":"ollama","available_providers":["ollama"],"model":"qwen2.5","available_models":["qwen2.5"],"#,
             r#""embedding_provider":"ollama","embedding_model":"nomic-embed-text","#,
             r#""available_embedding_providers":["disabled"],"available_embedding_models":["all-minilm"],"#,
-            r#""embedding_enabled":true,"extraction_model":"","available_extraction_models":[""],"#,
+            r#""embedding_enabled":true,"#,
             r#""ollama_host":"http://127.0.0.1:11434","ollama_token_saved":true,"#,
             r#""ollama_token_host":"http://127.0.0.1:11434","ollama_token_from_env":false,"#,
             r#""temperature":1.0,"top_p":0.95,"#,

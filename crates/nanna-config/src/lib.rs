@@ -656,8 +656,11 @@ pub struct MemoryConfig {
     pub storage_path: Option<PathBuf>,
     /// Ollama server URL (used for both chat and embeddings)
     pub ollama_host: String,
-    /// Model to use for memory extraction (empty = use chat model)
-    pub extraction_model: String,
+    // NOTE: `extraction_model` was removed 2026-10-03: declared, saved and
+    // loaded, and read by nothing — extraction always ran on the chat model,
+    // whatever it said. Old config.toml files carrying the key load unchanged
+    // (nothing here uses `#[serde(deny_unknown_fields)]`); covered by
+    // `legacy_extraction_model_key_still_loads`.
     /// Embedding model priority list for fallback
     /// Format: `["openai/text-embedding-3-small", "ollama/nomic-embed-text"]`
     pub embedding_priority: Vec<String>,
@@ -743,7 +746,6 @@ impl Default for MemoryConfig {
             vector_dimension: 1536,
             storage_path: None,
             ollama_host: "http://localhost:11434".to_string(),
-            extraction_model: String::new(), // Empty = use chat model
             // EMPTY means "not configured", which falls back to the
             // `embedding_provider`/`embedding_model` pair.
             //
@@ -2040,6 +2042,18 @@ mod tests {
         let parsed: MemoryConfig =
             toml::from_str("auto_remember_messages = false").unwrap();
         assert!(!parsed.auto_remember_messages);
+    }
+
+    #[test]
+    fn legacy_extraction_model_key_still_loads() {
+        // `[memory] extraction_model` was removed 2026-10-03: nothing read it.
+        // An install whose Settings ever saved it has the key on disk, and a
+        // config that refuses to parse is a dead app.
+        let legacy = "[memory]\nextraction_model = \"gpt-4o-mini\"\nollama_host = \"http://h:11434\"\n";
+        let config: Config = toml::from_str(legacy).expect("legacy config must still parse");
+        assert_eq!(config.memory.ollama_host, "http://h:11434");
+        let saved = toml::to_string(&config).expect("serializes");
+        assert!(!saved.contains("extraction_model"), "the stale key is not written back");
     }
 
     #[test]

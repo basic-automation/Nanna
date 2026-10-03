@@ -1454,12 +1454,20 @@ bugs and improvements here; do not bury them only in the backlog bullet.
             chat/session (3), sub-session (5) and agent-registry (5) commands, which go with the Stage
             4 cut-over and the sub-agent deletion, and the OAuth pair. Leave this item open until the
             cut-over removes those.
-      - [ ] *(found 2026-10-03)* **`[memory] extraction_model` is a dead config field.** Declared and
+      - [x] *(found 2026-10-03)* **`[memory] extraction_model` is a dead config field.** Declared and
             defaulted in `nanna-config` (`extraction_model: String`, "empty = use chat model"), saved
             and loaded, and read by nothing in the daemon — its only writer, the GUI's
             `set_extraction_model`, had no caller and is deleted. Either wire it (the extraction step
             would run on it) or remove it with a load-time tolerance for old configs; do not build on
-            it as if it worked. Still to triage: `search_memory`, `get_memory_stats`, `get_memory`,
+            it as if it worked.
+            *(2026-10-03, same run)* **Removed.** Wiring it would have been a new feature (an
+            extraction-model choice nobody asked for, with a hard-coded 2024 model list); removing
+            it costs nothing because no `Config` struct uses `deny_unknown_fields`, so an old
+            `config.toml` carrying the key still loads — pinned by
+            `legacy_extraction_model_key_still_loads`, which also checks the stale key is not
+            written back on save. Gone with it: the GUI settings wire's `extraction_model` /
+            `available_extraction_models` (the frontend never read them; the wire-shape test now
+            pins the smaller shape). Still to triage: `search_memory`, `get_memory_stats`, `get_memory`,
             `set_extraction_model`, the three notification commands, `show_window`,
             `clear_rate_limit`, `delete_cron_jobs_by_name`.
       *(2026-07-24)* **Verified in the real Tauri shell over WebDriver** (`cargo tauri build` release,
