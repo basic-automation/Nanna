@@ -8288,6 +8288,19 @@ as its turn (`TurnAdmission`, scope default `session`).
       workspaces once per boot. Test `registering_a_workspace_gives_its_board_a_router`.
       Not done: closing a workspace leaves its router row (routers are delete-protected); harmless
       until a board client lists closed boards.
+      - [ ] *(research 2026-10-03)* **The router's `assign` is a bounded choice — a contrastive
+            selector fits it better than generation.** CLM-8B (Contrastive-LM, Apache-2.0,
+            2026-09-25; frozen Qwen3-8B backbone with separate state/action projection heads)
+            embeds a state and each candidate action and *selects* the best match instead of
+            generating tokens; candidate embeddings cache independently, and it reports up to 9×
+            faster than a generative agent at matched success on tool-calling tasks
+            ([article](https://venturebeat.com/technology/stanford-and-nvidias-open-clm-8b-caches-reusable-agent-actions-and-runs-up-to-9x-faster-than-jev-in-tests),
+            [weights](https://huggingface.co/Contrastive-LM/CLM-v0.1-8B)). Our router asks a chat
+            model to *write* `{"decision":"assign","member":…}` and re-asks on a parse error; member
+            profiles change rarely, so their embeddings would cache across every card. Running the
+            model is Mummu's (a model port); the Nanna half is an `assign`-only fast path that
+            falls back to the generative router for split/clarify/park. Measure on the e2e router
+            fixtures before choosing.
 - [ ] Capability-tag adjustment at verdict time; posts the change on the agent's profile thread.
 - [ ] Heartbeat becomes a recurring card assigned to the router; the `heartbeat_prompt` config and
       the scheduler's chat-turn path are removed.
@@ -9929,6 +9942,10 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            Compiler API, which the Go-native core does not expose until **7.1**; the tracking issue
            is [vuejs/language-tools#5381](https://github.com/vuejs/language-tools/issues/5381).
            Do NOT re-attempt until 7.1 ships or `vue-tsc` publishes a tsgo-backed release.)*
+           *(2026-10-03)* Re-tried once more because a search summary claimed "TS 7 support since
+           vue-tsc 3.3.8": **false for us** — `vue-tsc@3.3.12` + `typescript@7.0.2` dies in
+           `resolveTscPath` with the same `ERR_PACKAGE_PATH_NOT_EXPORTED`. Reverted. The rule
+           above stands; trust a release note, not a summary.
      - [ ] *(research 2026-08-27)* **Evaluate `vue-tsgo` as the TS-7 escape hatch if 7.1 slips.**
            Two independent Go/tsgo-backed Vue SFC type checkers now exist —
            [KazariEX/vue-tsgo](https://github.com/KazariEX/vue-tsgo) (by a Vue Language Tools core
@@ -11148,6 +11165,13 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
                        item 4 (Mummu's MiniLM embedder behind the memory `embed_fn`) buildable.
                        The 0.8.0-pre watch above is now load-bearing for P12, not just for P13's
                        indexing question.
+                       *(2026-10-03)* **Nanna's half is done** — the pin is `=0.8.1` (see the turso
+                       item in Dependencies). **Mummu's half is not:** its `origin/main` (c49de14)
+                       still pins `burn 0.22.0-pre.3`, so its lockfile still carries
+                       `cubecl-environment 0.11.0-pre.3` → `rusqlite 0.40.2` / `libsqlite3-sys
+                       0.38.2`, and `burn 0.22.0-pre.4` has been on crates.io since 2026-09-22. The
+                       next step is Mummu's burn bump (its routine's item); re-try adding `mummu`
+                       here only after its lockfile is free of `rusqlite`.
                  - [ ] **Measure before deciding, if 0.8.0 stays unstable:** add `mummu` at
                        burn 0.22-pre.4 on a scratch branch and read the resolved lockfile. If the
                        guard passes and the second turso is confined to cubecl's autotune cache,
