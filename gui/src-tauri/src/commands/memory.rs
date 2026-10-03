@@ -415,34 +415,6 @@ pub async fn trigger_consolidation(
     })
 }
 
-/// Apply pending FSRS updates. The daemon applies these itself during recall, so
-/// this is a no-op accepted for UI compatibility.
-///
-/// # Errors
-///
-/// Never returns `Err`; the `Result` is what Tauri requires of an async command
-/// that borrows `State`.
-#[tauri::command]
-pub async fn apply_memory_updates(
-    _state: State<'_, Arc<RwLock<AppState>>>,
-) -> Result<(), String> {
-    Ok(())
-}
-
-/// Manually save memories. The daemon persists via Turso write-through on every
-/// mutation, so there is nothing to flush from the client — a no-op.
-///
-/// # Errors
-///
-/// Never returns `Err`; the `Result` is what Tauri requires of an async command
-/// that borrows `State`.
-#[tauri::command]
-pub async fn save_memories(
-    _state: State<'_, Arc<RwLock<AppState>>>,
-) -> Result<(), String> {
-    Ok(())
-}
-
 // =============================================================================
 // Memory Management Commands
 // =============================================================================

@@ -1087,16 +1087,6 @@ pub async fn set_embedding_config(
     Ok("Embedding settings updated. Restart required for changes to take effect. Note: Changing embedding dimensions will make existing memories incompatible.".to_string())
 }
 
-/// Get env var status (for checking if keys are set)
-///
-/// # Errors
-///
-/// Never returns `Err`.
-#[tauri::command]
-pub async fn check_env_var(name: String) -> Result<bool, String> {
-    Ok(std::env::var(&name).is_ok())
-}
-
 /// Set Ollama host URL
 ///
 /// The saved bearer token does not follow the address: it is bound to the

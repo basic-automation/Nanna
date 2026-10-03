@@ -185,11 +185,9 @@ macro_rules! command_handler {
             commands::settings::get_daemon_providers,
             commands::settings::get_mcp_servers,
             commands::system::get_cost_rollup,
-            commands::settings::check_env_var,
             // Cognitive memory (FSRS-6 + dreaming)
             commands::memory::get_cognitive_memory_stats,
             commands::memory::trigger_consolidation,
-            commands::memory::apply_memory_updates,
             // Memory & scheduling settings
             commands::memory::set_auto_remember_messages,
             commands::memory::set_max_compression_ratio,
@@ -214,7 +212,6 @@ macro_rules! command_handler {
             commands::settings::set_claude_proxy,
             commands::settings::check_claude_proxy_health,
             // Memory persistence
-            commands::memory::save_memories,
             // Memory management
             commands::memory::list_memories,
             commands::memory::get_memory,
@@ -286,15 +283,9 @@ macro_rules! command_handler {
             commands::workspaces::open_workspace,
             commands::workspaces::set_active_workspace,
             commands::workspaces::clear_active_workspace,
-            commands::workspaces::get_active_workspace,
-            commands::workspaces::get_workspace_context,
             commands::workspaces::reload_workspace,
             commands::workspaces::close_workspace,
-            commands::workspaces::discover_workspaces_in_path,
-            commands::workspaces::find_workspace_root_from_path,
-            commands::workspaces::save_workspace_file,
             commands::workspaces::init_workspace,
-            commands::workspaces::read_workspace_file,
             commands::workspaces::check_workspace_validity,
             // Agent visualization
             agents::get_agent_clusters,
@@ -307,23 +298,17 @@ macro_rules! command_handler {
             agents::cleanup_completed_agents,
             agents::get_workspace_agents,
             // User tool authoring
-            commands::tools::list_user_tools_cmd,
             commands::tools::get_user_tool,
             commands::tools::get_tool_source,
             commands::tools::create_user_tool,
             commands::tools::update_user_tool,
             commands::tools::delete_user_tool,
-            commands::tools::test_user_tool,
             // All registered tools
             commands::tools::list_tools,
             commands::tools::set_tool_enabled,
             commands::tools::get_tool_audit,
             commands::tools::get_tool,
             // Skill directory tools
-            commands::tools::list_skills,
-            commands::tools::create_skill,
-            commands::tools::update_skill,
-            commands::tools::delete_skill,
             commands::tools::test_skill,
             // Backend mode
             commands::system::get_backend_status,

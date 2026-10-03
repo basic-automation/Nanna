@@ -1408,6 +1408,26 @@ bugs and improvements here; do not bury them only in the backlog bullet.
             `update_skill`/`delete_skill`/`list_skills`, `test_all_channels`, `clear_rate_limit`, …).
             Each is either a feature with no UI or a leftover; triage into "wire up" vs "delete" rather
             than leaving an unaudited command surface exposed to the webview.
+            *(2026-10-03)* **Re-measured and the first cut made: 191 registered, 42 never named in
+            `app/`; 15 deleted.** Gone (no caller in the app, no Rust caller, no test): the workspace
+            file and path commands `save_workspace_file`, `read_workspace_file`,
+            `discover_workspaces_in_path`, `find_workspace_root_from_path`, `get_workspace_context`,
+            `get_active_workspace`; the skill-directory CRUD `list_skills`, `create_skill`,
+            `update_skill`, `delete_skill` (code written to disk from the webview) plus
+            `list_user_tools_cmd`, `test_user_tool`; `check_env_var` (an environment probe); and the
+            no-op `apply_memory_updates` / `save_memories`. Their helpers went with them
+            (`get_skills_path`, `validate_existing_skill_name` + its test, `registry_handle`,
+            `SkillInfo`, `SkillListResult`), and so did the GUI's **whole dependency on `nanna-tools`**
+            (its only use was skill discovery): the GUI's normal dependency graph is **862 → 740**
+            crates, and the Boa/Deno/Python scripting engines no longer link into the GUI.
+            **Kept on purpose:** the chat/session ones (`archive_and_delete_session`,
+            `set_session_workspace`, `set_session_tools`) and the sub-session / agent-registry ones go
+            with the Stage 4 chat and sub-agent deletion; `get_credential_status` /
+            `refresh_oauth_token` belong to the open OAuth item; `get_data_dir` / `set_data_dir` are
+            a built feature with **no UI** (see P0.1 "Data storage location selection") — wire, don't
+            delete. Still to triage: `search_memory`, `get_memory_stats`, `get_memory`,
+            `set_extraction_model`, the three notification commands, `show_window`,
+            `clear_rate_limit`, `delete_cron_jobs_by_name`.
       *(2026-07-24)* **Verified in the real Tauri shell over WebDriver** (`cargo tauri build` release,
       `nanna-gui.exe` 16 MB, built under the pinned toolchain): `document.title === "Nanna"`, `#__nuxt`
       attached, `typeof window.__TAURI_INTERNALS__ === "object"` (so this is the real IPC shell, not the
