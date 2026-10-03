@@ -26,7 +26,9 @@ Get the latest installer from [Releases](https://github.com/basic-automation/Nan
 ### 3. Run It
 Launch Nanna. On first run, it seeds its default tools into the user data directory —
 `~/.local/share/nanna/tools` on Linux, `~/Library/Application Support/nanna/tools` on macOS,
-`%APPDATA%\nanna\data\tools` on Windows.
+`%APPDATA%\nanna\data\tools` on Windows. To keep Nanna's data somewhere else, choose a folder in
+**Settings → Data → Data location**; it applies when the daemon next starts, and existing data is
+not moved.
 
 > **Note:** Binaries are not yet code-signed. Windows SmartScreen will warn — click *More info → Run anyway*.
 

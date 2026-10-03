@@ -329,6 +329,22 @@ Remaining: capture real screenshots to replace the README placeholders.
       `no_configured_data_dir_means_the_platform_default`,
       `a_configured_data_dir_wins_over_the_platform_default`, `a_blank_data_dir_is_treated_as_unset`,
       `a_data_dir_survives_a_save_load_round_trip`.
+      *(2026-10-03)* **The "place to choose it" did not exist until now** — `get_data_dir` /
+      `set_data_dir` were registered and nothing in the app called them (found by the dead-command
+      triage, P4). Settings → Data now has a **Data location** section: the folder, "Platform
+      default" / "Custom location", *Choose folder…* (native folder picker, then a confirm naming
+      both folders and saying nothing is moved) and *Use the default*. It tells the truth about
+      timing by asking the daemon rather than remembering: `system.status` now reports the
+      `data_dir` the daemon opened its store in, and both commands return it as `in_use`, so the
+      notice "Nanna keeps using X until the daemon restarts, then uses Y. Existing data is not
+      moved" shows exactly while a saved change waits — including one saved earlier, which a
+      page-open snapshot (the first draft) got wrong. Wording in `app/lib/dataDir.ts`, 4 vitest;
+      Playwright mock answers both commands. **Verified in the real app over WebDriver**
+      (isolated HOME/config, daemon on :51990): the section renders the live folder; a relative
+      path is refused with the validator's reason; a saved folder shows "Custom location" and the
+      notice after the page is reopened; *Use the default* opens the in-app confirm and saves;
+      then `restart_daemon` brings up a new daemon that opens `nanna.db` **in the chosen
+      folder**, `in_use` equals the setting and the notice is gone.
 - [ ] Model/backend status dashboard.
 - [~] Cost tracking for cloud models.
       *(See P6)* Core shipped — `CostTracker` with per-model pricing table, `estimate_cost_usd`,
@@ -1423,9 +1439,9 @@ bugs and improvements here; do not bury them only in the backlog bullet.
             **Kept on purpose:** the chat/session ones (`archive_and_delete_session`,
             `set_session_workspace`, `set_session_tools`) and the sub-session / agent-registry ones go
             with the Stage 4 chat and sub-agent deletion; `get_credential_status` /
-            `refresh_oauth_token` belong to the open OAuth item; `get_data_dir` / `set_data_dir` are
-            a built feature with **no UI** (see P0.1 "Data storage location selection") — wire, don't
-            delete. Still to triage: `search_memory`, `get_memory_stats`, `get_memory`,
+            `refresh_oauth_token` belong to the open OAuth item; `get_data_dir` / `set_data_dir` were
+            a built feature with **no UI** — wired the same day (Settings → Data → Data location, see
+            P0.1 "Data storage location selection"). Still to triage: `search_memory`, `get_memory_stats`, `get_memory`,
             `set_extraction_model`, the three notification commands, `show_window`,
             `clear_rate_limit`, `delete_cron_jobs_by_name`.
       *(2026-07-24)* **Verified in the real Tauri shell over WebDriver** (`cargo tauri build` release,

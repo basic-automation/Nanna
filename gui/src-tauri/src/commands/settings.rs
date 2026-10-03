@@ -2680,14 +2680,49 @@ pub struct DataDirInfo {
     pub default: String,
     /// Whether `[general] data_dir` names somewhere other than the default.
     pub is_custom: bool,
+    /// The folder the running daemon opened its store in (it reads the
+    /// setting only at boot), or `None` when the daemon could not be asked.
+    /// Differs from `effective` exactly while a saved change waits for a
+    /// restart.
+    pub in_use: Option<String>,
+}
+
+/// [`DataDirInfo`] for `config`, with the daemon's folder in use.
+fn data_dir_info(
+    config: &nanna_config::Config,
+    in_use: Option<String>,
+) -> Result<DataDirInfo, String> {
+    let default = nanna_config::Config::default_data_dir()
+        .map_err(|e| format!("Cannot determine the platform data directory: {e}"))?;
+    let effective = config
+        .resolve_data_dir()
+        .map_err(|e| format!("Cannot resolve the data directory: {e}"))?;
+    debug_assert!(default.is_absolute(), "the platform default is absolute");
+    Ok(DataDirInfo {
+        effective: effective.display().to_string(),
+        default: default.display().to_string(),
+        is_custom: config.has_custom_data_dir(),
+        in_use,
+    })
+}
+
+/// The folder the running daemon reports for its store; `None` when it
+/// cannot be asked or does not say (an older daemon), which the UI shows as
+/// "unknown" rather than guessing.
+async fn daemon_data_dir(state: &RwLock<AppState>) -> Option<String> {
+    let status = backend_handle(state).await.system_status().await.ok()?;
+    status
+        .get("data_dir")
+        .and_then(serde_json::Value::as_str)
+        .filter(|dir| !dir.is_empty())
+        .map(str::to_string)
 }
 
 /// Report the configured data directory.
 ///
-/// Reads the in-memory config the GUI already holds; nothing here touches the
-/// daemon, because the GUI is a pure client and the value the daemon *booted*
-/// with may differ from the value on disk until it restarts — which is exactly
-/// what the UI tells the user.
+/// Reads the in-memory config the GUI already holds, and asks the daemon which
+/// folder it is actually using: it read the setting when it booted, so the two
+/// differ until it restarts — which is exactly what the UI tells the user.
 ///
 /// # Errors
 ///
@@ -2697,18 +2732,8 @@ pub struct DataDirInfo {
 pub async fn get_data_dir(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<DataDirInfo, String> {
-    let state_guard = state.read().await;
-    let default = nanna_config::Config::default_data_dir()
-        .map_err(|e| format!("Cannot determine the platform data directory: {e}"))?;
-    let effective = state_guard
-        .config
-        .resolve_data_dir()
-        .map_err(|e| format!("Cannot resolve the data directory: {e}"))?;
-    Ok(DataDirInfo {
-        effective: effective.display().to_string(),
-        default: default.display().to_string(),
-        is_custom: state_guard.config.has_custom_data_dir(),
-    })
+    let in_use = daemon_data_dir(&state).await;
+    data_dir_info(&state.read().await.config, in_use)
 }
 
 /// Set (or, with `None` / blank, clear) the configured data directory.
@@ -2745,6 +2770,7 @@ pub async fn set_data_dir(
         .config
         .save()
         .map_err(|e| format!("Failed to save config: {e}"))?;
+    drop(state_guard);
 
     if let Some(dir) = &chosen {
         info!(
@@ -2755,17 +2781,8 @@ pub async fn set_data_dir(
         info!("Data directory reset to the platform default — takes effect when the daemon restarts");
     }
 
-    let default = nanna_config::Config::default_data_dir()
-        .map_err(|e| format!("Cannot determine the platform data directory: {e}"))?;
-    let effective = state_guard
-        .config
-        .resolve_data_dir()
-        .map_err(|e| format!("Cannot resolve the data directory: {e}"))?;
-    Ok(DataDirInfo {
-        effective: effective.display().to_string(),
-        default: default.display().to_string(),
-        is_custom: state_guard.config.has_custom_data_dir(),
-    })
+    let in_use = daemon_data_dir(&state).await;
+    data_dir_info(&state.read().await.config, in_use)
 }
 
 // =============================================================================
