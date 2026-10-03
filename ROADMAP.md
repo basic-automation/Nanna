@@ -4219,6 +4219,15 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             set. Worth measuring before pulling in a search crate, since it keeps the "Turso-only" invariant.
             This is also the cheapest path for the **tool-description keyword search** noted in P6/P11
             (tool descriptions currently need literal keywords because there is no lexical search at all).
+            *(2026-10-03)* **Not available on the current pin without work.** turso 0.8.1's `fts` feature
+            does not compile on our nightly (`DynVec::new_in(DynAllocator)` in
+            `index_method/fts/directory.rs` needs `--cfg nightly`), so the 0.8.1 move turned it off and
+            the FTS index method is no longer built. Taking this path means either building turso with
+            `RUSTFLAGS=--cfg nightly` (turning on its whole allocator_api code path, not just FTS) or
+            waiting for the upstream fix —
+            [turso#9463](https://github.com/tursodatabase/turso/issues/9463), open since 2026-10-02,
+            reports exactly this on nightly c36f14571 (our pin) and on beta, and says stable builds
+            it — and re-weigh a small BM25 crate against it.
       - [ ] *(research 2026-08-21 — settles HOW to fuse, which was the unstated hard part)* **Use
             Reciprocal Rank Fusion, not a weighted sum of scores.** RRF has the two properties this
             problem needs and a weighted sum does not: it is **score-independent** (only ranks enter the
@@ -8283,6 +8292,25 @@ as its turn (`TurnAdmission`, scope default `session`).
             `stalled` trigger = `in_progress`, no live `card:<id>` run, no `progress` post
             within the threshold. Also per-member concurrency is a *setting* there
             (`max_in_progress_per_profile`); ours is fixed at 1 by decision 3.
+            *(2026-10-03)* **The terminal-provider half landed.** A card run the provider
+            refuses outright — HTTP 401 / 402 / 403 or no key configured
+            (`is_terminal_provider_error`, the opposite of `is_transient_llm_error`) — is **not
+            resumed** (the run manager's 8 × 15 s provider-incident loop skips it) and **not
+            handed back**: the member asks the human at once (`ask_human_to_fix` →
+            `routing::ask_on_card`, "Fix the API key, account or model list … then complete this
+            card"), the card goes back to `pending` **with its member**, derived-blocked on the
+            question, and nothing counts toward `HAND_BACKS_MAX` — another member on the same
+            provider would fail the same way. Completing the question unblocks the card and its
+            run starts again. **The e2e probe found the real path:** the refusal never reaches the
+            run's stop — the harness abandons the item after persistent runner errors and the
+            source's `abandon` handed the card back within the same second, so the rule sits in
+            `abandon` as well as in `card_after_run`. New script form `STATUS <code> <body>` in
+            the e2e `ScriptedOllama`; e2e `a_card_run_the_provider_refuses_asks_the_human_at_once`
+            (red before: handed back to the router; green: question in 3.4 s), unit
+            `a_refused_key_asks_the_human_and_keeps_the_card_with_its_member`, classifier cases in
+            `how_a_run_stopped_decides_what_its_open_card_is_owed`. **Still open from Hermes:** a
+            rate-limited run (429) is requeued without counting a failure — ours still ends in a
+            hand-back after the in-step retries.
 - [ ] Sub-agent spawning is replaced by "create a sub-task assigned to another member". Delete
       `sub_agent`/`task` tool and `SubSessionInfo`.
       - [x] *(2026-10-01)* **The half that does not need chat deleted: a card run's `todo` works
@@ -9896,7 +9924,8 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `turso_core`'s FTS directory (`index_method/fts/directory.rs:345`) calls
            `DynVec::new_in(DynAllocator)`, which only type-checks under `--cfg nightly`, and
            without that cfg `DynVec` is a plain `Vec` (E0308). Nanna has no full-text index, so
-           `fts` is off — which also removes `tantivy` and 33 other crates from the lockfile,
+           `fts` is off (upstream: [turso#9463](https://github.com/tursodatabase/turso/issues/9463),
+           open) — which also removes `tantivy` and 33 other crates from the lockfile,
            among them `zstd-sys` (C) and the unsound `lru 0.16.4`. `mimalloc` stays on because
            it was a default before: turso installs it as the **process-wide
            `#[global_allocator]`** (`turso/src/lib.rs:36`), so dropping it would swap the whole

@@ -1301,8 +1301,10 @@ pub struct TursoTaskSource {
     /// `progress` posts and closings become `verdict` posts on the card's
     /// thread, authored by this member.
     member_id: Option<String>,
-    /// Set once this run handed its card back (see [`Self::hand_back`]):
-    /// from then on the card is the router's again, so nothing is served.
+    /// Set once this run gave its card up — handed it back (see
+    /// [`Self::hand_back`]) or put it to the human because the provider
+    /// refused the run (see [`Self::ask_human_to_fix`]): from then on the
+    /// card is not this run's, so nothing is served.
     handed_back: std::sync::atomic::AtomicBool,
 }
 
@@ -1349,6 +1351,12 @@ pub enum CardAfterRun {
     /// The run had nothing left it could work (the card waits on another):
     /// pending again, for the wake that unblocks it.
     Waiting,
+    /// The provider refused the run's credentials or account (see
+    /// [`is_terminal_provider_error`]): no member and no retry can finish the
+    /// card until a person fixes the setup, so the human is asked at once and
+    /// the card waits on the answer with its member — not a failed verdict,
+    /// and not counted toward the router's retry bound.
+    AskHuman(String),
 }
 
 /// Decide [`CardAfterRun`] for `card` after a run that stopped with `stop`.
@@ -1366,6 +1374,9 @@ pub fn card_after_run(card: &Task, stop: &StopReason) -> CardAfterRun {
         StopReason::TokenBudgetExhausted => CardAfterRun::HandBack(
             "the run used its whole token budget without finishing the card".to_string(),
         ),
+        StopReason::RunnerErrors { message } if is_terminal_provider_error(message) => {
+            CardAfterRun::AskHuman(message.clone())
+        }
         StopReason::RunnerErrors { message } => {
             CardAfterRun::HandBack(format!("the model kept failing: {message}"))
         }
@@ -1837,6 +1848,7 @@ impl TursoTaskSource {
                 )
                 .await;
             }
+            CardAfterRun::AskHuman(error) => self.ask_human_to_fix(&card, &error).await,
             CardAfterRun::Waiting => {
                 if card.status == "in_progress" {
                     let wait = TaskPatch {
@@ -1850,6 +1862,62 @@ impl TursoTaskSource {
             }
         }
     }
+    /// The run's provider refused it outright: ask the human to fix the setup
+    /// (P25 decision 6's clarification — the card waits on it, derived
+    /// `blocked`) and put the card back to `pending` with its member, so the
+    /// answer's `unblocked` restarts it. If the question cannot be asked the
+    /// card is handed back instead: never left in progress with nobody on it.
+    async fn ask_human_to_fix(&self, card: &Task, error: &str) {
+        let Some(member_id) = self.member_id.as_deref() else {
+            return;
+        };
+        debug_assert_eq!(self.subtree_root, Some(card.id), "only the run's own card");
+        let error = truncate_post(error);
+        let question = format!(
+            "The model provider refused {member_id}'s run on card #{}: {error}\nFix the API \
+             key, account or model list (Settings, or this agent's models on the Members \
+             page), then complete this card and the run starts again.",
+            card.id
+        );
+        let asked = nanna_storage::routing::ask_on_card(
+            &self.storage.tasks(),
+            member_id,
+            card,
+            &question,
+            "the provider refused the credentials or account; another try would fail the same way",
+        )
+        .await;
+        if let Err(e) = asked {
+            tracing::warn!(task_id = card.id, error = %e, "provider failure not put to the human; handing back");
+            if let Err(e) = self
+                .hand_back(
+                    card.id,
+                    &format!("the model provider refused the run: {error}"),
+                )
+                .await
+            {
+                tracing::warn!(task_id = card.id, error = %e, "card run's card not handed back");
+            }
+            return;
+        }
+        if card.status == "in_progress" {
+            let wait = TaskPatch {
+                status: Some("pending".to_string()),
+                ..TaskPatch::default()
+            };
+            if let Err(e) = self
+                .storage
+                .tasks()
+                .update(card.id, wait, Some(&self.actor))
+                .await
+            {
+                tracing::warn!(task_id = card.id, error = %e, "card run's card left in progress");
+            }
+        }
+        self.handed_back
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// A member's run gave up on its card: P25 decision 7 — a failed verdict
     /// goes back to the router with the failure posted, never to `cancelled`
     /// (a card is the human's; only they close it unfinished).
@@ -2117,6 +2185,18 @@ impl TaskSource for TursoTaskSource {
 
     async fn abandon(&self, id: i64, reason: &str) -> Result<(), String> {
         if self.member_id.is_some() && self.subtree_root == Some(id) {
+            // The harness abandons an item after persistent runner errors, so
+            // a refused key surfaces here first, not as the run's stop.
+            if is_terminal_provider_error(reason) {
+                let card = self
+                    .storage
+                    .tasks()
+                    .get(id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                self.ask_human_to_fix(&card, reason).await;
+                return Ok(());
+            }
             return self.hand_back(id, reason).await;
         }
         let repo = self.storage.tasks();
@@ -2959,6 +3039,21 @@ const STEP_RETRY_BACKOFF_SECS: [u64; 3] = [2, 5, 10];
 /// the ladder's retry-plus-runner-reset is exactly the right medicine, and a
 /// persistent wedge still surfaces through the circuit breaker). Shared by
 /// the step runner and the chat path — both heal with the same ladder.
+/// Provider failures no retry, resume or other member on the same provider
+/// can get past: the credentials or the account were refused (401 / 403),
+/// the account is out of credit (402), or no key is configured at all. The
+/// opposite of [`is_transient_llm_error`] — a run that stops on one of these
+/// is not resumed, and its card asks the human instead of going back to the
+/// router (Hermes Kanban blocks a card at once on a terminal provider error
+/// for the same reason). Matched on the rendered `LlmError` text, as the
+/// transient check is.
+pub(crate) fn is_terminal_provider_error(message: &str) -> bool {
+    message.contains("API error: 401")
+        || message.contains("API error: 402")
+        || message.contains("API error: 403")
+        || message.contains("Missing API key")
+}
+
 pub(crate) fn is_transient_llm_error(message: &str) -> bool {
     message.contains("API error: 5")
         || message.contains("timed out")
@@ -8333,7 +8428,12 @@ impl TaskRunManager {
                         interjector.as_deref().map(|i| i as &dyn Interjector),
                     )
                     .await;
-                let provider_died = matches!(report.stop, StopReason::RunnerErrors { .. });
+                // A refused key or account does not heal by resuming: the
+                // card asks the human instead (`CardAfterRun::AskHuman`).
+                let provider_died = matches!(
+                    &report.stop,
+                    StopReason::RunnerErrors { message } if !is_terminal_provider_error(message)
+                );
                 segments.push(report);
                 if !provider_died
                     || resumes >= RUN_RESUMES_MAX
@@ -10337,6 +10437,29 @@ mod card_run_tests {
                 "{stop:?} is a failure the router hears about"
             );
         }
+        for refused in [
+            "API error: 401 - {\"type\":\"authentication_error\"}",
+            "LLM error: API error: 402 - insufficient credits",
+            "API error: 403 - forbidden",
+            "Missing API key for provider: anthropic",
+        ] {
+            let stop = StopReason::RunnerErrors {
+                message: refused.to_string(),
+            };
+            assert_eq!(
+                card_after_run(&open, &stop),
+                CardAfterRun::AskHuman(refused.to_string()),
+                "{refused}: only a person can fix it"
+            );
+        }
+        for retryable in [
+            "API error: 429 - slow down",
+            "API error: 500",
+            "timed out",
+            "API error: 400 - context length exceeded",
+        ] {
+            assert!(!super::is_terminal_provider_error(retryable), "{retryable}");
+        }
         storage
             .tasks()
             .complete(id, None, None)
@@ -10382,6 +10505,52 @@ mod card_run_tests {
                 .iter()
                 .any(|n| n.content.starts_with("Stopped on request")),
             "{thread:?}"
+        );
+    }
+
+    /// A run the provider refused outright asks the human to fix the setup:
+    /// the card waits on that question with its member, and nothing is
+    /// handed back (it is not the member's failure, and not counted).
+    #[tokio::test]
+    async fn a_refused_key_asks_the_human_and_keeps_the_card_with_its_member() {
+        use nanna_agent::harness::StopReason;
+        let storage = builder_storage().await;
+        let tasks = storage.tasks();
+        let id = card(&storage, "needs a model", None, 3).await;
+        let source = card_source(&storage, id);
+        source.start(id).await.expect("picked up");
+        source
+            .settle_after_run(&StopReason::RunnerErrors {
+                message: "API error: 401 - invalid x-api-key".to_string(),
+            })
+            .await;
+
+        let waiting = tasks.get(id).await.expect("card");
+        assert_eq!(waiting.status, "pending");
+        assert_eq!(
+            waiting.assignee.as_deref(),
+            Some(AGENT),
+            "kept by its member"
+        );
+        assert!(waiting.blocked, "waits on the question");
+        let question = tasks.get(waiting.depends_on[0]).await.expect("question");
+        assert_eq!(
+            question.assignee.as_deref(),
+            Some(nanna_storage::HUMAN_MEMBER_ID)
+        );
+        assert!(
+            question
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains("invalid x-api-key")),
+            "{question:?}"
+        );
+        let activity = tasks.activity(id, 32).await.expect("activity");
+        assert!(
+            !activity
+                .iter()
+                .any(|a| a.action == super::HANDED_BACK_ACTION),
+            "not a hand-back"
         );
     }
 

@@ -21,7 +21,7 @@ uuid.workspace = true
 # It replaces the old exact `aegis` pin, which froze a version to dodge that C build.
 # `default-features = false` drops `fts` (Nanna has no full-text index): turso_core
 # 0.8.1's FTS directory calls `DynVec::new_in(DynAllocator)`, which only type-checks
-# under `--cfg nightly`, so with `fts` on it does not compile here. Dropping it also
+# under `--cfg nightly`, so with `fts` on it does not compile here (turso#9463). Dropping it also
 # drops `tantivy` and its unsound `lru 0.16` (RUSTSEC-2026-0253). `mimalloc` is kept
 # because it was a default before: turso installs it as the process-wide
 # `#[global_allocator]`, so removing it would swap the allocator of the whole binary.
