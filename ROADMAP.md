@@ -8128,6 +8128,33 @@ as its turn (`TurnAdmission`, scope default `session`).
       ends with its card still open for another reason (wall clock or token budget, a cancel) —
       that card is `in_progress` with no live run, i.e. the `stalled` trigger's. Still open:
       `stalled`, heartbeat.
+      *(2026-10-03)* **`stalled` landed.** The card-run worker also ticks every
+      `STALL_SWEEP_INTERVAL` = 5 min and runs `card_run_trigger::release_stalled`: an agent's
+      board card that is `in_progress`, board work (`is_board_creator`), **not paused** (its
+      newest run marker is not a `run_ended` with stop `Cancelled` — "Stop = stop"), served by
+      **no live run** (`TaskRunManager::serves_card`: its own `card:<id>` run, an ancestor's —
+      a sub-card worked inside its parent's run has none of its own — or a scope run over its
+      board) and **untouched for `STALL_AFTER` = 30 min** (newest of the row's `updated_at`,
+      its newest activity row and its newest post — new store reads `in_progress_board_cards`
+      and `touch_times`). The threshold is not Hermes' 4 h heartbeat timeout: we see run
+      liveness directly, so a quiet live run is never stalled; 30 min only covers the
+      pick-up/register race and a person moving an agent's card by hand. A stalled card gets,
+      in order: a closing `run_ended {stop: "stalled"}` if a run started and never ended (so the
+      next boot does not also "resume" it), a `stalled` activity row, its member shown idle
+      unless working elsewhere, a router post saying why, and a release to `pending` with nobody
+      on it written as the `stall` actor — **that release is the router's
+      `WakeReason::Stalled`**. Stalls **count toward `HAND_BACKS_MAX` with hand-backs**
+      (`hand_backs_in_a_row`), so a card that keeps stalling ends in a question to the human
+      rather than a reclaim loop — the bug Hermes fixed in
+      [#111446](https://github.com/NousResearch/hermes-agent/pull/111446) ("a claim that never
+      spawns a worker … reclaiming forever"). A stalled card is routed if any board creator made
+      it (the sweep only takes back board work, and a released card nobody routes would sit
+      unowned). Tests: store `the_stall_scan_reads_agents_in_progress_board_cards_and_their_last_touch`,
+      run manager `a_card_is_served_by_its_own_run_an_ancestors_or_its_boards`, wake
+      `the_stall_sweeps_release_wakes_it_and_its_other_writes_do_not`, two pure rules, and
+      `a_card_nobody_is_working_is_taken_back_for_the_router` (lost run released and counted;
+      paused, fresh and chat cards kept; idempotent). **Not proven end to end with a live
+      router:** the e2e rig cannot advance the sweep's wall clock. Still open: heartbeat.
 - [x] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
       *(2026-09-28)* `RouterDecision::Assign` gained optional `labels` and `acceptance`. Labels
@@ -8245,7 +8272,7 @@ as its turn (`TurnAdmission`, scope default `session`).
             the marker scan in `members.rs`); **not** proven across a real restart — the e2e
             rig runs the daemon in-process, so an aborted daemon's run task outlives it and
             would hold the store.
-      - [ ] *(research 2026-10-01)* **Borrow Hermes Kanban's failure and stall rules** when the
+      - [ ] *(research 2026-10-01; stall half done 2026-10-03, see Triggers)* **Borrow Hermes Kanban's failure and stall rules** when the
             auto-start lands ([docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban)):
             its dispatcher auto-blocks a card after `failure_limit` (default 2) consecutive failed
             runs, requeues a rate-limited run *without* counting a failure and blocks at once on

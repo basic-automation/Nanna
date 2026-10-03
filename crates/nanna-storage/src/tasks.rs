@@ -1000,6 +1000,103 @@ impl TaskRepository {
         Ok(cards)
     }
 
+    /// Up to `limit` board cards (any scope but `session`) that are
+    /// `in_progress` and assigned to a member whose id starts with
+    /// `assignee_prefix`, least recently updated first — the candidates the
+    /// stall sweep checks (P25 decision 7's `stalled` trigger). `blocked` is
+    /// not derived here.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a row does not
+    /// decode.
+    ///
+    /// # Panics
+    /// Panics if `limit` is 0 or above [`ASSIGNED_CARDS_MAX`], or if
+    /// `assignee_prefix` is empty or holds a `LIKE` wildcard.
+    pub async fn in_progress_board_cards(
+        &self,
+        assignee_prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<Task>, StorageError> {
+        assert!(
+            (1..=ASSIGNED_CARDS_MAX).contains(&limit),
+            "an in-progress scan is bounded and non-empty"
+        );
+        assert!(!assignee_prefix.is_empty(), "a prefix names some members");
+        assert!(
+            !assignee_prefix.contains(['%', '_']),
+            "the prefix is matched literally"
+        );
+        let pattern = format!("{assignee_prefix}%");
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT {TASK_COLUMNS} FROM tasks \
+                     WHERE status = 'in_progress' AND scope != 'session' AND assignee LIKE ?1 \
+                     ORDER BY updated_at, id LIMIT ?2"
+                ),
+                turso::params![pattern, limit],
+            )
+            .await?;
+        let mut cards = Vec::new();
+        while let Some(row) = rows.next().await? {
+            cards.push(decode_task_row(&row)?);
+        }
+        drop(rows);
+        drop(conn);
+        debug_assert!(
+            cards.iter().all(|t| t.status == "in_progress"
+                && t.scope != "session"
+                && t.assignee
+                    .as_deref()
+                    .is_some_and(|a| a.starts_with(assignee_prefix))),
+            "every card matches the scan"
+        );
+        Ok(cards)
+    }
+
+    /// When card `task_id` last changed in any way a reader could see: the
+    /// newest of its row's `updated_at`, its newest activity row and its
+    /// newest thread post, as the stored timestamp strings (absent ones left
+    /// out). The stall sweep reads this as "last sign of life".
+    ///
+    /// # Errors
+    /// Returns [`StorageError::NotFound`] if no task has `task_id`, or
+    /// [`StorageError::Database`] if a query fails.
+    pub async fn touch_times(&self, task_id: i64) -> Result<Vec<String>, StorageError> {
+        debug_assert!(task_id > 0, "store ids start at 1");
+        let conn = self.conn.lock().await;
+        let mut times = Vec::with_capacity(3);
+        for (index, sql) in [
+            "SELECT updated_at FROM tasks WHERE id = ?1",
+            "SELECT created_at FROM task_activity WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
+            "SELECT created_at FROM task_notes WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut rows = conn.query(sql, turso::params![task_id]).await?;
+            let time: Option<Option<String>> = match rows.next().await? {
+                Some(row) => Some(row.get(0)?),
+                None => None,
+            };
+            // Each cursor is gone before the next query: an open `Rows` on
+            // the shared connection swallows later writes.
+            drop(rows);
+            // The first query reads the card itself: no row, no card.
+            if index == 0 && time.is_none() {
+                drop(conn);
+                return Err(StorageError::NotFound(format!("task #{task_id}")));
+            }
+            times.extend(time.flatten());
+        }
+        drop(conn);
+        debug_assert!(times.len() <= 3, "one time per source at most");
+        Ok(times)
+    }
+
     /// Every open board card assigned to `member_id`, on every board (any
     /// scope but `session`), with `blocked` derived — the read behind a
     /// member's Inbox and Upcoming (P25 decision 11), which span workspaces.
@@ -3471,6 +3568,88 @@ mod tests {
         assert!(!mine.iter().find(|t| t.id == undated.id).unwrap().blocked, "a done dependency blocks nothing");
         assert_eq!(repo.assigned_open(crate::HUMAN_MEMBER_ID, 1).await.unwrap().len(), 1, "bounded");
         assert!(repo.assigned_open("agent:nobody", 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_stall_scan_reads_agents_in_progress_board_cards_and_their_last_touch() {
+        let (storage, repo) = repo().await;
+        storage
+            .members()
+            .create(crate::NewMember {
+                id: "agent:builder".to_string(),
+                name: "Builder".to_string(),
+                avatar: None,
+                kind: crate::MemberKind::Agent,
+                owner_kind: crate::MemberOwner::Workspace,
+                owner_id: None,
+                status: crate::MemberStatus::Idle,
+                profile: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let card = |title: &str, scope: &str, assignee: &str| NewTask {
+            scope: scope.to_string(),
+            scope_id: (scope == "session").then(|| "s1".to_string()),
+            title: title.to_string(),
+            priority: 3,
+            assignee: Some(assignee.to_string()),
+            ..NewTask::default()
+        };
+        let picked_up = TaskPatch {
+            status: Some("in_progress".to_string()),
+            ..TaskPatch::default()
+        };
+        let working = repo
+            .create(card("working", "global", "agent:builder"))
+            .await
+            .unwrap();
+        let waiting = repo
+            .create(card("waiting", "global", "agent:builder"))
+            .await
+            .unwrap();
+        let human = repo
+            .create(card("a person's", "global", crate::HUMAN_MEMBER_ID))
+            .await
+            .unwrap();
+        let chat = repo
+            .create(card("chat's own", "session", "agent:builder"))
+            .await
+            .unwrap();
+        for id in [working.id, human.id, chat.id] {
+            repo.update(id, picked_up.clone(), Some("test"))
+                .await
+                .unwrap();
+        }
+
+        let found = repo.in_progress_board_cards("agent:", 10).await.unwrap();
+        let ids: Vec<i64> = found.iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![working.id], "an agent's, on a board, picked up");
+        assert!(!ids.contains(&waiting.id) && !ids.contains(&human.id) && !ids.contains(&chat.id));
+
+        let before = repo.touch_times(working.id).await.unwrap();
+        assert_eq!(
+            before.len(),
+            2,
+            "the row and its activity; no post yet: {before:?}"
+        );
+        repo.post(
+            working.id,
+            Some("agent:builder"),
+            Some("agent:builder"),
+            TaskNoteKind::Progress,
+            "halfway",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.touch_times(working.id).await.unwrap().len(),
+            3,
+            "a post is a touch"
+        );
+        assert!(matches!(
+            repo.touch_times(999_999).await,
+            Err(StorageError::NotFound(_))
+        ));
     }
 
     #[tokio::test]

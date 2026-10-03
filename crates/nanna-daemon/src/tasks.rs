@@ -1426,6 +1426,13 @@ pub const RUN_ENDED_ACTION: &str = "run_ended";
 /// router unfinished. The router's worker counts them to bound retries.
 pub const HANDED_BACK_ACTION: &str = "handed_back";
 
+/// The activity row the stall sweep leaves when it takes a card back.
+///
+/// Written by [`crate::card_run_trigger::release_stalled`] for a card nobody
+/// was working. Counted with [`HANDED_BACK_ACTION`] toward the router's retry bound: a card
+/// that keeps stalling is as unfinished as one that keeps being handed back.
+pub const STALLED_ACTION: &str = "stalled";
+
 /// A board scope's hierarchy, as a card run sees it: who each card's parent
 /// is and who each card is assigned to.
 #[derive(Debug, Default)]
@@ -8408,6 +8415,37 @@ impl TaskRunManager {
         }
     }
 
+    /// Whether a live run serves a card of board `scope`/`scope_id` whose
+    /// lineage (the card, then its ancestors) is `lineage`: a card run on any
+    /// of them, or a scope run over the whole board. A sub-card worked inside
+    /// its parent's run has no run of its own and is still being worked.
+    pub async fn serves_card(&self, scope: &str, scope_id: Option<&str>, lineage: &[i64]) -> bool {
+        debug_assert!(!lineage.is_empty(), "a lineage starts at the card");
+        debug_assert!(
+            lineage.len() <= nanna_storage::TASK_DEPTH_MAX + 1,
+            "bounded by depth"
+        );
+        let scope_key = Self::scope_key(scope, scope_id);
+        let runs = self.runs.read().await;
+        runs.values().any(|run| {
+            run.card.as_ref().map_or_else(
+                || run.scope_key == scope_key,
+                |claim| lineage.contains(&claim.card_id),
+            )
+        })
+    }
+
+    /// Whether `member_id` is working a card right now.
+    pub async fn member_is_working(&self, member_id: &str) -> bool {
+        debug_assert!(!member_id.is_empty(), "a member has an id");
+        let runs = self.runs.read().await;
+        runs.values().any(|run| {
+            run.card
+                .as_ref()
+                .is_some_and(|claim| claim.member_id == member_id)
+        })
+    }
+
     /// Request cancellation of card `card_id`'s run. Returns false when no
     /// run is working that card.
     pub async fn cancel_card(&self, card_id: i64) -> bool {
@@ -9982,6 +10020,58 @@ mod card_run_tests {
         assert!(
             run_conflict(&runs, "session:s", None).is_some(),
             "one scope run per scope"
+        );
+    }
+
+    /// What the stall sweep asks of the run manager: is anything working this
+    /// card (its own run, an ancestor's run, a run over its whole board), and
+    /// is this member busy anywhere.
+    #[tokio::test]
+    async fn a_card_is_served_by_its_own_run_an_ancestors_or_its_boards() {
+        let manager = crate::tasks::TaskRunManager::new();
+        assert!(
+            !manager.serves_card("global", None, &[5]).await,
+            "nothing running"
+        );
+        manager
+            .claim_slot(
+                "card:2".to_string(),
+                "global:".to_string(),
+                "g".to_string(),
+                Some(claim(2, AGENT)),
+            )
+            .await
+            .expect("claimed");
+        assert!(
+            manager.serves_card("global", None, &[2]).await,
+            "its own run"
+        );
+        assert!(
+            manager.serves_card("global", None, &[7, 2]).await,
+            "a sub-card inside its parent's run"
+        );
+        assert!(
+            !manager.serves_card("global", None, &[7, 3]).await,
+            "a card beside it"
+        );
+        assert!(manager.member_is_working(AGENT).await);
+        assert!(!manager.member_is_working("agent:other").await);
+        manager
+            .claim_slot(
+                "workspace:w".to_string(),
+                "workspace:w".to_string(),
+                "g".to_string(),
+                None,
+            )
+            .await
+            .expect("claimed");
+        assert!(
+            manager.serves_card("workspace", Some("w"), &[11]).await,
+            "a run over its board"
+        );
+        assert!(
+            !manager.serves_card("workspace", Some("v"), &[11]).await,
+            "another board"
         );
     }
 
