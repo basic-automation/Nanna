@@ -23,6 +23,12 @@
 //! sign of life for [`STALL_AFTER`] is put back to `pending` with nobody on
 //! it, which wakes the board router ([`crate::board_router_trigger`]).
 //!
+//! **A rate-limited card is tried again once its wait is over.** A run the
+//! provider rate-limits leaves a `rate_limited {until}` row and keeps its
+//! card ([`crate::tasks::RATE_LIMITED_ACTION`]); [`try_start`] refuses it
+//! until then ([`cooling_down_until`]), and the same tick restarts every card
+//! whose wait has passed ([`restart_cooled_down`]).
+//!
 //! **Only board work is started** — cards the board client, a router or an
 //! agent member made ([`is_board_creator`]); never the chat harness's own
 //! workspace-scoped cards while chat lives (the same reason as the router's
@@ -204,9 +210,14 @@ pub async fn run(
         let wake = tokio::select! {
             wake = queue.recv() => wake,
             _ = stall_clock.tick() => {
-                let released = release_stalled(&control, &storage, chrono::Utc::now()).await;
+                let now = chrono::Utc::now();
+                let released = release_stalled(&control, &storage, now).await;
                 if released > 0 {
                     info!(released, "stalled board cards went back to their router");
+                }
+                let restarted = restart_cooled_down(&control, &storage).await;
+                if restarted > 0 {
+                    info!(restarted, "rate-limited board cards started again");
                 }
                 continue;
             }
@@ -540,6 +551,63 @@ async fn stall_card(
     }
 }
 
+/// When a card the provider rate-limited may be tried again, if not yet.
+///
+/// That is the `until` of its newest [`crate::tasks::RATE_LIMITED_ACTION`] row, if that row is newer
+/// than the card's last run start and `until` is still ahead of `now`.
+/// `activity` is oldest first. An unreadable `until` holds nothing back.
+#[must_use]
+pub fn cooling_down_until(
+    activity: &[nanna_storage::TaskActivityEntry],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    use crate::tasks::{RATE_LIMITED_ACTION, RUN_STARTED_ACTION};
+    let row = activity
+        .iter()
+        .rev()
+        .find(|row| row.action == RATE_LIMITED_ACTION || row.action == RUN_STARTED_ACTION)?;
+    if row.action != RATE_LIMITED_ACTION {
+        return None;
+    }
+    let until = row
+        .detail
+        .as_ref()
+        .and_then(|detail| detail.get("until"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::tasks::parse_db_time)?;
+    (until > now).then_some(until)
+}
+
+/// Start every rate-limited card whose wait is over; returns how many started.
+///
+/// The candidates are the cards whose newest `rate_limited` row is newer
+/// than their newest `run_started` (rate-limited and not tried since), among
+/// the newest [`RESUME_SCAN_ROWS`] such rows — each member works one card,
+/// so the waiting ones are few and recent. [`try_start`] makes every other
+/// check, including the wait itself.
+pub async fn restart_cooled_down(control: &ControlPlane, storage: &Storage) -> usize {
+    use crate::tasks::{RATE_LIMITED_ACTION, RUN_STARTED_ACTION};
+    let waiting = match storage
+        .tasks()
+        .cards_with_unended(RATE_LIMITED_ACTION, RUN_STARTED_ACTION, RESUME_SCAN_ROWS)
+        .await
+    {
+        Ok(waiting) => waiting,
+        Err(e) => {
+            warn!(error = %e, "card runs: rate-limited cards unreadable");
+            return 0;
+        }
+    };
+    let mut started = 0usize;
+    for card_id in waiting {
+        if try_start(control, storage, card_id).await {
+            started += 1;
+        }
+    }
+    debug_assert!(started <= RESUME_SCAN_ROWS, "one start per card read");
+    started
+}
+
 /// Start the best waiting card assigned to `member_id`, if any can start.
 async fn start_next_for(control: &ControlPlane, storage: &Storage, member_id: &str) {
     let waiting = match storage
@@ -581,6 +649,18 @@ async fn try_start(control: &ControlPlane, storage: &Storage, card_id: i64) -> b
     if !is_startable(&card, chrono::Utc::now()) {
         debug!(card_id, status = %card.status, "card runs: not workable now");
         return false;
+    }
+    match tasks.activity(card_id, MARKER_SCAN_ROWS).await {
+        Ok(activity) => {
+            if let Some(until) = cooling_down_until(&activity, chrono::Utc::now()) {
+                debug!(card_id, %until, "card runs: rate-limited; waits");
+                return false;
+            }
+        }
+        Err(e) => {
+            warn!(card_id, error = %e, "card runs: activity unreadable; not started");
+            return false;
+        }
     }
     match crate::tasks::subtree_has_work(storage, &card).await {
         Ok(true) => {}
@@ -849,6 +929,40 @@ mod tests {
             .await
             .expect("picked up");
         card.id
+    }
+
+    #[test]
+    fn a_rate_limit_holds_a_card_back_until_its_wait_or_its_next_run() {
+        use crate::tasks::{RATE_LIMITED_ACTION, RUN_STARTED_ACTION};
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-03T12:00:00Z")
+            .expect("time")
+            .with_timezone(&chrono::Utc);
+        let row = |action: &str, until: Option<&str>| nanna_storage::TaskActivityEntry {
+            id: 1,
+            task_id: 5,
+            actor: None,
+            action: action.to_string(),
+            detail: until.map(|u| json!({ "until": u })),
+            created_at: "2026-10-03 11:59:00".to_string(),
+            assignee: None,
+        };
+        let limited = row(RATE_LIMITED_ACTION, Some("2026-10-03T12:05:00Z"));
+        assert!(cooling_down_until(std::slice::from_ref(&limited), now).is_some());
+        let expired = row(RATE_LIMITED_ACTION, Some("2026-10-03T11:55:00Z"));
+        assert_eq!(
+            cooling_down_until(&[expired], now),
+            None,
+            "the wait is over"
+        );
+        let retried = [limited, row(RUN_STARTED_ACTION, None)];
+        assert_eq!(cooling_down_until(&retried, now), None, "tried again since");
+        let unreadable = row(RATE_LIMITED_ACTION, Some("soon"));
+        assert_eq!(
+            cooling_down_until(&[unreadable], now),
+            None,
+            "holds nothing back"
+        );
+        assert_eq!(cooling_down_until(&[], now), None);
     }
 
     /// The `stalled` trigger end to end in the store: an agent's board card

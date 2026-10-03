@@ -3715,6 +3715,65 @@ async fn a_card_run_the_provider_refuses_asks_the_human_at_once() {
     daemon.stop();
 }
 
+/// A card run the provider rate-limits (HTTP 429) waits it out with its
+/// member: no hand-back to the router, no question to the human, and a
+/// `rate_limited` row saying when it is tried again.
+#[tokio::test]
+async fn a_rate_limited_card_run_waits_with_its_member() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"{"decision":"assign","member":"agent:builder","reason":"it builds things"}"#.to_string(),
+        r#"STATUS 429 {"error":"rate limit exceeded"}"#.to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let created = client
+        .request(nanna_client::Action::Member(
+            nanna_client::MemberAction::Create {
+                name: "Builder".to_string(),
+                workspace_id: None,
+                personal: false,
+                avatar: None,
+                profile: None,
+            },
+        ))
+        .await
+        .expect("member.create answers");
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+
+    let id = create_global_card(&client, "Build the thing").await;
+    let card = card_when(&client, id, "waiting out the limit", |card| {
+        card["activity"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|row| row["action"] == "rate_limited"))
+            && card["task"]["status"] == "pending"
+    })
+    .await;
+    assert_eq!(
+        card["task"]["assignee"], "agent:builder",
+        "kept by its member: {card}"
+    );
+    let activity = card["activity"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !activity.iter().any(|row| row["action"] == "handed_back"),
+        "not a hand-back: {card}"
+    );
+    assert!(
+        card["task"]["depends_on"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "nobody is asked: {card}"
+    );
+    client.disconnect().await;
+    daemon.stop();
+}
+
 /// P25 decision 3 on the real daemon: one member, one card at a time. Two
 /// cards assigned to the same agent at once are both worked — the second
 /// waits while the member is busy and starts when its first card ends.

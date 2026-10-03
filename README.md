@@ -97,7 +97,10 @@ A fully local run needs none.
   agent's run, and mark it done (it stays open if its acceptance check fails, and says why).
   **Inbox** and **Upcoming** list what is assigned to you across every board; **Members** is where
   you add agents and give them models and capabilities; and a card that comes due, goes overdue,
-  or is handed to you with a question shows up in your notifications.
+  or is handed to you with a question shows up in your notifications. Cards are not left stuck:
+  one an agent stops working on goes back to the router after half an hour, a rejected API key
+  becomes a question to you instead of a failed card, and a rate-limited run waits and tries
+  again without counting as a failure.
 - **Long-horizon autonomy** — Mission mode drives multi-hour builds from a single prompt with automatic recovery from failures
 - **Headless daemon + GUI** — Runs as a Windows service with WebSocket IPC; the Tauri GUI attaches as a client
 - **Streaming chat** — Real-time responses with tool calling, thinking visualization, and context compression.

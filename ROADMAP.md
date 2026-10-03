@@ -532,9 +532,16 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
             the package-level `dompurify` it would bump is not the code monaco runs. Re-check on the
             next monaco release; exposure is monaco's own hover/markdown rendering of local content.
 
-- [ ] No GitHub secret scanning enabled.
+- [x] No GitHub secret scanning enabled.
       *(2026-07-24)* Dependabot shipped (see above). Secret scanning itself is still a repo-admin
       toggle on GitHub and is not something a PR can flip — left open.
+      *(2026-10-03, checked)* **On, since the move to `basic-automation/Nanna` (public).**
+      `gh api repos/basic-automation/Nanna` reports `secret_scanning`, `secret_scanning_push_protection`
+      and `dependabot_security_updates` all `enabled`, and the secret-scanning alerts list is **empty
+      (0)**. GitHub scans a public repo's whole history with its provider patterns, so that 0 also
+      covers the history for known token formats. Still off, and an owner toggle:
+      `secret_scanning_non_provider_patterns` (generic secrets such as private keys and passwords)
+      and `secret_scanning_validity_checks`.
 - [x] Store all secrets in OS keychain by default; remove secret fields from config.toml.
       *(2026-07-24)* **Done** as part of the onboarding/GUI keyring work above. `Config::save_to`
       always strips `llm.{api_key,openai_api_key,openrouter_api_key,github_token,ollama_api_key,
@@ -900,6 +907,15 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
 - [x] Unify ProjectDirs namespaces — config and credentials must use the same ("com", "nanna", "nanna") (or equivalent) namespace.
       *(2026-07-24)* Done — see the namespace-unification item above.
 - [ ] Run gitleaks detect --source . and trufflehog git file://. across full git history.
+      *(2026-10-03)* Partly answered: GitHub secret scanning (provider patterns, whole history) reports
+      0 alerts — see the item above. What is left is the **generic** patterns (keys, passwords,
+      high-entropy strings) that neither GitHub's default scan nor this host covers: neither
+      `gitleaks` nor `trufflehog` is installed here, and installing one is an owner step (a Go binary
+      or container from outside the Rust toolchain). A pattern pass over every added line in all 1776
+      commits (`git log -p --all`, grepping the Anthropic/OpenAI/OpenRouter/GitHub/AWS/Slack/Telegram
+      token shapes and PEM private-key headers) found only three test fixtures:
+      `sk-ant-from-the-environment`, `sk-ant-oat01-roundtrip-access`, `xoxb-1234567890-`. Not a
+      substitute for gitleaks' entropy rules, but nothing real in the common shapes.
 - [x] Remove or gitignore .claude/settings.local.json (committed with machine paths and broad agent permissions).
       *(2026-07-24)* **Untracked and gitignored.** It was committed in a **public** repo carrying 77 lines
       of Claude Code permission allowances — including `Bash(curl:*)`, `Bash(taskkill:*)`,
@@ -8281,7 +8297,7 @@ as its turn (`TurnAdmission`, scope default `session`).
             the marker scan in `members.rs`); **not** proven across a real restart — the e2e
             rig runs the daemon in-process, so an aborted daemon's run task outlives it and
             would hold the store.
-      - [ ] *(research 2026-10-01; stall half done 2026-10-03, see Triggers)* **Borrow Hermes Kanban's failure and stall rules** when the
+      - [x] *(research 2026-10-01; all three rules landed 2026-10-03 — stall in Triggers, terminal and rate-limit below)* **Borrow Hermes Kanban's failure and stall rules** when the
             auto-start lands ([docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban)):
             its dispatcher auto-blocks a card after `failure_limit` (default 2) consecutive failed
             runs, requeues a rate-limited run *without* counting a failure and blocks at once on
@@ -8308,9 +8324,25 @@ as its turn (`TurnAdmission`, scope default `session`).
             the e2e `ScriptedOllama`; e2e `a_card_run_the_provider_refuses_asks_the_human_at_once`
             (red before: handed back to the router; green: question in 3.4 s), unit
             `a_refused_key_asks_the_human_and_keeps_the_card_with_its_member`, classifier cases in
-            `how_a_run_stopped_decides_what_its_open_card_is_owed`. **Still open from Hermes:** a
-            rate-limited run (429) is requeued without counting a failure — ours still ends in a
-            hand-back after the in-step retries.
+            `how_a_run_stopped_decides_what_its_open_card_is_owed`.
+            *(2026-10-03, later)* **The rate-limit half landed too — the Hermes item is done.** A card
+            run the provider rate-limits (HTTP 429 / `Rate limit exceeded`, `is_rate_limited_error`)
+            keeps its card: once the in-run waits are spent (the e2e shows ~70 s of them — the
+            existing per-attempt rate-limit wait, unchanged), `wait_out_rate_limit` writes a
+            `rate_limited {until, reason}` row, posts "tries again after HH:MM UTC. Not counted as a
+            failure", and puts the card back to `pending` with its member. Nothing goes to the router
+            or the human, nothing counts toward `HAND_BACKS_MAX`. `until` = the provider's own wait
+            when the error names one (`LlmError::parse_retry_after`, now public), else
+            `RATE_LIMIT_COOLDOWN_DEFAULT` = 5 min (the worker's tick — shorter would not start any
+            sooner), never past `RATE_LIMIT_COOLDOWN_MAX` = 1 h. `try_start` refuses a card still
+            cooling down (`cooling_down_until`: the newest `rate_limited`/`run_started` row is a
+            `rate_limited` whose `until` is ahead), so a freed member does not restart it into the
+            same limit; the worker's 5-minute tick restarts every card whose wait is over
+            (`restart_cooled_down`, candidates from `cards_with_unended(rate_limited, run_started)`).
+            Same two sites as the terminal rule (`abandon` and `card_after_run`). Tests: unit
+            `a_rate_limited_card_waits_with_its_member`, pure
+            `a_rate_limit_holds_a_card_back_until_its_wait_or_its_next_run`, classifier and cooldown
+            cases, e2e `a_rate_limited_card_run_waits_with_its_member` (scripted 429).
 - [ ] Sub-agent spawning is replaced by "create a sub-task assigned to another member". Delete
       `sub_agent`/`task` tool and `SubSessionInfo`.
       - [x] *(2026-10-01)* **The half that does not need chat deleted: a card run's `todo` works
