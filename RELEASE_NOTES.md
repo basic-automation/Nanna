@@ -1,75 +1,63 @@
-# Nanna v0.3.35-beta.44 — The Board
+# Nanna v0.3.36-beta.45 — Cards don't get stuck
 
-Until this release the board existed only inside the daemon: cards, members, the router and
-agents working cards were all real, but there was no screen to see them on. Now there is. Open
-**Board** from the top of the left rail.
+The board shipped in the last release. This one is about what happens when the work on a card
+goes wrong: a card an agent stopped working on, a model provider that rejects the key, a
+provider that says "slow down". Each now ends somewhere you can see, instead of in a card that
+sits there.
 
 ## What's Changed
 
-**One line makes a card.** Type a card into the line at the top of the board. Tokens fill in
-its fields, and everything else is the title:
+**A card nobody is working goes back to the router.** If an agent's card has been in progress
+for half an hour with nothing working on it, and you did not stop it yourself, the board's
+router takes it back. It says so on the card's thread, then decides again who should do it. A
+card that keeps coming back this way ends with a question to you rather than going round
+forever, the same as a card agents keep handing back. A card you stopped stays with its agent
+until you resume or reassign it.
 
-- `#label` adds a label, `p1`–`p4` sets the priority, `@member` assigns it (`@me` is you).
-- A date defers the card until that day: `today`, `tomorrow`, `friday`, `next friday`,
-  `next week`, `in 3 days`, `march 30` or `2026-12-31`.
-- A date in braces sets the deadline instead: `{friday}`, `{march 30}`.
+**A rejected API key becomes a question for you.** When the model provider refuses an agent's
+run outright (an invalid key, an account out of credit, no key set), the card no longer fails or
+goes to another agent on the same broken provider. You get a question card that names the error
+and says what to fix. The work card waits for it, keeping its agent. Mark the question done once
+it is fixed, and the agent starts again.
 
-For example, `Ship the fix #release p2 @builder tomorrow {friday}`. Anything you leave out, the
-board's router fills in. If a token is wrong (an `@name` nobody on the board has, a deadline
-that is not a date), the line says why and no card is made.
+**A rate-limited run waits and tries again.** When the provider says too many requests, the card
+stays with its agent and says when it will try again (the provider's own wait, else five
+minutes). That does not count as a failure.
 
-**The board.** Four columns: To do, Waiting (cards held up by another card, such as a question
-for you), In progress and Done. Sub-cards sit inside their parent card, with a count, or on the
-board as cards of their own. Filter by assignee, label, priority, or date (startable now,
-deferred, overdue, no deadline). The board updates by itself as the router and agents work.
-
-**A card's own view.** Click a card to see its thread: progress, questions and verdicts as
-members post them, rendered as formatted text. From there you can post, reassign the card,
-change its priority, date, deadline, labels and description, see what it waits on and what its
-sub-cards are, add a sub-card, start, stop or resume an agent's work on it, and mark it done.
-If its "done when" check fails, the card stays open and says why.
-
-**Inbox and Upcoming.** Inbox lists the cards assigned to you that you can start now: no date,
-or a date that has come. Upcoming lists the later ones by day. Both cover every board, and each
-card says which board it is on.
-
-**Members.** Add agents to a board, give each a list of models (best first), capabilities and
-notes for the router, or make one your own so it follows you to every board. You can also set
-the router's own model list here.
-
-**Notifications.** You are notified when one of your cards' dates arrives, when its deadline
-passes, and when the router or an agent hands you a card, such as a question about their work.
+**Choose where Nanna keeps its data.** Settings → Data → **Data location** shows the folder the
+daemon keeps its database, memories and logs in, and lets you choose another one or go back to
+the default. The daemon reads this when it starts. Until it restarts, the page says it is still
+using the old folder, and it never moves your data: copy it there first if you want to keep it.
 
 ## Fixes
 
-- **A date can be removed from a card.** Clearing a card's date, deadline or description used to
-  be impossible; now it takes one click.
-- **Listing a large folder gives the same answer on every computer.** When a folder had more
-  entries than the project overview shows, which entries made the cut depended on the disk's
-  filesystem. It now always keeps the first ones by name.
+- **A board shows its own cards.** With the app open twice on different workspaces, a board
+  could list, and add cards to, whichever workspace the *other* window last picked. Each board
+  now names its own workspace.
 
 ## Under the hood
 
-- New daemon actions: `task.quick_add` (one line to one card, optionally as a sub-card) and
-  `task.assigned` (a member's open cards on every board).
-- The app now receives the daemon's card and roster change events, which it used to drop.
-- RustPython 0.6. This lifts two version holds: `libc` (now 0.2.189) and `malachite-bigint`
-  (now 0.12). Tauri's JavaScript packages now match the 2.12.1 Rust crates.
-- `devalue` 5.9.4 (pulled in by Nuxt), fixing six advisories, three of them high
-  ([GHSA-j22f-vq7h-c4qm](https://github.com/advisories/GHSA-j22f-vq7h-c4qm),
-  [GHSA-mcm9-63f2-9j32](https://github.com/advisories/GHSA-mcm9-63f2-9j32),
-  [GHSA-x5rw-q4pp-hg5g](https://github.com/advisories/GHSA-x5rw-q4pp-hg5g) and three lower).
-  One `node-forge` advisory has no fix yet; it only affects Nuxt's development server, which is
-  not part of the app.
-- Built with the Rust nightly of 2026-10-02 (rustc 1.101.0).
+- **turso 0.8.1** (from 0.7.2), built without its full-text search feature. That feature does
+  not compile on our toolchain ([turso#9463](https://github.com/tursodatabase/turso/issues/9463)),
+  and Nanna does not use it. Leaving it out removes 34 crates from the build, among them a C
+  compression library and an `lru` version with a soundness advisory (RUSTSEC-2026-0253). Checked
+  by starting the release daemon against a copy of a real 101 MB database.
+- **25 app commands nothing called are gone**, among them commands that could write workspace
+  files and tool code. The app no longer links Nanna's scripting engines: its dependency graph
+  went from 862 crates to 740.
+- The daemon's status now reports the data folder it is using, and `task.list` /
+  `task.quick_add` accept a `workspace_id`.
+- The unused `[memory] extraction_model` setting is removed. Old config files that still have it
+  load as before.
+- `uuid` 1.27 and `@lucide/vue` 1.51, plus routine lockfile updates. TypeScript 7 is still on
+  hold until `vue-tsc` supports it.
 
 ## Still open
 
-- The board shows the workspace selected at the top of the window, or the global board.
-- The board does not yet follow the Figma design's final styling.
-- The router does not yet notice a card that sits in progress with nobody working it (for
-  example one you paused), and the heartbeat is not a board card yet.
 - Chat is still there beside the board. Removing it is the next big step.
+- The heartbeat is not a board card yet, and the board does not yet follow the Figma design's
+  final styling.
+- There is no way yet to back up or export Nanna's data from the app.
 
-The previous release, [v0.3.34-beta.43](https://github.com/basic-automation/Nanna/releases/tag/v0.3.34-beta.43),
-made agents start on the cards assigned to them.
+The previous release, [v0.3.35-beta.44](https://github.com/basic-automation/Nanna/releases/tag/v0.3.35-beta.44),
+added the board.
