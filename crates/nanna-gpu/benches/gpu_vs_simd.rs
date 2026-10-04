@@ -230,7 +230,7 @@ fn main() {
                     );
 
                     let speedup =
-                        simd_result.mean.as_secs_f64() * 1e9 / gpu_result.mean.as_secs_f64() * 1e9;
+                        simd_result.mean.as_secs_f64() / gpu_result.mean.as_secs_f64();
                     let gpu_faster = speedup > 1.0;
 
                     if gpu_faster && !prev_gpu_faster {
@@ -357,6 +357,6 @@ fn measure_gpu_overhead(
     );
     println!(
         "GPU/SIMD overhead ratio: {:.0}×",
-        overhead.mean.as_secs_f64() * 1e9 / simd_single.mean.as_secs_f64() * 1e9
+        overhead.mean.as_secs_f64() / simd_single.mean.as_secs_f64()
     );
 }

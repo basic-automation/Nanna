@@ -226,7 +226,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -237,7 +237,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -457,13 +457,13 @@ dependencies = [
 
 [[package]]
 name = "async-recursion"
-version = "1.1.1"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b43422f69d8ff38f95f1b2bb76517c91589a924d1559a0e935d7c8ce0274c11"
+checksum = "4f8abc12baad266b1c8cec146854c195b5864b4221d4b2ca7296a7ae82d9e451"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -2492,7 +2492,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2524,7 +2524,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
- "libloading 0.7.4",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -2559,7 +2559,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "socket2",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2844,7 +2844,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3340,8 +3340,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.1.3",
- "windows-result 0.3.4",
+ "windows-link 0.2.1",
+ "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -3500,7 +3500,7 @@ dependencies = [
  "gobject-sys 0.22.9",
  "libc",
  "system-deps 9.0.0",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4023,7 +4023,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -4678,7 +4678,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cde48f36530cbd91b65f050101e6c056d6eb743cea2a8f0f19beef69c6742ff8"
 dependencies = [
  "scopeguard",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4875,15 +4875,6 @@ name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
-
-[[package]]
-name = "libmimalloc-sys"
-version = "0.1.49"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
-dependencies = [
- "cc",
-]
 
 [[package]]
 name = "libredox"
@@ -5192,15 +5183,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mimalloc"
-version = "0.1.52"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
-dependencies = [
- "libmimalloc-sys",
-]
-
-[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5250,9 +5232,9 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "1.2.3"
+version = "1.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b18443e9c262bfe8fa82f51666e2642c53393f7e5c27b3e1aeab922cff5b9d8"
+checksum = "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
 dependencies = [
  "libc",
  "wasi",
@@ -5296,7 +5278,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.21",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5345,7 +5327,7 @@ dependencies = [
 
 [[package]]
 name = "nanna"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5374,7 +5356,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-agent"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5403,7 +5385,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-bench"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "criterion",
  "nanna-simd",
@@ -5416,7 +5398,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-browser"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "async-trait",
  "chromiumoxide",
@@ -5432,7 +5414,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-channels"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "async-trait",
  "bitflags 2.13.2",
@@ -5453,7 +5435,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-client"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -5470,7 +5452,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-config"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "aes-gcm 0.11.1",
  "base64 0.23.1",
@@ -5490,7 +5472,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-core"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5514,7 +5496,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-daemon"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5562,7 +5544,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-gpu"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "bytemuck",
  "criterion",
@@ -5578,7 +5560,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-gui"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -5614,7 +5596,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-llm"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "async-stream",
  "directories",
@@ -5633,7 +5615,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-mcp"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -5650,7 +5632,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-memory"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "async-trait",
  "half",
@@ -5667,11 +5649,11 @@ dependencies = [
 
 [[package]]
 name = "nanna-numeric"
-version = "0.3.36"
+version = "0.3.37"
 
 [[package]]
 name = "nanna-proc"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "libc",
  "tempfile",
@@ -5682,7 +5664,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-scripting"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "boa_engine",
  "chrono",
@@ -5707,7 +5689,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-server"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "anyhow",
  "axum",
@@ -5738,7 +5720,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-simd"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "half",
  "wide",
@@ -5746,7 +5728,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-storage"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "chrono",
  "nanna-numeric",
@@ -5761,7 +5743,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-timeline"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "nanna-storage",
  "serde",
@@ -5772,7 +5754,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-tools"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "async-trait",
  "base64-simd",
@@ -5806,7 +5788,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-workspace"
-version = "0.3.36"
+version = "0.3.37"
 dependencies = [
  "serde",
  "serde_json",
@@ -5944,7 +5926,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6501,7 +6483,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.45.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7155,7 +7137,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -7795,7 +7777,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7808,7 +7790,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7865,7 +7847,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9007,7 +8989,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9122,7 +9104,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10312,7 +10294,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10534,9 +10516,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.53.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
 dependencies = [
  "bytes",
  "libc",
@@ -10865,7 +10847,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.21",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10924,7 +10906,6 @@ version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7de8cbeace6385bf3fcb346d4aace8d9ba0de5cffe5e5a0ed210beebd671c208"
 dependencies = [
- "mimalloc",
  "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
@@ -11148,7 +11129,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12005,7 +11986,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12026,7 +12007,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-quartz-core",
  "raw-window-handle",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
  "windows-version",
 ]
 

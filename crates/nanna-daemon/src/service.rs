@@ -286,11 +286,18 @@ impl ServiceManager {
             .join(format!("com.nanna.{}.plist", self.config.name))
     }
     
-    #[cfg(target_os = "macos")]
+    /// The launchd job. Built on every host so its escaping is tested here,
+    /// not only on a Mac.
+    #[cfg(any(target_os = "macos", test))]
     fn generate_launchd_plist(&self) -> String {
-        let exe = self.config.executable.display();
+        // Every interpolated string is XML-escaped: a plist is XML, so an
+        // install path or argument with `&` or `<` (legal in both) produced a
+        // file launchd refused to load — or, with a crafted `</string>`, a
+        // different program list.
+        let name = xml_escape(&self.config.name);
+        let exe = xml_escape(&self.config.executable.to_string_lossy());
         let args: String = self.config.arguments.iter()
-            .map(|a| format!("        <string>{}</string>", a))
+            .map(|a| format!("        <string>{}</string>", xml_escape(a)))
             .collect::<Vec<_>>()
             .join("\n");
         
@@ -299,11 +306,11 @@ impl ServiceManager {
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.nanna.{}</string>
+    <string>com.nanna.{name}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{}</string>
-{}
+        <string>{exe}</string>
+{args}
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -314,7 +321,7 @@ impl ServiceManager {
     <key>StandardErrorPath</key>
     <string>/tmp/nanna-daemon.err</string>
 </dict>
-</plist>"#, self.config.name, exe, args)
+</plist>"#)
     }
     
     // =========================================================================
@@ -467,6 +474,26 @@ fn systemd_quote(word: &str) -> String {
     quoted
 }
 
+/// `text` as XML character data or attribute content: the five characters
+/// XML reserves become entity references, everything else passes through.
+#[cfg(any(target_os = "macos", test))]
+fn xml_escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(c),
+        }
+    }
+    debug_assert!(escaped.len() >= text.len(), "escaping only ever adds");
+    debug_assert!(!escaped.contains('<'), "no markup survives");
+    escaped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +511,26 @@ mod tests {
         );
         assert_eq!(systemd_quote(r#"a"b\c"#), r#""a\"b\\c""#);
         assert_eq!(systemd_quote("100%"), "\"100%%\"", "no specifier expansion");
+    }
+
+    #[test]
+    fn plist_strings_are_xml_escaped() {
+        assert_eq!(xml_escape("/Applications/Nanna.app"), "/Applications/Nanna.app");
+        assert_eq!(xml_escape(r#"a&b<c>d"e'f"#), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+
+        let manager = ServiceManager::new(ServiceConfig {
+            name: "R&D".to_string(),
+            executable: PathBuf::from("/Users/u/Tools & Apps/nanna-daemon"),
+            arguments: vec!["run".to_string(), "</string><string>/bin/sh".to_string()],
+            ..ServiceConfig::default()
+        });
+        let plist = manager.generate_launchd_plist();
+        assert!(plist.contains("<string>com.nanna.R&amp;D</string>"));
+        assert!(plist.contains("<string>/Users/u/Tools &amp; Apps/nanna-daemon</string>"));
+        assert!(plist.contains("<string>&lt;/string&gt;&lt;string&gt;/bin/sh</string>"));
+        // One <string> per program word plus the label and two log paths:
+        // an argument cannot open a new array element.
+        assert_eq!(plist.matches("<string>").count(), 6);
     }
 
     /// The bug this guards: Windows needs the `service` subcommand (the SCM

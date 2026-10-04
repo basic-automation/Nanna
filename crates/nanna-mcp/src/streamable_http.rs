@@ -997,6 +997,24 @@ mod tests {
         assert_eq!(events, ["{\"a\":1}", "x\ny"]);
     }
 
+    /// Both SSE transports (this one and the 2024 legacy one in
+    /// `sse_legacy.rs`) feed raw network chunks to this parser. A chunk
+    /// boundary may fall inside a multibyte character; the event must come out
+    /// whole wherever it falls — the class that once failed every provider
+    /// stream and silently dropped legacy-MCP replies.
+    #[test]
+    fn a_multibyte_event_survives_every_chunk_split() {
+        let stream = "event: message\r\ndata: {\"text\":\"héllo — 日本 🦀\"}\r\n\r\n".as_bytes();
+        for split in 0..=stream.len() {
+            let mut parser = SseParser::default();
+            let mut events = parser.push_events(&stream[..split]).unwrap();
+            events.extend(parser.push_events(&stream[split..]).unwrap());
+            assert_eq!(events.len(), 1, "split at byte {split}");
+            assert_eq!(events[0].event.as_deref(), Some("message"));
+            assert_eq!(events[0].data, "{\"text\":\"héllo — 日本 🦀\"}", "split at byte {split}");
+        }
+    }
+
     #[test]
     fn an_oversized_sse_event_is_an_error_not_unbounded_growth() {
         let mut parser = SseParser::default();

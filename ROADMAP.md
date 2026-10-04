@@ -2223,9 +2223,14 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
                   as `��`. Both now frame raw bytes first (`listeners::sse::take_event`, shared) and
                   decode one complete event at a time; tests over every split point. Not
                   live-verified — no Signal/WhatsApp bridge on this host.
-            - [ ] **PR #344's new `nanna-mcp/src/sse_legacy.rs` reads `bytes_stream()` too** — check it
+            - [x] **PR #344's new `nanna-mcp/src/sse_legacy.rs` reads `bytes_stream()` too** — check it
                   for the same per-chunk decode once #344 merges (it is not on master, so it could
                   not be fixed here).
+                  *(2026-10-04 — checked: not affected.)* It feeds raw chunks to the shared
+                  `SseParser`, which buffers bytes and decodes one complete line at a time (the
+                  `\n` delimiter is ASCII, so a whole line is whole characters). Pinned rather
+                  than asserted: `a_multibyte_event_survives_every_chunk_split` splits an event
+                  carrying 2-, 3- and 4-byte characters at every byte offset.
       - [x] *(2026-09-21)* **The e2e suite now gates PRs: `.github/workflows/e2e.yml`.** CI compiled
             the test suite (`test-compile.yml`, `--no-run`) but ran almost none of it — only three
             budget-gate subsets — so the conversation path was exercised by nightly runs alone. The new
@@ -2640,6 +2645,11 @@ and ships TLS, QR address output, abuse defense, and client authorization out of
       and record the decision here so the next sweep stops re-deriving it. Sources:
       [Arti 2.6.0](https://blog.torproject.org/arti_2_6_0_released/),
       [onyums](https://crates.io/crates/onyums).
+      *(research 2026-10-04 — corrects "onyums did not move")* **`onyums 0.5.0` (2026-09-24) moved
+      to `arti-client`/`tor-hsservice` `^0.46`**, one minor behind `arti-client 0.47.0` (2026-10-01).
+      The lag is about a week, not open-ended, which weakens the case for bypassing it; the
+      decision still wants making, but the evidence now leans to keeping `onyums` and re-checking
+      its lag when P9 starts.
 
 ### P10 — Token Efficiency & Cost Optimization ✅ (mostly)
 Done: Anthropic + OpenAI native prompt caching + hit tracking, cross-provider model routing with
@@ -8973,6 +8983,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       space started the wrong program. **Still open:** the launchd plist (`cfg(target_os =
       "macos")`, XML-escape its strings) and `windows_service` Running-after-exit — neither
       compiles on this Linux host, so neither is changed blind.
+      *(2026-10-04 — the plist.)* `generate_launchd_plist` now compiles on every host
+      (`cfg(any(target_os = "macos", test))`) so its escaping is tested here: the label, the
+      executable and every argument go through `xml_escape` (the five reserved characters). An
+      install path with `&` or `<` produced a plist launchd refused to load, and an argument
+      holding `</string><string>…` added a program word. Test `plist_strings_are_xml_escaped`
+      counts the `<string>` elements to pin the second. **Still open:** `windows_service`
+      Running-after-exit (does not compile here; not changed blind).
 - [x] Config: `file_encryption_key` must pick one key source and stick to it; `SecureStore::set`
       must remove the file copy like `delete` does; `save_to` writes atomically (tmp + rename)
       because the daemon watches the file; document env precedence (`credentials.rs:639,224`,
@@ -9201,6 +9218,22 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       visited set; `SystemExit` must carry its status; manifest skills with `kill_on_drop`; the
       registry backstop must extend for undeclared timeouts too (`boa_impl.rs:43,779`,
       `python.rs:147,374`, `engine.rs:414,203`, `skills/executable.rs:150`).
+- [x] *(found 2026-10-04, scanning for `expect`/`unwrap` on production paths)* **A tool script's
+      native call could abort the daemon.** Every bridge native in `boa_impl.rs` (`exec`,
+      `readFile`, `writeFile`, `listDir`, `stat`, `fetch`, `callService` — 7 sites) ran its async
+      work on a fresh runtime built with `.expect("Failed to create runtime")` inside a spawned
+      thread. Building a runtime can fail (no fd left for its epoll), and under the release
+      profile's `panic = "abort"` a panic in *any* thread ends the process — the
+      `join().map_err("Thread panicked")` meant to catch it never ran. One helper,
+      `run_on_own_runtime`, now turns that into a JS error for the calling script; test
+      `a_native_call_runs_on_its_own_runtime_inside_another`. Same scan, `server.rs`: a
+      user-edited `discover_tools` that no longer parses aborted the boot (`.expect`), now a
+      skipped tool with a warning; and the JSON-migration path's `json_path.unwrap()` became a
+      `let` chain. A scan of every crate's non-test code for `.unwrap()`/`.expect(` now finds
+      only builder invariants (`nanna-server`'s `AppStateBuilder`), the GPU buffer created
+      mapped, the Windows-only job-object size, and four `unwrap`s in `service.rs`'s
+      macOS-only install/uninstall (`plist_path.parent()`, `to_str()`), left alone because
+      that code does not compile on this host — **still open**, for a run with a macOS check.
 - [x] Tool authoring: `tools.update` refuses bundled names and runs `check_syntax`; GUI
       `update_skill` validates the name (`tool_authoring.rs:99,236`, `gui/.../tools.rs:458`). Both
       move with the `default-skills` → tools rename.
@@ -9345,7 +9378,7 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       and the state flipping, with no deterministic hook). e2e daemon suite: 42/42.
 
 **Independent — fix when in the file:**
-- [~] `nanna-simd` NEON arm has a trailing semicolon and does not compile on aarch64
+- [x] `nanna-simd` NEON arm has a trailing semicolon and does not compile on aarch64
       (`lib.rs:174,204`); `nanna-gpu` `search` must check buffer limits, `append` dirty index
       off-by-one; `nanna-bench` fixture divides by 24 576 instead of 2^24; `src/installer/windows/
       Cargo.toml` declares a missing `build.rs`.
@@ -9360,6 +9393,32 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       "random" vectors; now `/2^24`, pinned by a range test. It feeds only latency benches, so no
       baseline moves. **Installer manifest:** orphaned (written by an agent run, referenced by
       nothing, not a workspace member) — deleted. **Still open:** `search` buffer limits.
+      *(2026-10-04 — the line is complete.)* **`search` scores in as many dispatches as the
+      device's limits require.** One dispatch over a store past `max_storage_buffer_binding_size`
+      (128 MiB on wgpu's defaults: 87 381 vectors at 384 wide, 21 845 at 1 536) or past
+      `max_compute_workgroups_per_dimension` × 64 invocations (4 194 240 vectors) was a wgpu
+      validation error, which wgpu's default handler turns into a panic — under `panic = "abort"`,
+      the daemon. `vectors_per_dispatch` takes the smallest of the three bounds (vectors' binding,
+      output binding, workgroups) and the query buffer is uploaded once for all dispatches; a
+      vector wider than a binding, and a trailing partial vector (silently dropped before), are
+      refused (`GpuError::InvalidInput`). Proven on the 4070: both GPU regressions
+      (`a_store_past_the_binding_limit_is_scored_in_full`, `…workgroup_limit…`) fail with
+      `Buffer binding 2 range 134217744 exceeds … limit 134217728` / a workgroup validation error
+      on the single-dispatch code and pass with the fix; split scores match a CPU cosine.
+      `gpu_vs_simd_quick`: GPU fixed dispatch 85 µs (was characterized at ~200 µs), so no
+      regression. **Same pass: every GPU bench's ratio was off by 10^18.** The 2026-09-22 lint
+      pass rewrote `as_nanos() as f64` to `as_secs_f64() * 1e9` on both sides of a division, so
+      `a * 1e9 / b * 1e9` = (a/b)·10^18: `ratio < 1.0` could never hold and the four benches'
+      crossover detection could never report a GPU win. 8 sites fixed; real ratios at 768 wide
+      run 238× (10 vectors) down to 4.3× (10 000) — SIMD still wins the whole quick range.
+      (The GPU path has no production caller today: `VectorStore::with_gpu` is never called.)
+      - [ ] *(found 2026-10-04)* **Decide: wire the GPU search path or delete it.** Nothing calls
+            `VectorStore::with_gpu`, so the daemon's `GPU_THRESHOLD = 50_000` branch never runs and
+            `nanna-memory` links `wgpu` for nothing. Wiring it costs a wgpu device on the card the
+            local model needs (VRAM is the scarcest resource) to win only past ~50k memories —
+            the operator's store is 3 730, and the corrected quick bench has SIMD ahead across
+            its whole range (4.3× at 10k). Deleting it keeps `nanna-gpu` for the planned DSP
+            kernels. Product call; until made, the GPU path is tested but dormant.
 - [x] **aarch64 is lint-dirty and nothing looks.** `cargo clippy -p nanna-simd --target
       aarch64-unknown-linux-gnu --all-targets` reports ~24 warnings no x86 run can see — 10 lossy
       `as` casts (owner rule: route through `nanna-numeric`), 4 `mul_add`, doc backticks, a
@@ -10012,6 +10071,8 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            knowing on this Hyprland host, where the tray is a D-Bus client. Do nothing until a
            beta; then one migration item, verified over the `e2e-webdriver` harness.
            ([release](https://github.com/tauri-apps/tauri/releases/tag/tauri-v3.0.0-alpha.3))
+           *(re-checked 2026-10-04)* Still alpha: `tauri 3.0.0-alpha.4` (2026-10-01), `tauri-build
+           3.0.0-alpha.3`; stable line is `tauri 2.12.1` / `tauri-build 2.7.1`. No action.
    - *(2026-09-26 sweep)* `cargo update` → 57 lock changes, driven by **tauri 2.12.0** (`tauri-build`/
      `-codegen`/`-macros`/`-plugin` 2.7.0, `tao 0.37`, `muda 0.20`, `tray-icon 0.25`) plus `aegis 0.9.20`,
      `fancy-regex 0.19`, `brotli 9`. **`tauri-build 2.7.0` is the release carrying tauri#15831, so
@@ -10066,13 +10127,30 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            nanna-daemon` 6m52s, and a release boot against a copy of the operator's real 101 MB
            `nanna.db` + WAL (3730 memories and 23 sessions load, "Daemon ready", no panic).
            Unblocks the P12 `mummu` integration retry below (the turso split).
-     - [ ] *(found 2026-10-03)* **turso makes `mimalloc` (a C allocator) Nanna's global
+     - [x] *(found 2026-10-03)* **turso makes `mimalloc` (a C allocator) Nanna's global
            allocator.** `turso` 0.7 and 0.8 both declare `#[global_allocator] static GLOBAL:
            mimalloc::MiMalloc` under their default `mimalloc` feature, so every allocation in the
            daemon — not only the database's — goes through C mimalloc, and nobody chose that.
            Measure before deciding: idle RSS, the Suite 2/3 benches and a dream cycle with the
            feature on vs off (system allocator); keep whichever wins, and state it in
            `nanna-storage/Cargo.toml` as a decision rather than an inherited default.
+           *(2026-10-04 — measured, switched off.)* Release builds, both orders run: the in-RAM
+           recall scan at 50k (every recall and ingest) **11.2 → 4.7 ms** without it; `bulk_load`
+           at 50k (once per boot) **121 → 181 ms**; booting on a copy of the operator's 105 MB
+           store (3 730 memories, isolated, no model): ready in 0.12–0.22 s either way, peak RSS
+           ~295 → ~232 MB, but RSS after 60 s idle **~185 → ~237 MB** (mimalloc hands freed
+           memory back; glibc keeps it). `libmimalloc-sys` (C) leaves the build. Numbers in
+           `bench/BASELINE.md` Suite 2c and the decision in `nanna-storage/Cargo.toml`.
+           Not measured: a dream cycle (no summarizer model on this host).
+           - [ ] **Watch the idle RSS over a long-lived daemon.** glibc's per-thread arenas keep
+                 freed memory, and the 60 s reading is already ~50 MB above mimalloc's. Sample
+                 the operator daemon's RSS over a day after this ships; if it climbs, the fix is
+                 cheap (`M_ARENA_MAX`/`malloc_trim` after `bulk_load`, or mimalloc back on with
+                 the scan's layout cost understood) — decide on the curve, not on one reading.
+                 *(2026-10-04, same run)* First step taken: `release_boot_heap` calls
+                 `malloc_trim(0)` once before "Daemon ready" (Linux glibc only). On the same
+                 store copy, RSS a minute after ready went **~237 → ~213 MB** and stopped
+                 growing (mimalloc: ~185 MB). Still open: the day-long curve.
      - [ ] *(P13, research 2026-09-26)* **FSRS-7 exists but is not shippable yet.** ts-fsrs merged it
            ([PR #520](https://github.com/open-spaced-repetition/ts-fsrs/pull/520), 2026-09-18,
            unreleased); `fsrs-rs` is at 6.6.2 with no FSRS-7, and no FSRS-7 default parameters are
