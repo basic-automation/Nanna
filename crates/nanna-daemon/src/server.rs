@@ -4989,14 +4989,20 @@ impl DaemonServer {
         // Register discover_tools (JS/TS skill with registry access)
         if let Some(ref dir) = tools_dir {
             if let Some(source) = nanna_tools::skills::defaults::load_discover_tools_source(dir) {
-                let wrapper = nanna_tools::skills::ScriptedToolWrapper::from_source(
+                // The tools directory is the user's to edit, so a skill that
+                // no longer parses is a skipped tool, not an aborted boot.
+                match nanna_tools::skills::ScriptedToolWrapper::from_source(
                     "discover_tools",
                     &source,
-                )
-                .expect("discover_tools skill must parse")
-                .with_registry(Arc::downgrade(&tools));
-                tools.register(wrapper).await;
-                info!("Registered discover_tools skill from {:?}", dir);
+                ) {
+                    Ok(wrapper) => {
+                        tools
+                            .register(wrapper.with_registry(Arc::downgrade(&tools)))
+                            .await;
+                        info!("Registered discover_tools skill from {:?}", dir);
+                    }
+                    Err(e) => warn!("discover_tools in {:?} does not parse; not registered: {}", dir, e),
+                }
             } else {
                 warn!("discover_tools not found in tools directory");
             }
@@ -5696,8 +5702,7 @@ impl DaemonServer {
             false
         };
 
-        if should_migrate {
-            let path = json_path.unwrap();
+        if should_migrate && let Some(path) = json_path {
             info!(
                 "Migrating memories from {:?} to Turso (one-time migration)",
                 path

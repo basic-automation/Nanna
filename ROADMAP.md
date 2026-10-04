@@ -9208,6 +9208,22 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       visited set; `SystemExit` must carry its status; manifest skills with `kill_on_drop`; the
       registry backstop must extend for undeclared timeouts too (`boa_impl.rs:43,779`,
       `python.rs:147,374`, `engine.rs:414,203`, `skills/executable.rs:150`).
+- [x] *(found 2026-10-04, scanning for `expect`/`unwrap` on production paths)* **A tool script's
+      native call could abort the daemon.** Every bridge native in `boa_impl.rs` (`exec`,
+      `readFile`, `writeFile`, `listDir`, `stat`, `fetch`, `callService` — 7 sites) ran its async
+      work on a fresh runtime built with `.expect("Failed to create runtime")` inside a spawned
+      thread. Building a runtime can fail (no fd left for its epoll), and under the release
+      profile's `panic = "abort"` a panic in *any* thread ends the process — the
+      `join().map_err("Thread panicked")` meant to catch it never ran. One helper,
+      `run_on_own_runtime`, now turns that into a JS error for the calling script; test
+      `a_native_call_runs_on_its_own_runtime_inside_another`. Same scan, `server.rs`: a
+      user-edited `discover_tools` that no longer parses aborted the boot (`.expect`), now a
+      skipped tool with a warning; and the JSON-migration path's `json_path.unwrap()` became a
+      `let` chain. A scan of every crate's non-test code for `.unwrap()`/`.expect(` now finds
+      only builder invariants (`nanna-server`'s `AppStateBuilder`), the GPU buffer created
+      mapped, the Windows-only job-object size, and four `unwrap`s in `service.rs`'s
+      macOS-only install/uninstall (`plist_path.parent()`, `to_str()`), left alone because
+      that code does not compile on this host — **still open**, for a run with a macOS check.
 - [x] Tool authoring: `tools.update` refuses bundled names and runs `check_syntax`; GUI
       `update_skill` validates the name (`tool_authoring.rs:99,236`, `gui/.../tools.rs:458`). Both
       move with the `default-skills` → tools rename.
