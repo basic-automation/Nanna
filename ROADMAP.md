@@ -2223,9 +2223,14 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
                   as `��`. Both now frame raw bytes first (`listeners::sse::take_event`, shared) and
                   decode one complete event at a time; tests over every split point. Not
                   live-verified — no Signal/WhatsApp bridge on this host.
-            - [ ] **PR #344's new `nanna-mcp/src/sse_legacy.rs` reads `bytes_stream()` too** — check it
+            - [x] **PR #344's new `nanna-mcp/src/sse_legacy.rs` reads `bytes_stream()` too** — check it
                   for the same per-chunk decode once #344 merges (it is not on master, so it could
                   not be fixed here).
+                  *(2026-10-04 — checked: not affected.)* It feeds raw chunks to the shared
+                  `SseParser`, which buffers bytes and decodes one complete line at a time (the
+                  `\n` delimiter is ASCII, so a whole line is whole characters). Pinned rather
+                  than asserted: `a_multibyte_event_survives_every_chunk_split` splits an event
+                  carrying 2-, 3- and 4-byte characters at every byte offset.
       - [x] *(2026-09-21)* **The e2e suite now gates PRs: `.github/workflows/e2e.yml`.** CI compiled
             the test suite (`test-compile.yml`, `--no-run`) but ran almost none of it — only three
             budget-gate subsets — so the conversation path was exercised by nightly runs alone. The new
