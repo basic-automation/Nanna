@@ -9345,7 +9345,7 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       and the state flipping, with no deterministic hook). e2e daemon suite: 42/42.
 
 **Independent — fix when in the file:**
-- [~] `nanna-simd` NEON arm has a trailing semicolon and does not compile on aarch64
+- [x] `nanna-simd` NEON arm has a trailing semicolon and does not compile on aarch64
       (`lib.rs:174,204`); `nanna-gpu` `search` must check buffer limits, `append` dirty index
       off-by-one; `nanna-bench` fixture divides by 24 576 instead of 2^24; `src/installer/windows/
       Cargo.toml` declares a missing `build.rs`.
@@ -9360,6 +9360,25 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       "random" vectors; now `/2^24`, pinned by a range test. It feeds only latency benches, so no
       baseline moves. **Installer manifest:** orphaned (written by an agent run, referenced by
       nothing, not a workspace member) — deleted. **Still open:** `search` buffer limits.
+      *(2026-10-04 — the line is complete.)* **`search` scores in as many dispatches as the
+      device's limits require.** One dispatch over a store past `max_storage_buffer_binding_size`
+      (128 MiB on wgpu's defaults: 87 381 vectors at 384 wide, 21 845 at 1 536) or past
+      `max_compute_workgroups_per_dimension` × 64 invocations (4 194 240 vectors) was a wgpu
+      validation error, which wgpu's default handler turns into a panic — under `panic = "abort"`,
+      the daemon. `vectors_per_dispatch` takes the smallest of the three bounds (vectors' binding,
+      output binding, workgroups) and the query buffer is uploaded once for all dispatches; a
+      vector wider than a binding, and a trailing partial vector (silently dropped before), are
+      refused (`GpuError::InvalidInput`). Proven on the 4070: both GPU regressions
+      (`a_store_past_the_binding_limit_is_scored_in_full`, `…workgroup_limit…`) fail with
+      `Buffer binding 2 range 134217744 exceeds … limit 134217728` / a workgroup validation error
+      on the single-dispatch code and pass with the fix; split scores match a CPU cosine.
+      `gpu_vs_simd_quick`: GPU fixed dispatch 85 µs (was characterized at ~200 µs), so no
+      regression. **Same pass: every GPU bench's ratio was off by 10^18.** The 2026-09-22 lint
+      pass rewrote `as_nanos() as f64` to `as_secs_f64() * 1e9` on both sides of a division, so
+      `a * 1e9 / b * 1e9` = (a/b)·10^18: `ratio < 1.0` could never hold and the four benches'
+      crossover detection could never report a GPU win. 8 sites fixed; real ratios at 768 wide
+      run 238× (10 vectors) down to 4.3× (10 000) — SIMD still wins the whole quick range.
+      (The GPU path has no production caller today: `VectorStore::with_gpu` is never called.)
 - [x] **aarch64 is lint-dirty and nothing looks.** `cargo clippy -p nanna-simd --target
       aarch64-unknown-linux-gnu --all-targets` reports ~24 warnings no x86 run can see — 10 lossy
       `as` casts (owner rule: route through `nanna-numeric`), 4 `mul_add`, doc backticks, a
