@@ -2645,6 +2645,11 @@ and ships TLS, QR address output, abuse defense, and client authorization out of
       and record the decision here so the next sweep stops re-deriving it. Sources:
       [Arti 2.6.0](https://blog.torproject.org/arti_2_6_0_released/),
       [onyums](https://crates.io/crates/onyums).
+      *(research 2026-10-04 — corrects "onyums did not move")* **`onyums 0.5.0` (2026-09-24) moved
+      to `arti-client`/`tor-hsservice` `^0.46`**, one minor behind `arti-client 0.47.0` (2026-10-01).
+      The lag is about a week, not open-ended, which weakens the case for bypassing it; the
+      decision still wants making, but the evidence now leans to keeping `onyums` and re-checking
+      its lag when P9 starts.
 
 ### P10 — Token Efficiency & Cost Optimization ✅ (mostly)
 Done: Anthropic + OpenAI native prompt caching + hit tracking, cross-provider model routing with
@@ -10059,6 +10064,8 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            knowing on this Hyprland host, where the tray is a D-Bus client. Do nothing until a
            beta; then one migration item, verified over the `e2e-webdriver` harness.
            ([release](https://github.com/tauri-apps/tauri/releases/tag/tauri-v3.0.0-alpha.3))
+           *(re-checked 2026-10-04)* Still alpha: `tauri 3.0.0-alpha.4` (2026-10-01), `tauri-build
+           3.0.0-alpha.3`; stable line is `tauri 2.12.1` / `tauri-build 2.7.1`. No action.
    - *(2026-09-26 sweep)* `cargo update` → 57 lock changes, driven by **tauri 2.12.0** (`tauri-build`/
      `-codegen`/`-macros`/`-plugin` 2.7.0, `tao 0.37`, `muda 0.20`, `tray-icon 0.25`) plus `aegis 0.9.20`,
      `fancy-regex 0.19`, `brotli 9`. **`tauri-build 2.7.0` is the release carrying tauri#15831, so
