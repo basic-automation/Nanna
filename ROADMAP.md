@@ -8973,6 +8973,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       space started the wrong program. **Still open:** the launchd plist (`cfg(target_os =
       "macos")`, XML-escape its strings) and `windows_service` Running-after-exit — neither
       compiles on this Linux host, so neither is changed blind.
+      *(2026-10-04 — the plist.)* `generate_launchd_plist` now compiles on every host
+      (`cfg(any(target_os = "macos", test))`) so its escaping is tested here: the label, the
+      executable and every argument go through `xml_escape` (the five reserved characters). An
+      install path with `&` or `<` produced a plist launchd refused to load, and an argument
+      holding `</string><string>…` added a program word. Test `plist_strings_are_xml_escaped`
+      counts the `<string>` elements to pin the second. **Still open:** `windows_service`
+      Running-after-exit (does not compile here; not changed blind).
 - [x] Config: `file_encryption_key` must pick one key source and stick to it; `SecureStore::set`
       must remove the file copy like `delete` does; `save_to` writes atomically (tmp + rename)
       because the daemon watches the file; document env precedence (`credentials.rs:639,224`,
