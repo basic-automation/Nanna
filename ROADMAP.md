@@ -10140,6 +10140,10 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
                  the operator daemon's RSS over a day after this ships; if it climbs, the fix is
                  cheap (`M_ARENA_MAX`/`malloc_trim` after `bulk_load`, or mimalloc back on with
                  the scan's layout cost understood) — decide on the curve, not on one reading.
+                 *(2026-10-04, same run)* First step taken: `release_boot_heap` calls
+                 `malloc_trim(0)` once before "Daemon ready" (Linux glibc only). On the same
+                 store copy, RSS a minute after ready went **~237 → ~213 MB** and stopped
+                 growing (mimalloc: ~185 MB). Still open: the day-long curve.
      - [ ] *(P13, research 2026-09-26)* **FSRS-7 exists but is not shippable yet.** ts-fsrs merged it
            ([PR #520](https://github.com/open-spaced-repetition/ts-fsrs/pull/520), 2026-09-18,
            unreleased); `fsrs-rs` is at 6.6.2 with no FSRS-7, and no FSRS-7 default parameters are

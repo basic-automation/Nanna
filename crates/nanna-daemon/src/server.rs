@@ -3891,6 +3891,8 @@ impl DaemonServer {
 
         self.spawn_sub_agent_checkin();
 
+        release_boot_heap();
+
         // The configured address: with port 0 the real port is only known once
         // the IPC task binds, and its own "listening" line reports that.
         info!(
@@ -6667,6 +6669,27 @@ fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsC
                 allowed_channels: vec![], // nanna_config::SlackConfig has no allowed_channels yet
             })
         }),
+    }
+}
+
+
+/// Return the heap the boot freed to the OS, once, just before serving.
+///
+/// Boot is the daemon's allocation peak: `bulk_load` builds every memory and
+/// its vectors through temporaries, and glibc keeps the freed pages in its
+/// arenas indefinitely. Measured on a copy of a real 105 MB store (2026-10-04,
+/// system allocator since mimalloc was switched off): without this, ~214 MB at
+/// ready grew to ~237 MB a minute later; with it, ~213 MB at both — the work
+/// after ready reuses the returned pages instead of growing the arenas.
+/// Mimalloc, which purges on its own, idled at ~185 MB. No per-request path
+/// pays for it.
+fn release_boot_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: `malloc_trim` takes no pointers and only returns free pages
+        // to the OS; glibc documents it as callable at any time, from any thread.
+        let released = unsafe { libc::malloc_trim(0) };
+        debug!(released = released != 0, "Returned the boot's freed heap to the OS");
     }
 }
 
