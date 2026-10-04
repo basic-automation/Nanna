@@ -22,7 +22,13 @@ uuid.workspace = true
 # `default-features = false` drops `fts` (Nanna has no full-text index): turso_core
 # 0.8.1's FTS directory calls `DynVec::new_in(DynAllocator)`, which only type-checks
 # under `--cfg nightly`, so with `fts` on it does not compile here (turso#9463). Dropping it also
-# drops `tantivy` and its unsound `lru 0.16` (RUSTSEC-2026-0253). `mimalloc` is kept
-# because it was a default before: turso installs it as the process-wide
-# `#[global_allocator]`, so removing it would swap the allocator of the whole binary.
-turso = { version = "=0.8.1", default-features = false, features = ["mimalloc", "pure-rust-crypto"] }
+# drops `tantivy` and its unsound `lru 0.16` (RUSTSEC-2026-0253).
+# `mimalloc` is OFF, as a measured decision (2026-10-04), not an accident: turso's
+# `mimalloc` feature installs C mimalloc as the `#[global_allocator]` of every binary
+# that links this crate, so it chooses the whole daemon's allocator. Against the
+# system allocator (release build, same tree, both orders run): the in-RAM recall
+# scan at 50k memories took 11.2 ms vs 4.7 ms (it runs on every recall and every
+# ingest), `bulk_load` at 50k 121 ms vs 181 ms (once per boot), and a boot on a real
+# 105 MB store peaked at ~295 MB vs ~232 MB RSS but idled at ~185 MB vs ~237 MB.
+# The hot path wins, and no C allocator is built. Re-measure before turning it on.
+turso = { version = "=0.8.1", default-features = false, features = ["pure-rust-crypto"] }

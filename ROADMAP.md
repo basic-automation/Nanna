@@ -10092,13 +10092,26 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            nanna-daemon` 6m52s, and a release boot against a copy of the operator's real 101 MB
            `nanna.db` + WAL (3730 memories and 23 sessions load, "Daemon ready", no panic).
            Unblocks the P12 `mummu` integration retry below (the turso split).
-     - [ ] *(found 2026-10-03)* **turso makes `mimalloc` (a C allocator) Nanna's global
+     - [x] *(found 2026-10-03)* **turso makes `mimalloc` (a C allocator) Nanna's global
            allocator.** `turso` 0.7 and 0.8 both declare `#[global_allocator] static GLOBAL:
            mimalloc::MiMalloc` under their default `mimalloc` feature, so every allocation in the
            daemon — not only the database's — goes through C mimalloc, and nobody chose that.
            Measure before deciding: idle RSS, the Suite 2/3 benches and a dream cycle with the
            feature on vs off (system allocator); keep whichever wins, and state it in
            `nanna-storage/Cargo.toml` as a decision rather than an inherited default.
+           *(2026-10-04 — measured, switched off.)* Release builds, both orders run: the in-RAM
+           recall scan at 50k (every recall and ingest) **11.2 → 4.7 ms** without it; `bulk_load`
+           at 50k (once per boot) **121 → 181 ms**; booting on a copy of the operator's 105 MB
+           store (3 730 memories, isolated, no model): ready in 0.12–0.22 s either way, peak RSS
+           ~295 → ~232 MB, but RSS after 60 s idle **~185 → ~237 MB** (mimalloc hands freed
+           memory back; glibc keeps it). `libmimalloc-sys` (C) leaves the build. Numbers in
+           `bench/BASELINE.md` Suite 2c and the decision in `nanna-storage/Cargo.toml`.
+           Not measured: a dream cycle (no summarizer model on this host).
+           - [ ] **Watch the idle RSS over a long-lived daemon.** glibc's per-thread arenas keep
+                 freed memory, and the 60 s reading is already ~50 MB above mimalloc's. Sample
+                 the operator daemon's RSS over a day after this ships; if it climbs, the fix is
+                 cheap (`M_ARENA_MAX`/`malloc_trim` after `bulk_load`, or mimalloc back on with
+                 the scan's layout cost understood) — decide on the curve, not on one reading.
      - [ ] *(P13, research 2026-09-26)* **FSRS-7 exists but is not shippable yet.** ts-fsrs merged it
            ([PR #520](https://github.com/open-spaced-repetition/ts-fsrs/pull/520), 2026-09-18,
            unreleased); `fsrs-rs` is at 6.6.2 with no FSRS-7, and no FSRS-7 default parameters are

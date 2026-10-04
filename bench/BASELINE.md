@@ -798,6 +798,25 @@ residency the comparison is about; quiet host, 20 samples, criterion mean with i
 | `ram_scan` *(shipped)* | **39.85 µs** [39.69, 40.00] | **1.441 ms** [1.411, 1.483] | **10.89 ms** [10.84, 10.94] |
 | `ram_scan_prior_code` *(control B)* | 46.12 µs [45.90, 46.30] | 1.767 ms [1.670, 1.857] | 11.53 ms [11.48, 11.58] |
 | `ram_scan_sort_same_cmp` *(control A)* | 50.06 µs [49.68, 50.40] | 1.908 ms [1.891, 1.925] | 14.09 ms [13.83, 14.27] |
+
+**2026-10-04 — the allocator moves these rows, and the old ones were measured under mimalloc.**
+Every row above ran with turso's C `mimalloc` as the process's `#[global_allocator]` (a default
+nobody chose). With it switched off (`nanna-storage/Cargo.toml` states the decision), same tree
+and toolchain (nightly-2026-10-02), quiet host, both orders run — mimalloc → system and system →
+mimalloc — with matching numbers:
+
+| Arm (N=50,000) | mimalloc | system allocator |
+| --- | --- | --- |
+| `ram_scan` *(shipped)* | 11.58 ms / 11.20 ms | **4.93 ms / 4.67 ms** |
+| `ram_scan_prior_code` | 11.99 ms | 5.52 ms |
+| `sql_knn` | 80.34 ms | 79.28 ms |
+| `bulk_load` | **119.4 ms / 121.3 ms** | 181.1 ms / 180.7 ms |
+
+At 10k: `ram_scan` 1.566 → 0.724 ms, `bulk_load` 23.0 → 36.6 ms. The per-query scan (every
+recall, every ingest) is ~2.4× faster; the once-per-boot load is ~1.5× slower. Cause not
+isolated (no `perf` on this host; no mimalloc runtime option — purge delay, THP, eager commit,
+large OS pages — moved the scan). **Baseline for `ram_scan` at 50k is now ~4.8 ms**; its budget
+(through Suite 2's `simd_batch` ceilings) is unchanged.
 | `bulk_load` *(one-time)* | 1.203 ms [1.197, 1.207] | 26.32 ms [26.06, 26.72] | 141.6 ms [140.8, 142.5] |
 
 #### Finding 1 — keep the in-RAM scan as the live recall path. Do not wire SQL k-NN into it.
