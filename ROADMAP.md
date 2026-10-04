@@ -9412,6 +9412,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       crossover detection could never report a GPU win. 8 sites fixed; real ratios at 768 wide
       run 238× (10 vectors) down to 4.3× (10 000) — SIMD still wins the whole quick range.
       (The GPU path has no production caller today: `VectorStore::with_gpu` is never called.)
+      - [ ] *(found 2026-10-04)* **Decide: wire the GPU search path or delete it.** Nothing calls
+            `VectorStore::with_gpu`, so the daemon's `GPU_THRESHOLD = 50_000` branch never runs and
+            `nanna-memory` links `wgpu` for nothing. Wiring it costs a wgpu device on the card the
+            local model needs (VRAM is the scarcest resource) to win only past ~50k memories —
+            the operator's store is 3 730, and the corrected quick bench has SIMD ahead across
+            its whole range (4.3× at 10k). Deleting it keeps `nanna-gpu` for the planned DSP
+            kernels. Product call; until made, the GPU path is tested but dormant.
 - [x] **aarch64 is lint-dirty and nothing looks.** `cargo clippy -p nanna-simd --target
       aarch64-unknown-linux-gnu --all-targets` reports ~24 warnings no x86 run can see — 10 lossy
       `as` casts (owner rule: route through `nanna-numeric`), 4 `mul_add`, doc backticks, a
