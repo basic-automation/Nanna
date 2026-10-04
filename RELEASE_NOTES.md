@@ -1,63 +1,54 @@
-# Nanna v0.3.36-beta.45 — Cards don't get stuck
+# Nanna v0.3.37-beta.46 — Fewer ways to crash, faster recall
 
-The board shipped in the last release. This one is about what happens when the work on a card
-goes wrong: a card an agent stopped working on, a model provider that rejects the key, a
-provider that says "slow down". Each now ends somewhere you can see, instead of in a card that
-sits there.
+This release has no new screens. It removes several ways the daemon could take itself down, makes
+memory search faster, and fixes where future updates are downloaded from.
 
 ## What's Changed
 
-**A card nobody is working goes back to the router.** If an agent's card has been in progress
-for half an hour with nothing working on it, and you did not stop it yourself, the board's
-router takes it back. It says so on the card's thread, then decides again who should do it. A
-card that keeps coming back this way ends with a question to you rather than going round
-forever, the same as a card agents keep handing back. A card you stopped stays with its agent
-until you resume or reassign it.
+**Memory search is about twice as fast.** Nanna was using a memory allocator it inherited from
+its database library rather than one anyone chose. Measured against the system allocator, the
+search that runs on every recall and every new memory took 11.2 ms at 50,000 memories; it now
+takes 4.7 ms. Loading memories at startup got slower (121 ms → 181 ms at 50,000, once per
+launch). One C library is gone from the build. After startup, the daemon now returns the memory
+that loading used to the system: on a real 3,730-memory store it settles at about 213 MB, down
+from about 237 MB.
 
-**A rejected API key becomes a question for you.** When the model provider refuses an agent's
-run outright (an invalid key, an account out of credit, no key set), the card no longer fails or
-goes to another agent on the same broken provider. You get a question card that names the error
-and says what to fix. The work card waits for it, keeping its agent. Mark the question done once
-it is fixed, and the agent starts again.
+**A tool can no longer take the daemon down with it.** When a tool script reads a file, runs a
+command, fetches a URL or calls a service, Nanna starts a small worker for that call. If the
+worker could not start (for example because the system had run out of file handles), the whole
+daemon used to stop. Now that one call fails with an error saying why, and everything else keeps
+running. Similarly, if you edit the `discover_tools` tool so that it no longer parses, startup now
+skips that tool with a warning instead of failing.
 
-**A rate-limited run waits and tries again.** When the provider says too many requests, the card
-stays with its agent and says when it will try again (the provider's own wait, else five
-minutes). That does not count as a failure.
-
-**Choose where Nanna keeps its data.** Settings → Data → **Data location** shows the folder the
-daemon keeps its database, memories and logs in, and lets you choose another one or go back to
-the default. The daemon reads this when it starts. Until it restarts, the page says it is still
-using the old folder, and it never moves your data: copy it there first if you want to keep it.
+**Updates download from the repository's current home.** Since the project moved to
+`basic-automation/Nanna`, each release's update manifest still pointed installers at the old
+address. Downloads only worked because GitHub redirects the old address. The manifest generator
+now uses the repository's actual name, and new installs check for updates there directly.
+Existing installs keep working as before.
 
 ## Fixes
 
-- **A board shows its own cards.** With the app open twice on different workspaces, a board
-  could list, and add cards to, whichever workspace the *other* window last picked. Each board
-  now names its own workspace.
+- **GPU vector search handles large stores.** Searching more vectors than the graphics card
+  accepts in one batch was a hard crash. The search now splits the work into batches the card
+  accepts. (Nanna does not use the GPU path today. This keeps it safe for when it does.)
+- **macOS service install escapes its settings.** An install path or argument containing `&` or
+  `<` produced a launchd file macOS refused to load. Values are now escaped, and that is tested on
+  every platform.
 
 ## Under the hood
 
-- **turso 0.8.1** (from 0.7.2), built without its full-text search feature. That feature does
-  not compile on our toolchain ([turso#9463](https://github.com/tursodatabase/turso/issues/9463)),
-  and Nanna does not use it. Leaving it out removes 34 crates from the build, among them a C
-  compression library and an `lru` version with a soundness advisory (RUSTSEC-2026-0253). Checked
-  by starting the release daemon against a copy of a real 101 MB database.
-- **25 app commands nothing called are gone**, among them commands that could write workspace
-  files and tool code. The app no longer links Nanna's scripting engines: its dependency graph
-  went from 862 crates to 740.
-- The daemon's status now reports the data folder it is using, and `task.list` /
-  `task.quick_add` accept a `workspace_id`.
-- The unused `[memory] extraction_model` setting is removed. Old config files that still have it
-  load as before.
-- `uuid` 1.27 and `@lucide/vue` 1.51, plus routine lockfile updates. TypeScript 7 is still on
-  hold until `vue-tsc` supports it.
+- The GPU benchmarks reported speed ratios 10^18 times too large, so they could never report a GPU
+  win. Fixed. With correct numbers, SIMD wins across the tested range (4.3× faster at 10,000
+  vectors).
+- New tests: an MCP stream event split at every byte offset, the GPU batch limits (run on an RTX
+  4070 Ti SUPER), the launchd escaping, and the tool-runtime helper.
+- `tokio` 1.53.2, `mio` 1.2.4, `async-recursion` 1.2 and `@lucide/vue` 1.52. TypeScript 7 is still
+  on hold until `vue-tsc` supports it, and `rten` 0.27 until `ocrs` supports it.
 
 ## Still open
 
 - Chat is still there beside the board. Removing it is the next big step.
+- Whether to keep the system allocator long term depends on how the daemon's memory use looks over
+  a full day of running.
 - The heartbeat is not a board card yet, and the board does not yet follow the Figma design's
   final styling.
-- There is no way yet to back up or export Nanna's data from the app.
-
-The previous release, [v0.3.35-beta.44](https://github.com/basic-automation/Nanna/releases/tag/v0.3.35-beta.44),
-added the board.
