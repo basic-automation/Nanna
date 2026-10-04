@@ -1,15 +1,15 @@
 {
-  "version": "0.3.36",
-  "notes": "Stuck cards go back to the router, a rejected key becomes a question for you, rate-limited runs wait and retry, and you can choose where Nanna keeps its data.",
-  "pub_date": "2026-10-03T14:15:50.013Z",
+  "version": "0.3.37",
+  "notes": "Memory search about twice as fast, tool calls can no longer crash the daemon, and updates download from the repository's current home.",
+  "pub_date": "2026-10-04T13:19:15Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWd4ZElzTkhtRmJFbkxKLzJSd3d0SW5UenlqNFErN0JUQXZmNXBSQUpGSFhRa3RMeWFIa2g0d2dzNzE4YlZYeGNNM20xRjJwYVdvaDNDMlRISktGb2c4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMDM2OTAwCWZpbGU6TmFubmFfMC4zLjM2X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMzYKMU02MkRabGFpWnhmUEFYZUwvRkVISFJpOEFYUEd0bU1ta2FaamFIYWxycHluR3V0U2hzbHRtTGx1Um5PNzFrS2NhZml4SDFmU1lhYU1laGJNTjdNQmc9PQo=",
-      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.36-beta.45/Nanna_0.3.36_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWtralU4d2UrUXJRNGRRYWFyOTJvK0hJTEg1T0J3TGNHaVZTZ0t6MWIvRm5lazRLcXdTb2FCOXI4cnN6bzVZcU12eEZId0tJZ1JjcklLODlMdDVCRWdzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMTE5OTIyCWZpbGU6TmFubmFfMC4zLjM3X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMzcKWUE5dHlVbEdKVlBGYWpsVFcwVmVzMFZlakNPK1ZxamwrMXdQZzVlU054bWhCaWZsYkJGdVZLRVdtNVQzVVlwYlFxWFg1YnNhSUhuUG0reHV4MUFDQ3c9PQo=",
+      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.37-beta.46/Nanna_0.3.37_x64-setup.exe"
     },
     "linux-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaW85bUhZekNYdTZ6WThFR1FWd1E2MkxyVU5WZTBmZWkrdFRpZjFTN1pyT2dtMkxqMXFkZ1NNNW5lbWtYNlB6YmhGVDZhK1FPaUh5Rk1QaEpCejk4UEFRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMDM2ODI0CWZpbGU6TmFubmFfMC4zLjM2X2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjM2ClYxZXZHUW9UT1VuYWtGT2gzYld3VUdlNkhoeERDSnBVQnVQTHJDcCs4WnMyWUZRMkhFK05tYkRNM3VIWWdIY05hM3dnVFpveERuWHZZSU1wV0hSMkRBPT0K",
-      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.36-beta.45/Nanna_0.3.36_amd64.AppImage"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWszcTc5Vm5STDg0WUViWGd2RlBvdVoycWpQL2V2a3Q1V1V3MVVGUTh0UGNxQ040Y3FqZUJKa0x5OXI1bnRkYlBaNjdSK1hXMjN0eTlwenJCaEtiTVFRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMTE3OTIxCWZpbGU6TmFubmFfMC4zLjM3X2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjM3Cm15Unlpd0Y0Wnl2TXNWb2ZVMDNtcWhXNXpSOEVQRURsSXhwOUo3aEpsdnVNMmhZUkJhNTBUMlVKYXo0UkIrN2pXM2haTVhObWI5eWtROHowSmNqN0J3PT0K",
+      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.37-beta.46/Nanna_0.3.37_amd64.AppImage"
     }
   }
 }
