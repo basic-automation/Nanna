@@ -545,9 +545,16 @@ impl IpcServer {
                 tokio::select! {
                     // Forward messages from the channel to WebSocket
                     Some(msg) = msg_rx.recv() => {
+                        let reply_bytes = match &msg {
+                            Message::Text(text) => text.len(),
+                            _ => 0,
+                        };
                         if ws_tx.send(msg).await.is_err() {
                             break;
                         }
+                        // The frame and its string are gone now; a large one
+                        // leaves its heap at the high water unless trimmed.
+                        crate::heap::after_large_reply(reply_bytes);
                     }
                     // Forward broadcast events to this client. Every receive result is
                     // handled: an `Ok(event)` pattern let a `Lagged` error fail the match,

@@ -10194,7 +10194,7 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            memory back; glibc keeps it). `libmimalloc-sys` (C) leaves the build. Numbers in
            `bench/BASELINE.md` Suite 2c and the decision in `nanna-storage/Cargo.toml`.
            Not measured: a dream cycle (no summarizer model on this host).
-           - [ ] **Watch the idle RSS over a long-lived daemon.** glibc's per-thread arenas keep
+           - [x] **Watch the idle RSS over a long-lived daemon.** glibc's per-thread arenas keep
                  freed memory, and the 60 s reading is already ~50 MB above mimalloc's. Sample
                  the operator daemon's RSS over a day after this ships; if it climbs, the fix is
                  cheap (`M_ARENA_MAX`/`malloc_trim` after `bulk_load`, or mimalloc back on with
@@ -10227,6 +10227,21 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
                  that remain come from building the 14 MB reply itself (a `serde_json::Value` tree,
                  then a string, then a frame). The next levers are a trim after a large reply, or
                  serializing the list without the intermediate `Value`.
+                 *(2026-10-05, same run — decided on the curve.)* **Trim after a large reply.**
+                 `crate::heap::after_large_reply` runs `malloc_trim(0)` on the blocking pool once
+                 a reply of ≥ 1 MiB has been sent (and its string dropped), at most once per 10 s.
+                 Each trim took ~4.5 ms. Same load, four daemons side by side (KB RSS):
+                 | after | old | old + `MALLOC_ARENA_MAX=2` | clone fix | clone fix + trim |
+                 |---|---|---|---|---|
+                 | 9 cycles | ~425 000 | ~352 000 | ~300 000 | **~178 000** |
+                 | ~25–40 cycles | 608 000 (40, still climbing) | 366 000 (25) | 377 000 (25, climbing) | 192 000 (9) |
+                 The boot trim moved into the same module. Not measured: a real operator day.
+                 Re-check the installed daemon's RSS after a day of use.
+           - [ ] *(2026-10-05)* **Serialize `memory.list` without the intermediate `Value`.** The
+                 14 MB reply is built as a `serde_json::Value` tree, then a string, then a frame,
+                 several times the reply in transient heap. A typed `Serialize` struct written
+                 straight to the frame's string removes the tree. The trim already returns the
+                 transient, so this is CPU and peak heap, not retained RSS.
      - [ ] *(P13, research 2026-09-26)* **FSRS-7 exists but is not shippable yet.** ts-fsrs merged it
            ([PR #520](https://github.com/open-spaced-repetition/ts-fsrs/pull/520), 2026-09-18,
            unreleased); `fsrs-rs` is at 6.6.2 with no FSRS-7, and no FSRS-7 default parameters are
