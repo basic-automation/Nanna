@@ -1871,16 +1871,18 @@ impl MemoryService {
 
     /// Get memory statistics
     pub async fn stats(&self) -> MemoryStats {
-        let entries = self.store.all_entries().await;
         let params = &self.config.fsrs;
-        
+        // Projected, not `all_entries`: that clones every vector of every
+        // entry to count four states.
+        let fsrs_states = self.store.map_entries(|entry| entry.fsrs.state(params)).await;
+
         let mut stats = MemoryStats {
-            total: entries.len(),
+            total: fsrs_states.len(),
             ..MemoryStats::default()
         };
-        
-        for entry in entries {
-            match entry.fsrs.state(params) {
+
+        for state in fsrs_states {
+            match state {
                 MemoryState::Active => stats.active += 1,
                 MemoryState::Dormant => stats.dormant += 1,
                 MemoryState::Silent => stats.silent += 1,
@@ -1893,28 +1895,29 @@ impl MemoryService {
     }
 
     /// Get all memories with their FSRS state
+    ///
+    /// Projected under the store's read lock rather than through
+    /// `all_entries`, which clones every entry whole: the current embedding
+    /// and every model bucket (6 KiB per 1536-dim vector per model), none of
+    /// which a list entry carries. On a 3 730-memory store that clone was
+    /// most of a `memory.list` call's transient heap, and glibc kept the high
+    /// water: one call took an idle daemon from ~142 to ~217 MB RSS.
     pub async fn list_all(&self) -> Vec<MemoryListEntry> {
-        let entries = self.store.all_entries().await;
         let params = &self.config.fsrs;
-        
-        entries.into_iter().map(|e| {
-            let weight = e.fsrs.weight(params);
-            let state = e.fsrs.state(params);
-            let retrievability = e.fsrs.retrievability(params);
-            
-            MemoryListEntry {
-                id: e.id,
-                content: e.content,
-                metadata: e.metadata,
+        self.store
+            .map_entries(|e| MemoryListEntry {
+                id: e.id.clone(),
+                content: e.content.clone(),
+                metadata: e.metadata.clone(),
                 timestamp: e.timestamp,
-                state,
-                weight,
-                retrievability,
+                state: e.fsrs.state(params),
+                weight: e.fsrs.weight(params),
+                retrievability: e.fsrs.retrievability(params),
                 importance: e.fsrs.importance,
                 access_count: e.fsrs.access_count,
-                workspace_id: e.workspace_id,
-            }
-        }).collect()
+                workspace_id: e.workspace_id.clone(),
+            })
+            .await
     }
 
     /// Every memory as an export record: content, provenance, workspace, the
@@ -2253,11 +2256,8 @@ impl MemoryService {
     async fn with_store_timescale(&self, config: &ConsolidationConfig) -> ConsolidationConfig {
         let mut config = config.clone();
         let span_minutes = {
-            let all = self.store.all_entries().await;
-            match (
-                all.iter().map(|e| e.timestamp).min(),
-                all.iter().map(|e| e.timestamp).max(),
-            ) {
+            let times = self.store.map_entries(|e| e.timestamp).await;
+            match (times.iter().min(), times.iter().max()) {
                 (Some(first), Some(last)) => (last - first).lossy_f32() / 60.0,
                 _ => 0.0,
             }

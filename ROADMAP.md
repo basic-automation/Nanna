@@ -10212,6 +10212,21 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
                  [ivygrep#409](https://github.com/bvolpato/ivygrep/pull/409),
                  [scrypted#2027](https://github.com/koush/scrypted/discussions/2027)). No daemon was
                  running on this host on 2026-10-05, so there is still no day-long sample.
+                 *(2026-10-05, measured)* **Idle, it is flat; under load, it climbs.** The release
+                 daemon ran isolated on a copy of the operator's store (3 730 memories, no model):
+                 idle for 19 min it held at 142.5 MB. Then a light load every 2 min (`memory.list`,
+                 which returns 14.4 MB, plus a keyword search and stats) stepped it up after big
+                 replies and held each step: **142 → 217 MB after one call, ~425 MB after nine,
+                 439 MB after twenty**. That is allocator retention, not a leak: it plateaus between
+                 steps. Two levers, A/B on the same load at nine cycles. **Fixed (shipped):**
+                 `MemoryService::list_all`, `stats` and the consolidation timescale read went
+                 through `all_entries()`, which **cloned every entry whole, including its embedding
+                 and every model bucket**, to read content, FSRS state or a timestamp. They now
+                 project under the read lock (`map_entries`), and the plateau drops to **~292–306
+                 MB**. `MALLOC_ARENA_MAX=2` on the old code reached ~352 MB. Still open: the steps
+                 that remain come from building the 14 MB reply itself (a `serde_json::Value` tree,
+                 then a string, then a frame). The next levers are a trim after a large reply, or
+                 serializing the list without the intermediate `Value`.
      - [ ] *(P13, research 2026-09-26)* **FSRS-7 exists but is not shippable yet.** ts-fsrs merged it
            ([PR #520](https://github.com/open-spaced-repetition/ts-fsrs/pull/520), 2026-09-18,
            unreleased); `fsrs-rs` is at 6.6.2 with no FSRS-7, and no FSRS-7 default parameters are
