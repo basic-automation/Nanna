@@ -96,11 +96,6 @@ pub const STALL_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// reads, once per sweep.
 pub const STALL_SCAN_CARDS_MAX: usize = nanna_storage::MEMBERS_MAX;
 
-/// How much of a card's newest activity is read to find its newest run
-/// marker. Bound justification: a run's own rows on its card are a handful
-/// (start, checks, end); 64 rows reach back several runs.
-const MARKER_SCAN_ROWS: i64 = 64;
-
 /// Why the run worker was woken.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunWake {
@@ -442,7 +437,19 @@ async fn stall_check(
     if !is_board_creator(tasks.created_by(card.id).await?.as_deref()) {
         return Ok(None);
     }
-    let marker = newest_run_marker(&tasks.activity(card.id, MARKER_SCAN_ROWS).await?);
+    // By action, not within a window of the newest rows: 64 edits or board
+    // reorders after a Stop used to push its marker out of view, and the
+    // paused card was then taken back as stalled.
+    let marker_row = tasks
+        .newest_activity_of(
+            card.id,
+            &[
+                crate::tasks::RUN_STARTED_ACTION,
+                crate::tasks::RUN_ENDED_ACTION,
+            ],
+        )
+        .await?;
+    let marker = newest_run_marker(marker_row.as_slice());
     if marker == RunMarker::Paused {
         return Ok(None);
     }
@@ -632,6 +639,72 @@ async fn start_next_for(control: &ControlPlane, storage: &Storage, member_id: &s
     );
 }
 
+/// The actor a paused card is put back to `pending` as when it has been
+/// given to another member (see [`take_over_paused`]).
+pub const HANDOVER_ACTOR: &str = "handover";
+
+/// Whether a card's newest run marker `marker` is a pause (Stop) by a member
+/// other than `assignee`, an agent it has been given to since.
+///
+/// The pause post says the card "stays with me until it is restarted or
+/// reassigned"; a pause therefore holds only for the member it stopped. A
+/// marker that does not name who held the card (written before that was
+/// recorded) is taken as the current assignee's: never un-pause on a guess.
+#[must_use]
+pub fn paused_for_another_member(
+    marker: Option<&nanna_storage::TaskActivityEntry>,
+    assignee: Option<&str>,
+) -> bool {
+    let Some(row) = marker else {
+        return false;
+    };
+    let Some(paused_member) = row.assignee.as_deref() else {
+        return false;
+    };
+    newest_run_marker(std::slice::from_ref(row)) == RunMarker::Paused
+        && assignee.is_some_and(|a| a.starts_with(AGENT_MEMBER_PREFIX) && a != paused_member)
+}
+
+/// `card`, put back to `pending` when it is a paused card given to another
+/// member, so that member's run can start it; else `card` unchanged.
+///
+/// Stop leaves a card `in_progress` with its member, and a run starts only
+/// on a `pending` card. Reassigning a stopped card used to leave it there for
+/// good: not startable, and never stalled either, since the sweep spares a
+/// paused card.
+async fn take_over_paused(
+    tasks: &nanna_storage::TaskRepository,
+    card: Task,
+) -> Result<Task, nanna_storage::StorageError> {
+    if card.status != "in_progress" {
+        return Ok(card);
+    }
+    let marker = tasks
+        .newest_activity_of(
+            card.id,
+            &[
+                crate::tasks::RUN_STARTED_ACTION,
+                crate::tasks::RUN_ENDED_ACTION,
+            ],
+        )
+        .await?;
+    if !paused_for_another_member(marker.as_ref(), card.assignee.as_deref()) {
+        return Ok(card);
+    }
+    let pending = nanna_storage::TaskPatch {
+        status: Some("pending".to_string()),
+        ..nanna_storage::TaskPatch::default()
+    };
+    let taken = tasks.update(card.id, pending, Some(HANDOVER_ACTOR)).await?;
+    debug_assert_eq!(taken.status, "pending", "the patch set it");
+    info!(
+        card_id = card.id,
+        assignee = card.assignee.as_deref().unwrap_or_default(),
+        "card runs: a stopped card was given to another member; it is theirs to start"
+    );
+    Ok(taken)
+}
+
 /// Start card `card_id`'s run if it is workable now; `true` when it started.
 ///
 /// Every refusal is ordinary — the card is closed, blocked, deferred, held
@@ -646,13 +719,29 @@ async fn try_start(control: &ControlPlane, storage: &Storage, card_id: i64) -> b
             return false;
         }
     };
+    let card = match take_over_paused(&tasks, card).await {
+        Ok(card) => card,
+        Err(e) => {
+            warn!(card_id, error = %e, "card runs: paused card not handed over; not started");
+            return false;
+        }
+    };
     if !is_startable(&card, chrono::Utc::now()) {
         debug!(card_id, status = %card.status, "card runs: not workable now");
         return false;
     }
-    match tasks.activity(card_id, MARKER_SCAN_ROWS).await {
-        Ok(activity) => {
-            if let Some(until) = cooling_down_until(&activity, chrono::Utc::now()) {
+    let newest_wait_or_start = tasks
+        .newest_activity_of(
+            card_id,
+            &[
+                crate::tasks::RATE_LIMITED_ACTION,
+                crate::tasks::RUN_STARTED_ACTION,
+            ],
+        )
+        .await;
+    match newest_wait_or_start {
+        Ok(row) => {
+            if let Some(until) = cooling_down_until(row.as_slice(), chrono::Utc::now()) {
                 debug!(card_id, %until, "card runs: rate-limited; waits");
                 return false;
             }
@@ -1006,6 +1095,20 @@ mod tests {
             )
             .await
             .expect("marker");
+        // Edits after the Stop (renames, board reorders) each log a row; 70
+        // of them used to push the pause marker out of the 64 rows read, and
+        // the paused card was taken back as stalled.
+        for edit in 0..70 {
+            tasks
+                .log_activity(
+                    paused,
+                    Some("gui"),
+                    "updated",
+                    Some(json!({ "edit": edit })),
+                )
+                .await
+                .expect("edit");
+        }
         let chat = picked_up_card(&storage, "harness", "chat's own").await;
 
         assert_eq!(
@@ -1055,6 +1158,112 @@ mod tests {
             release_stalled(&control, &storage, later).await,
             0,
             "a released card is not released twice"
+        );
+    }
+
+    #[test]
+    fn a_pause_holds_only_for_the_member_it_stopped() {
+        use crate::tasks::{RUN_ENDED_ACTION, RUN_STARTED_ACTION};
+        let row = |action: &str, stop: Option<&str>, held_by: Option<&str>| {
+            nanna_storage::TaskActivityEntry {
+                id: 1,
+                task_id: 5,
+                actor: None,
+                action: action.to_string(),
+                detail: stop.map(|stop| json!({ "stop": stop })),
+                created_at: "2026-10-05 10:00:00".to_string(),
+                assignee: held_by.map(str::to_string),
+            }
+        };
+        let paused_by_a = row(RUN_ENDED_ACTION, Some("Cancelled"), Some("agent:a"));
+        assert!(paused_for_another_member(
+            Some(&paused_by_a),
+            Some("agent:b")
+        ));
+        assert!(
+            !paused_for_another_member(Some(&paused_by_a), Some("agent:a")),
+            "still its own"
+        );
+        assert!(
+            !paused_for_another_member(Some(&paused_by_a), Some("human")),
+            "a person starts it"
+        );
+        assert!(!paused_for_another_member(Some(&paused_by_a), None));
+
+        let unnamed = row(RUN_ENDED_ACTION, Some("Cancelled"), None);
+        assert!(
+            !paused_for_another_member(Some(&unnamed), Some("agent:b")),
+            "never on a guess"
+        );
+        let ended = row(RUN_ENDED_ACTION, Some("AllTasksDone"), Some("agent:a"));
+        assert!(!paused_for_another_member(Some(&ended), Some("agent:b")));
+        let started = row(RUN_STARTED_ACTION, None, Some("agent:a"));
+        assert!(!paused_for_another_member(Some(&started), Some("agent:b")));
+        assert!(!paused_for_another_member(None, Some("agent:b")));
+    }
+
+    /// Stop, then give the card to someone else: it goes back to `pending`
+    /// for them, where it used to stay `in_progress` with no run, forever.
+    #[tokio::test]
+    async fn a_stopped_card_given_to_another_member_is_theirs_to_start() {
+        use crate::tasks::RUN_ENDED_ACTION;
+        let storage = Storage::in_memory().await.expect("storage");
+        for id in ["agent:builder", "agent:helper"] {
+            storage
+                .members()
+                .create(nanna_storage::NewMember {
+                    id: id.to_string(),
+                    name: id.trim_start_matches("agent:").to_string(),
+                    avatar: None,
+                    kind: nanna_storage::MemberKind::Agent,
+                    owner_kind: nanna_storage::MemberOwner::Workspace,
+                    owner_id: None,
+                    status: nanna_storage::MemberStatus::Idle,
+                    profile: json!({}),
+                })
+                .await
+                .expect("member");
+        }
+        let tasks = storage.tasks();
+        let mut cards = Vec::new();
+        for title in ["handed on", "kept"] {
+            let card = picked_up_card(&storage, "gui", title).await;
+            tasks
+                .log_activity(
+                    card,
+                    Some("agent:builder"),
+                    RUN_ENDED_ACTION,
+                    Some(json!({"stop": "Cancelled"})),
+                )
+                .await
+                .expect("pause");
+            cards.push(card);
+        }
+        let reassign = nanna_storage::TaskPatch {
+            assignee: Some(Some("agent:helper".to_string())),
+            ..nanna_storage::TaskPatch::default()
+        };
+        tasks
+            .update(cards[0], reassign, Some("gui"))
+            .await
+            .expect("reassigned");
+
+        let handed_on = take_over_paused(&tasks, tasks.get(cards[0]).await.expect("card"))
+            .await
+            .expect("take over");
+        assert_eq!(handed_on.status, "pending");
+        assert_eq!(handed_on.assignee.as_deref(), Some("agent:helper"));
+        assert!(
+            is_startable(&handed_on, chrono::Utc::now()),
+            "the new member's to run"
+        );
+
+        let kept = take_over_paused(&tasks, tasks.get(cards[1]).await.expect("card"))
+            .await
+            .expect("read");
+        assert_eq!(
+            kept.status, "in_progress",
+            "Stop still means stop for its own member"
         );
     }
 

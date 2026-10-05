@@ -27,37 +27,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
-
-/// File name under the daemon data directory.
-pub const EXIT_REASON_FILE: &str = "nanna-daemon.exit.json";
-
-/// Whether the recorded process believed itself alive or terminated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExitState {
-    /// Startup marker: the process was running when this was written.
-    Running,
-    /// A terminal reason was recorded on the way out.
-    Exited,
-}
-
-/// One record, serialized as JSON. The whole file is a single record; every
-/// write replaces it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExitReasonRecord {
-    pub state: ExitState,
-    /// PID of the process that wrote the record.
-    pub pid: u32,
-    /// Terminal reason (`clean_shutdown`, `panic`, `signal`, ...). None while running.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    /// Free-form detail: panic payload + location, signal name, error text.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-    /// RFC3339 timestamp of the write.
-    pub at: String,
-}
+// The record itself is shared with the GUI, which adds the exit status it
+// saw when the daemon died without writing a reason (see `nanna_core::exit_record`).
+pub use nanna_core::exit_record::{EXIT_REASON_FILE, ExitReasonRecord, ExitState, ObservedExit};
 
 /// What the previous process left behind.
 #[derive(Debug, Clone)]
@@ -93,12 +65,22 @@ impl PreviousExit {
                  (a torn write during a hard death lands here)"
             ),
             Self::Record(r) => match r.state {
-                ExitState::Running => format!(
-                    "previous daemon (PID {}) exited UNCLEANLY: it marked itself running at {} \
-                     and never recorded a terminal reason — it died through a path no hook \
-                     could see (hard kill, OOM, power loss)",
-                    r.pid, r.at
-                ),
+                ExitState::Running => {
+                    // The process that spawned it may have seen how it ended.
+                    let how = r.observed_exit.as_ref().map_or_else(
+                        || {
+                            " — it died through a path no hook could see (hard kill, OOM, \
+                             power loss)"
+                                .to_string()
+                        },
+                        |observed| format!("; {}", observed.describe()),
+                    );
+                    format!(
+                        "previous daemon (PID {}) exited UNCLEANLY: it marked itself running at \
+                         {} and never recorded a terminal reason{how}",
+                        r.pid, r.at
+                    )
+                }
                 ExitState::Exited => format!(
                     "previous daemon (PID {}) exited at {}: {}{}",
                     r.pid,
@@ -160,6 +142,7 @@ impl ExitReasonFile {
             reason: None,
             detail: None,
             at: now_rfc3339(),
+            observed_exit: None,
         });
         self.armed.store(true, Ordering::Release);
     }
@@ -177,6 +160,7 @@ impl ExitReasonFile {
             reason: Some(reason.to_string()),
             detail: detail.map(str::to_string),
             at: now_rfc3339(),
+            observed_exit: None,
         });
     }
 
@@ -305,6 +289,43 @@ mod tests {
             }
             other => panic!("expected panic record, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_next_boot_names_the_exit_the_app_saw() {
+        // The 2026-09-28 AppImage death: the daemon is killed by a signal no
+        // hook sees, its GUI waits on it and notes the status, and the next
+        // boot's warning says what happened instead of guessing.
+        let dir = tempfile::tempdir().unwrap();
+        let spawned_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        file_in(&dir).mark_running();
+        let observed = ObservedExit {
+            code: None,
+            signal: Some(7),
+            observer: "the app".to_string(),
+            killed_by_observer: false,
+            at: now_rfc3339(),
+        };
+        let outcome = nanna_core::exit_record::note_observed_exit(
+            dir.path(),
+            std::process::id(),
+            spawned_at,
+            observed,
+        );
+        assert_eq!(
+            outcome.unwrap(),
+            nanna_core::exit_record::NoteOutcome::Noted
+        );
+
+        let prev = file_in(&dir).read_previous();
+        assert!(prev.is_unclean(), "the daemon still never said why");
+        let text = prev.describe();
+        assert!(text.contains("UNCLEAN"), "got: {text}");
+        assert!(
+            text.contains("the app saw it end by signal 7"),
+            "got: {text}"
+        );
+        assert!(!text.contains("no hook could see"), "got: {text}");
     }
 
     #[test]

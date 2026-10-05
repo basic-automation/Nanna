@@ -1,54 +1,56 @@
-# Nanna v0.3.37-beta.46 — Fewer ways to crash, faster recall
+# Nanna v0.3.38-beta.47 — Steadier memory use, fewer stuck cards
 
-This release has no new screens. It removes several ways the daemon could take itself down, makes
-memory search faster, and fixes where future updates are downloaded from.
+This release has no new screens. The daemon stops growing after large requests. Cards on the
+board no longer get stuck in ways that need a restart. When the daemon dies unexpectedly, you
+can now see how it died.
 
 ## What's Changed
 
-**Memory search is about twice as fast.** Nanna was using a memory allocator it inherited from
-its database library rather than one anyone chose. Measured against the system allocator, the
-search that runs on every recall and every new memory took 11.2 ms at 50,000 memories; it now
-takes 4.7 ms. Loading memories at startup got slower (121 ms → 181 ms at 50,000, once per
-launch). One C library is gone from the build. After startup, the daemon now returns the memory
-that loading used to the system: on a real 3,730-memory store it settles at about 213 MB, down
-from about 237 MB.
+**The daemon grows far less with use.** Opening the Memory page asks the daemon for every
+memory at once. On a real store of 3,730 memories that reply is 14 MB, and building it used to
+leave the daemon permanently larger each time. In a test that repeated the request every two
+minutes, memory use went from 142 MB at rest to 608 MB, and it was still climbing. Two changes
+cut this sharply:
 
-**A tool can no longer take the daemon down with it.** When a tool script reads a file, runs a
-command, fetches a URL or calls a service, Nanna starts a small worker for that call. If the
-worker could not start (for example because the system had run out of file handles), the whole
-daemon used to stop. Now that one call fails with an error saying why, and everything else keeps
-running. Similarly, if you edit the `discover_tools` tool so that it no longer parses, startup now
-skips that tool with a warning instead of failing.
+- Listing memories, and the memory statistics on the Settings page, no longer copy every
+  memory's search vectors just to read the text.
+- After any reply over 1 MB is sent, the daemon hands the freed memory back to the system. This
+  takes about 5 ms and runs at most once every 10 seconds.
 
-**Updates download from the repository's current home.** Since the project moved to
-`basic-automation/Nanna`, each release's update manifest still pointed installers at the old
-address. Downloads only worked because GitHub redirects the old address. The manifest generator
-now uses the repository's actual name, and new installs check for updates there directly.
-Existing installs keep working as before.
+In the same test, memory use was about 213 MB after the same number of requests that had taken the
+old version to 439 MB. It still creeps up slowly, at about a third of the old rate.
 
-## Fixes
+**Board cards no longer get stuck.**
 
-- **GPU vector search handles large stores.** Searching more vectors than the graphics card
-  accepts in one batch was a hard crash. The search now splits the work into batches the card
-  accepts. (Nanna does not use the GPU path today. This keeps it safe for when it does.)
-- **macOS service install escapes its settings.** An install path or argument containing `&` or
-  `<` produced a launchd file macOS refused to load. Values are now escaped, and that is tested on
-  every platform.
+- **Stop keeps meaning stop.** After about 64 edits or reorders, a card you had stopped could be
+  treated as abandoned and taken back from its agent. It now stays stopped for as long as you
+  leave it.
+- **A stopped card you give to someone else starts for them.** Its "stopped" note says it stays
+  with the agent until it is restarted or reassigned. Reassigning it used to leave it stuck in
+  progress with nobody working on it. Now the new agent picks it up.
+- **A card that comes back unfinished in two different rounds no longer goes straight to you.**
+  The count of failed attempts now starts over once a card has been finished. Previously, a
+  repeating card that failed once one week and once the next asked you "2 runs could not finish
+  it" right away.
+
+**You can now see how an unexpected crash happened.** If the daemon is killed by something it
+cannot catch, such as a crash signal or a forced kill, the app now records how it ended. The next
+start reports it, for example "the app saw it end by signal 9 (SIGKILL)", where the daemon used to
+say only that it had "died through a path no hook could see". `nanna doctor` has a new
+`daemon.last_exit` check with the same information: whether the daemon is running, stopped
+cleanly, or died, and where to look in the logs.
 
 ## Under the hood
 
-- The GPU benchmarks reported speed ratios 10^18 times too large, so they could never report a GPU
-  win. Fixed. With correct numbers, SIMD wins across the tested range (4.3× faster at 10,000
-  vectors).
-- New tests: an MCP stream event split at every byte offset, the GPU batch limits (run on an RTX
-  4070 Ti SUPER), the launchd escaping, and the tool-runtime helper.
-- `tokio` 1.53.2, `mio` 1.2.4, `async-recursion` 1.2 and `@lucide/vue` 1.52. TypeScript 7 is still
-  on hold until `vue-tsc` supports it, and `rten` 0.27 until `ocrs` supports it.
+- Toolchain: nightly-2026-10-03. Newer nightlies cannot build Nanna yet: Rust renamed an internal
+  function, and a library our database depends on still uses the old name. That library has a fix
+  pending.
+- Dependencies: postcss 8.5.29, plus three small lockfile updates.
 
 ## Still open
 
-- Chat is still there beside the board. Removing it is the next big step.
-- Whether to keep the system allocator long term depends on how the daemon's memory use looks over
-  a full day of running.
-- The heartbeat is not a board card yet, and the board does not yet follow the Figma design's
-  final styling.
+- `memory.list` still builds its whole reply in memory before sending it. The memory is now
+  handed back afterwards, but building the reply directly would also make it faster.
+- These memory numbers come from a test on a copy of a real store, not from a day of real use.
+- If you press Start on a card in the same moment the stall check is releasing it, the start
+  can still lose. The window is a few milliseconds.

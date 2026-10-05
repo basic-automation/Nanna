@@ -8260,6 +8260,26 @@ as its turn (`TurnAdmission`, scope default `session`).
       `a_card_nobody_is_working_is_taken_back_for_the_router` (lost run released and counted;
       paused, fresh and chat cards kept; idempotent). **Not proven end to end with a live
       router:** the e2e rig cannot advance the sweep's wall clock. Still open: heartbeat.
+- [x] *(found 2026-10-05, review of the Stage 3 run code)* **Three ways a card got stuck or was
+      judged wrongly, fixed.** (1) **Stop stopped meaning stop after 64 edits.** The pause marker
+      was searched only within a card's newest 64 activity rows, and every rename or board reorder
+      logs one, so after 64 a paused card read as never run and the stall sweep took it back for the
+      router. New store read `TaskRepository::newest_activity_of(task_id, actions)` (by action,
+      like `created_by`) for the run marker and the rate-limit wait. The extended stall test
+      released the paused card on the old read (2 released, not 1). (2) **A stopped card given to
+      another member stayed `in_progress` with no run, forever.** A run starts only on `pending`,
+      and the sweep spares a paused card. The pause post itself says the card stays "until it is
+      restarted or reassigned", so a pause now holds only for the member it stopped (the
+      `run_ended` row records who held the card). On the reassignment's wake, the card goes back
+      to `pending` as actor `handover` and the new member's run starts. A marker that names nobody
+      is never un-paused on a guess. (3) **`hand_backs_in_a_row` counted across completions**, so
+      a recurring card handed back once in each of two rounds asked the human "2 runs could not
+      finish it" at once. A `completed` row now ends the row. `reopened` deliberately does not,
+      since the harness writes it when a done-claim fails mid-cycle. Not changed: a panicking card
+      run cannot wedge its card in release builds (`panic = "abort"` takes the daemon down, and the
+      boot close-out handles the rest); a narrow race between the sweep's liveness read and a
+      manual Start is still open (a second `serves_card` check just before the release would
+      close most of it).
 - [x] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
       *(2026-09-28)* `RouterDecision::Assign` gained optional `labels` and `acceptance`. Labels
@@ -9871,6 +9891,26 @@ keep the phases readable; promote individual items into a phase when they become
             from `ExitRequested`. First, reproduce it deliberately: launch the AppImage, `kill
             -TERM` the GUI, and read `coredumpctl`. Note also that the operator's desktop entry
             still launches **0.3.19**, while beta.30 is published.
+            *(2026-10-05)* **Not fixed in this PR**: a re-exec-from-a-staged-copy fix
+            (`crates/nanna-daemon/src/appimage.rs`) has sat uncommitted in the
+            `.claude/worktrees/elegant-jackson-2ab1ef` worktree since 2026-09-28. It is someone
+            else's work in progress, so the nightly neither touched nor duplicated it. Land or drop it.
+      - [x] *(2026-10-05)* **A death no daemon hook can see now leaves its exit status on record.**
+            The exit record (`nanna-daemon.exit.json`) said only "it died through a path no hook
+            could see" for exactly the deaths worth explaining: this item's `SIGBUS`, and an
+            unexplained 2026-09-28 15:31Z death with no core, no OOM and no panic. The GUI waits on
+            its sidecar and gets the status, but it only logged it, and its log went when it exited.
+            Now the record type is shared (`nanna_core::exit_record`, re-exported by
+            `nanna_daemon::exit_reason`), and on a sidecar exit the GUI adds an `observed_exit`
+            (code or signal, and whether the GUI sent the kill itself) to the record. It does this
+            only when the record is still that process's `running` marker: same PID, and written
+            after the spawn, so a reused PID never matches. The write happens before the exit is
+            flagged, so no respawn can race it. The record still reads as unclean, and the next
+            boot logs `… never recorded a terminal reason; the app saw it end by signal 7 (SIGBUS)
+            at …`. New `nanna doctor` check `daemon.last_exit` surfaces the same verdict without the
+            log: a live daemon (checked on Linux through `/proc/<pid>/comm`, so a reused PID is not
+            mistaken for the daemon), a clean stop, or a WARN for an unclean death, a panic or an
+            IPC-server failure, with the log path and `coredumpctl` as the remedy. 6 + 1 + 4 tests.
       - [ ] `~/.claude/scheduled-tasks/_shared/tauri-webdriver.sh` prints the wrong package in its
             `ensure` failure text (it names `webkit2gtk-4.1`). Corrected in place on this host
             2026-09-14; the file lives outside this repo, so it is recorded here rather than in the PR.
@@ -10095,10 +10135,22 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      The updater plugin's 2.12 break (`allowDowngrades` left the JS `check()`) does not touch us:
      `useAppUpdater.ts` never passed it. Re-checked and unchanged: `rustpython-vm` still ends at
      0.5.0 (both pin-backs stay), `vue-tsc` still 3.3.11, TypeScript 7.1 unreleased.
-     - [ ] **`boa_engine 0.22.0` is on crates.io (2026-08-28) and depends on icu `~2.3`** — try
+     - [x] **`boa_engine 0.22.0` is on crates.io (2026-08-28) and depends on icu `~2.3`** — try
            replacing the boa git pin (rev `4f98f644`). The `~` ranges do not mix, so it needs icu
            2.3 across the whole graph; check what `deno_core`/`turso` resolve before starting.
            ([deps](https://crates.io/api/v1/crates/boa_engine/0.22.0/dependencies))
+           *(2026-10-05 — already done; closing a stale box.)* `69a68aae` (2026-09-08) retired the
+           git pin for `boa_engine = "0.22"` from crates.io; nothing left to do here.
+     - [ ] *(found 2026-10-05)* **The toolchain pin cannot pass nightly-2026-10-03 until turso takes
+           `branches 0.5`.** nightly-2026-10-04 removed `core::intrinsics::abort`, and `branches 0.4.6`
+           calls it (`E0425` at `branches/src/lib.rs:45`), so no newer nightly compiles the workspace.
+           `branches` comes only through `turso_core`, which requires `^0.4.3` in 0.8.1 and in
+           0.8.2-pre.2 alike; `branches 0.5.1` (2026-10-04) is the fixed line, and a 0.4.x patch would
+           also do. Moved the pin 10-02 → 10-03 (the newest that builds, release 7m51s cold). Probe a
+           nightly with `cargo +nightly-<date> build --release -p branches` (1 s) before the full build.
+           Upstream: [branches#10](https://github.com/fereidani/branches/issues/10), fix in
+           [branches#11](https://github.com/fereidani/branches/pull/11) (the intrinsic was renamed in
+           rust-lang/rust#163574) — a 0.4.x patch release from that PR unblocks us with no turso change.
      - [ ] **`turso` 0.7.2 is the latest stable (2026-07-30); we are exact-pinned at `=0.6.1`.** 0.7.0
            brought MVCC passive checkpoints, recovery fixes and an MVCC-safe AUTOINCREMENT
            ([notes](https://github.com/tursodatabase/turso/releases/tag/v0.7.0)); 0.8.0 is in
@@ -10142,7 +10194,7 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            memory back; glibc keeps it). `libmimalloc-sys` (C) leaves the build. Numbers in
            `bench/BASELINE.md` Suite 2c and the decision in `nanna-storage/Cargo.toml`.
            Not measured: a dream cycle (no summarizer model on this host).
-           - [ ] **Watch the idle RSS over a long-lived daemon.** glibc's per-thread arenas keep
+           - [x] **Watch the idle RSS over a long-lived daemon.** glibc's per-thread arenas keep
                  freed memory, and the 60 s reading is already ~50 MB above mimalloc's. Sample
                  the operator daemon's RSS over a day after this ships; if it climbs, the fix is
                  cheap (`M_ARENA_MAX`/`malloc_trim` after `bulk_load`, or mimalloc back on with
@@ -10151,6 +10203,48 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
                  `malloc_trim(0)` once before "Daemon ready" (Linux glibc only). On the same
                  store copy, RSS a minute after ready went **~237 → ~213 MB** and stopped
                  growing (mimalloc: ~185 MB). Still open: the day-long curve.
+                 *(research 2026-10-05)* The 2026 fixes for this exact ratchet converge on two
+                 knobs: `mallopt(M_ARENA_MAX, 2..4)` before any thread starts, plus a trim when the
+                 process goes idle rather than on a clock (one report: 226 → 159 MB with
+                 arena_max=2 and a 128 KiB trim threshold). Nanna already has an idle gate (the
+                 dreaming idle check), so "trim on idle" needs no new timer. Still decide on the
+                 curve. ([ctox#248](https://github.com/metric-space-ai/ctox/pull/248),
+                 [ivygrep#409](https://github.com/bvolpato/ivygrep/pull/409),
+                 [scrypted#2027](https://github.com/koush/scrypted/discussions/2027)). No daemon was
+                 running on this host on 2026-10-05, so there is still no day-long sample.
+                 *(2026-10-05, measured)* **Idle, it is flat; under load, it climbs.** The release
+                 daemon ran isolated on a copy of the operator's store (3 730 memories, no model):
+                 idle for 19 min it held at 142.5 MB. Then a light load every 2 min (`memory.list`,
+                 which returns 14.4 MB, plus a keyword search and stats) stepped it up after big
+                 replies and held each step: **142 → 217 MB after one call, ~425 MB after nine,
+                 439 MB after twenty**. That is allocator retention, not a leak: it plateaus between
+                 steps. Two levers, A/B on the same load at nine cycles. **Fixed (shipped):**
+                 `MemoryService::list_all`, `stats` and the consolidation timescale read went
+                 through `all_entries()`, which **cloned every entry whole, including its embedding
+                 and every model bucket**, to read content, FSRS state or a timestamp. They now
+                 project under the read lock (`map_entries`), and the plateau drops to **~292–306
+                 MB**. `MALLOC_ARENA_MAX=2` on the old code reached ~352 MB. Still open: the steps
+                 that remain come from building the 14 MB reply itself (a `serde_json::Value` tree,
+                 then a string, then a frame). The next levers are a trim after a large reply, or
+                 serializing the list without the intermediate `Value`.
+                 *(2026-10-05, same run — decided on the curve.)* **Trim after a large reply.**
+                 `crate::heap::after_large_reply` runs `malloc_trim(0)` on the blocking pool once
+                 a reply of ≥ 1 MiB has been sent (and its string dropped), at most once per 10 s.
+                 Each trim took ~4.5 ms. Same load, four daemons side by side (KB RSS):
+                 | after | old | old + `MALLOC_ARENA_MAX=2` | clone fix | clone fix + trim |
+                 |---|---|---|---|---|
+                 | 9 cycles | ~425 000 | ~352 000 | ~300 000 | **~178 000** |
+                 | later | 608 000 (40, still climbing) | 366 000 (25) | 377 000 (25, climbing) | ~213 000 (15), drifting slowly |
+                 The boot trim moved into the same module. The trimmed daemon is not flat: it
+                 drifts at about a third of the untrimmed rate, which is fragmentation the trim
+                 cannot return. Not measured: a real operator day. Re-check the installed daemon's
+                 RSS after a day of use; the serialize-without-`Value` item below shrinks what is
+                 fragmented in the first place.
+           - [ ] *(2026-10-05)* **Serialize `memory.list` without the intermediate `Value`.** The
+                 14 MB reply is built as a `serde_json::Value` tree, then a string, then a frame,
+                 several times the reply in transient heap. A typed `Serialize` struct written
+                 straight to the frame's string removes the tree. The trim already returns the
+                 transient, so this is CPU and peak heap, not retained RSS.
      - [ ] *(P13, research 2026-09-26)* **FSRS-7 exists but is not shippable yet.** ts-fsrs merged it
            ([PR #520](https://github.com/open-spaced-repetition/ts-fsrs/pull/520), 2026-09-18,
            unreleased); `fsrs-rs` is at 6.6.2 with no FSRS-7, and no FSRS-7 default parameters are

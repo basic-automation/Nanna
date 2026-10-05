@@ -6681,16 +6681,10 @@ fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsC
 /// system allocator since mimalloc was switched off): without this, ~214 MB at
 /// ready grew to ~237 MB a minute later; with it, ~213 MB at both — the work
 /// after ready reuses the returned pages instead of growing the arenas.
-/// Mimalloc, which purges on its own, idled at ~185 MB. No per-request path
-/// pays for it.
+/// Mimalloc, which purges on its own, idled at ~185 MB. Large IPC replies
+/// get the same treatment, rate-limited (see `crate::heap`).
 fn release_boot_heap() {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    {
-        // SAFETY: `malloc_trim` takes no pointers and only returns free pages
-        // to the OS; glibc documents it as callable at any time, from any thread.
-        let released = unsafe { libc::malloc_trim(0) };
-        debug!(released = released != 0, "Returned the boot's freed heap to the OS");
-    }
+    crate::heap::release_freed_heap();
 }
 
 #[cfg(test)]

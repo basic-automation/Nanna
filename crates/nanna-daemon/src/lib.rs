@@ -37,6 +37,7 @@ pub mod embedding_router;
 pub mod exit_reason;
 pub mod export;
 pub mod health;
+pub mod heap;
 pub mod liveness;
 pub mod ipc;
 #[cfg(windows)]

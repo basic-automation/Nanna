@@ -12,11 +12,18 @@
 #   while a cached rlib existed, so "the pin built fine yesterday" proves nothing after
 #   any bump that dirties turso_core.
 #
-# This channel (rustc 1.101.0-nightly, commit c36f14571) builds `cargo build --release
-# -p nanna-daemon` green — verified in 9m43s on 2026-10-02, from a cold target dir —
-# with no tokio ICE and no turso depth overflow, and the full gate was re-run under it
-# (clippy 0 warnings / 0 errors after two new-lint fixes, see below).
-# (The previous pin, nightly-2026-09-28 / d080e7dff, was verified the same way in 8m12s
+# This channel (rustc 1.101.0-nightly, commit 0abfedbc7) builds `cargo build --release
+# -p nanna-daemon` green — verified in 7m51s on 2026-10-05, from a cold target dir —
+# with no tokio ICE and no turso depth overflow, and the full gate was re-run under it.
+#
+# It is the NEWEST nightly that can build this workspace, as of 2026-10-05:
+# nightly-2026-10-04 and -05 removed `core::intrinsics::abort`, which `branches 0.4.6`
+# calls (E0425), and `branches` comes in through `turso_core 0.8.1`, so there is no
+# version of ours to bump. `branches 0.5.1` (2026-10-04) is the fixed line; the pin can
+# move once a turso release takes it. Check with
+# `cargo +nightly-<date> build --release -p branches` before trying the full build.
+# (nightly-2026-10-02 / c36f14571 was verified the same way in 9m43s on 2026-10-02;
+# nightly-2026-09-28 / d080e7dff in 8m12s
 # on 2026-09-29; nightly-2026-09-20 / feaadeeac in 9m06s
 # on 2026-09-20; nightly-2026-09-17 / 923c95cdf in 7m35s on 2026-09-18; nightly-2026-09-08 /
 # cea272fa3 in 8m33s on 2026-09-09; nightly-2026-08-27 / bff8e12ff in 20m08s on 2026-08-27.)
@@ -55,5 +62,5 @@
 # `toolchain:` inputs in .github/workflows/{budget-gate,release-check,test-compile}.yml —
 # release-check was missing from this list until 2026-08-26) forward to it.
 [toolchain]
-channel = "nightly-2026-10-02"
+channel = "nightly-2026-10-03"
 components = ["rustfmt", "clippy"]

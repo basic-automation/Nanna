@@ -962,6 +962,50 @@ const fn replaces_record(record: Option<&StartFailure>) -> bool {
     )
 }
 
+/// Where a sidecar's exit status goes when it dies without saying why: the
+/// daemon's exit record (see `nanna_core::exit_record`), which the next boot
+/// reads. A daemon killed by a signal no hook of its own sees (the `SIGBUS`
+/// of an `AppImage` mount that went away, a `SIGKILL`) used to leave only
+/// "it died through a path no hook could see"; the status this app got from
+/// waiting on it was logged here and then lost with the app.
+struct ExitRecordTarget {
+    /// The daemon's data directory, resolved as the daemon resolves it.
+    data_dir: std::path::PathBuf,
+    pid: u32,
+    /// Taken just before the spawn: a record written earlier is not this
+    /// process's, whatever its PID says.
+    spawned_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ExitRecordTarget {
+    /// Add the exit to the record if it is still this process's `running`
+    /// marker. Best effort: a failure is logged, and the exit is handled the
+    /// same either way.
+    async fn note(self, code: Option<i32>, signal: Option<i32>, killed_by_app: bool) {
+        use nanna_core::exit_record::{NoteOutcome, ObservedExit, note_observed_exit};
+        let observed = ObservedExit {
+            code,
+            signal,
+            observer: "the app".to_string(),
+            killed_by_observer: killed_by_app,
+            at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        };
+        let Self { data_dir, pid, spawned_at } = self;
+        let noted = tokio::task::spawn_blocking(move || {
+            note_observed_exit(&data_dir, pid, spawned_at, observed)
+        })
+        .await;
+        match noted {
+            Ok(Ok(NoteOutcome::Noted)) => warn!(
+                "The daemon (PID {pid}) ended without recording why: its exit status is now on its exit record"
+            ),
+            Ok(Ok(outcome)) => debug!("Daemon exit record left as it was: {outcome:?}"),
+            Ok(Err(e)) => warn!("Could not add the daemon's exit status to its exit record: {e}"),
+            Err(e) => warn!("Noting the daemon's exit status did not finish: {e}"),
+        }
+    }
+}
+
 /// The event task of one spawned sidecar: it relays the output into the log
 /// and the boot log, and records the exit.
 struct SidecarEvents {
@@ -986,7 +1030,12 @@ impl SidecarEvents {
     /// running and nothing retrying, and the health monitor reported the
     /// dead process as still running and never restarted it (the second
     /// splash review, 2026-09-18).
-    async fn run(self, mut child: Child, mut kills: mpsc::UnboundedReceiver<KillRequest>) {
+    async fn run(
+        self,
+        mut child: Child,
+        mut kills: mpsc::UnboundedReceiver<KillRequest>,
+        record: Option<ExitRecordTarget>,
+    ) {
         // Held open until the exit, as the shell plugin held it.
         let _stdin = child.stdin.take();
         let readers = [
@@ -997,10 +1046,12 @@ impl SidecarEvents {
                 tokio::spawn(relay_output(Arc::clone(&self.watch), BootStream::Stderr, pipe))
             }),
         ];
+        let mut killed_by_app = false;
         let status = loop {
             tokio::select! {
                 status = child.wait() => break status,
                 Some(answer) = kills.recv() => {
+                    killed_by_app = true;
                     if let Err(e) = child.start_kill() {
                         warn!("Failed to kill daemon process: {}", e);
                     }
@@ -1033,6 +1084,11 @@ impl SidecarEvents {
                 (None, None)
             }
         };
+        // Before `on_exit` flags the exit: a next spawn waits for that flag,
+        // so no new daemon can be writing the record meanwhile.
+        if let Some(record) = record {
+            record.note(code, signal, killed_by_app).await;
+        }
         self.on_exit(code, signal).await;
     }
 
@@ -1111,6 +1167,24 @@ async fn wait_for_terminated(watch: &SpawnWatch, timeout: Duration) -> bool {
         sleep(Duration::from_millis(100)).await;
     }
     false
+}
+
+/// The data directory `NANNA_DEV_DATA_DIR` gives the sidecar, if set.
+fn dev_data_dir() -> Option<String> {
+    std::env::var("NANNA_DEV_DATA_DIR")
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
+}
+
+/// The sidecar's data directory, resolved as the daemon resolves its own:
+/// `--data-dir` (which this app passes only from `NANNA_DEV_DATA_DIR`), then
+/// `[general] data_dir` from the config file, then the platform default.
+/// Without reading secrets, so no keyring prompt.
+#[cfg(not(test))]
+fn sidecar_data_dir() -> Option<std::path::PathBuf> {
+    dev_data_dir()
+        .map(std::path::PathBuf::from)
+        .or_else(|| nanna_config::Config::data_dir_from_disk().ok())
 }
 
 /// `start`'s error when a stop took over. Public to the crate so a caller can
@@ -1439,6 +1513,7 @@ impl DaemonManager {
         // or not), and the relayed lines reached the log view and the boot
         // log full of escape codes.
         let command: std::process::Command = sidecar.args(args).env("NO_COLOR", "1").into();
+        let spawned_at = chrono::Utc::now();
         // The plugin resolves the bundled program, pipes its stdio and, on
         // Windows, hides its console window. The process itself is ours to
         // wait for, not the plugin's (see `SidecarEvents::run`).
@@ -1468,7 +1543,16 @@ impl DaemonManager {
 
         // The event task also records the termination, which is what ends
         // the ready-wait for a sidecar that dies while booting.
-        tokio::spawn(self.sidecar_events(attempt, Arc::clone(&watch)).run(child, kills));
+        // Tests run stand-in programs and must not touch a real data dir.
+        #[cfg(test)]
+        let record = None;
+        #[cfg(not(test))]
+        let record = sidecar_data_dir()
+            .filter(|_| pid != 0)
+            .map(|data_dir| ExitRecordTarget { data_dir, pid, spawned_at });
+        #[cfg(test)]
+        let _ = spawned_at;
+        tokio::spawn(self.sidecar_events(attempt, Arc::clone(&watch)).run(child, kills, record));
         Ok(watch)
     }
 
@@ -1599,12 +1683,11 @@ impl DaemonManager {
             "--host".into(),
             self.config.host.clone(),
         ];
-        if let Ok(dev_data_dir) = std::env::var("NANNA_DEV_DATA_DIR")
-            && !dev_data_dir.trim().is_empty() {
-                info!("NANNA_DEV_DATA_DIR set — isolating daemon store at {dev_data_dir}");
-                args.push("--data-dir".into());
-                args.push(dev_data_dir);
-            }
+        if let Some(dev_data_dir) = dev_data_dir() {
+            info!("NANNA_DEV_DATA_DIR set — isolating daemon store at {dev_data_dir}");
+            args.push("--data-dir".into());
+            args.push(dev_data_dir);
+        }
         // A killed GUI must not leave its daemon behind (Unix; on Windows
         // the Job Object already covers it, and the daemon ignores the flag).
         args.push("--exit-with-parent".into());

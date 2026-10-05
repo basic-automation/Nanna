@@ -49,6 +49,14 @@ pub const TASK_LABELS_MAX: usize = 32;
 /// any word-or-phrase tag and keeps one label inside a filter chip.
 pub const TASK_LABEL_MAX_BYTES: usize = 64;
 
+/// Most actions [`TaskRepository::newest_activity_of`] takes in one read.
+///
+/// Bound justification: it answers "the latest of these markers", and every
+/// marker set read today is two actions (a run's start and end, a rate-limit
+/// wait and a start); four leaves room without making the `IN` list a query
+/// builder.
+pub const ACTIVITY_ACTIONS_MAX: usize = 4;
+
 /// Maximum tool names in one task's `tool_scope`.
 ///
 /// Bound justification: the scope is a hint (it gates nothing — the harness
@@ -1228,6 +1236,77 @@ impl TaskRepository {
         drop(rows);
         drop(conn);
         found.ok_or_else(|| StorageError::NotFound(format!("created row for task #{task_id}")))
+    }
+
+    /// The newest activity row of card `task_id` whose action is one of
+    /// `actions`, or `None` when it has none.
+    ///
+    /// For markers whose meaning is "the latest of these": a run's start and
+    /// end, a rate-limit wait. Reading the newest N rows of any kind and
+    /// searching them lost the marker once N later edits (a rename, a board
+    /// reorder) pushed it out, and a card the human had paused with Stop then
+    /// read as never run. Looked up by action, like [`Self::created_by`], so
+    /// the answer does not depend on how busy the card's log is.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or the row does
+    /// not decode. Unparseable detail JSON loads as `None`.
+    ///
+    /// # Panics
+    /// When `actions` is empty or longer than [`ACTIVITY_ACTIONS_MAX`].
+    pub async fn newest_activity_of(
+        &self,
+        task_id: i64,
+        actions: &[&str],
+    ) -> Result<Option<TaskActivityEntry>, StorageError> {
+        assert!(
+            (1..=ACTIVITY_ACTIONS_MAX).contains(&actions.len()),
+            "one to {ACTIVITY_ACTIONS_MAX} actions"
+        );
+        debug_assert!(task_id > 0, "store ids start at 1");
+        let placeholders = (0..actions.len())
+            .map(|index| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT id, task_id, actor, action, detail, created_at, assignee \
+             FROM task_activity WHERE task_id = ?1 AND action IN ({placeholders}) \
+             ORDER BY id DESC LIMIT 1"
+        );
+        let mut params = vec![turso::Value::Integer(task_id)];
+        params.extend(
+            actions
+                .iter()
+                .map(|action| turso::Value::Text((*action).to_string())),
+        );
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(&sql, params).await?;
+        let entry = match rows.next().await? {
+            Some(row) => {
+                let detail_str: Option<String> = row.get(4)?;
+                Some(TaskActivityEntry {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    actor: row.get(2)?,
+                    action: row.get(3)?,
+                    detail: detail_str.and_then(|s| serde_json::from_str(&s).ok()),
+                    created_at: row.get(5)?,
+                    assignee: row.get(6)?,
+                })
+            }
+            None => None,
+        };
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        debug_assert!(
+            entry
+                .as_ref()
+                .is_none_or(|e| actions.contains(&e.action.as_str())),
+            "only an asked-for action comes back"
+        );
+        Ok(entry)
     }
 
     /// One thread post by its id.
@@ -3568,6 +3647,64 @@ mod tests {
         assert!(!mine.iter().find(|t| t.id == undated.id).unwrap().blocked, "a done dependency blocks nothing");
         assert_eq!(repo.assigned_open(crate::HUMAN_MEMBER_ID, 1).await.unwrap().len(), 1, "bounded");
         assert!(repo.assigned_open("agent:nobody", 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_newest_of_some_actions_is_found_however_long_the_log_is() {
+        let storage = crate::Storage::in_memory().await.expect("storage");
+        let tasks = storage.tasks();
+        let card = tasks
+            .create(NewTask {
+                title: "busy card".to_string(),
+                scope: "global".to_string(),
+                priority: 3,
+                ..NewTask::default()
+            })
+            .await
+            .expect("card");
+        assert!(
+            tasks
+                .newest_activity_of(card.id, &["run_started", "run_ended"])
+                .await
+                .expect("read")
+                .is_none(),
+            "no marker yet"
+        );
+        tasks
+            .log_activity(card.id, None, "run_started", None)
+            .await
+            .expect("start");
+        tasks
+            .log_activity(
+                card.id,
+                None,
+                "run_ended",
+                Some(serde_json::json!({"stop": "Cancelled"})),
+            )
+            .await
+            .expect("end");
+        for _ in 0..100 {
+            tasks
+                .log_activity(card.id, Some("gui"), "updated", None)
+                .await
+                .expect("edit");
+        }
+        let newest = tasks
+            .newest_activity_of(card.id, &["run_started", "run_ended"])
+            .await
+            .expect("read")
+            .expect("the marker is still found");
+        assert_eq!(newest.action, "run_ended");
+        assert_eq!(
+            newest.detail,
+            Some(serde_json::json!({"stop": "Cancelled"}))
+        );
+        let start = tasks
+            .newest_activity_of(card.id, &["run_started"])
+            .await
+            .expect("read")
+            .expect("start");
+        assert!(start.id < newest.id);
     }
 
     #[tokio::test]

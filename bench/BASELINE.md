@@ -916,6 +916,28 @@ before it starts failing anyone's CI.
 
 Machine-readable rows land under `suite = "guardrails"`.
 
+### 2026-10-05: RSS of a long-lived daemon under a light IPC load
+
+The idle figure above is a fresh store. A real store, used, is a different number. The release
+daemon ran isolated (`--data-dir` on a copy of the operator's store: 3 730 memories and a 105 MB
+`nanna.db`; heartbeat off; no model) and was sampled once a minute. Idle for 19 min, it held flat
+at **142.5 MB**. Then every 2 min a stdlib-Python WebSocket client sent `memory.list` (a 14.4 MB
+reply), a keyword `memory.search` and `memory.stats`. Four daemons ran side by side on that load
+(RSS in kB):
+
+| build | after 1 cycle | after 9 cycles | later |
+| --- | --- | --- | --- |
+| before (master) | 217 172 | ~425 700 | 608 388 after ~40, still climbing |
+| before + `MALLOC_ARENA_MAX=2` | 235 752 | ~351 700 | 366 204 after ~25 |
+| `list_all`/`stats` project instead of cloning vectors | 194 336 | ~300 000 | 377 056 after ~25, climbing |
+| + `malloc_trim(0)` after a reply of ≥ 1 MiB (≤ 1 per 10 s) | 145 300 | **~177 700** | ~213 000 after ~15 (one 267 000 peak), still drifting slowly |
+
+Each trim took 4.4–4.7 ms. RSS moves in steps, not a steady leak: it holds between the large
+replies and rises only at them. The trim returns most of each reply's transient heap, but not all
+of it: the trimmed daemon still drifts up slowly, at about a third of the untrimmed rate. At ~15
+cycles the four builds stood at ~439 / ~352 / ~306 / ~213 MB. Not covered: a day of real use on
+the operator's machine.
+
 ---
 
 ## Suite 6 — Efficiency (not yet baselined)
