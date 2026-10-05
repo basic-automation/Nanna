@@ -17,7 +17,8 @@ fix this:
 - After any reply over 1 MB is sent, the daemon hands the freed memory back to the system. This
   takes about 5 ms and runs at most once every 10 seconds.
 
-In the same test, memory use now settles at about 180–190 MB.
+In the same test, memory use was about 213 MB after the same number of requests that had taken the
+old version to 439 MB. It still creeps up slowly, at about a third of the old rate.
 
 **Board cards no longer get stuck.**
 

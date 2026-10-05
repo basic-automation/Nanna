@@ -10234,9 +10234,12 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
                  | after | old | old + `MALLOC_ARENA_MAX=2` | clone fix | clone fix + trim |
                  |---|---|---|---|---|
                  | 9 cycles | ~425 000 | ~352 000 | ~300 000 | **~178 000** |
-                 | ~25–40 cycles | 608 000 (40, still climbing) | 366 000 (25) | 377 000 (25, climbing) | 192 000 (9) |
-                 The boot trim moved into the same module. Not measured: a real operator day.
-                 Re-check the installed daemon's RSS after a day of use.
+                 | later | 608 000 (40, still climbing) | 366 000 (25) | 377 000 (25, climbing) | ~213 000 (15), drifting slowly |
+                 The boot trim moved into the same module. The trimmed daemon is not flat: it
+                 drifts at about a third of the untrimmed rate, which is fragmentation the trim
+                 cannot return. Not measured: a real operator day. Re-check the installed daemon's
+                 RSS after a day of use; the serialize-without-`Value` item below shrinks what is
+                 fragmented in the first place.
            - [ ] *(2026-10-05)* **Serialize `memory.list` without the intermediate `Value`.** The
                  14 MB reply is built as a `serde_json::Value` tree, then a string, then a frame,
                  several times the reply in transient heap. A typed `Serialize` struct written
