@@ -10095,10 +10095,22 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      The updater plugin's 2.12 break (`allowDowngrades` left the JS `check()`) does not touch us:
      `useAppUpdater.ts` never passed it. Re-checked and unchanged: `rustpython-vm` still ends at
      0.5.0 (both pin-backs stay), `vue-tsc` still 3.3.11, TypeScript 7.1 unreleased.
-     - [ ] **`boa_engine 0.22.0` is on crates.io (2026-08-28) and depends on icu `~2.3`** — try
+     - [x] **`boa_engine 0.22.0` is on crates.io (2026-08-28) and depends on icu `~2.3`** — try
            replacing the boa git pin (rev `4f98f644`). The `~` ranges do not mix, so it needs icu
            2.3 across the whole graph; check what `deno_core`/`turso` resolve before starting.
            ([deps](https://crates.io/api/v1/crates/boa_engine/0.22.0/dependencies))
+           *(2026-10-05 — already done; closing a stale box.)* `69a68aae` (2026-09-08) retired the
+           git pin for `boa_engine = "0.22"` from crates.io; nothing left to do here.
+     - [ ] *(found 2026-10-05)* **The toolchain pin cannot pass nightly-2026-10-03 until turso takes
+           `branches 0.5`.** nightly-2026-10-04 removed `core::intrinsics::abort`, and `branches 0.4.6`
+           calls it (`E0425` at `branches/src/lib.rs:45`), so no newer nightly compiles the workspace.
+           `branches` comes only through `turso_core`, which requires `^0.4.3` in 0.8.1 and in
+           0.8.2-pre.2 alike; `branches 0.5.1` (2026-10-04) is the fixed line, and a 0.4.x patch would
+           also do. Moved the pin 10-02 → 10-03 (the newest that builds, release 7m51s cold). Probe a
+           nightly with `cargo +nightly-<date> build --release -p branches` (1 s) before the full build.
+           Upstream: [branches#10](https://github.com/fereidani/branches/issues/10), fix in
+           [branches#11](https://github.com/fereidani/branches/pull/11) (the intrinsic was renamed in
+           rust-lang/rust#163574) — a 0.4.x patch release from that PR unblocks us with no turso change.
      - [ ] **`turso` 0.7.2 is the latest stable (2026-07-30); we are exact-pinned at `=0.6.1`.** 0.7.0
            brought MVCC passive checkpoints, recovery fixes and an MVCC-safe AUTOINCREMENT
            ([notes](https://github.com/tursodatabase/turso/releases/tag/v0.7.0)); 0.8.0 is in
@@ -10151,6 +10163,15 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
                  `malloc_trim(0)` once before "Daemon ready" (Linux glibc only). On the same
                  store copy, RSS a minute after ready went **~237 → ~213 MB** and stopped
                  growing (mimalloc: ~185 MB). Still open: the day-long curve.
+                 *(research 2026-10-05)* The 2026 fixes for this exact ratchet converge on two
+                 knobs: `mallopt(M_ARENA_MAX, 2..4)` before any thread starts, plus a trim when the
+                 process goes idle rather than on a clock (one report: 226 → 159 MB with
+                 arena_max=2 and a 128 KiB trim threshold). Nanna already has an idle gate (the
+                 dreaming idle check), so "trim on idle" needs no new timer. Still decide on the
+                 curve. ([ctox#248](https://github.com/metric-space-ai/ctox/pull/248),
+                 [ivygrep#409](https://github.com/bvolpato/ivygrep/pull/409),
+                 [scrypted#2027](https://github.com/koush/scrypted/discussions/2027)). No daemon was
+                 running on this host on 2026-10-05, so there is still no day-long sample.
      - [ ] *(P13, research 2026-09-26)* **FSRS-7 exists but is not shippable yet.** ts-fsrs merged it
            ([PR #520](https://github.com/open-spaced-repetition/ts-fsrs/pull/520), 2026-09-18,
            unreleased); `fsrs-rs` is at 6.6.2 with no FSRS-7, and no FSRS-7 default parameters are
