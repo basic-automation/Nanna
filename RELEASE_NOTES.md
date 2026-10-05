@@ -6,11 +6,11 @@ can now see how it died.
 
 ## What's Changed
 
-**The daemon no longer grows with use.** Opening the Memory page asks the daemon for every
+**The daemon grows far less with use.** Opening the Memory page asks the daemon for every
 memory at once. On a real store of 3,730 memories that reply is 14 MB, and building it used to
 leave the daemon permanently larger each time. In a test that repeated the request every two
 minutes, memory use went from 142 MB at rest to 608 MB, and it was still climbing. Two changes
-fix this:
+cut this sharply:
 
 - Listing memories, and the memory statistics on the Settings page, no longer copy every
   memory's search vectors just to read the text.
