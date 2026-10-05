@@ -8260,6 +8260,26 @@ as its turn (`TurnAdmission`, scope default `session`).
       `a_card_nobody_is_working_is_taken_back_for_the_router` (lost run released and counted;
       paused, fresh and chat cards kept; idempotent). **Not proven end to end with a live
       router:** the e2e rig cannot advance the sweep's wall clock. Still open: heartbeat.
+- [x] *(found 2026-10-05, review of the Stage 3 run code)* **Three ways a card got stuck or was
+      judged wrongly, fixed.** (1) **Stop stopped meaning stop after 64 edits.** The pause marker
+      was searched only within a card's newest 64 activity rows, and every rename or board reorder
+      logs one, so after 64 a paused card read as never run and the stall sweep took it back for the
+      router. New store read `TaskRepository::newest_activity_of(task_id, actions)` (by action,
+      like `created_by`) for the run marker and the rate-limit wait. The extended stall test
+      released the paused card on the old read (2 released, not 1). (2) **A stopped card given to
+      another member stayed `in_progress` with no run, forever.** A run starts only on `pending`,
+      and the sweep spares a paused card. The pause post itself says the card stays "until it is
+      restarted or reassigned", so a pause now holds only for the member it stopped (the
+      `run_ended` row records who held the card). On the reassignment's wake, the card goes back
+      to `pending` as actor `handover` and the new member's run starts. A marker that names nobody
+      is never un-paused on a guess. (3) **`hand_backs_in_a_row` counted across completions**, so
+      a recurring card handed back once in each of two rounds asked the human "2 runs could not
+      finish it" at once. A `completed` row now ends the row. `reopened` deliberately does not,
+      since the harness writes it when a done-claim fails mid-cycle. Not changed: a panicking card
+      run cannot wedge its card in release builds (`panic = "abort"` takes the daemon down, and the
+      boot close-out handles the rest); a narrow race between the sweep's liveness read and a
+      manual Start is still open (a second `serves_card` check just before the release would
+      close most of it).
 - [x] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
       *(2026-09-28)* `RouterDecision::Assign` gained optional `labels` and `acceptance`. Labels

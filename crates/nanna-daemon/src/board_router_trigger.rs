@@ -79,6 +79,10 @@ pub const HAND_BACKS_MAX: usize = 2;
 /// answer is a fresh attempt.
 pub const HAND_BACK_LIMIT_ACTION: &str = "hand_back_limit";
 
+/// The activity row `TaskRepository::complete` writes when a card is marked
+/// done. A hand-back before it is not part of the current row.
+const COMPLETED_ACTION: &str = "completed";
+
 /// How much of a card's activity is read to count its hand-backs.
 ///
 /// Bound justification: one run leaves a handful of rows on its card
@@ -342,7 +346,11 @@ pub async fn card_to_route(storage: &Storage, wake: Wake) -> Option<Task> {
 ///
 /// A card comes back when its member's run hands it back or the stall sweep
 /// takes it back. Counted newest first until the last time the human was
-/// asked about it; the reason is the newest one's.
+/// asked about it, or the last time the card was completed: a recurring card
+/// that came back once last week and was then finished, or a done card the
+/// human reopened, starts a new row. Without that break a second hand-back
+/// weeks later asked the human that "2 runs could not finish it" at once.
+/// The reason is the newest one's.
 ///
 /// # Errors
 /// The store failure reading the card's activity.
@@ -355,7 +363,7 @@ pub async fn hand_backs_in_a_row(
     let mut latest: Option<String> = None;
     // `activity` is the newest rows, oldest first: walk it backwards.
     for row in activity.iter().rev() {
-        if row.action == HAND_BACK_LIMIT_ACTION {
+        if row.action == HAND_BACK_LIMIT_ACTION || row.action == COMPLETED_ACTION {
             break;
         }
         if row.action == crate::tasks::HANDED_BACK_ACTION
@@ -889,5 +897,44 @@ mod tests {
             0,
             "asking the human starts the count over"
         );
+    }
+
+    /// Finishing a card ends its row of hand-backs: a recurring card handed
+    /// back once a round must not reach the bound across rounds.
+    #[tokio::test]
+    async fn a_completion_starts_the_hand_back_count_over() {
+        let storage = Storage::in_memory().await.unwrap();
+        let tasks = storage.tasks();
+        let card = tasks
+            .create(nanna_storage::NewTask {
+                scope: "global".to_string(),
+                title: "Weekly report".to_string(),
+                priority: 3,
+                created_by: Some(BOARD_CLIENT_ACTOR.to_string()),
+                ..nanna_storage::NewTask::default()
+            })
+            .await
+            .unwrap();
+        let hand_back = || async {
+            tasks
+                .log_activity(
+                    card.id,
+                    Some("agent:builder"),
+                    crate::tasks::HANDED_BACK_ACTION,
+                    Some(json!({"member": "agent:builder", "reason": "ran out"})),
+                )
+                .await
+                .unwrap();
+        };
+        hand_back().await;
+        tasks
+            .complete(card.id, Some("agent:helper"), None)
+            .await
+            .unwrap();
+        tasks.reopen(card.id, Some(RECURRENCE_ACTOR)).await.unwrap();
+        hand_back().await;
+        let (count, latest) = hand_backs_in_a_row(&tasks, card.id).await.unwrap();
+        assert_eq!(count, 1, "last round's hand-back is not this round's");
+        assert_eq!(latest, "ran out");
     }
 }
