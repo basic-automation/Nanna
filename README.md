@@ -225,8 +225,10 @@ Checks the configuration and, for anything it finds, prints the fix rather than
 just the verdict — a missing tools directory, a `[infer]` section that names no
 model, a clustering configuration that would merge unrelated memories, a
 hand-edited summarization model with no provider prefix that will be sent to the
-wrong provider (and how to write it, e.g. `ollama/qwen3`). Exits non-zero when
-something is actually broken, so it also works from a script or a health probe.
+wrong provider (and how to write it, e.g. `ollama/qwen3`). It also says how the
+last daemon ended: still running, stopped cleanly, or died, and by which signal
+when the app saw it (`daemon.last_exit`). Exits non-zero when something is
+actually broken, so it also works from a script or a health probe.
 
 By default it is **offline**: no provider call, no network probe, no keyring
 read. That makes it fast and safe to run anywhere, and it means a clean report
