@@ -14,6 +14,7 @@
 
 pub mod cron;
 mod dreaming;
+pub mod exit_record;
 pub mod log_buffer;
 mod scheduler;
 mod workspace;

@@ -9871,6 +9871,26 @@ keep the phases readable; promote individual items into a phase when they become
             from `ExitRequested`. First, reproduce it deliberately: launch the AppImage, `kill
             -TERM` the GUI, and read `coredumpctl`. Note also that the operator's desktop entry
             still launches **0.3.19**, while beta.30 is published.
+            *(2026-10-05)* **Not fixed in this PR**: a re-exec-from-a-staged-copy fix
+            (`crates/nanna-daemon/src/appimage.rs`) has sat uncommitted in the
+            `.claude/worktrees/elegant-jackson-2ab1ef` worktree since 2026-09-28. It is someone
+            else's work in progress, so the nightly neither touched nor duplicated it. Land or drop it.
+      - [x] *(2026-10-05)* **A death no daemon hook can see now leaves its exit status on record.**
+            The exit record (`nanna-daemon.exit.json`) said only "it died through a path no hook
+            could see" for exactly the deaths worth explaining: this item's `SIGBUS`, and an
+            unexplained 2026-09-28 15:31Z death with no core, no OOM and no panic. The GUI waits on
+            its sidecar and gets the status, but it only logged it, and its log went when it exited.
+            Now the record type is shared (`nanna_core::exit_record`, re-exported by
+            `nanna_daemon::exit_reason`), and on a sidecar exit the GUI adds an `observed_exit`
+            (code or signal, and whether the GUI sent the kill itself) to the record. It does this
+            only when the record is still that process's `running` marker: same PID, and written
+            after the spawn, so a reused PID never matches. The write happens before the exit is
+            flagged, so no respawn can race it. The record still reads as unclean, and the next
+            boot logs `… never recorded a terminal reason; the app saw it end by signal 7 (SIGBUS)
+            at …`. New `nanna doctor` check `daemon.last_exit` surfaces the same verdict without the
+            log: a live daemon (checked on Linux through `/proc/<pid>/comm`, so a reused PID is not
+            mistaken for the daemon), a clean stop, or a WARN for an unclean death, a panic or an
+            IPC-server failure, with the log path and `coredumpctl` as the remedy. 6 + 1 + 4 tests.
       - [ ] `~/.claude/scheduled-tasks/_shared/tauri-webdriver.sh` prints the wrong package in its
             `ensure` failure text (it names `webkit2gtk-4.1`). Corrected in place on this host
             2026-09-14; the file lives outside this repo, so it is recorded here rather than in the PR.
