@@ -9871,7 +9871,7 @@ keep the phases readable; promote individual items into a phase when they become
             `clean_shutdown`, no process left — where the run before it had to stop the orphan by
             hand. Windows is unchanged (its Job Object already covers this; the flag is accepted
             and ignored).
-      - [ ] *(found 2026-09-18, on the operator's machine)* **In the AppImage, closing the GUI
+      - [x] *(found 2026-09-18, on the operator's machine)* **In the AppImage, closing the GUI
             crashes its daemon (SIGBUS) instead of stopping it.** Seen live, not reproduced:
             the installed `Nanna_0.3.19_amd64.AppImage` daemon dumped core **twice**, each time in
             the same second its GUI's launch scope ended. `nanna-daemon` 342632 died at 09:05:09
@@ -9891,10 +9891,19 @@ keep the phases readable; promote individual items into a phase when they become
             from `ExitRequested`. First, reproduce it deliberately: launch the AppImage, `kill
             -TERM` the GUI, and read `coredumpctl`. Note also that the operator's desktop entry
             still launches **0.3.19**, while beta.30 is published.
-            *(2026-10-05)* **Not fixed in this PR**: a re-exec-from-a-staged-copy fix
-            (`crates/nanna-daemon/src/appimage.rs`) has sat uncommitted in the
-            `.claude/worktrees/elegant-jackson-2ab1ef` worktree since 2026-09-28. It is someone
-            else's work in progress, so the nightly neither touched nor duplicated it. Land or drop it.
+            *(2026-10-05, landed on the owner's go-ahead)* **Shape (1), done at the daemon's end.** A
+            daemon started from inside the mount (`$APPDIR` set and `/proc/self/exe` under it) copies
+            itself and the bundle libraries it has mapped to
+            `$XDG_CACHE_HOME/nanna/appimage-daemon/<version>-<hash>/`, checks that the copy starts
+            (`--version`), and `exec`s it. The PID, parent and stdio stay the same, so the GUI's
+            sidecar handle is unchanged; the copy restores the original `LD_LIBRARY_PATH` for its
+            children; stagings of other builds are pruned. Best-effort: any failure runs from the
+            mount, as before, with a WARN. **Reproduced and verified with a real FUSE mount:** a
+            test AppImage (the 0.3.19 runtime + a squashfs holding this build's daemon) was mounted
+            with `--appimage-mount`, the daemon started from the mount, the runtime (FUSE server)
+            was SIGKILLed, then the daemon got SIGTERM. With staging bypassed
+            (`NANNA_APPIMAGE_STAGED=1`), it **dumped core with SIGBUS**, the reported crash. With
+            staging, it ran from the cache copy and recorded `clean_shutdown`, with no core.
       - [x] *(2026-10-05)* **A death no daemon hook can see now leaves its exit status on record.**
             The exit record (`nanna-daemon.exit.json`) said only "it died through a path no hook
             could see" for exactly the deaths worth explaining: this item's `SIGBUS`, and an

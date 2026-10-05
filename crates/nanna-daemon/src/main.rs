@@ -195,6 +195,12 @@ fn own_spans_only(metadata: &tracing::Metadata<'_>) -> bool {
 
 fn main() {
     let cli = Cli::parse();
+
+    // Before anything starts a thread: a daemon inside the AppImage mount
+    // re-execs from a copy outside it (see `nanna_daemon::appimage`).
+    #[cfg(target_os = "linux")]
+    let staging = matches!(cli.command, Commands::Run)
+        .then(nanna_daemon::appimage::run_outside_the_mount);
     
     // Special case: Windows Service mode doesn't parse args normally
     #[cfg(windows)]
@@ -255,6 +261,17 @@ fn main() {
 
     // Store log_buffer so run_daemon can pass it to the DaemonBuilder
     LOG_BUFFER.set(log_buffer).ok();
+
+    #[cfg(target_os = "linux")]
+    match staging {
+        Some(nanna_daemon::appimage::Outcome::Staged { exe }) => {
+            info!("Running from {}, a copy outside the AppImage mount", exe.display());
+        }
+        Some(nanna_daemon::appimage::Outcome::Failed(reason)) => tracing::warn!(
+            "Running from inside the AppImage mount ({reason}): if the app exits first, this daemon's shutdown can die of SIGBUS"
+        ),
+        Some(nanna_daemon::appimage::Outcome::NotInAppImage) | None => {}
+    }
     
     let result = match cli.command {
         Commands::Run => run_daemon(&cli),
