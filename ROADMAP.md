@@ -8907,6 +8907,12 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
             search path. Also test-only, same audit: the `AnalyzeImageTool`,
             `TextToSpeechTool`/`TranscribeTool`, `DescribeImageTool` and `ReadPdfTool` structs —
             their closures/functions are live, the Tool wrappers are not.
+            *(same run)* `AnalyzeImageTool`, `TextToSpeechTool`, `TranscribeTool` and their
+            `create_*_tool`/`create_audio_tools` factories deleted (~350 lines; only "it constructs"
+            tests used them). The daemon's closures (`create_vision_fn`, `create_tts_fn`,
+            `create_transcribe_tool_fn`) are untouched. `DescribeImageTool` and `ReadPdfTool` stay
+            with the OCR decision: `ReadPdfTool` also describes a PDF's embedded images, which the
+            daemon's `pdf.read` service does not.
 
 **Stage 1 — store, memory, storage:**
 - [x] `VectorStore::update_content` must also clear `memories.embedding`/`embedding_model` and

@@ -1,18 +1,10 @@
 //! Vision backend wiring
 //!
-//! Connects vision tools to the Anthropic Claude vision API.
+//! Builds the vision callback on the Anthropic Claude vision API.
 
-use super::vision::{AnalyzeImageTool, VisionFn};
+use super::vision::VisionFn;
 use nanna_llm::{AnthropicMessage, AnthropicRequest, ContentBlock, LlmClient};
 use std::sync::Arc;
-
-/// Create an `analyze_image` tool wired to an LLM client with vision support.
-///
-/// The LLM client should support Anthropic's vision API (claude-3-* models).
-#[must_use]
-pub fn create_vision_tool(llm: Arc<LlmClient>, model: String) -> AnalyzeImageTool {
-    AnalyzeImageTool::new().with_vision_fn(create_vision_fn(llm, model))
-}
 
 /// The vision call on its own, without the tool wrapper.
 ///
@@ -93,21 +85,4 @@ pub fn create_vision_fn(llm: Arc<LlmClient>, model: String) -> VisionFn {
     });
 
     vision_fn
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    // Same bit-rot as `context_limit` above: this test never compiled while the
-    // `vision` feature was enabled nowhere, and `definition()` needs its trait.
-    use crate::Tool;
-
-    #[test]
-    fn test_vision_tool_creation() {
-        // Just verify the types work
-        let llm = Arc::new(LlmClient::anthropic("test-key"));
-        let tool = create_vision_tool(llm, "claude-sonnet-4-20250514".to_string());
-        let def = tool.definition();
-        assert_eq!(def.name, "analyze_image");
-    }
 }

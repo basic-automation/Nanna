@@ -1,9 +1,6 @@
-//! Vision tools - image analysis
+//! Vision: the callback type the daemon's `vision.analyze` service holds, and
+//! the image reading it shares with the bundled skills.
 
-use crate::{Tool, ToolDefinition, ToolError, ToolResult};
-use async_trait::async_trait;
-use serde_json::Value;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Callback for analyzing images with a vision model
@@ -87,68 +84,6 @@ pub async fn read_image_as_base64(
         "the file changed size between stat and read",
     );
     Ok((base64_simd::STANDARD.encode_to_string(&bytes), media_type))
-}
-
-/// Tool for analyzing images using a vision model
-pub struct AnalyzeImageTool {
-    vision_fn: Option<VisionFn>,
-}
-
-impl AnalyzeImageTool {
-    #[must_use]
-    pub fn new() -> Self {
-        Self { vision_fn: None }
-    }
-
-    /// Set the vision function callback.
-    #[must_use]
-    pub fn with_vision_fn(mut self, f: VisionFn) -> Self {
-        self.vision_fn = Some(f);
-        self
-    }
-}
-
-impl Default for AnalyzeImageTool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl Tool for AnalyzeImageTool {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition::new("analyze_image", "Analyze an image using a vision model")
-            .string_param("image", "Base64-encoded image data or URL", true)
-            .string_param("prompt", "What to analyze or look for in the image", true)
-            .string_param("media_type", "MIME type (image/jpeg, image/png, etc.) - required for base64", false)
-    }
-
-    async fn execute(&self, params: HashMap<String, Value>) -> Result<ToolResult, ToolError> {
-        let image = params
-            .get("image")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParams("Missing 'image' parameter".to_string()))?;
-
-        let prompt = params
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Describe this image in detail.");
-
-        let media_type = params
-            .get("media_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("image/jpeg");
-
-        let vision_fn = self.vision_fn.as_ref().ok_or_else(|| {
-            ToolError::ExecutionFailed("Vision model not configured".to_string())
-        })?;
-
-        let result = vision_fn(image.to_string(), prompt.to_string(), media_type.to_string())
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Vision analysis failed: {e}")))?;
-
-        Ok(ToolResult::success(result))
-    }
 }
 
 #[cfg(test)]
