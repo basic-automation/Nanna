@@ -84,6 +84,10 @@ pub struct ModelStats {
     pub tier_failures: TierCounts,
     /// Number of escalations (cheap model failed, had to use more expensive one)
     pub escalations: u64,
+    /// Every request's latency since the daemon started, failures included,
+    /// bucketed for `/metrics` (not persisted; see [`crate::histogram`]).
+    #[serde(skip)]
+    pub latency_histogram: crate::histogram::LatencyHistogram,
 }
 
 /// Per-complexity-tier counters.
@@ -139,6 +143,10 @@ pub struct ModelStatsSummary {
     pub last_failure_epoch_ms: u64,
     pub is_healthy: bool,
     pub escalation_count: u64,
+    /// See [`ModelStats::latency_histogram`]; read by `/metrics`, not sent to
+    /// clients.
+    #[serde(skip)]
+    pub latency_histogram: crate::histogram::LatencyHistogram,
 }
 
 /// Estimated USD spend for one model over its tracked lifetime.
@@ -216,6 +224,11 @@ impl ModelStatsTracker {
 
         stats.total_requests += 1;
         let latency_ms = millis_u64(obs.latency);
+        // Failures too: a request that timed out after 120 s is exactly the
+        // latency a scrape should see (the p95 ring keeps successes only).
+        stats
+            .latency_histogram
+            .observe(&crate::histogram::MODEL_LATENCY_BOUNDS_MS, latency_ms);
 
         if obs.success {
             stats.successful_requests += 1;
@@ -412,6 +425,7 @@ impl ModelStats {
             tier_successes: TierCounts::default(),
             tier_failures: TierCounts::default(),
             escalations: 0,
+            latency_histogram: crate::histogram::LatencyHistogram::default(),
         }
     }
 
@@ -460,6 +474,7 @@ impl ModelStats {
             last_failure_epoch_ms: self.last_failure_epoch_ms,
             is_healthy: self.consecutive_failures < UNHEALTHY_THRESHOLD,
             escalation_count: self.escalations,
+            latency_histogram: self.latency_histogram,
         }
     }
 }
@@ -545,6 +560,7 @@ impl ModelStatsTracker {
                 escalations: s.escalations,
                 latencies_ms: s.latencies_ms,
                 throughput_tps: s.throughput_tps,
+                latency_histogram: crate::histogram::LatencyHistogram::default(),
             };
             inner.models.insert(s.model, stats);
         }
@@ -697,6 +713,25 @@ mod tests {
     // and the control plane by cloning it. This is only correct if clones
     // share underlying state — a record via one clone must be visible via
     // another. Guards the P11 "wire shared stats tracker" fix.
+    /// Every request reaches the `/metrics` histogram — a failure's latency
+    /// too, unlike the p95 ring — and a restore from storage starts it empty.
+    #[tokio::test]
+    async fn every_request_feeds_the_latency_histogram() {
+        let tracker = ModelStatsTracker::new();
+        tracker.record(observation("m", true)).await;
+        tracker.record(observation("m", false)).await;
+        let summary = tracker.summary("m").await.expect("recorded");
+        assert_eq!(summary.latency_histogram.count(), 2);
+        assert_eq!(summary.latency_histogram.sum_ms(), 20);
+        assert_eq!(summary.latency_histogram.cumulative()[0], 2, "10 ms is in the first bucket");
+
+        let restored = ModelStatsTracker::new();
+        restored.import_from_storage(tracker.export_for_storage().await).await;
+        let after = restored.summary("m").await.expect("restored");
+        assert_eq!(after.total_requests, 2, "the counters are restored");
+        assert_eq!(after.latency_histogram.count(), 0, "the histogram describes this process");
+    }
+
     #[tokio::test]
     async fn clone_shares_underlying_state() {
         let main = ModelStatsTracker::new();

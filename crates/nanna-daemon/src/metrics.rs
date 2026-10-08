@@ -13,6 +13,9 @@
 
 use std::fmt::Write as _;
 
+use nanna_agent::histogram::{
+    LATENCY_BUCKETS, LatencyHistogram, MODEL_LATENCY_BOUNDS_MS, TOOL_LATENCY_BOUNDS_MS,
+};
 use nanna_agent::model_stats::ModelStatsSummary;
 use nanna_agent::tool_stats::ToolStatsSummary;
 
@@ -53,7 +56,7 @@ fn label(value: &str) -> String {
 /// Append one metric family header.
 fn family(out: &mut String, name: &str, kind: &str, help: &str) {
     debug_assert!(name.starts_with("nanna_"), "one namespace: {name}");
-    debug_assert!(matches!(kind, "gauge" | "counter"));
+    debug_assert!(matches!(kind, "gauge" | "counter" | "histogram"));
     let _ = writeln!(out, "# HELP {name} {help}");
     let _ = writeln!(out, "# TYPE {name} {kind}");
 }
@@ -139,6 +142,40 @@ fn render_tools(out: &mut String, tools: &[ToolStatsSummary]) {
             t.p95_latency_ms
         );
     }
+    render_histogram(
+        out,
+        (
+            "nanna_tool_duration_milliseconds",
+            "Executed tool call latency since the daemon started.",
+            "tool",
+        ),
+        &TOOL_LATENCY_BOUNDS_MS,
+        tools.iter().map(|t| (t.name.as_str(), &t.latency_histogram)),
+    );
+}
+
+/// One histogram family over `series` (label value, histogram): a cumulative
+/// `_bucket` per bound plus `+Inf`, then `_sum` and `_count`, per series.
+/// `_count` is the `+Inf` bucket, so the three always agree.
+fn render_histogram<'a>(
+    out: &mut String,
+    (name, help, label_key): (&str, &str, &str),
+    bounds: &[u64; LATENCY_BUCKETS],
+    series: impl Iterator<Item = (&'a str, &'a LatencyHistogram)>,
+) {
+    family(out, name, "histogram", help);
+    for (value, histogram) in series {
+        let value = label(value);
+        let cumulative = histogram.cumulative();
+        for (bound, count) in bounds.iter().zip(cumulative) {
+            let _ = writeln!(out, "{name}_bucket{{{label_key}=\"{value}\",le=\"{bound}\"}} {count}");
+        }
+        let total = cumulative[LATENCY_BUCKETS];
+        debug_assert_eq!(total, histogram.count(), "+Inf is the count");
+        let _ = writeln!(out, "{name}_bucket{{{label_key}=\"{value}\",le=\"+Inf\"}} {total}");
+        let _ = writeln!(out, "{name}_sum{{{label_key}=\"{value}\"}} {}", histogram.sum_ms());
+        let _ = writeln!(out, "{name}_count{{{label_key}=\"{value}\"}} {total}");
+    }
 }
 
 fn render_models(out: &mut String, models: &[ModelStatsSummary]) {
@@ -179,6 +216,16 @@ fn render_models(out: &mut String, models: &[ModelStatsSummary]) {
             );
         }
     }
+    render_histogram(
+        out,
+        (
+            "nanna_model_request_duration_milliseconds",
+            "Model request latency since the daemon started, failures included.",
+            "model",
+        ),
+        &MODEL_LATENCY_BOUNDS_MS,
+        models.iter().map(|m| (m.model.as_str(), &m.latency_histogram)),
+    );
     family(
         out,
         "nanna_model_healthy",
@@ -379,11 +426,16 @@ mod tests {
             "an unnamed skipped entry is not a series: {text}"
         );
         assert!(text.contains("nanna_memory_entries 10\n"));
-        // Every sample line belongs to a declared family.
+        // Every sample line belongs to a declared family; a histogram's
+        // `_bucket`/`_sum`/`_count` samples belong to its base name.
         for line in text.lines().filter(|l| !l.starts_with('#')) {
             let name = line.split(['{', ' ']).next().expect("name");
+            let histogram_base = ["_bucket", "_sum", "_count"]
+                .iter()
+                .find_map(|suffix| name.strip_suffix(suffix))
+                .filter(|base| text.contains(&format!("# TYPE {base} histogram\n")));
             assert!(
-                text.contains(&format!("# TYPE {name} ")),
+                histogram_base.is_some() || text.contains(&format!("# TYPE {name} ")),
                 "undeclared series {name}"
             );
         }
@@ -393,5 +445,39 @@ mod tests {
     fn label_values_are_escaped() {
         assert_eq!(label(r#"a"b\c"#), r#"a\"b\\c"#);
         assert_eq!(label("line\nbreak"), "line\\nbreak");
+    }
+
+    /// The histogram family is what Prometheus needs to compute quantiles
+    /// across scrapes: cumulative buckets ending in `+Inf`, then `_sum` and a
+    /// `_count` equal to the `+Inf` bucket.
+    #[test]
+    fn latencies_render_as_a_cumulative_histogram() {
+        let mut read_file = tool("read_file", 3, 0);
+        for ms in [8, 40, 400] {
+            read_file
+                .latency_histogram
+                .observe(&TOOL_LATENCY_BOUNDS_MS, ms);
+        }
+        let text = render_metrics(&MetricsSnapshot {
+            tools: vec![read_file],
+            ..MetricsSnapshot::default()
+        });
+        assert!(text.contains("# TYPE nanna_tool_duration_milliseconds histogram\n"));
+        for line in [
+            "nanna_tool_duration_milliseconds_bucket{tool=\"read_file\",le=\"10\"} 1\n",
+            "nanna_tool_duration_milliseconds_bucket{tool=\"read_file\",le=\"50\"} 2\n",
+            "nanna_tool_duration_milliseconds_bucket{tool=\"read_file\",le=\"250\"} 2\n",
+            "nanna_tool_duration_milliseconds_bucket{tool=\"read_file\",le=\"500\"} 3\n",
+            "nanna_tool_duration_milliseconds_bucket{tool=\"read_file\",le=\"+Inf\"} 3\n",
+            "nanna_tool_duration_milliseconds_sum{tool=\"read_file\"} 448\n",
+            "nanna_tool_duration_milliseconds_count{tool=\"read_file\"} 3\n",
+        ] {
+            assert!(text.contains(line), "missing {line:?} in:\n{text}");
+        }
+        let buckets = text
+            .lines()
+            .filter(|l| l.starts_with("nanna_tool_duration_milliseconds_bucket"))
+            .count();
+        assert_eq!(buckets, LATENCY_BUCKETS + 1, "every bound plus +Inf, once");
     }
 }

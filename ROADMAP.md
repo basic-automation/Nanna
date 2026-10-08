@@ -1843,7 +1843,7 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
             on *every* attempt is a configuration fault, not a transient one, and deserves to
             surface (health endpoint degradation, or a once-per-boot loud notice) rather than
             scroll past. Needs a decision on where operator-visible faults belong.
-- [~] **Prometheus metrics** — new `nanna-metrics` crate (`NannaMetrics`: llm_request_duration,
+- [x] **Prometheus metrics** — new `nanna-metrics` crate (`NannaMetrics`: llm_request_duration,
       llm_tokens_total, tool_execution_duration, channel_messages/errors_total, queue_depth,
       active_sessions, memory_entries); expose via `/metrics` on the Axum health server + a GUI event.
       *(2026-09-17)* **`GET /metrics` landed on the health server (5148), no new crate or
@@ -1860,6 +1860,20 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
       and `nanna_channel_send_failures_total{channel}`, counted where a channel message crosses the
       daemon boundary (inbound + immediate replies in `process_message`, turn answers and reminders
       in the reply forwarder); names bounded at 16 then folded into `other`. Only histograms remain.
+      *(2026-10-08)* **Histograms landed — the item's last piece.** `nanna_tool_duration_milliseconds`
+      (per tool, executed calls only — a breaker replay never ran) and
+      `nanna_model_request_duration_milliseconds` (per model, failures included: a 120 s timeout is
+      exactly the latency a scrape should see), as standard `_bucket{le}`/`_sum`/`_count` families.
+      `nanna_agent::histogram::LatencyHistogram` is 13 saturating counters + a sum (112 B) beside
+      each tool's and model's stats, with fixed bounds (tools 10 ms–120 s, under `exec`'s 180 s
+      ceiling; models 250 ms–10 min), so series stay bounded by configuration. It is
+      `#[serde(skip)]` on the stats and their summaries: no client wire or stored format changes,
+      and it describes the running process (resets on restart, which scrapers handle as a counter
+      reset). `_count` is the `+Inf` bucket by construction. 6 tests (bucketing incl. inclusive
+      `le`, saturation, rendering, the trackers' real `record` paths, not exported, not restored).
+      **Not live-scraped with data:** tool and model stats are recorded inside agent turns, and a
+      direct `tool.execute` (tried on an isolated daemon) records none; `/metrics` itself served
+      200 there. Kept the `p95` gauges for existing dashboards.
 - [x] **Structured tracing spans** — hierarchy Session → Agent Loop → LLM/Tool Call, capturing
       name/duration/IO-size/success via `#[tracing::instrument]` + `info_span!`.
       *(2026-09-21)* The daemon had **zero** spans, so two overlapping turns interleaved their
