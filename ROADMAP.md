@@ -37,7 +37,7 @@ corrupt-Turso-memories salvage + `/status` surfacing, real tool-failure logs, Wi
 normalization, and the heartbeat `HEARTBEAT.md` read. Detailed dated notes collapsed to a one-line ledger
 (full rationale in each commit).
 **Repo:** local Cargo workspace, branch `master` — one Rust workspace + a Tauri 2 / Nuxt 4 GUI.
-**Stack:** Rust 2024 (rustc 1.85+) · Tokio · **Burn** (wgpu + ndarray) for on-device inference · wgpu 24 · Tauri 2 · Nuxt 4 / Vue 3 / Tailwind 4 · **Turso** (embedded, SQLite-compatible) · Boa + Deno scripting.
+**Stack:** Rust 2024 (rustc 1.85+) · Tokio · **Burn** (wgpu + ndarray) for on-device inference · wgpu 24 · Tauri 2 · Nuxt 4 / Vue 3 / Tailwind 4 · **Turso** (embedded, SQLite-compatible) · Boa scripting.
 
 > **Direction (2026-07-06 pivot) — local-first by default.** A small open model running on a single
 > consumer GPU *is* the agent and does the whole job — full agentic reasoning, tools, and memory —
@@ -93,7 +93,7 @@ Tier 1  nanna-infer*      Burn model runner: local LLM inference (wgpu + ndarray
         nanna-llm         Inference routing: local (nanna-infer) first · cloud APIs optional
           |
 Tier 2  nanna-tools       Tool system (all tools are filesystem JS/TS skills)
-        nanna-scripting   Boa (pure-Rust JS) + Deno (V8/TS) engines; embedded Python
+        nanna-scripting   Boa (pure-Rust JS) engine; embedded Python
         nanna-workspace   Workspace detection, .nanna/ context files (SOUL/USER/AGENTS/…)
         nanna-channels    Channel listeners + unified message router
         nanna-browser     Browser control (CDP / Playwright)
@@ -157,7 +157,8 @@ Concretely, today Nanna:
 - Has a **cognitive memory** system (FSRS-6 spaced repetition, semantic recall with testing-effect
   reinforcement, consolidation/"dreaming", duplicate detection) persisted to **Turso**.
 - Ships **all tools as filesystem JS/TS skills** (39 default skills) executed by the Boa engine, plus
-  **MCP client** integration and an **embedded/tiered OCR** pipeline (pure-Rust `ocrs` → vision-model fallback).
+  **MCP client** integration and **model OCR** (the `ocr` skill and `read_pdf`'s scanned pages go to a
+  vision model; the pure-Rust `ocrs` tier is built but not wired — see the dead-subsystems item in P25).
 - Connects **five channels** (Telegram, Discord, Slack, Signal, WhatsApp) with a webhook server and a
   unified router that delivers agent responses back to the originating channel.
 - Presents a **Tauri 2 + Nuxt 4** desktop GUI: streaming chat, Tiptap+Monaco rich editor, session
@@ -8845,9 +8846,29 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `TextToSpeechTool`/`TranscribeTool` and their `create_*_tool` factories, `OcrTool`,
       `DescribeImageTool`, `ReadPdfTool` — the daemon calls the `create_*_fn` closures and the
       pdf/ocr functions, never the structs); the CLI path's 16 tools (an owner call: is the
-      `nanna` CLI/`serve` path still wanted beside the daemon?); and the Deno path —
-      `nanna-scripting`'s `deno` feature is enabled by no crate (only its own unused `full`), so
-      `deno_core`/`deno_ast`/`deno_error` are optional dependencies nothing builds.
+      `nanna` CLI/`serve` path still wanted beside the daemon?).
+      *(2026-10-08, same run — the Deno path.)* `nanna-scripting`'s `deno` feature was enabled by
+      no crate (only its own unused `full`), so the V8 engine was never compiled into anything we
+      ship and every script already ran on Boa: with `deno` off, both engine orders resolved to
+      Boa with no fallback. Deleted `deno_impl.rs`, `EngineKind::Deno`, the fallback machinery
+      (`prefer_deno`, `no_fallback`, `ExecutionResult::{used_fallback, primary_error}`), the
+      "needs an advanced engine" routing, and the `deno`/`full` features — **~1 320 lines, and
+      the lockfile drops the whole V8/swc stack** (`deno_core`, `deno_ast`, `deno_v8`,
+      `serde_v8`, `bindgen`, …). No runtime change: nothing that ran before runs differently.
+      - [ ] *(found 2026-10-08)* **Decide: wire the embedded OCR tier or delete it.** The
+            "Current State" said Nanna ships an embedded/tiered OCR pipeline (`ocrs` → vision
+            model). It does not: `embedded_ocr`/`run_ocrs_sync` (`nanna-tools` `ocr.rs`) are
+            reached only through `OcrTool`, which only its own tests construct; the bundled `ocr`
+            skill and `read_pdf`'s scanned-page fallback go to the vision-model service
+            (`vision_service.rs`), and with no vision model configured they are withheld. So
+            `ocrs` + `rten` (an ONNX runtime, and the reason `rten 0.27`/dependabot #411 cannot
+            land) compile into every build for nothing. **Wire it** (local-first fits the North
+            Star: OCR with no model and no key; but it downloads two `.rten` models from the
+            network on first use, so the first call needs a bounded, announced fetch) **or delete
+            it** (drops `ocrs`, `rten`, `rten-imageproc` and their tree). Owner call, like the GPU
+            search path. Also test-only, same audit: the `AnalyzeImageTool`,
+            `TextToSpeechTool`/`TranscribeTool`, `DescribeImageTool` and `ReadPdfTool` structs —
+            their closures/functions are live, the Tool wrappers are not.
 
 **Stage 1 — store, memory, storage:**
 - [x] `VectorStore::update_content` must also clear `memories.embedding`/`embedding_model` and

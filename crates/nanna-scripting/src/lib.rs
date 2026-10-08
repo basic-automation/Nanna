@@ -4,13 +4,12 @@
 //! JavaScript/TypeScript scripting engine for Nanna
 //!
 //! Provides a unified interface for executing user-authored tools written in JS/TS.
-//! Uses Boa (pure Rust) as the primary engine with Deno (V8) as a fallback.
+//! Runs them on Boa, a pure-Rust engine.
 //!
 //! # Features
 //!
 //! - `boa` (default): Pure Rust JavaScript engine, lightweight (~5MB)
-//! - `deno`: V8-based engine, full ECMAScript + TypeScript support (~30MB)
-//! - `full`: Both engines with automatic fallback
+//! - `python`: an embedded Python interpreter (`RustPython`)
 //!
 //! # Example
 //!
@@ -46,9 +45,6 @@ mod boa_impl;
 /// shipped JS/TS skills.
 #[cfg(feature = "boa")]
 pub use boa_impl::check_syntax;
-
-#[cfg(feature = "deno")]
-mod deno_impl;
 
 #[cfg(feature = "python")]
 pub mod python;

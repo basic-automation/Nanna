@@ -7,9 +7,7 @@ description = "JavaScript/TypeScript scripting engine for Nanna tools"
 [features]
 default = ["boa"]
 boa = ["boa_engine"]
-deno = ["deno_core", "deno_ast", "deno_error"]
 python = ["rustpython-vm", "rustpython-stdlib", "rustpython-pylib"]
-full = ["boa", "deno"]
 
 [dependencies]
 tokio.workspace = true
@@ -37,15 +35,8 @@ nanna-proc = { path = "../nanna-proc" }
 # optional dep that no source file has ever referenced.
 boa_engine = { version = "0.22", optional = true }
 
-# Deno - V8-based (full featured fallback)
-deno_core = { version = "0.412", optional = true }
-deno_ast = { version = "0.53", features = ["transpiling"], optional = true }
-deno_error = { version = "0.7", optional = true }
-
-# NOTE: the old direct `swc_core` dep ("TypeScript transpilation for Boa") was
-# dead — nothing in this crate referenced it, no feature enabled it, and its
-# version conflicted with deno_ast 0.53's exact swc pins. TS transpilation for
-# the Deno path comes from deno_ast's own bundled swc.
+# The V8 (Deno) engine was an optional dependency set (`deno_core`, `deno_ast`,
+# `deno_error`) behind a `deno` feature no crate enabled; deleted 2026-10-08.
 
 # RustPython - Embedded Python interpreter (no system Python needed)
 rustpython-vm = { version = "0.6", default-features = false, features = ["compiler", "encodings", "freeze-stdlib"], optional = true }

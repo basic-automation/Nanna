@@ -878,10 +878,11 @@ fn js_to_json_bounded(
 }
 
 /// Transpile TypeScript to JavaScript
-/// Note: Boa doesn't support TypeScript natively. If actual TS syntax is present,
-/// execution will fail and trigger Deno fallback (which has real TS support).
+/// Note: Boa doesn't support TypeScript natively, and there is no other
+/// engine: a `tool.ts` with real TS syntax fails to parse, which
+/// `check_syntax` catches for every shipped skill before it can ship.
 fn transpile_typescript(source: &str) -> String {
-    // Just pass through - Boa handles plain JS, Deno handles TS
+    // Pass through: shipped `tool.ts` files are plain JS by construction.
     source.to_string()
 }
 
