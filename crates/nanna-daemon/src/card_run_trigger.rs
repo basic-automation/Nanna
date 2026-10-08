@@ -411,7 +411,7 @@ pub async fn release_stalled(
                 // before this card's release (and keeps the card) or wholly
                 // after it (and is refused: the card is no longer its member's).
                 let fence = runs.fence_starts().await;
-                if still_stalled(storage, &fence, &card, &stalled.lineage).await
+                if still_stalled(storage, &fence, &card, &stalled.lineage, now).await
                     && stall_card(storage, &fence, &card, stalled.minutes, stalled.marker).await
                 {
                     released += 1;
@@ -495,28 +495,43 @@ async fn stall_check(
 }
 
 /// [`stall_check`]'s verdict, re-read under `fence`: still no live run on
-/// `card`'s lineage (a manual Start may have registered since), and the card
+/// `card`'s lineage (a manual Start may have registered since), the card
 /// still `in_progress` with the same member (a person may have moved or
-/// finished it). Either change keeps the card as it now is.
+/// finished it), and still untouched past the threshold at `now` (a post or
+/// an edit since the judgement is someone working it). Any change keeps the
+/// card as it now is.
 async fn still_stalled(
     storage: &Storage,
     fence: &crate::tasks::StartFence<'_>,
     card: &Task,
     lineage: &[i64],
+    now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
     debug_assert_eq!(lineage.first(), Some(&card.id), "a lineage starts at the card");
     if fence.serves_card(&card.scope, card.scope_id.as_deref(), lineage) {
         debug!(card_id = card.id, "stall sweep: a run started on the card; kept");
         return false;
     }
-    match storage.tasks().get(card.id).await {
-        Ok(current) if current.status == "in_progress" && current.assignee == card.assignee => true,
+    let tasks = storage.tasks();
+    match tasks.get(card.id).await {
+        Ok(current) if current.status == "in_progress" && current.assignee == card.assignee => {}
         Ok(current) => {
             debug!(card_id = card.id, status = %current.status, "stall sweep: card changed; kept");
-            false
+            return false;
         }
         Err(e) => {
             warn!(card_id = card.id, error = %e, "stall sweep: card unreadable; kept");
+            return false;
+        }
+    }
+    match tasks.touch_times(card.id).await {
+        Ok(times) if stalled_minutes(last_touch(&times), now).is_some() => true,
+        Ok(_) => {
+            debug!(card_id = card.id, "stall sweep: card touched since judged; kept");
+            false
+        }
+        Err(e) => {
+            warn!(card_id = card.id, error = %e, "stall sweep: card times unreadable; kept");
             false
         }
     }
@@ -1130,7 +1145,7 @@ mod tests {
 
         let fence = runs.fence_starts().await;
         assert!(
-            !still_stalled(&storage, &fence, &card, &stalled.lineage).await,
+            !still_stalled(&storage, &fence, &card, &stalled.lineage, later).await,
             "a run serves it now"
         );
         drop(fence);
@@ -1212,8 +1227,23 @@ mod tests {
         tasks.update(other, patch, Some("gui")).await.expect("moved");
         let fence = runs.fence_starts().await;
         assert!(
-            !still_stalled(&storage, &fence, &judged, &[other]).await,
+            !still_stalled(&storage, &fence, &judged, &[other], chrono::Utc::now() + chrono::Duration::minutes(31)).await,
             "the person's change stands"
+        );
+        drop(fence);
+
+        // Re-judged at a moment the card's newest touch is inside the
+        // threshold (a post or an edit since the sweep read it): kept.
+        let touched = picked_up_card(&storage, "gui", "commented on").await;
+        let card = tasks.get(touched).await.expect("card");
+        let fence = runs.fence_starts().await;
+        assert!(
+            still_stalled(&storage, &fence, &card, &[touched], chrono::Utc::now() + chrono::Duration::minutes(31)).await,
+            "untouched for 31 minutes: still stalled"
+        );
+        assert!(
+            !still_stalled(&storage, &fence, &card, &[touched], chrono::Utc::now()).await,
+            "touched within the threshold: kept"
         );
     }
 

@@ -8314,6 +8314,9 @@ as its turn (`TurnAdmission`, scope default `session`).
       Tests `a_start_between_the_judgement_and_the_release_keeps_its_card`,
       `a_start_after_the_release_is_refused`, `the_fence_holds_starts_and_a_changed_card_is_kept`;
       each of the two guards, removed, fails its test.
+      *(same run, after review)* The fenced re-judge also re-reads the card's last touch: a post
+      or an edit between the sweep's read and the fence now keeps the card (it was the one input
+      `still_stalled` did not repeat). Mutation-checked like the other two.
 - [x] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
       *(2026-09-28)* `RouterDecision::Assign` gained optional `labels` and `acceptance`. Labels

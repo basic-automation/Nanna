@@ -804,12 +804,6 @@ impl ControlPlane {
     // via Turso write-through on every mutation (add/remove/update).
     // No explicit save calls are required.
 
-    /// Handle an action and return a response.
-    ///
-    /// `Arc` receiver: the chat path spawns its heavy turn preparation
-    /// (recall, workspace context, memory writes) onto a task that outlives
-    /// this request, so the delivery ack can return in milliseconds (P22) —
-    /// that task needs an owned handle to the control plane.
     /// [`Self::handle`] for the IPC send path: the same answer, except that a
     /// reply too large to hold as a tree comes back already serialized
     /// (today `memory.list`, see `memory_list_raw`).
@@ -825,6 +819,12 @@ impl ControlPlane {
         Reply::Tree(self.handle(client_id, action).await)
     }
 
+    /// Handle an action and return a response.
+    ///
+    /// `Arc` receiver: the chat path spawns its heavy turn preparation
+    /// (recall, workspace context, memory writes) onto a task that outlives
+    /// this request, so the delivery ack can return in milliseconds (P22) —
+    /// that task needs an owned handle to the control plane.
     pub async fn handle(self: &Arc<Self>, client_id: &str, action: Action) -> Value {
         match action {
             Action::Chat(chat) => {
