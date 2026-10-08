@@ -5543,6 +5543,9 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             first time — so nothing we share with the TypeScript SDK misreads the spec where rmcp
             reads it differently, at least on these paths. Live suite 11/11; runs in `mcp-interop`.
             (b), whether nanna-mcp should sit on `rmcp`, stays open.
+            *(2026-10-08)* Both interop fixtures moved to their latest: `rmcp =3.4.0 → =3.5.1` and
+            the TypeScript SDK `@modelcontextprotocol/{client,server} 2.0.0 → 2.3.1`. Live suite
+            `dual_era_live -- --ignored` **11/11** on each step (rmcp first, then the TS SDK).
       - [x] *(found 2026-09-18)* `cargo clippy -p nanna-mcp --no-default-features --features stdio`
             warns on two unused imports (`adapter.rs` `RwLock`, `server.rs` `ToolContent`) — the
             feature-gated build nobody gates. Trivial; gate the imports on their features.
