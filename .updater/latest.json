@@ -1,15 +1,15 @@
 {
-  "version": "0.3.38",
-  "notes": "Steadier memory use under load, fewer stuck board cards, and an unexpected daemon death now says how it ended.",
-  "pub_date": "2026-10-05T14:09:58.210Z",
+  "version": "0.3.39",
+  "notes": "Faster Memory page, a board race closed, latency histograms on /metrics, and less dead code.",
+  "pub_date": "2026-10-08T14:35:07.126Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWtLYlZ4TGxNcHpkdjZrblArVDZmL2NhVWRZaE9neU41b2hjVjFpRWFaUDlUdW9Id0Zhd1pRRmpadWl5ejgvTU5HMlZrR1RxN3NxNkhCYmVzOTkrMVFJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMjA5MzQ0CWZpbGU6TmFubmFfMC4zLjM4X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMzgKcm1Ha0NLeWFNQjczY2xoUEU0anNzaSs1eTh1TVo2T2lIMjhEZjM1ZSs1US9DckpCb2J1aWx3SUpYS1FRUXZYeGY3bEoxQUk1K3pxa3lCT1RNeW1PQ3c9PQo=",
-      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.38-beta.47/Nanna_0.3.38_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXRSRUJpUTNmK2JSSzZEcDdKWmxhUkY1ZEZSdDg1ZU9reUgrZENLMWNYRjJscTFlcFZFcjBGMG9rZGVkcnpZbjRWSG9uU3F4cnFpWmhheDVXNmhFU3dJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxNDcwMDAxCWZpbGU6TmFubmFfMC4zLjM5X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMzkKNVcvUDUrc1JDQUxPUVg2bzNVT2pDazJNMFBXVkxUdFIzNStBbEJka1B2ek1MNDE0cUdPbGllMjQ5SXFpZ2Zod2hianU3U2tMQXdHenkzU2VFcjZsQnc9PQo=",
+      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.39-beta.48/Nanna_0.3.39_x64-setup.exe"
     },
     "linux-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWk1VWdBTWxsaU80b2t6SVRLUGtDdjZwNFZpRHVkVFNrQ0lVb3NaY0RpQSt2aVJaeE1hT2Y5K0FkaDNvNVduNEV6VlB6VmVkcDZrSUhCcVBGenZNYmc4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMjA5MTk1CWZpbGU6TmFubmFfMC4zLjM4X2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjM4CjBZSEFJZEVVSFhmbjdUaDYrWTVJYVVpcHpPNFpQeEREQnNJeVMzamZOcDBzc2lJK0dQQVk1ZHY5SUpESE1yRTJtT0UvTGlKUXhGK1dXNE5pQXJ3RENRPT0K",
-      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.38-beta.47/Nanna_0.3.38_amd64.AppImage"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXZSam5PNEJIUi9kckxXbTI5Sm15SHRta0FWMFpqTXdvbTVEMXorQTFESlJYaXpGUmdrZTMrLzFrSkRhU0RNdVJjc3BlMkVzREZTZmY2Yk5LUTdTdVFnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxNDY5MTM0CWZpbGU6TmFubmFfMC4zLjM5X2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjM5Cm4zUWdZTC9lYURzUjVoR1pWMW1lNy9sSjdjYmdaTGxwVjcxV0wrUlRxODRRYUJRT0pVcTVQK1Job0F6SWxVeWorMWJBZG83ajl5STRocTlPd3NrWUJnPT0K",
+      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.39-beta.48/Nanna_0.3.39_amd64.AppImage"
     }
   }
 }
