@@ -2,7 +2,7 @@
 //!
 //! Handles connections from channel clients (GUI, CLI, API, etc.)
 
-use crate::protocol::{Event, Request, RequestId, Response};
+use crate::protocol::{Event, Reply, Request, RequestId, Response};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -389,6 +389,25 @@ impl IpcServer {
     /// response cannot be serialized, or when its connection's outgoing
     /// channel is closed (the client went away mid-send).
     pub async fn send_response(&self, client_id: &str, response: Response) -> Result<(), String> {
+        let msg = serde_json::to_string(&response).map_err(|e| e.to_string())?;
+        self.send_text(client_id, msg).await
+    }
+
+    /// Send a handler's [`Reply`] as the success response to request `id`.
+    /// Serialized once, straight into the frame's text: no [`Response`] (and
+    /// so no copy of a tree reply) is built on the way.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::send_response`]: the client is not connected, the reply
+    /// cannot be serialized, or the connection's outgoing channel is closed.
+    pub async fn send_reply(&self, client_id: &str, id: &RequestId, reply: &Reply) -> Result<(), String> {
+        let msg = reply.success_text(id).map_err(|e| e.to_string())?;
+        debug_assert!(msg.starts_with('{'), "a response frame is one JSON object");
+        self.send_text(client_id, msg).await
+    }
+
+    async fn send_text(&self, client_id: &str, msg: String) -> Result<(), String> {
         // The sender is cloned out and the guard released BEFORE the send. The
         // channel is bounded, so a client that stops reading makes `send`
         // wait — and a read guard held across that wait blocked every writer:
@@ -400,7 +419,6 @@ impl IpcServer {
             .get(client_id)
             .map(|client| client.tx.clone())
             .ok_or_else(|| format!("Client not found: {client_id}"))?;
-        let msg = serde_json::to_string(&response).map_err(|e| e.to_string())?;
         tx.send(Message::Text(msg.into()))
             .await
             .map_err(|e| e.to_string())

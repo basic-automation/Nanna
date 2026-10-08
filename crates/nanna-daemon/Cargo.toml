@@ -40,7 +40,8 @@ nanna-scripting = { path = "../nanna-scripting", features = ["python"] }
 tokio.workspace = true
 directories.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# `raw_value`: a large reply (`memory.list`) is serialized once, never as a tree.
+serde_json = { workspace = true, features = ["raw_value"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true

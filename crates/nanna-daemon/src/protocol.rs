@@ -966,12 +966,14 @@ pub enum ResponseResult {
 }
 
 impl Response {
-    pub fn success(id: RequestId, data: impl Serialize) -> Self {
+    /// A success response carrying `data` as is. It takes the tree by value:
+    /// the old `impl Serialize` form ran `to_value` on a `Value`, which deep-
+    /// copied every reply (a 14 MB `memory.list` twice over).
+    #[must_use]
+    pub const fn success(id: RequestId, data: Value) -> Self {
         Self {
             id,
-            result: ResponseResult::Success {
-                data: serde_json::to_value(data).unwrap_or(Value::Null),
-            },
+            result: ResponseResult::Success { data },
         }
     }
 
@@ -1006,6 +1008,123 @@ impl Response {
         match &self.result {
             ResponseResult::Error { message, .. } => Some(message),
             ResponseResult::Success { .. } => None,
+        }
+    }
+}
+
+/// What a request handler gives the IPC layer to send back as `data`.
+///
+/// Almost every handler builds a [`Value`]. A handler whose reply is large
+/// (`memory.list`) serializes it straight from typed rows instead, so the
+/// daemon never holds the reply as a tree of heap nodes.
+#[derive(Debug)]
+pub enum Reply {
+    Tree(Value),
+    Raw(RawJson),
+}
+
+impl Reply {
+    /// The reply as a tree, for in-process callers. Parses a raw reply, so
+    /// it is for tests and small replies, never the IPC send path.
+    ///
+    /// # Errors
+    ///
+    /// A raw reply that is not valid JSON (it was serialized by `serde_json`,
+    /// so this means a bug, not bad input).
+    pub fn into_value(self) -> serde_json::Result<Value> {
+        match self {
+            Self::Tree(value) => Ok(value),
+            Self::Raw(raw) => serde_json::from_str(raw.get()),
+        }
+    }
+
+    /// The wire text of a success [`Response`] carrying this reply, written
+    /// without first building a [`Response`]: a tree is borrowed, a raw reply
+    /// is spliced into a frame allocated once at its exact size. Byte for
+    /// byte what serializing `Response::success(id, data)` gives
+    /// (`a_raw_reply_is_the_same_wire_response_as_its_tree`).
+    ///
+    /// # Errors
+    ///
+    /// Only what `serde_json::to_string` can return for a tree or a request
+    /// id, which in practice is nothing.
+    pub fn success_text(&self, id: &RequestId) -> serde_json::Result<String> {
+        const OPEN: &str = r#"{"id":"#;
+        const DATA: &str = r#","result":{"status":"success","data":"#;
+        const CLOSE: &str = "}}";
+        match self {
+            Self::Tree(data) => serde_json::to_string(&SuccessFrame::new(id, data)),
+            Self::Raw(data) => {
+                // `Response`'s layout spelled out: `id`, then `result` tagged
+                // by `status`. One allocation at the final size: a 16 MB reply
+                // grown by doubling left glibc arenas fragmented (measured).
+                let id_json = serde_json::to_string(id)?;
+                let bytes = OPEN.len() + id_json.len() + DATA.len() + data.get().len() + CLOSE.len();
+                let mut text = String::with_capacity(bytes);
+                for part in [OPEN, id_json.as_str(), DATA, data.get(), CLOSE] {
+                    text.push_str(part);
+                }
+                debug_assert_eq!(text.len(), bytes, "sized exactly");
+                Ok(text)
+            }
+        }
+    }
+}
+
+/// JSON text that `serde_json` wrote, so valid by construction: it can be
+/// spliced into a frame without being parsed again.
+#[derive(Debug)]
+pub struct RawJson(String);
+
+impl RawJson {
+    /// Serialize `value` into a buffer reserved at `capacity_bytes` up front.
+    /// A large reply's caller passes its size estimate: a buffer grown by
+    /// doubling to 16 MB leaves the freed 8, 4, 2 … MB blocks behind.
+    ///
+    /// # Errors
+    ///
+    /// What `serde_json` returns for `value` (a map with non-string keys, a
+    /// failing `Serialize` impl).
+    pub fn to_json<T: Serialize + ?Sized>(value: &T, capacity_bytes: usize) -> serde_json::Result<Self> {
+        let mut buf = Vec::with_capacity(capacity_bytes);
+        serde_json::to_writer(&mut buf, value)?;
+        debug_assert!(!buf.is_empty(), "every JSON value has text");
+        // serde_json writes UTF-8 only; the check is a scan, not a parse.
+        String::from_utf8(buf)
+            .map(Self)
+            .map_err(<serde_json::Error as serde::ser::Error>::custom)
+    }
+
+    /// The JSON text.
+    #[must_use]
+    pub fn get(&self) -> &str {
+        &self.0
+    }
+}
+
+/// `Response { id, result: Success { data } }` by reference. The field order
+/// and the `status` tag are [`ResponseResult`]'s `#[serde(tag = "status")]`
+/// layout, spelled out.
+#[derive(Serialize)]
+struct SuccessFrame<'a, D: ?Sized> {
+    id: &'a RequestId,
+    result: SuccessResult<'a, D>,
+}
+
+#[derive(Serialize)]
+struct SuccessResult<'a, D: ?Sized> {
+    status: &'static str,
+    data: &'a D,
+}
+
+impl<'a, D: ?Sized> SuccessFrame<'a, D> {
+    const fn new(id: &'a RequestId, data: &'a D) -> Self {
+        Self {
+            id,
+            result: SuccessResult {
+                status: "success",
+                data,
+            },
         }
     }
 }
@@ -1431,6 +1550,30 @@ impl From<ControlAction> for Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The IPC server writes success frames through [`Reply::success_text`]
+    /// instead of serializing a [`Response`]. Clients parse `Response`, so the
+    /// frame must be the same text — for a tree and for a raw reply alike.
+    #[test]
+    fn a_raw_reply_is_the_same_wire_response_as_its_tree() {
+        let data = serde_json::json!({
+            "memories": [{ "id": "m1", "content": "a \"quoted\" line\n", "session_id": null, "weight": 0.5 }],
+            "count": 1,
+        });
+        // An id that needs escaping: the raw frame writes it through serde.
+        let id: RequestId = "req-\"7\"".to_string();
+        let expected = serde_json::to_string(&Response::success(id.clone(), data.clone())).expect("serialize");
+        let raw = RawJson::to_json(&data, 16).expect("raw");
+
+        let tree_text = Reply::Tree(data).success_text(&id).expect("tree frame");
+        let raw_text = Reply::Raw(raw).success_text(&id).expect("raw frame");
+
+        assert_eq!(tree_text, expected);
+        assert_eq!(raw_text, expected);
+        let parsed: Response = serde_json::from_str(&raw_text).expect("a client parses it");
+        assert_eq!(parsed.id, id);
+        assert_eq!(parsed.data().and_then(|d| d["count"].as_u64()), Some(1));
+    }
 
     /// The IPC layer logs every request as `{:?}`. A key under validation, a
     /// `config.set` of a key, and an imported config all printed their secrets

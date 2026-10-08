@@ -10268,11 +10268,24 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
                  cannot return. Not measured: a real operator day. Re-check the installed daemon's
                  RSS after a day of use; the serialize-without-`Value` item below shrinks what is
                  fragmented in the first place.
-           - [ ] *(2026-10-05)* **Serialize `memory.list` without the intermediate `Value`.** The
+           - [x] *(2026-10-05)* **Serialize `memory.list` without the intermediate `Value`.** The
                  14 MB reply is built as a `serde_json::Value` tree, then a string, then a frame,
                  several times the reply in transient heap. A typed `Serialize` struct written
                  straight to the frame's string removes the tree. The trim already returns the
                  transient, so this is CPU and peak heap, not retained RSS.
+                 *(2026-10-08)* Shipped. It was worse than the note said: `Response::success`
+                 ran `to_value` on the handler's `Value`, a **deep copy of every reply**, every
+                 request; it now takes the `Value` by move. `memory.list` writes typed rows
+                 (`MemoryListRow`) into a buffer reserved at an estimate of the final size
+                 (`RawJson::to_json`) and the server splices it into a frame allocated once at its
+                 exact size (`Reply::success_text`, sent by `IpcServer::send_reply` from
+                 `ControlPlane::handle_reply`). Same text on the wire: fields declared in the
+                 tree's sorted key order and floats widened to f64 as `json!` did (a first cut
+                 printed `0.9` where the tree printed `0.8999999761581421`; the oracle test now
+                 compares text, with values that have no exact f32). Measured on a 15.8 MB reply
+                 (3 927 memories, release, A/B): **78.8 → 66.7 ms** per call; RSS and VmHWM
+                 unchanged within noise (`bench/BASELINE.md` Suite 5). A first version that grew
+                 two 16 MB strings by doubling ratcheted RSS 107 → 204 MB and was not shipped.
      - [ ] *(P13, research 2026-09-26)* **FSRS-7 exists but is not shippable yet.** ts-fsrs merged it
            ([PR #520](https://github.com/open-spaced-repetition/ts-fsrs/pull/520), 2026-09-18,
            unreleased); `fsrs-rs` is at 6.6.2 with no FSRS-7, and no FSRS-7 default parameters are
