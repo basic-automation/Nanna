@@ -34,8 +34,8 @@ percentile.
 ## Under the hood
 
 - **Dependencies:** the turso database moves from 0.8.1 to 0.8.2, plus 37 other compatible
-  updates. The GUI moves to Nuxt 4.6.0. Two updates were held back because they do not build:
-  `rustpython-ruff` 0.16.10 and `rten` 0.27.
+  updates. Three updates were held back because they do not build: `rustpython-ruff` 0.16.10,
+  `rten` 0.27, and Nuxt 4.6.0, whose static build fails on Windows. The GUI stays on Nuxt 4.5.2.
 - **Security audit:** four new advisories against `simple-git` are exempted, with the reasons
   recorded. It is used only by Nuxt's developer tools, which are switched off in the app you
   install. The fixed version cannot be used yet because it would break the development server.
