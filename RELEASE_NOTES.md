@@ -1,56 +1,51 @@
-# Nanna v0.3.38-beta.47 — Steadier memory use, fewer stuck cards
+# Nanna v0.3.39-beta.48 — A faster Memory page, and a board race closed
 
-This release has no new screens. The daemon stops growing after large requests. Cards on the
-board no longer get stuck in ways that need a restart. When the daemon dies unexpectedly, you
-can now see how it died.
+This release has no new screens. The Memory page loads faster on large stores, a timing gap that
+could take a card away from an agent that had just started on it is closed, and a lot of code that
+nothing used is gone.
 
 ## What's Changed
 
-**The daemon grows far less with use.** Opening the Memory page asks the daemon for every
-memory at once. On a real store of 3,730 memories that reply is 14 MB, and building it used to
-leave the daemon permanently larger each time. In a test that repeated the request every two
-minutes, memory use went from 142 MB at rest to 608 MB, and it was still climbing. Two changes
-cut this sharply:
+**The Memory page loads faster on a large store.** Opening it asks the daemon for every memory at
+once. That reply used to be built twice in memory before it was sent: once as a tree of small
+pieces, then a full copy of that tree. It is now written straight out once. On a store of 3,927
+memories (a 15.8 MB reply) each request took about 79 ms before and about 67 ms now. What the app
+receives is unchanged, byte for byte. Memory use after these requests is about the same as before.
 
-- Listing memories, and the memory statistics on the Settings page, no longer copy every
-  memory's search vectors just to read the text.
-- After any reply over 1 MB is sent, the daemon hands the freed memory back to the system. This
-  takes about 5 ms and runs at most once every 10 seconds.
+**A card you start by hand can no longer be taken away at the same moment.** Every 5 minutes the
+daemon looks for cards that an agent holds but nothing has worked on for 30 minutes, and hands
+them back to the board's router. If you pressed Start on such a card at the exact moment of that
+check, the card could be handed back while its new run was already working on it. Both now take
+turns: either your Start comes first and the card stays with its agent, or the hand-back comes
+first and the late Start is refused with "no longer assigned". A card someone commented on or
+edited in that moment is also kept.
 
-In the same test, memory use was about 213 MB after the same number of requests that had taken the
-old version to 439 MB. It still creeps up slowly, at about a third of the old rate.
+**Response-time histograms for monitoring.** `/metrics` on the health port now includes how long
+each tool call and each model request took, in the standard histogram format. A Prometheus or
+Grafana setup can chart percentiles over time from it. Before, it showed only a recent 95th
+percentile.
 
-**Board cards no longer get stuck.**
+**Less dead code.** About 3,200 lines that nothing called were removed:
 
-- **Stop keeps meaning stop.** After about 64 edits or reorders, a card you had stopped could be
-  treated as abandoned and taken back from its agent. It now stays stopped for as long as you
-  leave it.
-- **A stopped card you give to someone else starts for them.** Its "stopped" note says it stays
-  with the agent until it is restarted or reassigned. Reassigning it used to leave it stuck in
-  progress with nobody working on it. Now the new agent picks it up.
-- **A card that comes back unfinished in two different rounds no longer goes straight to you.**
-  The count of failed attempts now starts over once a card has been finished. Previously, a
-  repeating card that failed once one week and once the next asked you "2 runs could not finish
-  it" right away.
-
-**You can now see how an unexpected crash happened.** If the daemon is killed by something it
-cannot catch, such as a crash signal or a forced kill, the app now records how it ended. The next
-start reports it, for example "the app saw it end by signal 9 (SIGKILL)", where the daemon used to
-say only that it had "died through a path no hook could see". `nanna doctor` has a new
-`daemon.last_exit` check with the same information: whether the daemon is running, stopped
-cleanly, or died, and where to look in the logs.
+- an unused second JavaScript engine (V8, through Deno). It was never compiled into the app, so
+  the app does not change, but 83 packages leave the dependency list;
+- 17 old built-in tools. The tools you use are the bundled skills, which are unchanged.
 
 ## Under the hood
 
-- Toolchain: nightly-2026-10-03. Newer nightlies cannot build Nanna yet: Rust renamed an internal
-  function, and a library our database depends on still uses the old name. That library has a fix
-  pending.
-- Dependencies: postcss 8.5.29, plus three small lockfile updates.
+- **Dependencies:** the turso database moves from 0.8.1 to 0.8.2, plus 37 other compatible
+  updates. The GUI moves to Nuxt 4.6.0. Two updates were held back because they do not build:
+  `rustpython-ruff` 0.16.10 and `rten` 0.27.
+- **Security audit:** four new advisories against `simple-git` are exempted, with the reasons
+  recorded. It is used only by Nuxt's developer tools, which are switched off in the app you
+  install. The fixed version cannot be used yet because it would break the development server.
+- **Checked against outside implementations:** the MCP compatibility tests now run against the
+  latest official Rust SDK (3.5.1) and TypeScript SDK (2.3.1). All 11 pass.
 
 ## Still open
 
-- `memory.list` still builds its whole reply in memory before sending it. The memory is now
-  handed back afterwards, but building the reply directly would also make it faster.
-- These memory numbers come from a test on a copy of a real store, not from a day of real use.
-- If you press Start on a card in the same moment the stall check is releasing it, the start
-  can still lose. The window is a few milliseconds.
+- The built-in offline text recognition (OCR) is compiled into the app, but nothing calls it.
+  Whether to connect it or remove it is the owner's call.
+- The router still has no heartbeat card.
+- Nanna does not yet run models itself. That waits on the Mummu model runner, which first needs to
+  move to burn 0.22.0, released 2026-10-06.
