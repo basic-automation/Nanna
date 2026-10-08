@@ -31,4 +31,4 @@ uuid.workspace = true
 # ingest), `bulk_load` at 50k 121 ms vs 181 ms (once per boot), and a boot on a real
 # 105 MB store peaked at ~295 MB vs ~232 MB RSS but idled at ~185 MB vs ~237 MB.
 # The hot path wins, and no C allocator is built. Re-measure before turning it on.
-turso = { version = "=0.8.1", default-features = false, features = ["pure-rust-crypto"] }
+turso = { version = "=0.8.2", default-features = false, features = ["pure-rust-crypto"] }

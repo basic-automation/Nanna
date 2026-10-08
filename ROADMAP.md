@@ -10098,6 +10098,22 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `pnpm outdated` reports `4.1.0 → 2.24.3` — the v4 line is published under `next`, so `latest`
            points at the *older* Vue-2 package. **Never let `pnpm update --latest` "upgrade" this one**;
            it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
+   - *(2026-10-08 sweep)* `cargo update` → 37 compatible bumps, led by **`turso 0.8.2`** (stable,
+     2026-10-06; the exact pin moved `=0.8.1 → =0.8.2` so `turso` and `turso_core` stay in
+     lockstep) plus `hyper 1.12`, `h2 0.4.20`, `jiff 0.2.38`, `toml 1.1.7`, `zerocopy 0.8.62`,
+     `tauri-plugin-{shell 2.4.1, updater 2.13.2}`. **Held back, with the exact failure:**
+     `rustpython-ruff_* 0.16.5 → 0.16.10` is a semver break for `rustpython-codegen 0.6.0` (still
+     the latest): `ExprCompare` lost `left`/`comparators` and the comprehension `generators` became
+     `Box<[_]>` (E0026/E0308, 10 errors), so all five ruff crates stay at 0.16.5 via
+     `cargo update --precise`. `cargo upgrade --incompatible` offered only `rten 0.26 → 0.27`, and
+     it is the 0.24/0.25 story again: `ocrs 0.13.1` (latest, 2026-09-13) requires `rten ^0.26`, so
+     the bump resolves two `rten`s (dependabot #411 fails CI for the same reason). Not taken.
+     `turso_core 0.8.2` still requires `branches ^0.4.3` and no `branches 0.4.7` exists, so the
+     toolchain pin stays at nightly-2026-10-03. GUI: `nuxt 4.6.0`, `vue-router 5.4.0`,
+     `marked 18.1.0`, `@lucide/vue 1.53.0`, `@playwright/test 1.64.0` and the two Tauri plugin JS
+     halves in lockstep; TypeScript 7 still blocked (`vue-tsc` 3.3.12). Verified: clippy 0
+     warnings, **2828 Rust tests / 89 binaries, 0 failures**, vitest 437/437, typecheck 0 errors,
+     `pnpm generate` green.
    - *(2026-09-27 sweep)* `cargo update` → the Tauri plugin minors (`dialog 2.8.0`, `fs 2.6.0`,
      `notification 2.5.0`, `process 2.4.0`, `shell 2.4.0`, `updater 2.13.0`,
      `tauri-winrt-notification 0.8.1`) plus `notify-rust 4.18.1`; the JS halves bumped in
