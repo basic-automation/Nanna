@@ -8830,6 +8830,24 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       which the context and the root crate use, stay. And the multi-agent module (`multi.rs`,
       1 098 lines: `AgentCoordinator`, `SwarmCoordinator` and eleven more re-exported types —
       the review's `MultiAgent`) — no caller; sub-agents are sub-tasks now.
+      *(2026-10-08 — the Rust built-in tools, audited type by type.)* Of 37 `impl Tool` types in
+      `nanna-tools/src/builtin`, the daemon builds exactly one (`AskParentTool`, `server.rs`); 16
+      more are registered only by the root `nanna` CLI/`serve` path (`src/setup.rs`
+      `init_components`) and stay while that path exists. **Deleted, no constructor anywhere
+      outside their own files (~1 490 lines):** `code.rs` (`CodeOutlineTool`, `CodeSearchTool`,
+      `ProjectStructureTool` — the live ones of those names are `tool.ts`), `authoring.rs`
+      (`CreateToolTool`/`ListToolsTool`/`DeleteToolTool`/`ScriptToolExecutor`/`ToolStore`; the
+      daemon's authoring is the `tools.*` script service), `browser.rs` (four browser tools, built
+      only by `create_browser_tools`, which had no caller), `task.rs` (`TaskTool`; sub-agents are
+      sub-tasks), `WebSearchBatchTool`, and the stub `ScreenshotTool` that returned "not yet
+      implemented". `glob` left with them. `AgentSpawner` stays (the daemon implements it).
+      **Still open:** test-only Tool structs whose *functions* are live (`AnalyzeImageTool`,
+      `TextToSpeechTool`/`TranscribeTool` and their `create_*_tool` factories, `OcrTool`,
+      `DescribeImageTool`, `ReadPdfTool` — the daemon calls the `create_*_fn` closures and the
+      pdf/ocr functions, never the structs); the CLI path's 16 tools (an owner call: is the
+      `nanna` CLI/`serve` path still wanted beside the daemon?); and the Deno path —
+      `nanna-scripting`'s `deno` feature is enabled by no crate (only its own unused `full`), so
+      `deno_core`/`deno_ast`/`deno_error` are optional dependencies nothing builds.
 
 **Stage 1 — store, memory, storage:**
 - [x] `VectorStore::update_content` must also clear `memories.embedding`/`embedding_model` and
@@ -10179,7 +10197,7 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            Upstream: [branches#10](https://github.com/fereidani/branches/issues/10), fix in
            [branches#11](https://github.com/fereidani/branches/pull/11) (the intrinsic was renamed in
            rust-lang/rust#163574) — a 0.4.x patch release from that PR unblocks us with no turso change.
-     - [ ] **`turso` 0.7.2 is the latest stable (2026-07-30); we are exact-pinned at `=0.6.1`.** 0.7.0
+     - [x] **`turso` 0.7.2 is the latest stable (2026-07-30); we are exact-pinned at `=0.6.1`.** 0.7.0
            brought MVCC passive checkpoints, recovery fixes and an MVCC-safe AUTOINCREMENT
            ([notes](https://github.com/tursodatabase/turso/releases/tag/v0.7.0)); 0.8.0 is in
            pre-release (pre.13, 2026-09-25). Migrate one minor at a time, release-build gated. It does
@@ -10207,6 +10225,8 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            nanna-daemon` 6m52s, and a release boot against a copy of the operator's real 101 MB
            `nanna.db` + WAL (3730 memories and 23 sessions load, "Daemon ready", no panic).
            Unblocks the P12 `mummu` integration retry below (the turso split).
+           *(2026-10-08 — closing the box.)* Done since 10-03; the pin moved again today to
+           `=0.8.2` (stable 2026-10-06) in the dependency sweep.
      - [x] *(found 2026-10-03)* **turso makes `mimalloc` (a C allocator) Nanna's global
            allocator.** `turso` 0.7 and 0.8 both declare `#[global_allocator] static GLOBAL:
            mimalloc::MiMalloc` under their default `mimalloc` feature, so every allocation in the
@@ -10291,6 +10311,9 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            unreleased); `fsrs-rs` is at 6.6.2 with no FSRS-7, and no FSRS-7 default parameters are
            published (srs-benchmark experiments are still open). Re-check when `fsrs-rs` ships it;
            adopting it is the same retention-harness A/B the FSRS-6 weight decision needed.
+           *(re-checked 2026-10-08)* Still unreleased: `fsrs` 6.6.2 is the newest crate, but FSRS-7 has
+           reached fsrs-rs itself as open work ([fsrs-rs#463](https://github.com/open-spaced-repetition/fsrs-rs/pull/463),
+           aligning its training defaults with srs-benchmark). Watch for a 7.x crate.
      - [ ] *(research 2026-09-29)* **Upstream is moving `turso_core` to pure Rust by default** —
            [tursodatabase/turso#7660](https://github.com/tursodatabase/turso/issues/7660) proposes
            putting `aegis` and `simsimd` behind a feature flag. We already select
@@ -11414,6 +11437,16 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
                        0.38.2`, and `burn 0.22.0-pre.4` has been on crates.io since 2026-09-22. The
                        next step is Mummu's burn bump (its routine's item); re-try adding `mummu`
                        here only after its lockfile is free of `rusqlite`.
+                       *(research 2026-10-08)* **The chain lines up exactly now.** `burn 0.22.0` went
+                       stable on 2026-10-06; `burn-cubecl 0.22.0` → `cubecl ^0.11.0` →
+                       `cubecl-environment 0.11.0`, whose only database dependency is an *optional*
+                       `turso ^0.8.2` — no `rusqlite` — and Nanna's pin moved to `=0.8.2` today, so a
+                       Mummu on burn 0.22.0 should resolve to **one** turso in Nanna's graph.
+                       ([crates.io deps](https://crates.io/api/v1/crates/cubecl-environment/0.11.0/dependencies))
+                       Mummu's `origin/main` (58f8ad2) still pins `0.22.0-pre.3` with `rusqlite 0.40.2`
+                       in its lock, so the step is still Mummu's: pre.3 → 0.22.0 stable (no longer a
+                       pre-release on an exact pin), re-run its parity harness, then add `mummu` here
+                       and read the lockfile.
                  - [ ] **Measure before deciding, if 0.8.0 stays unstable:** add `mummu` at
                        burn 0.22-pre.4 on a scratch branch and read the resolved lockfile. If the
                        guard passes and the second turso is confined to cubecl's autotune cache,

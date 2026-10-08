@@ -3,7 +3,6 @@
 //! Provides helpers to connect browser tools to actual browser backends
 //! (CDP via chromiumoxide or Playwright).
 
-use super::browser::{BrowserActionTool, BrowserEvaluateTool, BrowserExtractTool, BrowserFn, BrowserScreenshotTool};
 use nanna_browser::{Browser, BrowserConfig, BrowserError, BrowserPage, ScreenshotOptions, ImageFormat};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -294,47 +293,6 @@ impl BrowserManager {
     pub async fn close(&self) -> Result<(), BrowserError> {
         self.browser.close().await
     }
-}
-
-/// Create wired browser tools from a browser manager.
-///
-/// Returns a tuple of (screenshot, extract, action, evaluate) tools.
-pub fn create_browser_tools(
-    manager: Arc<BrowserManager>,
-) -> (BrowserScreenshotTool, BrowserExtractTool, BrowserActionTool, BrowserEvaluateTool) {
-    // Screenshot tool
-    let mgr = manager.clone();
-    let screenshot_fn: BrowserFn<Vec<u8>> = Arc::new(move |url, params| {
-        let mgr = mgr.clone();
-        Box::pin(async move { mgr.screenshot(&url, &params).await })
-    });
-    let screenshot_tool = BrowserScreenshotTool::new().with_screenshot_fn(screenshot_fn);
-
-    // Extract tool
-    let mgr = manager.clone();
-    let extract_fn: BrowserFn<String> = Arc::new(move |url, params| {
-        let mgr = mgr.clone();
-        Box::pin(async move { mgr.extract(&url, &params).await })
-    });
-    let extract_tool = BrowserExtractTool::new().with_extract_fn(extract_fn);
-
-    // Action tool
-    let mgr = manager.clone();
-    let action_fn: BrowserFn<String> = Arc::new(move |url, params| {
-        let mgr = mgr.clone();
-        Box::pin(async move { mgr.action(&url, &params).await })
-    });
-    let action_tool = BrowserActionTool::new().with_action_fn(action_fn);
-
-    // Evaluate tool
-    let mgr = manager;
-    let evaluate_fn: BrowserFn<Value> = Arc::new(move |url, params| {
-        let mgr = mgr.clone();
-        Box::pin(async move { mgr.evaluate(&url, &params).await })
-    });
-    let evaluate_tool = BrowserEvaluateTool::new().with_evaluate_fn(evaluate_fn);
-
-    (screenshot_tool, extract_tool, action_tool, evaluate_tool)
 }
 
 #[cfg(test)]

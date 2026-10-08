@@ -151,45 +151,6 @@ impl Tool for AnalyzeImageTool {
     }
 }
 
-/// Tool for taking screenshots of web pages
-pub struct ScreenshotTool {
-    // Will be implemented with browser automation
-}
-
-impl ScreenshotTool {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {}
-    }
-}
-
-impl Default for ScreenshotTool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl Tool for ScreenshotTool {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition::new("screenshot", "Take a screenshot of a web page (not yet implemented)")
-            .string_param("url", "URL of the page to screenshot", true)
-            .bool_param("full_page", "Capture full page (not just viewport)", false)
-    }
-
-    async fn execute(&self, params: HashMap<String, Value>) -> Result<ToolResult, ToolError> {
-        let url = params
-            .get("url")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParams("Missing 'url' parameter".to_string()))?;
-
-        // Placeholder - will be implemented with browser automation
-        Err(ToolError::ExecutionFailed(format!(
-            "Screenshot tool not yet implemented. URL: {url}"
-        )))
-    }
-}
-
 #[cfg(test)]
 mod image_input_tests {
     use super::{IMAGE_BYTES_MAX, image_media_type, read_image_as_base64};

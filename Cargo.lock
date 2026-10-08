@@ -5760,7 +5760,6 @@ dependencies = [
  "base64-simd",
  "directories",
  "futures",
- "glob",
  "image",
  "lopdf",
  "nanna-browser",
