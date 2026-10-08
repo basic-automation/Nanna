@@ -1,0 +1,67 @@
+# Gate: the frontend must still generate on Windows.
+#
+# The hole this closes (2026-10-08): the nightly took `nuxt 4.5.2 -> 4.6.0`.
+# `pnpm generate` passed on Linux, locally and in every PR check, and the PR's
+# Windows `build-release` job passed too, because that job builds only the
+# daemon. The first Windows `pnpm generate` was inside `release.yml`, after the
+# merge, and it failed: every prerendered route answered 500 with
+# "Either manifest or precomputed data must be provided" (nuxt's server
+# renderer). The release published nothing and the bump had to be reverted.
+#
+# So a change to what the frontend is built from runs the release's own
+# frontend command on the release's own OS before it can merge. It is cheap
+# (no Rust), so it runs on every such change rather than weekly.
+name: frontend-windows
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "gui/package.json"
+      - "gui/pnpm-lock.yaml"
+      - "gui/nuxt.config.ts"
+      - "gui/scripts/clean-nuxt-cache.mjs"
+      - ".github/workflows/frontend-windows.yml"
+  pull_request:
+    paths:
+      - "gui/package.json"
+      - "gui/pnpm-lock.yaml"
+      - "gui/nuxt.config.ts"
+      - "gui/scripts/clean-nuxt-cache.mjs"
+      - ".github/workflows/frontend-windows.yml"
+  # Nothing in the repo has to change for this to break (a runner image or a
+  # Node update can); once a week catches that without paying per push.
+  schedule:
+    - cron: "0 9 * * 3"
+  workflow_dispatch:
+
+concurrency:
+  group: frontend-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generate:
+    name: pnpm generate (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      # No `cache: pnpm`, for the same reason as release.yml: its post-step
+      # path validation can fail a job that otherwise succeeded.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install frontend dependencies
+        working-directory: gui
+        run: pnpm install --frozen-lockfile
+
+      # Exactly the frontend half of release.yml's beforeBuildCommand.
+      - name: Generate the static frontend
+        working-directory: gui
+        run: pnpm generate
