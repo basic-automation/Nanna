@@ -1241,7 +1241,7 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       `gui/e2e/tauri-driver.md` (launch → Settings → Logs → close hygiene). Soft-skips when binary/driver missing
       so web CI stays hermetic; armed via `NANNA_TAURI_E2E=1` once a packaged binary is present. Wire full
       WebDriverIO session when nightly hosts a display + driver pair.
-- [ ] *(measured 2026-09-08)* **GUI WebDriver verification is unavailable on the Linux host, and
+- [x] *(measured 2026-09-08)* **GUI WebDriver verification is unavailable on the Linux host, and
       NOT because a package is merely uninstalled.** The routine's own host notes say
       `WebKitWebDriver` arrives with `pacman -S webkit2gtk-4.1`. That is wrong for Arch:
       **`webkit2gtk-4.1` 2.52.6-1 IS installed** here and its 416-file manifest ships
@@ -1263,6 +1263,10 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       verification** — headless checks plus "needs on-device verification" is the honest ceiling.
       `cargo-tauri` and `tauri-driver` are also not installed, but those are `cargo install`-able
       and are not the blocker.
+      *(2026-10-08 — closed, superseded.)* The alternative provider landed: `e2e-webdriver` +
+      `tauri-webdriver` (P0.3 Linux host section) needs no `WebKitWebDriver`, has worked since
+      2026-09-18, and drove the built GUI again this run. The shared `.sh` harness still targets
+      `tauri-driver`; that stays its own item.
 - [x] **Critical-path scenarios** *(2026-07-22)* — `e2e/critical-path.spec.ts`: first-run/no-key empty state;
       chat send → stream → Stop (mock LLM); session create/rename/delete/switch; backend disconnect toast +
       reconnect affordance; Settings API-key round-trip; Logs Live/Paused, Clear, Copy all.
@@ -2901,7 +2905,7 @@ so neither CI nor any prior run could have caught them:
       and the presence of `discover_tools/tool.ts` rather than the spelling of the path. 1728
       workspace tests green.
 
-- [ ] *(measured 2026-09-13)* **GUI WebDriver verification is blocked on this host, and every
+- [x] *(measured 2026-09-13)* **GUI WebDriver verification is blocked on this host, and every
       published install instruction for it names the wrong Arch package.** The shared harness's
       `ensure` reports `MISS WebKitWebDriver` and advises `sudo pacman -S --needed webkit2gtk-4.1` —
       but `webkit2gtk-4.1 2.52.6-1` **is already installed here and does not contain the binary**.
@@ -2914,6 +2918,9 @@ so neither CI nor any prior run could have caught them:
       verification as unavailable rather than skipped — the Linux WebDriver harness has still never
       had a successful `exec`. Sources: [Tauri WebDriver](https://v2.tauri.app/develop/tests/webdriver/),
       [WebdriverIO Tauri platform support](https://webdriver.io/docs/desktop-testing/tauri/platform-support/).
+      *(2026-10-08 — closed, superseded.)* The plugin route (`e2e-webdriver` + `tauri-webdriver`,
+      below under the WebKitWebDriver item) needs no `WebKitWebDriver` and has worked since
+      2026-09-18; this run drove the built GUI with it again (memory page over a scratch daemon).
 - [ ] *(2026-09-13)* **Correct the harness's own remedy string** once the package above is confirmed:
       `~/.claude/scheduled-tasks/_shared/tauri-webdriver.sh` prints the `webkit2gtk-4.1` advice, which
       sends the reader to a package they already have. It lives outside this repo, so a run cannot
@@ -9853,7 +9860,7 @@ keep the phases readable; promote individual items into a phase when they become
       **4.1**, and WebKitGTK's automation handshake is per-library-generation. **Whether a 6.0 driver
       can drive a 4.1 app is unproven and is the actual open question** — it is not a package the owner
       has simply not installed yet.
-      - [ ] Owner step, in this order. **(a)** `sudo pacman -S --needed webkitgtk-6.0` — seconds, and
+      - [x] Owner step, in this order. **(a)** `sudo pacman -S --needed webkitgtk-6.0` — seconds, and
             the only packaged candidate; if a 6.0 driver can drive a 4.1 app the problem is over.
             **(b)** If it cannot, the community's answer is a **source build of WebKitWebDriver
             matched to the installed `webkit2gtk-4.1`** (`-DENABLE_WEBDRIVER=ON`), which must be
@@ -9863,6 +9870,9 @@ keep the phases readable; promote individual items into a phase when they become
             or WebdriverIO's `@wdio/tauri-service`, whose docs list other Linux providers).
             Until one lands **the Linux WebDriver harness stays UNVALIDATED** and no run may claim
             GUI verification passed.
+            *(2026-10-08 — closed, superseded.)* The plugin route (`e2e-webdriver` + `tauri-webdriver`,
+            below under the WebKitWebDriver item) needs no `WebKitWebDriver` and has worked since
+            2026-09-18; this run drove the built GUI with it again (memory page over a scratch daemon).
       - [x] *(research 2026-09-17 — option (c) above has matured into the cheapest route)*
             **`tauri-plugin-webdriver` 0.2.3 + `tauri-webdriver` 0.2.0 (both 2026-09-01, MIT; the
             plugin has ~119k downloads)** embed a W3C WebDriver server *inside the Tauri app*, so on
