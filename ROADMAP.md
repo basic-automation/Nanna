@@ -8280,6 +8280,18 @@ as its turn (`TurnAdmission`, scope default `session`).
       boot close-out handles the rest); a narrow race between the sweep's liveness read and a
       manual Start is still open (a second `serves_card` check just before the release would
       close most of it).
+      *(2026-10-08)* **The race is closed in both directions, not narrowed.** The sweep's release
+      and a run's registration now happen under the same `runs` write guard: the sweep takes
+      `TaskRunManager::fence_starts()` and re-judges under it (`still_stalled`: no live run on the
+      card's lineage, and the card still `in_progress` with the same member, so a person's edit
+      since the judgement stands too) before writing anything; `claim_slot` re-reads the card
+      under the guard and refuses a claim whose card is no longer assigned to the claiming member.
+      So a Start lands wholly before the release (the card is kept, and no `stalled` row counts
+      against the router's retry bound) or wholly after it (refused: "no longer assigned").
+      The fence is held for the few store writes of one release, never across a model call.
+      Tests `a_start_between_the_judgement_and_the_release_keeps_its_card`,
+      `a_start_after_the_release_is_refused`, `the_fence_holds_starts_and_a_changed_card_is_kept`;
+      each of the two guards, removed, fails its test.
 - [x] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
       *(2026-09-28)* `RouterDecision::Assign` gained optional `labels` and `acceptance`. Labels
