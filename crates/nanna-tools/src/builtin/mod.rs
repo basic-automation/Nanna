@@ -2,9 +2,6 @@
 
 mod ask_parent;
 mod audio;
-mod authoring;
-mod browser;
-mod code;
 mod curiosity;
 mod echo;
 mod exec;
@@ -14,7 +11,6 @@ mod memory_storage;
 mod ocr;
 mod pdf;
 mod schedule;
-mod task;
 mod vision;
 mod web;
 
@@ -26,10 +22,7 @@ mod vision_wiring;
 
 mod audio_wiring;
 
-pub use audio::{OpenAiTts, OpenAiWhisper, TextToSpeechTool, TranscribeFn, TranscribeTool, TtsFn};
-pub use authoring::{CreateToolTool, DeleteToolTool, ListToolsTool, ScriptTool, ScriptToolExecutor, ToolStore};
-pub use browser::{BrowserActionTool, BrowserEvaluateTool, BrowserExtractTool, BrowserFn, BrowserScreenshotTool};
-pub use code::{CodeOutlineTool, CodeSearchTool, ProjectStructureTool};
+pub use audio::{OpenAiTts, OpenAiWhisper, TranscribeFn, TtsFn};
 pub use curiosity::{ExploreTool, WonderTool, StatusTool};
 pub use echo::EchoTool;
 pub use exec::ExecTool;
@@ -40,16 +33,15 @@ pub use ocr::{DescribeImageTool, OcrTool, OcrVisionFn};
 pub use pdf::{OcrFn as PdfOcrFn, PDF_MAX_BYTES, PageSelection, PdfExtract, PdfOcrOutcome, PdfVisionFn, ReadPdfTool, ocr_empty_pages, parse_page_selection, read_pdf_text};
 pub use schedule::{ReminderStore, SchedulerState, RemindTool, ListRemindersTool, CancelReminderTool};
 pub use ask_parent::AskParentTool;
-pub use task::TaskTool;
-pub use vision::{AnalyzeImageTool, IMAGE_BYTES_MAX, ScreenshotTool, VisionFn, image_media_type, read_image_as_base64};
-pub use web::{WebSearchTool, WebSearchBatchTool, WebFetchTool};
+pub use vision::{IMAGE_BYTES_MAX, VisionFn, image_media_type, read_image_as_base64};
+pub use web::{WebSearchTool, WebFetchTool};
 
 #[cfg(feature = "browser")]
-pub use browser_wiring::{BrowserManager, create_browser_tools};
+pub use browser_wiring::BrowserManager;
 #[cfg(feature = "browser")]
 pub use nanna_browser::{BrowserConfig, BrowserType};
 
 #[cfg(feature = "vision")]
-pub use vision_wiring::{create_vision_fn, create_vision_tool};
+pub use vision_wiring::create_vision_fn;
 
-pub use audio_wiring::{create_audio_tools, create_transcribe_tool, create_transcribe_tool_fn, create_tts_fn, create_tts_tool, create_tts_tool_with_dir};
+pub use audio_wiring::{create_transcribe_tool_fn, create_tts_fn};

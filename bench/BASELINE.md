@@ -938,6 +938,33 @@ of it: the trimmed daemon still drifts up slowly, at about a third of the untrim
 cycles the four builds stood at ~439 / ~352 / ~306 / ~213 MB. Not covered: a day of real use on
 the operator's machine.
 
+### 2026-10-08: `memory.list` serialized from typed rows
+
+`memory.list` used to build its reply as a `serde_json::Value` tree, deep-copy that tree into the
+`Response` (`Response::success` ran `to_value` on a `Value`), then write the string. It now writes
+typed rows into one buffer reserved at an estimate of the final size and splices that into a frame
+allocated once at its exact size. The reply text is unchanged: same keys in the same order, floats
+widened to f64 as before.
+
+Release daemons A (before) and B (after), same tree otherwise, run one after the other with the
+harness above (isolated HOME/config/data dir, heartbeat off, no model). The operator's store has
+shrunk to 561 memories (a 0.64 MB reply, below the 1 MiB trim line), so the large case is a copy of
+it inflated to **3 927 memories** by duplicating rows with padded content (**15.8 MB reply**). One
+`memory.list` every 11.5 s, 8 calls; latency is send-to-full-reply at the client, RSS is read 1.5 s
+after the reply.
+
+| store | build | latency, calls 1–7 (mean) | RSS after call 7 | VmHWM after call 7 |
+| --- | --- | --- | --- | --- |
+| 561 memories | A | 5.1–8.2 ms | 76.1 MB | 76.1 MB |
+| 561 memories | B | 4.1–6.9 ms | 70.3 MB | 70.8 MB |
+| 3 927 memories | A | 63–92 ms (**78.8**) | 166.8 MB | 185.2 MB |
+| 3 927 memories | B | 59–78 ms (**66.7**) | 159.3 MB | 191.9 MB |
+
+About 15% less time per large reply. RSS and peak are **not** improved beyond noise: a second run
+of A on the same load ended at 127 MB, the first at 167 MB. A first version of B that grew two
+16 MB strings by doubling was clearly worse (RSS 107 → 204 MB over 8 calls, VmHWM 236 MB) and was
+not shipped; reserving the buffers up front is what removed that.
+
 ---
 
 ## Suite 6 — Efficiency (not yet baselined)

@@ -11,7 +11,6 @@ use crate::ipc::{IpcServer, IpcServerConfig};
 use crate::llm_router::LlmRouter;
 use crate::memory_persistence::TursoMemoryPersistence;
 use crate::persistence::PersistenceManager;
-use crate::protocol::Response;
 use crate::session::SessionManager;
 use crate::webhook::{DEFAULT_WEBHOOK_PORT, WebhookConfig, WebhookServer};
 use async_trait::async_trait;
@@ -4810,9 +4809,8 @@ impl DaemonServer {
 
                     tokio::spawn(async move {
                         let request_id = request.id.clone();
-                        let result = control.handle(&client_id, request.action).await;
-                        let response = Response::success(request_id, result);
-                        if let Err(e) = ipc.send_response(&client_id, response).await {
+                        let reply = control.handle_reply(&client_id, request.action).await;
+                        if let Err(e) = ipc.send_reply(&client_id, &request_id, &reply).await {
                             warn!("Failed to send response to client {}: {}", client_id, e);
                         }
                     });

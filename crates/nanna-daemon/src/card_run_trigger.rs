@@ -405,10 +405,18 @@ pub async fn release_stalled(
     let mut released = 0usize;
     for card in candidates {
         match stall_check(storage, runs, &card, now).await {
-            Ok(Some((minutes, marker))) => {
-                if stall_card(storage, runs, &card, minutes, marker).await {
+            Ok(Some(stalled)) => {
+                // Judged again and released with starts held off: a manual
+                // Start registers under the same guard, so it lands wholly
+                // before this card's release (and keeps the card) or wholly
+                // after it (and is refused: the card is no longer its member's).
+                let fence = runs.fence_starts().await;
+                if still_stalled(storage, &fence, &card, &stalled.lineage, now).await
+                    && stall_card(storage, &fence, &card, stalled.minutes, stalled.marker).await
+                {
                     released += 1;
                 }
+                drop(fence);
             }
             Ok(None) => {}
             Err(e) => warn!(card_id = card.id, error = %e, "stall sweep: card not judged"),
@@ -421,14 +429,25 @@ pub async fn release_stalled(
     released
 }
 
-/// Whether `card` is stalled at `now`: its idle minutes and newest run
-/// marker when it is, `None` when it is not. Cheapest checks first.
+/// A card [`stall_check`] judged stalled.
+struct Stalled {
+    /// How long nothing has touched it.
+    minutes: i64,
+    /// Its newest run marker (a `Started` one is closed out on release).
+    marker: RunMarker,
+    /// The card, then its ancestors: what a serving run may be working.
+    lineage: Vec<i64>,
+}
+
+/// Whether `card` is stalled at `now`, `None` when it is not. Cheapest
+/// checks first. Read without holding starts off; [`still_stalled`] repeats
+/// the run check under the fence before anything is written.
 async fn stall_check(
     storage: &Storage,
     runs: &crate::tasks::TaskRunManager,
     card: &Task,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<(i64, RunMarker)>, nanna_storage::StorageError> {
+) -> Result<Option<Stalled>, nanna_storage::StorageError> {
     debug_assert_eq!(card.status, "in_progress", "the scan reads picked-up cards");
     let tasks = storage.tasks();
     let Some(minutes) = stalled_minutes(last_touch(&tasks.touch_times(card.id).await?), now) else {
@@ -468,7 +487,54 @@ async fn stall_check(
     {
         return Ok(None);
     }
-    Ok(Some((minutes, marker)))
+    Ok(Some(Stalled {
+        minutes,
+        marker,
+        lineage,
+    }))
+}
+
+/// [`stall_check`]'s verdict, re-read under `fence`: still no live run on
+/// `card`'s lineage (a manual Start may have registered since), the card
+/// still `in_progress` with the same member (a person may have moved or
+/// finished it), and still untouched past the threshold at `now` (a post or
+/// an edit since the judgement is someone working it). Any change keeps the
+/// card as it now is.
+async fn still_stalled(
+    storage: &Storage,
+    fence: &crate::tasks::StartFence<'_>,
+    card: &Task,
+    lineage: &[i64],
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    debug_assert_eq!(lineage.first(), Some(&card.id), "a lineage starts at the card");
+    if fence.serves_card(&card.scope, card.scope_id.as_deref(), lineage) {
+        debug!(card_id = card.id, "stall sweep: a run started on the card; kept");
+        return false;
+    }
+    let tasks = storage.tasks();
+    match tasks.get(card.id).await {
+        Ok(current) if current.status == "in_progress" && current.assignee == card.assignee => {}
+        Ok(current) => {
+            debug!(card_id = card.id, status = %current.status, "stall sweep: card changed; kept");
+            return false;
+        }
+        Err(e) => {
+            warn!(card_id = card.id, error = %e, "stall sweep: card unreadable; kept");
+            return false;
+        }
+    }
+    match tasks.touch_times(card.id).await {
+        Ok(times) if stalled_minutes(last_touch(&times), now).is_some() => true,
+        Ok(_) => {
+            debug!(card_id = card.id, "stall sweep: card touched since judged; kept");
+            false
+        }
+        Err(e) => {
+            warn!(card_id = card.id, error = %e, "stall sweep: card times unreadable; kept");
+            false
+        }
+    }
 }
 
 /// Hand stalled `card` back to its router; `true` when it was released.
@@ -478,7 +544,7 @@ async fn stall_check(
 /// the release that is the wake.
 async fn stall_card(
     storage: &Storage,
-    runs: &crate::tasks::TaskRunManager,
+    fence: &crate::tasks::StartFence<'_>,
     card: &Task,
     minutes: i64,
     marker: RunMarker,
@@ -515,7 +581,7 @@ async fn stall_card(
         warn!(card_id, error = %e, "stall sweep: stall not recorded; card kept");
         return false;
     }
-    if !runs.member_is_working(&member_id).await
+    if !fence.member_is_working(&member_id)
         && let Err(e) = storage
             .members()
             .set_status(&member_id, nanna_storage::MemberStatus::Idle)
@@ -1018,6 +1084,167 @@ mod tests {
             .await
             .expect("picked up");
         card.id
+    }
+
+    /// A control plane with a run manager, a store, and `agent:builder`.
+    async fn stall_rig() -> (ControlPlane, Arc<Storage>) {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let control = ControlPlane::new(Arc::new(crate::session::SessionManager::new()))
+            .with_task_runs(Arc::new(crate::tasks::TaskRunManager::new()))
+            .with_storage(Arc::clone(&storage))
+            .await;
+        storage
+            .members()
+            .create(nanna_storage::NewMember {
+                id: "agent:builder".to_string(),
+                name: "Builder".to_string(),
+                avatar: None,
+                kind: nanna_storage::MemberKind::Agent,
+                owner_kind: nanna_storage::MemberOwner::Workspace,
+                owner_id: None,
+                status: nanna_storage::MemberStatus::Busy,
+                profile: json!({}),
+            })
+            .await
+            .expect("member");
+        (control, storage)
+    }
+
+    fn builder_claim(card_id: i64) -> crate::tasks::CardClaim {
+        crate::tasks::CardClaim {
+            card_id,
+            member_id: "agent:builder".to_string(),
+        }
+    }
+
+    /// The sweep judged a card stalled, then a manual Start registered a run
+    /// on it before the release. The release is judged again under the
+    /// fence, so the started card keeps its member and no stall is recorded.
+    #[tokio::test]
+    async fn a_start_between_the_judgement_and_the_release_keeps_its_card() {
+        let (control, storage) = stall_rig().await;
+        let runs = Arc::clone(control.task_runs().expect("runs"));
+        let tasks = storage.tasks();
+        let id = picked_up_card(&storage, "gui", "raced").await;
+        let card = tasks.get(id).await.expect("card");
+        let later = chrono::Utc::now() + chrono::Duration::minutes(31);
+        let stalled = stall_check(&storage, &runs, &card, later)
+            .await
+            .expect("judged")
+            .expect("stalled before the start");
+
+        runs.claim_slot(
+            format!("card:{id}"),
+            "global:".to_string(),
+            "raced".to_string(),
+            Some(builder_claim(id)),
+            Some(&storage),
+        )
+        .await
+        .expect("the start registers: the card is still the builder's");
+
+        let fence = runs.fence_starts().await;
+        assert!(
+            !still_stalled(&storage, &fence, &card, &stalled.lineage, later).await,
+            "a run serves it now"
+        );
+        drop(fence);
+        assert_eq!(release_stalled(&control, &storage, later).await, 0);
+        let kept = tasks.get(id).await.expect("card");
+        assert_eq!(kept.status, "in_progress");
+        assert_eq!(kept.assignee.as_deref(), Some("agent:builder"));
+        let activity = tasks.activity(id, 32).await.expect("activity");
+        assert!(
+            !activity.iter().any(|row| row.action == crate::tasks::STALLED_ACTION),
+            "no stall recorded against a card being worked: {activity:?}"
+        );
+    }
+
+    /// The other order: the release lands first, and a Start that read the
+    /// card before it is refused at registration — the card is no longer
+    /// its member's, so nobody works a card the router now owns.
+    #[tokio::test]
+    async fn a_start_after_the_release_is_refused() {
+        let (control, storage) = stall_rig().await;
+        let runs = Arc::clone(control.task_runs().expect("runs"));
+        let id = picked_up_card(&storage, "gui", "released").await;
+        let later = chrono::Utc::now() + chrono::Duration::minutes(31);
+        assert_eq!(release_stalled(&control, &storage, later).await, 1);
+
+        let refused = runs
+            .claim_slot(
+                format!("card:{id}"),
+                "global:".to_string(),
+                "released".to_string(),
+                Some(builder_claim(id)),
+                Some(&storage),
+            )
+            .await
+            .expect_err("a stale claim does not register");
+        assert!(refused.contains("no longer assigned"), "{refused}");
+        assert!(!runs.serves_card("global", None, &[id]).await, "nothing registered");
+        assert!(!runs.member_is_working("agent:builder").await);
+    }
+
+    /// While the sweep holds the fence, a start waits; it registers once the
+    /// fence drops. And a card a person changed after the judgement is kept.
+    #[tokio::test]
+    async fn the_fence_holds_starts_and_a_changed_card_is_kept() {
+        let (control, storage) = stall_rig().await;
+        let runs = Arc::clone(control.task_runs().expect("runs"));
+        let tasks = storage.tasks();
+        let id = picked_up_card(&storage, "gui", "fenced").await;
+
+        let fence = runs.fence_starts().await;
+        let start = {
+            let runs = Arc::clone(&runs);
+            let storage = Arc::clone(&storage);
+            tokio::spawn(async move {
+                runs.claim_slot(
+                    format!("card:{id}"),
+                    "global:".to_string(),
+                    "fenced".to_string(),
+                    Some(builder_claim(id)),
+                    Some(&storage),
+                )
+                .await
+                .map(|_| ())
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!start.is_finished(), "a start cannot register through the fence");
+        assert!(!fence.serves_card("global", None, &[id]));
+        drop(fence);
+        start.await.expect("joined").expect("registered after the fence");
+        assert!(runs.serves_card("global", None, &[id]).await);
+
+        let other = picked_up_card(&storage, "gui", "moved by hand").await;
+        let judged = tasks.get(other).await.expect("card");
+        let patch = nanna_storage::TaskPatch {
+            assignee: Some(None),
+            ..nanna_storage::TaskPatch::default()
+        };
+        tasks.update(other, patch, Some("gui")).await.expect("moved");
+        let fence = runs.fence_starts().await;
+        assert!(
+            !still_stalled(&storage, &fence, &judged, &[other], chrono::Utc::now() + chrono::Duration::minutes(31)).await,
+            "the person's change stands"
+        );
+        drop(fence);
+
+        // Re-judged at a moment the card's newest touch is inside the
+        // threshold (a post or an edit since the sweep read it): kept.
+        let touched = picked_up_card(&storage, "gui", "commented on").await;
+        let card = tasks.get(touched).await.expect("card");
+        let fence = runs.fence_starts().await;
+        assert!(
+            still_stalled(&storage, &fence, &card, &[touched], chrono::Utc::now() + chrono::Duration::minutes(31)).await,
+            "untouched for 31 minutes: still stalled"
+        );
+        assert!(
+            !still_stalled(&storage, &fence, &card, &[touched], chrono::Utc::now()).await,
+            "touched within the threshold: kept"
+        );
     }
 
     #[test]

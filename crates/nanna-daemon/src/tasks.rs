@@ -8341,6 +8341,77 @@ fn run_conflict(
     None
 }
 
+/// Whether a live run in `runs` serves a card of board `scope`/`scope_id`
+/// whose lineage (the card, then its ancestors) is `lineage`.
+fn serves_card_in(
+    runs: &HashMap<String, ActiveRun>,
+    scope: &str,
+    scope_id: Option<&str>,
+    lineage: &[i64],
+) -> bool {
+    debug_assert!(!lineage.is_empty(), "a lineage starts at the card");
+    debug_assert!(
+        lineage.len() <= nanna_storage::TASK_DEPTH_MAX + 1,
+        "bounded by depth"
+    );
+    let scope_key = TaskRunManager::scope_key(scope, scope_id);
+    runs.values().any(|run| {
+        run.card.as_ref().map_or_else(
+            || run.scope_key == scope_key,
+            |claim| lineage.contains(&claim.card_id),
+        )
+    })
+}
+
+fn member_is_working_in(runs: &HashMap<String, ActiveRun>, member_id: &str) -> bool {
+    debug_assert!(!member_id.is_empty(), "a member has an id");
+    runs.values().any(|run| {
+        run.card
+            .as_ref()
+            .is_some_and(|claim| claim.member_id == member_id)
+    })
+}
+
+/// The run table, held so no run starts or ends while the holder acts on a
+/// judgement about it (see [`TaskRunManager::fence_starts`]).
+pub struct StartFence<'a> {
+    runs: tokio::sync::RwLockWriteGuard<'a, HashMap<String, ActiveRun>>,
+}
+
+impl StartFence<'_> {
+    /// [`TaskRunManager::serves_card`], read through the fence.
+    #[must_use]
+    pub fn serves_card(&self, scope: &str, scope_id: Option<&str>, lineage: &[i64]) -> bool {
+        serves_card_in(&self.runs, scope, scope_id, lineage)
+    }
+
+    /// [`TaskRunManager::member_is_working`], read through the fence.
+    #[must_use]
+    pub fn member_is_working(&self, member_id: &str) -> bool {
+        member_is_working_in(&self.runs, member_id)
+    }
+}
+
+/// `Ok` when card `claim.card_id` is still assigned to `claim.member_id`.
+async fn claim_still_holds(store: &Storage, claim: &CardClaim) -> Result<(), String> {
+    debug_assert!(claim.card_id > 0, "a claim names a card");
+    let card = store
+        .tasks()
+        .get(claim.card_id)
+        .await
+        .map_err(|e| format!("card #{} is unreadable: {e}", claim.card_id))?;
+    if card.assignee.as_deref() == Some(claim.member_id.as_str()) {
+        return Ok(());
+    }
+    Err(format!(
+        "card #{} is no longer assigned to {} (now: {}); it was released or reassigned before \
+         its run could start",
+        claim.card_id,
+        claim.member_id,
+        card.assignee.as_deref().unwrap_or("nobody"),
+    ))
+}
+
 /// Status snapshot returned over IPC.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RunStatus {
@@ -8465,16 +8536,28 @@ impl TaskRunManager {
 
     /// Register a run under `key`, or say why it may not start. Checked and
     /// inserted under one write guard, so two starts cannot both pass.
-    async fn claim_slot(
+    ///
+    /// With `store`, a card claim is also checked against the card itself,
+    /// under the same guard: the card must still be assigned to the claiming
+    /// member. A start reads the card long before it registers (it builds a
+    /// runner in between), and the stall sweep releases cards under this
+    /// guard too ([`Self::fence_starts`]), so a card released or reassigned in
+    /// that gap is refused here instead of being worked by a member it no
+    /// longer belongs to.
+    pub(crate) async fn claim_slot(
         &self,
         key: String,
         scope_key: String,
         goal: String,
         card: Option<CardClaim>,
+        store: Option<&Storage>,
     ) -> Result<CancelToken, String> {
         let mut runs = self.runs.write().await;
         if let Some(reason) = run_conflict(&runs, &scope_key, card.as_ref()) {
             return Err(reason);
+        }
+        if let (Some(claim), Some(store)) = (card.as_ref(), store) {
+            claim_still_holds(store, claim).await?;
         }
         let cancel = CancelToken::new();
         let previous = runs.insert(
@@ -8505,7 +8588,7 @@ impl TaskRunManager {
             .as_ref()
             .map_or_else(|| scope_key.clone(), |claim| Self::card_key(claim.card_id));
         let cancel = self
-            .claim_slot(key.clone(), scope_key, goal.clone(), card.clone())
+            .claim_slot(key.clone(), scope_key, goal.clone(), card.clone(), Some(&source.storage))
             .await?;
         let busy_member = card.map(|claim| claim.member_id);
         set_member_status(&source.storage, busy_member.as_deref(), MemberStatus::Busy).await;
@@ -8640,30 +8723,24 @@ impl TaskRunManager {
     /// of them, or a scope run over the whole board. A sub-card worked inside
     /// its parent's run has no run of its own and is still being worked.
     pub async fn serves_card(&self, scope: &str, scope_id: Option<&str>, lineage: &[i64]) -> bool {
-        debug_assert!(!lineage.is_empty(), "a lineage starts at the card");
-        debug_assert!(
-            lineage.len() <= nanna_storage::TASK_DEPTH_MAX + 1,
-            "bounded by depth"
-        );
-        let scope_key = Self::scope_key(scope, scope_id);
-        let runs = self.runs.read().await;
-        runs.values().any(|run| {
-            run.card.as_ref().map_or_else(
-                || run.scope_key == scope_key,
-                |claim| lineage.contains(&claim.card_id),
-            )
-        })
+        serves_card_in(&*self.runs.read().await, scope, scope_id, lineage)
     }
 
     /// Whether `member_id` is working a card right now.
     pub async fn member_is_working(&self, member_id: &str) -> bool {
-        debug_assert!(!member_id.is_empty(), "a member has an id");
-        let runs = self.runs.read().await;
-        runs.values().any(|run| {
-            run.card
-                .as_ref()
-                .is_some_and(|claim| claim.member_id == member_id)
-        })
+        member_is_working_in(&*self.runs.read().await, member_id)
+    }
+
+    /// Hold the run table against every start (and every end) until the
+    /// returned fence drops: [`Self::claim_slot`] registers under this same
+    /// write guard. The stall sweep judges "no live run serves this card" and
+    /// releases the card inside one fence, so a manual Start can no longer
+    /// register between the judgement and the release. Held for a few store
+    /// writes; never across a model call.
+    pub async fn fence_starts(&self) -> StartFence<'_> {
+        StartFence {
+            runs: self.runs.write().await,
+        }
     }
 
     /// Request cancellation of card `card_id`'s run. Returns false when no
@@ -10259,6 +10336,7 @@ mod card_run_tests {
                 "global:".to_string(),
                 "g".to_string(),
                 Some(claim(2, AGENT)),
+                None,
             )
             .await
             .expect("claimed");
@@ -10281,6 +10359,7 @@ mod card_run_tests {
                 "workspace:w".to_string(),
                 "workspace:w".to_string(),
                 "g".to_string(),
+                None,
                 None,
             )
             .await

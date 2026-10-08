@@ -1,7 +1,7 @@
 //! User-authored skills (tools) system
 //!
 //! Supports two tiers of tool authoring:
-//! 1. **Scripted (Boa/Deno)** - JS/TS tools with sandboxing (requires `scripting` feature)
+//! 1. **Scripted (Boa)** - JS/TS tools with sandboxing (requires `scripting` feature)
 //! 2. **Executable (Manifest)** - Python/shell/binary via tool.yaml
 //!
 //! # Directory Structure

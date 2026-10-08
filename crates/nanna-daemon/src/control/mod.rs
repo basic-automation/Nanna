@@ -12,7 +12,7 @@
 use crate::agent_service::AgentService;
 use crate::llm_router::LlmRouter;
 use crate::log_buffer::LogBuffer;
-use crate::protocol::{ChannelAction, ChatAction, Event, ConfigAction, MemberAction, MemoryAction, SchedulerAction, SessionAction, SystemAction, TaskAction, ToolAction, WorkspaceAction, Action, SubscribeAction, UnsubscribeAction};
+use crate::protocol::{ChannelAction, ChatAction, Event, ConfigAction, MemberAction, MemoryAction, Reply, SchedulerAction, SessionAction, SystemAction, TaskAction, ToolAction, WorkspaceAction, Action, SubscribeAction, UnsubscribeAction};
 use crate::session::{MessageRole, SessionManager, SubSessionInfo, SubSessionState};
 use crate::user_tools::UserToolManager;
 use nanna_channels::StatusManager;
@@ -803,6 +803,21 @@ impl ControlPlane {
     // NOTE: save_memories_if_needed() removed — memory is now persisted
     // via Turso write-through on every mutation (add/remove/update).
     // No explicit save calls are required.
+
+    /// [`Self::handle`] for the IPC send path: the same answer, except that a
+    /// reply too large to hold as a tree comes back already serialized
+    /// (today `memory.list`, see `memory_list_raw`).
+    pub async fn handle_reply(self: &Arc<Self>, client_id: &str, action: Action) -> Reply {
+        if let Action::Memory(MemoryAction::List { scope }) = &action
+            && let Some(memory) = &self.memory
+        {
+            return match Self::memory_list_raw(memory, scope.clone()).await {
+                Ok(raw) => Reply::Raw(raw),
+                Err(e) => Reply::Tree(Self::memory_list_failed(&e)),
+            };
+        }
+        Reply::Tree(self.handle(client_id, action).await)
+    }
 
     /// Handle an action and return a response.
     ///

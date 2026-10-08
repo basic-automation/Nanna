@@ -37,7 +37,7 @@ corrupt-Turso-memories salvage + `/status` surfacing, real tool-failure logs, Wi
 normalization, and the heartbeat `HEARTBEAT.md` read. Detailed dated notes collapsed to a one-line ledger
 (full rationale in each commit).
 **Repo:** local Cargo workspace, branch `master` — one Rust workspace + a Tauri 2 / Nuxt 4 GUI.
-**Stack:** Rust 2024 (rustc 1.85+) · Tokio · **Burn** (wgpu + ndarray) for on-device inference · wgpu 24 · Tauri 2 · Nuxt 4 / Vue 3 / Tailwind 4 · **Turso** (embedded, SQLite-compatible) · Boa + Deno scripting.
+**Stack:** Rust 2024 (rustc 1.85+) · Tokio · **Burn** (wgpu + ndarray) for on-device inference · wgpu 24 · Tauri 2 · Nuxt 4 / Vue 3 / Tailwind 4 · **Turso** (embedded, SQLite-compatible) · Boa scripting.
 
 > **Direction (2026-07-06 pivot) — local-first by default.** A small open model running on a single
 > consumer GPU *is* the agent and does the whole job — full agentic reasoning, tools, and memory —
@@ -93,7 +93,7 @@ Tier 1  nanna-infer*      Burn model runner: local LLM inference (wgpu + ndarray
         nanna-llm         Inference routing: local (nanna-infer) first · cloud APIs optional
           |
 Tier 2  nanna-tools       Tool system (all tools are filesystem JS/TS skills)
-        nanna-scripting   Boa (pure-Rust JS) + Deno (V8/TS) engines; embedded Python
+        nanna-scripting   Boa (pure-Rust JS) engine; embedded Python
         nanna-workspace   Workspace detection, .nanna/ context files (SOUL/USER/AGENTS/…)
         nanna-channels    Channel listeners + unified message router
         nanna-browser     Browser control (CDP / Playwright)
@@ -157,7 +157,8 @@ Concretely, today Nanna:
 - Has a **cognitive memory** system (FSRS-6 spaced repetition, semantic recall with testing-effect
   reinforcement, consolidation/"dreaming", duplicate detection) persisted to **Turso**.
 - Ships **all tools as filesystem JS/TS skills** (39 default skills) executed by the Boa engine, plus
-  **MCP client** integration and an **embedded/tiered OCR** pipeline (pure-Rust `ocrs` → vision-model fallback).
+  **MCP client** integration and **model OCR** (the `ocr` skill and `read_pdf`'s scanned pages go to a
+  vision model; the pure-Rust `ocrs` tier is built but not wired — see the dead-subsystems item in P25).
 - Connects **five channels** (Telegram, Discord, Slack, Signal, WhatsApp) with a webhook server and a
   unified router that delivers agent responses back to the originating channel.
 - Presents a **Tauri 2 + Nuxt 4** desktop GUI: streaming chat, Tiptap+Monaco rich editor, session
@@ -539,6 +540,17 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
             globbing; the shipped static bundle contains no braces code (the word appears only in
             Monaco/TypeScript message strings). Exempted by id beside node-forge, reasoning in
             `audit.yml`'s header. **Remove the entry when `braces` or `micromatch` ships a fix.**
+      - [ ] *(2026-10-08)* **Four `simple-git` advisories (two critical) are exempted, not fixed** —
+            GHSA-v5rq-49vh-5v5c, GHSA-x6jw-m9v5-85vh, GHSA-g4wm-2vf7-vfgr, GHSA-858h-whjf-mvg5,
+            all `<4.0.1`, all about attacker-controlled git options/env. Published after the
+            10-05 audit, so master's gate is red against today's database too. Path: `nuxt →
+            @nuxt/devtools 3.4.2 → simple-git 3.36.0`, used only to name a build analysis with
+            fixed arguments on our own root; devtools is off in production. **An override to 4.x
+            is not a fix:** simple-git 4 has no default export and devtools does `import Git from
+            'simple-git'`, so `nuxt dev` would fail at link time (checked against 4.0.2). Drop the
+            ids from `pnpm.auditConfig.ignoreGhsas` when devtools moves to simple-git 4 (its
+            `4.0.0-beta` line is the place to watch). DOMPurify's two new *lows* stay below the
+            `moderate` gate (monaco pins 3.4.15).
       - [ ] *(2026-10-02)* **`node-forge` GHSA-86w9-cpqp-85rv (high) is exempted, not fixed.** No
             release fixes it (1.4.0 is the latest; the advisory lists no patched version); it
             comes through `nuxt → listhen`, the dev server's cert helper, which the shipped static
@@ -1229,7 +1241,7 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       `gui/e2e/tauri-driver.md` (launch → Settings → Logs → close hygiene). Soft-skips when binary/driver missing
       so web CI stays hermetic; armed via `NANNA_TAURI_E2E=1` once a packaged binary is present. Wire full
       WebDriverIO session when nightly hosts a display + driver pair.
-- [ ] *(measured 2026-09-08)* **GUI WebDriver verification is unavailable on the Linux host, and
+- [x] *(measured 2026-09-08)* **GUI WebDriver verification is unavailable on the Linux host, and
       NOT because a package is merely uninstalled.** The routine's own host notes say
       `WebKitWebDriver` arrives with `pacman -S webkit2gtk-4.1`. That is wrong for Arch:
       **`webkit2gtk-4.1` 2.52.6-1 IS installed** here and its 416-file manifest ships
@@ -1251,6 +1263,10 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       verification** — headless checks plus "needs on-device verification" is the honest ceiling.
       `cargo-tauri` and `tauri-driver` are also not installed, but those are `cargo install`-able
       and are not the blocker.
+      *(2026-10-08 — closed, superseded.)* The alternative provider landed: `e2e-webdriver` +
+      `tauri-webdriver` (P0.3 Linux host section) needs no `WebKitWebDriver`, has worked since
+      2026-09-18, and drove the built GUI again this run. The shared `.sh` harness still targets
+      `tauri-driver`; that stays its own item.
 - [x] **Critical-path scenarios** *(2026-07-22)* — `e2e/critical-path.spec.ts`: first-run/no-key empty state;
       chat send → stream → Stop (mock LLM); session create/rename/delete/switch; backend disconnect toast +
       reconnect affordance; Settings API-key round-trip; Logs Live/Paused, Clear, Copy all.
@@ -1827,7 +1843,7 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
             on *every* attempt is a configuration fault, not a transient one, and deserves to
             surface (health endpoint degradation, or a once-per-boot loud notice) rather than
             scroll past. Needs a decision on where operator-visible faults belong.
-- [~] **Prometheus metrics** — new `nanna-metrics` crate (`NannaMetrics`: llm_request_duration,
+- [x] **Prometheus metrics** — new `nanna-metrics` crate (`NannaMetrics`: llm_request_duration,
       llm_tokens_total, tool_execution_duration, channel_messages/errors_total, queue_depth,
       active_sessions, memory_entries); expose via `/metrics` on the Axum health server + a GUI event.
       *(2026-09-17)* **`GET /metrics` landed on the health server (5148), no new crate or
@@ -1844,6 +1860,20 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
       and `nanna_channel_send_failures_total{channel}`, counted where a channel message crosses the
       daemon boundary (inbound + immediate replies in `process_message`, turn answers and reminders
       in the reply forwarder); names bounded at 16 then folded into `other`. Only histograms remain.
+      *(2026-10-08)* **Histograms landed — the item's last piece.** `nanna_tool_duration_milliseconds`
+      (per tool, executed calls only — a breaker replay never ran) and
+      `nanna_model_request_duration_milliseconds` (per model, failures included: a 120 s timeout is
+      exactly the latency a scrape should see), as standard `_bucket{le}`/`_sum`/`_count` families.
+      `nanna_agent::histogram::LatencyHistogram` is 13 saturating counters + a sum (112 B) beside
+      each tool's and model's stats, with fixed bounds (tools 10 ms–120 s, under `exec`'s 180 s
+      ceiling; models 250 ms–10 min), so series stay bounded by configuration. It is
+      `#[serde(skip)]` on the stats and their summaries: no client wire or stored format changes,
+      and it describes the running process (resets on restart, which scrapers handle as a counter
+      reset). `_count` is the `+Inf` bucket by construction. 6 tests (bucketing incl. inclusive
+      `le`, saturation, rendering, the trackers' real `record` paths, not exported, not restored).
+      **Not live-scraped with data:** tool and model stats are recorded inside agent turns, and a
+      direct `tool.execute` (tried on an isolated daemon) records none; `/metrics` itself served
+      200 there. Kept the `p95` gauges for existing dashboards.
 - [x] **Structured tracing spans** — hierarchy Session → Agent Loop → LLM/Tool Call, capturing
       name/duration/IO-size/success via `#[tracing::instrument]` + `info_span!`.
       *(2026-09-21)* The daemon had **zero** spans, so two overlapping turns interleaved their
@@ -2889,7 +2919,7 @@ so neither CI nor any prior run could have caught them:
       and the presence of `discover_tools/tool.ts` rather than the spelling of the path. 1728
       workspace tests green.
 
-- [ ] *(measured 2026-09-13)* **GUI WebDriver verification is blocked on this host, and every
+- [x] *(measured 2026-09-13)* **GUI WebDriver verification is blocked on this host, and every
       published install instruction for it names the wrong Arch package.** The shared harness's
       `ensure` reports `MISS WebKitWebDriver` and advises `sudo pacman -S --needed webkit2gtk-4.1` —
       but `webkit2gtk-4.1 2.52.6-1` **is already installed here and does not contain the binary**.
@@ -2902,6 +2932,9 @@ so neither CI nor any prior run could have caught them:
       verification as unavailable rather than skipped — the Linux WebDriver harness has still never
       had a successful `exec`. Sources: [Tauri WebDriver](https://v2.tauri.app/develop/tests/webdriver/),
       [WebdriverIO Tauri platform support](https://webdriver.io/docs/desktop-testing/tauri/platform-support/).
+      *(2026-10-08 — closed, superseded.)* The plugin route (`e2e-webdriver` + `tauri-webdriver`,
+      below under the WebKitWebDriver item) needs no `WebKitWebDriver` and has worked since
+      2026-09-18; this run drove the built GUI with it again (memory page over a scratch daemon).
 - [ ] *(2026-09-13)* **Correct the harness's own remedy string** once the package above is confirmed:
       `~/.claude/scheduled-tasks/_shared/tauri-webdriver.sh` prints the `webkit2gtk-4.1` advice, which
       sends the reader to a package they already have. It lives outside this repo, so a run cannot
@@ -5531,6 +5564,9 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             first time — so nothing we share with the TypeScript SDK misreads the spec where rmcp
             reads it differently, at least on these paths. Live suite 11/11; runs in `mcp-interop`.
             (b), whether nanna-mcp should sit on `rmcp`, stays open.
+            *(2026-10-08)* Both interop fixtures moved to their latest: `rmcp =3.4.0 → =3.5.1` and
+            the TypeScript SDK `@modelcontextprotocol/{client,server} 2.0.0 → 2.3.1`. Live suite
+            `dual_era_live -- --ignored` **11/11** on each step (rmcp first, then the TS SDK).
       - [x] *(found 2026-09-18)* `cargo clippy -p nanna-mcp --no-default-features --features stdio`
             warns on two unused imports (`adapter.rs` `RwLock`, `server.rs` `ToolContent`) — the
             feature-gated build nobody gates. Trivial; gate the imports on their features.
@@ -8280,6 +8316,21 @@ as its turn (`TurnAdmission`, scope default `session`).
       boot close-out handles the rest); a narrow race between the sweep's liveness read and a
       manual Start is still open (a second `serves_card` check just before the release would
       close most of it).
+      *(2026-10-08)* **The race is closed in both directions, not narrowed.** The sweep's release
+      and a run's registration now happen under the same `runs` write guard: the sweep takes
+      `TaskRunManager::fence_starts()` and re-judges under it (`still_stalled`: no live run on the
+      card's lineage, and the card still `in_progress` with the same member, so a person's edit
+      since the judgement stands too) before writing anything; `claim_slot` re-reads the card
+      under the guard and refuses a claim whose card is no longer assigned to the claiming member.
+      So a Start lands wholly before the release (the card is kept, and no `stalled` row counts
+      against the router's retry bound) or wholly after it (refused: "no longer assigned").
+      The fence is held for the few store writes of one release, never across a model call.
+      Tests `a_start_between_the_judgement_and_the_release_keeps_its_card`,
+      `a_start_after_the_release_is_refused`, `the_fence_holds_starts_and_a_changed_card_is_kept`;
+      each of the two guards, removed, fails its test.
+      *(same run, after review)* The fenced re-judge also re-reads the card's last touch: a post
+      or an edit between the sweep's read and the fence now keeps the card (it was the one input
+      `still_stalled` did not repeat). Mutation-checked like the other two.
 - [x] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
       *(2026-09-28)* `RouterDecision::Assign` gained optional `labels` and `acceptance`. Labels
@@ -8818,6 +8869,50 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       which the context and the root crate use, stay. And the multi-agent module (`multi.rs`,
       1 098 lines: `AgentCoordinator`, `SwarmCoordinator` and eleven more re-exported types —
       the review's `MultiAgent`) — no caller; sub-agents are sub-tasks now.
+      *(2026-10-08 — the Rust built-in tools, audited type by type.)* Of 37 `impl Tool` types in
+      `nanna-tools/src/builtin`, the daemon builds exactly one (`AskParentTool`, `server.rs`); 16
+      more are registered only by the root `nanna` CLI/`serve` path (`src/setup.rs`
+      `init_components`) and stay while that path exists. **Deleted, no constructor anywhere
+      outside their own files (~1 490 lines):** `code.rs` (`CodeOutlineTool`, `CodeSearchTool`,
+      `ProjectStructureTool` — the live ones of those names are `tool.ts`), `authoring.rs`
+      (`CreateToolTool`/`ListToolsTool`/`DeleteToolTool`/`ScriptToolExecutor`/`ToolStore`; the
+      daemon's authoring is the `tools.*` script service), `browser.rs` (four browser tools, built
+      only by `create_browser_tools`, which had no caller), `task.rs` (`TaskTool`; sub-agents are
+      sub-tasks), `WebSearchBatchTool`, and the stub `ScreenshotTool` that returned "not yet
+      implemented". `glob` left with them. `AgentSpawner` stays (the daemon implements it).
+      **Still open:** test-only Tool structs whose *functions* are live (`AnalyzeImageTool`,
+      `TextToSpeechTool`/`TranscribeTool` and their `create_*_tool` factories, `OcrTool`,
+      `DescribeImageTool`, `ReadPdfTool` — the daemon calls the `create_*_fn` closures and the
+      pdf/ocr functions, never the structs); the CLI path's 16 tools (an owner call: is the
+      `nanna` CLI/`serve` path still wanted beside the daemon?).
+      *(2026-10-08, same run — the Deno path.)* `nanna-scripting`'s `deno` feature was enabled by
+      no crate (only its own unused `full`), so the V8 engine was never compiled into anything we
+      ship and every script already ran on Boa: with `deno` off, both engine orders resolved to
+      Boa with no fallback. Deleted `deno_impl.rs`, `EngineKind::Deno`, the fallback machinery
+      (`prefer_deno`, `no_fallback`, `ExecutionResult::{used_fallback, primary_error}`), the
+      "needs an advanced engine" routing, and the `deno`/`full` features — **~1 320 lines, and
+      the lockfile drops the whole V8/swc stack** (`deno_core`, `deno_ast`, `deno_v8`,
+      `serde_v8`, `bindgen`, …). No runtime change: nothing that ran before runs differently.
+      - [ ] *(found 2026-10-08)* **Decide: wire the embedded OCR tier or delete it.** The
+            "Current State" said Nanna ships an embedded/tiered OCR pipeline (`ocrs` → vision
+            model). It does not: `embedded_ocr`/`run_ocrs_sync` (`nanna-tools` `ocr.rs`) are
+            reached only through `OcrTool`, which only its own tests construct; the bundled `ocr`
+            skill and `read_pdf`'s scanned-page fallback go to the vision-model service
+            (`vision_service.rs`), and with no vision model configured they are withheld. So
+            `ocrs` + `rten` (an ONNX runtime, and the reason `rten 0.27`/dependabot #411 cannot
+            land) compile into every build for nothing. **Wire it** (local-first fits the North
+            Star: OCR with no model and no key; but it downloads two `.rten` models from the
+            network on first use, so the first call needs a bounded, announced fetch) **or delete
+            it** (drops `ocrs`, `rten`, `rten-imageproc` and their tree). Owner call, like the GPU
+            search path. Also test-only, same audit: the `AnalyzeImageTool`,
+            `TextToSpeechTool`/`TranscribeTool`, `DescribeImageTool` and `ReadPdfTool` structs —
+            their closures/functions are live, the Tool wrappers are not.
+            *(same run)* `AnalyzeImageTool`, `TextToSpeechTool`, `TranscribeTool` and their
+            `create_*_tool`/`create_audio_tools` factories deleted (~350 lines; only "it constructs"
+            tests used them). The daemon's closures (`create_vision_fn`, `create_tts_fn`,
+            `create_transcribe_tool_fn`) are untouched. `DescribeImageTool` and `ReadPdfTool` stay
+            with the OCR decision: `ReadPdfTool` also describes a PDF's embedded images, which the
+            daemon's `pdf.read` service does not.
 
 **Stage 1 — store, memory, storage:**
 - [x] `VectorStore::update_content` must also clear `memories.embedding`/`embedding_model` and
@@ -9788,7 +9883,7 @@ keep the phases readable; promote individual items into a phase when they become
       **4.1**, and WebKitGTK's automation handshake is per-library-generation. **Whether a 6.0 driver
       can drive a 4.1 app is unproven and is the actual open question** — it is not a package the owner
       has simply not installed yet.
-      - [ ] Owner step, in this order. **(a)** `sudo pacman -S --needed webkitgtk-6.0` — seconds, and
+      - [x] Owner step, in this order. **(a)** `sudo pacman -S --needed webkitgtk-6.0` — seconds, and
             the only packaged candidate; if a 6.0 driver can drive a 4.1 app the problem is over.
             **(b)** If it cannot, the community's answer is a **source build of WebKitWebDriver
             matched to the installed `webkit2gtk-4.1`** (`-DENABLE_WEBDRIVER=ON`), which must be
@@ -9798,6 +9893,9 @@ keep the phases readable; promote individual items into a phase when they become
             or WebdriverIO's `@wdio/tauri-service`, whose docs list other Linux providers).
             Until one lands **the Linux WebDriver harness stays UNVALIDATED** and no run may claim
             GUI verification passed.
+            *(2026-10-08 — closed, superseded.)* The plugin route (`e2e-webdriver` + `tauri-webdriver`,
+            below under the WebKitWebDriver item) needs no `WebKitWebDriver` and has worked since
+            2026-09-18; this run drove the built GUI with it again (memory page over a scratch daemon).
       - [x] *(research 2026-09-17 — option (c) above has matured into the cheapest route)*
             **`tauri-plugin-webdriver` 0.2.3 + `tauri-webdriver` 0.2.0 (both 2026-09-01, MIT; the
             plugin has ~119k downloads)** embed a W3C WebDriver server *inside the Tauri app*, so on
@@ -10098,6 +10196,22 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `pnpm outdated` reports `4.1.0 → 2.24.3` — the v4 line is published under `next`, so `latest`
            points at the *older* Vue-2 package. **Never let `pnpm update --latest` "upgrade" this one**;
            it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
+   - *(2026-10-08 sweep)* `cargo update` → 37 compatible bumps, led by **`turso 0.8.2`** (stable,
+     2026-10-06; the exact pin moved `=0.8.1 → =0.8.2` so `turso` and `turso_core` stay in
+     lockstep) plus `hyper 1.12`, `h2 0.4.20`, `jiff 0.2.38`, `toml 1.1.7`, `zerocopy 0.8.62`,
+     `tauri-plugin-{shell 2.4.1, updater 2.13.2}`. **Held back, with the exact failure:**
+     `rustpython-ruff_* 0.16.5 → 0.16.10` is a semver break for `rustpython-codegen 0.6.0` (still
+     the latest): `ExprCompare` lost `left`/`comparators` and the comprehension `generators` became
+     `Box<[_]>` (E0026/E0308, 10 errors), so all five ruff crates stay at 0.16.5 via
+     `cargo update --precise`. `cargo upgrade --incompatible` offered only `rten 0.26 → 0.27`, and
+     it is the 0.24/0.25 story again: `ocrs 0.13.1` (latest, 2026-09-13) requires `rten ^0.26`, so
+     the bump resolves two `rten`s (dependabot #411 fails CI for the same reason). Not taken.
+     `turso_core 0.8.2` still requires `branches ^0.4.3` and no `branches 0.4.7` exists, so the
+     toolchain pin stays at nightly-2026-10-03. GUI: `nuxt 4.6.0`, `vue-router 5.4.0`,
+     `marked 18.1.0`, `@lucide/vue 1.53.0`, `@playwright/test 1.64.0` and the two Tauri plugin JS
+     halves in lockstep; TypeScript 7 still blocked (`vue-tsc` 3.3.12). Verified: clippy 0
+     warnings, **2828 Rust tests / 89 binaries, 0 failures**, vitest 437/437, typecheck 0 errors,
+     `pnpm generate` green.
    - *(2026-09-27 sweep)* `cargo update` → the Tauri plugin minors (`dialog 2.8.0`, `fs 2.6.0`,
      `notification 2.5.0`, `process 2.4.0`, `shell 2.4.0`, `updater 2.13.0`,
      `tauri-winrt-notification 0.8.1`) plus `notify-rust 4.18.1`; the JS halves bumped in
@@ -10151,7 +10265,7 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            Upstream: [branches#10](https://github.com/fereidani/branches/issues/10), fix in
            [branches#11](https://github.com/fereidani/branches/pull/11) (the intrinsic was renamed in
            rust-lang/rust#163574) — a 0.4.x patch release from that PR unblocks us with no turso change.
-     - [ ] **`turso` 0.7.2 is the latest stable (2026-07-30); we are exact-pinned at `=0.6.1`.** 0.7.0
+     - [x] **`turso` 0.7.2 is the latest stable (2026-07-30); we are exact-pinned at `=0.6.1`.** 0.7.0
            brought MVCC passive checkpoints, recovery fixes and an MVCC-safe AUTOINCREMENT
            ([notes](https://github.com/tursodatabase/turso/releases/tag/v0.7.0)); 0.8.0 is in
            pre-release (pre.13, 2026-09-25). Migrate one minor at a time, release-build gated. It does
@@ -10179,6 +10293,8 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            nanna-daemon` 6m52s, and a release boot against a copy of the operator's real 101 MB
            `nanna.db` + WAL (3730 memories and 23 sessions load, "Daemon ready", no panic).
            Unblocks the P12 `mummu` integration retry below (the turso split).
+           *(2026-10-08 — closing the box.)* Done since 10-03; the pin moved again today to
+           `=0.8.2` (stable 2026-10-06) in the dependency sweep.
      - [x] *(found 2026-10-03)* **turso makes `mimalloc` (a C allocator) Nanna's global
            allocator.** `turso` 0.7 and 0.8 both declare `#[global_allocator] static GLOBAL:
            mimalloc::MiMalloc` under their default `mimalloc` feature, so every allocation in the
@@ -10240,16 +10356,32 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
                  cannot return. Not measured: a real operator day. Re-check the installed daemon's
                  RSS after a day of use; the serialize-without-`Value` item below shrinks what is
                  fragmented in the first place.
-           - [ ] *(2026-10-05)* **Serialize `memory.list` without the intermediate `Value`.** The
+           - [x] *(2026-10-05)* **Serialize `memory.list` without the intermediate `Value`.** The
                  14 MB reply is built as a `serde_json::Value` tree, then a string, then a frame,
                  several times the reply in transient heap. A typed `Serialize` struct written
                  straight to the frame's string removes the tree. The trim already returns the
                  transient, so this is CPU and peak heap, not retained RSS.
+                 *(2026-10-08)* Shipped. It was worse than the note said: `Response::success`
+                 ran `to_value` on the handler's `Value`, a **deep copy of every reply**, every
+                 request; it now takes the `Value` by move. `memory.list` writes typed rows
+                 (`MemoryListRow`) into a buffer reserved at an estimate of the final size
+                 (`RawJson::to_json`) and the server splices it into a frame allocated once at its
+                 exact size (`Reply::success_text`, sent by `IpcServer::send_reply` from
+                 `ControlPlane::handle_reply`). Same text on the wire: fields declared in the
+                 tree's sorted key order and floats widened to f64 as `json!` did (a first cut
+                 printed `0.9` where the tree printed `0.8999999761581421`; the oracle test now
+                 compares text, with values that have no exact f32). Measured on a 15.8 MB reply
+                 (3 927 memories, release, A/B): **78.8 → 66.7 ms** per call; RSS and VmHWM
+                 unchanged within noise (`bench/BASELINE.md` Suite 5). A first version that grew
+                 two 16 MB strings by doubling ratcheted RSS 107 → 204 MB and was not shipped.
      - [ ] *(P13, research 2026-09-26)* **FSRS-7 exists but is not shippable yet.** ts-fsrs merged it
            ([PR #520](https://github.com/open-spaced-repetition/ts-fsrs/pull/520), 2026-09-18,
            unreleased); `fsrs-rs` is at 6.6.2 with no FSRS-7, and no FSRS-7 default parameters are
            published (srs-benchmark experiments are still open). Re-check when `fsrs-rs` ships it;
            adopting it is the same retention-harness A/B the FSRS-6 weight decision needed.
+           *(re-checked 2026-10-08)* Still unreleased: `fsrs` 6.6.2 is the newest crate, but FSRS-7 has
+           reached fsrs-rs itself as open work ([fsrs-rs#463](https://github.com/open-spaced-repetition/fsrs-rs/pull/463),
+           aligning its training defaults with srs-benchmark). Watch for a 7.x crate.
      - [ ] *(research 2026-09-29)* **Upstream is moving `turso_core` to pure Rust by default** —
            [tursodatabase/turso#7660](https://github.com/tursodatabase/turso/issues/7660) proposes
            putting `aegis` and `simsimd` behind a feature flag. We already select
@@ -11373,6 +11505,16 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
                        0.38.2`, and `burn 0.22.0-pre.4` has been on crates.io since 2026-09-22. The
                        next step is Mummu's burn bump (its routine's item); re-try adding `mummu`
                        here only after its lockfile is free of `rusqlite`.
+                       *(research 2026-10-08)* **The chain lines up exactly now.** `burn 0.22.0` went
+                       stable on 2026-10-06; `burn-cubecl 0.22.0` → `cubecl ^0.11.0` →
+                       `cubecl-environment 0.11.0`, whose only database dependency is an *optional*
+                       `turso ^0.8.2` — no `rusqlite` — and Nanna's pin moved to `=0.8.2` today, so a
+                       Mummu on burn 0.22.0 should resolve to **one** turso in Nanna's graph.
+                       ([crates.io deps](https://crates.io/api/v1/crates/cubecl-environment/0.11.0/dependencies))
+                       Mummu's `origin/main` (58f8ad2) still pins `0.22.0-pre.3` with `rusqlite 0.40.2`
+                       in its lock, so the step is still Mummu's: pre.3 → 0.22.0 stable (no longer a
+                       pre-release on an exact pin), re-run its parity harness, then add `mummu` here
+                       and read the lockfile.
                  - [ ] **Measure before deciding, if 0.8.0 stays unstable:** add `mummu` at
                        burn 0.22-pre.4 on a scratch branch and read the resolved lockfile. If the
                        guard passes and the second turso is confined to cubecl's autotune cache,

@@ -2,9 +2,9 @@
 //!
 //! The bundled `screenshot` skill declares it and nothing registered it, so the
 //! skill was withheld at every boot. The roadmap's note ("skill exists, service
-//! missing, Rust tool is a stub") is accurate: `ScreenshotTool` in
-//! `nanna-tools` is a placeholder that returns "not yet implemented", so there
-//! was nothing to wire — this is the implementation, not a registration.
+//! missing, Rust tool is a stub") was accurate: `nanna-tools`' `ScreenshotTool`
+//! was a placeholder that returned "not yet implemented" (deleted 2026-10-08),
+//! so there was nothing to wire — this is the implementation, not a registration.
 //!
 //! **Shelling out to the desktop's own capture tool, rather than taking a
 //! screen-capture dependency.** Screen capture is not portable library work:

@@ -11,6 +11,7 @@ pub mod compressor;
 mod context;
 pub mod cost;
 pub mod harness;
+pub mod histogram;
 pub mod image_util;
 mod loop_runner;
 pub mod model_stats;

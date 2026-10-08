@@ -2115,6 +2115,108 @@ async fn memory_search_and_list_agree_on_the_global_scope() {
     assert_eq!(ids(&searched), ["global", "scoped"], "{searched}");
 }
 
+/// `memory.list` is serialized from typed rows (`memory_list_raw`) instead of a
+/// `json!` tree. The GUI parses its fields by name, so the typed form must be
+/// the same document: the tree the old code built is kept here as the oracle,
+/// covering provenance present and absent, a session id, a workspace, and a
+/// content string that needs escaping.
+#[tokio::test]
+async fn a_typed_memory_list_is_the_tree_it_replaced() {
+    // (id, workspace, metadata, timestamp)
+    type Row<'a> = (&'a str, Option<&'a str>, &'a [(&'a str, &'a str)], i64);
+    let memory = Arc::new(nanna_memory::MemoryService::new(
+        nanna_memory::MemoryServiceConfig {
+            dimension: 4,
+            ..Default::default()
+        },
+    ));
+    let rows: [Row<'_>; 3] = [
+        ("plain", None, &[], 0),
+        (
+            "provenanced",
+            Some("ws-a"),
+            &[("fact_type", "observed"), ("session_id", "s-1")],
+            1_760_000_000,
+        ),
+        ("escaped", Some("ws-b"), &[("fact_type", "stated")], -1),
+    ];
+    for (id, workspace, metadata, timestamp) in rows {
+        memory
+            .add_entry(nanna_memory::MemoryEntry {
+                id: id.to_string(),
+                content: format!("{id}: a \"quoted\" line\n\ttab \u{1F600}"),
+                embeddings: std::collections::HashMap::new(),
+                embedding_model: None,
+                embedding: vec![1.0, 0.0, 0.0, 0.0],
+                metadata: metadata
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+                timestamp,
+                // 0.7 has no exact f32: the typed row must print the same
+                // digits the tree did, not the f32's shortest form.
+                fsrs: nanna_memory::FsrsState {
+                    importance: 0.7,
+                    stability: 2.3,
+                    ..nanna_memory::FsrsState::default()
+                },
+                workspace_id: workspace.map(str::to_string),
+            })
+            .await
+            .expect("add");
+    }
+    // The pre-change `memory_list` body, verbatim in what it emitted.
+    let oracle = |scope: Option<&str>, listed: &[nanna_memory::MemoryListEntry]| -> Value {
+        let memories: Vec<Value> = listed
+            .iter()
+            .filter(|m| ControlPlane::memory_scope(scope).admits(m.workspace_id.as_deref()))
+            .map(|m| {
+                let fact_type = m.metadata.get("fact_type").cloned().unwrap_or_else(|| "unknown".to_string());
+                let created_at = chrono::DateTime::from_timestamp(m.timestamp, 0)
+                    .map_or_else(|| m.timestamp.to_string(), |dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
+                json!({
+                    "id": m.id,
+                    "content": m.content,
+                    "fact_type": fact_type,
+                    "importance": m.importance,
+                    "state": format!("{:?}", m.state).to_lowercase(),
+                    "weight": m.weight,
+                    "retrievability": m.retrievability,
+                    "access_count": m.access_count,
+                    "created_at": created_at,
+                    "session_id": m.metadata.get("session_id"),
+                    "workspace_id": m.workspace_id,
+                })
+            })
+            .collect();
+        json!({ "memories": memories })
+    };
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.memory = Some(Arc::clone(&memory));
+    let cp = Arc::new(cp);
+
+    let listed = memory.list_all().await;
+    // Compared as text as well as trees: a tree comparison parses both sides
+    // to f64 and would call `0.7` and `0.699999988079071` different values
+    // only by luck of the parse.
+    let raw = ControlPlane::memory_list_raw(&memory, None).await.expect("raw");
+    assert_eq!(raw.get(), serde_json::to_string(&oracle(None, &listed)).expect("text"));
+    for scope in [None, Some("global"), Some("ws-a")] {
+        let action = || {
+            Action::Memory(MemoryAction::List {
+                scope: scope.map(str::to_string),
+            })
+        };
+        let expected = oracle(scope, &listed);
+        let tree = cp.handle("test", action()).await;
+        assert_eq!(tree, expected, "scope {scope:?}");
+        let reply = cp.handle_reply("test", action()).await;
+        assert!(matches!(reply, Reply::Raw(_)), "the IPC path never builds the tree");
+        assert_eq!(reply.into_value().expect("valid JSON"), expected, "scope {scope:?}");
+    }
+    assert_eq!(oracle(None, &listed)["memories"].as_array().map(Vec::len), Some(3));
+}
+
 /// Records every row the daemon asks storage to delete, and refuses one.
 struct RecordingDeletes {
     refuse: Option<&'static str>,

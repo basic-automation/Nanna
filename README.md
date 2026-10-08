@@ -484,7 +484,7 @@ nanna/
 │   ├── nanna-storage/       # Turso persistence (embedded SQLite-compatible)
 │   ├── nanna-llm/           # Inference routing: local + cloud
 │   ├── nanna-tools/         # Tool system (filesystem JS/TS skills)
-│   ├── nanna-scripting/     # Boa (JS) + Deno (TS) engines
+│   ├── nanna-scripting/     # Boa (JS) engine + embedded Python
 │   ├── nanna-workspace/     # Workspace detection + context
 │   ├── nanna-channels/      # Channel listeners + router
 │   ├── nanna-browser/       # Browser control (CDP/Playwright)
