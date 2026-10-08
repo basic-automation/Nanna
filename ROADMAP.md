@@ -540,6 +540,17 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
             globbing; the shipped static bundle contains no braces code (the word appears only in
             Monaco/TypeScript message strings). Exempted by id beside node-forge, reasoning in
             `audit.yml`'s header. **Remove the entry when `braces` or `micromatch` ships a fix.**
+      - [ ] *(2026-10-08)* **Four `simple-git` advisories (two critical) are exempted, not fixed** —
+            GHSA-v5rq-49vh-5v5c, GHSA-x6jw-m9v5-85vh, GHSA-g4wm-2vf7-vfgr, GHSA-858h-whjf-mvg5,
+            all `<4.0.1`, all about attacker-controlled git options/env. Published after the
+            10-05 audit, so master's gate is red against today's database too. Path: `nuxt →
+            @nuxt/devtools 3.4.2 → simple-git 3.36.0`, used only to name a build analysis with
+            fixed arguments on our own root; devtools is off in production. **An override to 4.x
+            is not a fix:** simple-git 4 has no default export and devtools does `import Git from
+            'simple-git'`, so `nuxt dev` would fail at link time (checked against 4.0.2). Drop the
+            ids from `pnpm.auditConfig.ignoreGhsas` when devtools moves to simple-git 4 (its
+            `4.0.0-beta` line is the place to watch). DOMPurify's two new *lows* stay below the
+            `moderate` gate (monaco pins 3.4.15).
       - [ ] *(2026-10-02)* **`node-forge` GHSA-86w9-cpqp-85rv (high) is exempted, not fixed.** No
             release fixes it (1.4.0 is the latest; the advisory lists no patched version); it
             comes through `nuxt → listhen`, the dev server's cert helper, which the shipped static

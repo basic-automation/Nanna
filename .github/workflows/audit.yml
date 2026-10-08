@@ -33,6 +33,16 @@ name: Dependency audit
 #   app ships contains no braces code (checked: the word appears in the
 #   bundle only inside Monaco/TypeScript message strings). Drop the entry when
 #   braces or micromatch ships a fix.
+# - Four more, added 2026-10-08, for a different reason (a fix exists but
+#   cannot be taken): GHSA-v5rq-49vh-5v5c, GHSA-x6jw-m9v5-85vh (critical) and
+#   GHSA-g4wm-2vf7-vfgr, GHSA-858h-whjf-mvg5 (high), all simple-git <4.0.1
+#   letting attacker-controlled git options or env reach `git`. simple-git
+#   arrives only through nuxt -> @nuxt/devtools 3.4.2 (`simple-git ^3.36.0`),
+#   which calls `branch()`, `revparse(['--short','HEAD'])` and `status()` with
+#   fixed arguments on our own rootDir to name a build analysis; devtools is
+#   off in production builds. The fix (4.x) drops the default export devtools
+#   imports, so a pnpm override breaks `nuxt dev` at module link time
+#   (verified). Drop the entries when @nuxt/devtools ships on simple-git 4.
 #
 # Triggered by the files that can change the answer, plus weekly: an advisory
 # can be published against a lockfile nobody touched.
