@@ -280,7 +280,6 @@ impl WebhookState {
 struct TelegramUpdate {
     update_id: i64,
     message: Option<TelegramMessage>,
-    edited_message: Option<TelegramMessage>,
 #[serde(rename = "callback_query")]
     _callback_query: Option<TelegramCallbackQuery>,
 }
@@ -369,7 +368,9 @@ async fn telegram_webhook(
     debug!("Telegram webhook: received update {}", update.update_id);
     
     // Extract message
-    let tg_message = update.message.or(update.edited_message);
+    // New messages only: an edit is not a new request, and treating one as
+    // a message ran the agent again for a fixed typo.
+    let tg_message = update.message;
     
     let webhook_message = tg_message.and_then(|msg| {
         let text = msg.text?;

@@ -9331,11 +9331,14 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       any Telegram user who found the bot got a full agent turn with tools (the webhook secret
       proves the POST came from Telegram, not who wrote it). The processor now applies the same
       rule from the live config (`webhook_chat_allowed`, test
-      `telegram_webhook_messages_honour_allowed_users`).
+      `telegram_webhook_messages_honour_allowed_users`). *(same run)* An edited Telegram message
+      started a second turn — `message.or(edited_message)` in the listener and both webhook
+      handlers — so fixing a typo ran the agent again (a duplicate reply, tool side effects
+      again). Edits are now acknowledged and ignored, and the listener no longer subscribes to
+      them (test `an_edited_message_does_not_start_a_turn`).
       **Filed from the same audit, not fixed this run:** Telegram replies go out as legacy
       `Markdown` with no fallback, so an unmatched `_` makes Telegram reject the whole reply (and a
-      split reply stops at the first rejected part); an edited Telegram message starts a second
-      turn (`message.or(edited_message)` in the listener and both webhook handlers); the daemon's
+      split reply stops at the first rejected part); the daemon's
       Discord interaction webhook passes the command name instead of its options and never
       completes the deferred response; `nanna serve`'s Slack and Discord handlers return the
       reply in the HTTP body (Slack ignores it and retries the event up to 3 times; Discord needs

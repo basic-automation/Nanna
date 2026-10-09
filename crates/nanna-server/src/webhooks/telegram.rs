@@ -16,7 +16,6 @@ const PROVIDER: &str = "telegram";
 pub struct TelegramUpdate {
     pub update_id: i64,
     pub message: Option<TelegramMessage>,
-    pub edited_message: Option<TelegramMessage>,
 #[serde(rename = "callback_query")]
     pub _callback_query: Option<CallbackQuery>,
     pub message_reaction: Option<MessageReactionUpdate>,
@@ -141,10 +140,8 @@ pub async fn handle(
     }
 
     // Extract message
-    let message = update
-        .message
-        .or(update.edited_message)
-        .ok_or(StatusCode::OK)?; // No message, just acknowledge
+    // New messages only (an edit is acknowledged, not answered again).
+    let message = update.message.ok_or(StatusCode::OK)?; // No message, just acknowledge
 
     let text = message.text.as_deref().unwrap_or("");
     if text.is_empty() {
