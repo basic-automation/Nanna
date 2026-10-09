@@ -294,7 +294,11 @@ impl MessageRepository {
         message
     }
 
-    /// Up to `limit` messages of a session, oldest first.
+    /// The FIRST `limit` messages of a session, oldest first.
+    ///
+    /// This is the session's opening, not its latest exchange: a caller that
+    /// wants recent context (resuming a conversation, answering "what was
+    /// said last") wants [`Self::get_recent_by_session`].
     ///
     /// # Errors
     /// Returns [`StorageError::Database`] if the query fails or a column does
@@ -304,15 +308,48 @@ impl MessageRepository {
         session_id: &str,
         limit: i64,
     ) -> Result<Vec<Message>, StorageError> {
-        let conn = self.conn.lock().await;
+        self.read_session(session_id, limit, SessionEnd::Oldest)
+            .await
+    }
 
-        let mut rows = conn
-            .query(
+    /// The NEWEST `limit` messages of a session, returned oldest first so they
+    /// replay in conversation order.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a column does
+    /// not decode. Unparseable metadata loads as `None`.
+    pub async fn get_recent_by_session(
+        &self,
+        session_id: &str,
+        limit: i64,
+    ) -> Result<Vec<Message>, StorageError> {
+        self.read_session(session_id, limit, SessionEnd::Newest)
+            .await
+    }
+
+    /// Read up to `limit` messages from one end of a session, oldest first.
+    ///
+    /// `created_at` has one-second resolution, so a turn's user message and
+    /// its reply usually share it; `id` (monotonic per insert) breaks the tie,
+    /// or "oldest first" would be the engine's choice within a second.
+    async fn read_session(
+        &self,
+        session_id: &str,
+        limit: i64,
+        end: SessionEnd,
+    ) -> Result<Vec<Message>, StorageError> {
+        let sql = match end {
+            SessionEnd::Oldest => {
                 "SELECT id, session_id, role, content, content_type, tool_use_id, created_at, tokens_in, tokens_out, metadata
-                 FROM messages WHERE session_id = ?1 ORDER BY created_at ASC LIMIT ?2",
-                turso::params![session_id, limit],
-            )
-            .await?;
+                 FROM messages WHERE session_id = ?1 ORDER BY created_at ASC, id ASC LIMIT ?2"
+            }
+            SessionEnd::Newest => {
+                "SELECT id, session_id, role, content, content_type, tool_use_id, created_at, tokens_in, tokens_out, metadata
+                 FROM messages WHERE session_id = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2"
+            }
+        };
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(sql, turso::params![session_id, limit]).await?;
 
         let mut messages = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -335,8 +372,31 @@ impl MessageRepository {
         drop(rows);
         drop(conn);
 
+        if end == SessionEnd::Newest {
+            messages.reverse();
+        }
+        debug_assert!(
+            usize::try_from(limit)
+                .ok()
+                .is_none_or(|max| messages.len() <= max),
+            "the read never returns more than `limit` rows"
+        );
+        debug_assert!(
+            messages
+                .windows(2)
+                .all(|pair| (pair[0].created_at.as_str(), pair[0].id)
+                    < (pair[1].created_at.as_str(), pair[1].id)),
+            "messages come back oldest first"
+        );
         Ok(messages)
     }
+}
+
+/// Which end of a session [`MessageRepository::read_session`] reads from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionEnd {
+    Oldest,
+    Newest,
 }
 
 /// Memory repository (for vector search)

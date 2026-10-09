@@ -215,7 +215,7 @@ pub async fn run_cli(
 
     // Load session history if resuming
     if is_resume
-        && let Ok(messages) = storage.messages().get_by_session(&session_id, 50).await {
+        && let Ok(messages) = storage.messages().get_recent_by_session(&session_id, 50).await {
             let msg_count = messages.len();
             for msg in messages {
                 match msg.role.as_str() {

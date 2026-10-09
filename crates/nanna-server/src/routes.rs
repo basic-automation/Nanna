@@ -237,6 +237,7 @@ impl MessageResponse {
     }
 }
 
+/// A session's newest 100 messages, oldest first.
 async fn get_messages(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -244,7 +245,7 @@ async fn get_messages(
     let messages = state
         .storage
         .messages()
-        .get_by_session(&session_id, 100)
+        .get_recent_by_session(&session_id, 100)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     

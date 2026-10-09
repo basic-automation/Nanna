@@ -9522,9 +9522,14 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       turn (`ProcessedReply { text, stored }`); the route answers from it and never re-reads. A failed
       write is now logged instead of `let _ =`-discarded, and the reply still carries the agent's
       text with id 0. `process_message` (webhooks, `/api/chat`) keeps its `String` shape. 2 tests.
-      **Not changed:** `GET …/messages` still returns the *oldest* 100 messages of a long session —
-      the repository has no newest-N read; `nanna-server` is not a supported surface until P25
-      decides what stays (see the webhooks item), so that is filed rather than built.
+      *(same run)* **The same oldest-first read had two more victims.** `GET …/messages` returned
+      a long session's *first* 100 messages, and the CLI's `nanna chat --resume` loaded the *first*
+      50 — so resuming a long conversation dropped exactly the recent context it was resumed for.
+      New `MessageRepository::get_recent_by_session` reads the newest N and returns them oldest
+      first; both callers use it. Both reads now break `created_at` ties (one-second resolution — a
+      turn's question and reply usually share it) on `id`, so "oldest first" is no longer the
+      engine's choice within a second. 2 storage tests (`session_messages.rs`); no caller of the
+      old read wanted the opening.
 - [x] `nanna-simd` NEON arm has a trailing semicolon and does not compile on aarch64
       (`lib.rs:174,204`); `nanna-gpu` `search` must check buffer limits, `append` dirty index
       off-by-one; `nanna-bench` fixture divides by 24 576 instead of 2^24; `src/installer/windows/
