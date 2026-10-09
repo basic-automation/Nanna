@@ -262,7 +262,7 @@ ollama serve
 
 ### Daemon Not Responding
 ```bash
-# Check if the daemon is running
+# Check if the daemon is running (add --port N if you started it with one)
 nanna daemon status
 
 # Restart the daemon
@@ -449,7 +449,8 @@ See [PRIVACY.md](PRIVACY.md) for full details.
 - Credentials: OS keyring (encrypted)
 
 **Taking your data with you:** `nanna export <session-id>` (Markdown, or `--format json`
-for the complete stored session) and `nanna export --memories` — the daemon must be running.
+for the complete stored session) and `nanna export --memories` — the daemon must be running
+(`--daemon ws://host:port` for one not on the default port).
 
 **What's sent externally (when configured):**
 - Chat messages → your chosen LLM provider
