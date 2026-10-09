@@ -9599,6 +9599,19 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       before `max_chars` applied, so a fast link could feed gigabytes within the 30 s timeout; it
       now reads chunk by chunk and refuses past `READ_FILE_BYTES_MAX` (64 MiB, `readFile`'s cap),
       declared or not. Test `a_fetched_body_is_read_only_up_to_the_cap` (loopback server).
+- [x] *(found 2026-10-09, audit of MCP)* **A legacy SSE MCP server could redirect the bearer
+      token.** `SseLegacyTransport` joined the `endpoint` event's URL onto the base and POSTed every
+      message there with the configured bearer, so a `url` server whose Streamable-HTTP probe fell
+      back to SSE could name `https://attacker.example/x` (or `//attacker.example/x`) and receive
+      the stored credential. `same_origin_endpoint` now refuses an endpoint on another origin, as
+      the TypeScript SDK does. Test `a_message_endpoint_must_stay_on_the_connections_origin`.
+      **Filed from the same audit, not fixed this run:** a stdio MCP server started via `npx`/`uvx`
+      is killed without its process group, orphaning the real server (`nanna-proc` has the group
+      kill); Streamable HTTP buffers a whole body before its 16 MiB check (and `notify`/SSE error
+      bodies are unbounded); the encrypted-credentials file fallback has no cross-process lock
+      (a CLI `mcp secret set` racing the daemon can lose a key or corrupt the envelope via the fixed
+      `credentials.enc.tmp`); a 404 on a legacy Streamable-HTTP session never re-initializes; and a
+      dropped legacy SSE GET stream leaves every later request waiting its full 60 s.
 - [x] Tool authoring: `tools.update` refuses bundled names and runs `check_syntax`; GUI
       `update_skill` validates the name (`tool_authoring.rs:99,236`, `gui/.../tools.rs:458`). Both
       move with the `default-skills` → tools rename.

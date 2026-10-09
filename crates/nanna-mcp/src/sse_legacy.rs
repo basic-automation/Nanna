@@ -107,10 +107,7 @@ impl LegacySseTransport {
         })
         .await
         .map_err(|_| McpError::Protocol(format!("`{url}` named no message endpoint")))??;
-        let post_url = base
-            .join(endpoint.trim())
-            .map_err(|e| McpError::Protocol(format!("bad endpoint `{endpoint}`: {e}")))?
-            .to_string();
+        let post_url = same_origin_endpoint(&base, &endpoint)?;
         debug!(post_url, "Legacy MCP SSE endpoint");
 
         let client = reqwest::Client::builder()
@@ -299,5 +296,55 @@ impl Transport for LegacySseTransport {
 
     fn list_changed_flags(&self) -> Option<Arc<ListChangedFlags>> {
         Some(Arc::clone(&self.list_changed))
+    }
+}
+
+/// The message endpoint a legacy SSE server named, resolved against the URL it
+/// was reached at — refused unless it is on that same origin.
+///
+/// Every POST to it carries the server's bearer token, so taking the
+/// `endpoint` event's URL as given let a server (or anything on its path)
+/// redirect the configured credential to another host: `data:
+/// https://attacker.example/x`, or the scheme-relative `//attacker.example/x`.
+/// The TypeScript SDK refuses a cross-origin endpoint for the same reason.
+fn same_origin_endpoint(base: &reqwest::Url, endpoint: &str) -> Result<String> {
+    let joined = base
+        .join(endpoint.trim())
+        .map_err(|e| McpError::Protocol(format!("bad endpoint `{endpoint}`: {e}")))?;
+    if joined.origin() != base.origin() {
+        return Err(McpError::Protocol(format!(
+            "the server named a message endpoint on another origin (`{}`, connected to `{}`); \
+             refusing to send its credential there",
+            joined.origin().ascii_serialization(),
+            base.origin().ascii_serialization()
+        )));
+    }
+    debug_assert_eq!(joined.origin(), base.origin(), "same origin only");
+    Ok(joined.to_string())
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::same_origin_endpoint;
+
+    #[test]
+    fn a_message_endpoint_must_stay_on_the_connections_origin() {
+        let base = reqwest::Url::parse("https://mcp.example.com/sse").expect("url");
+        assert_eq!(
+            same_origin_endpoint(&base, "/messages?session=1").expect("relative"),
+            "https://mcp.example.com/messages?session=1"
+        );
+        assert!(same_origin_endpoint(&base, "https://mcp.example.com/m").is_ok());
+        for elsewhere in [
+            "https://attacker.example/x",
+            "//attacker.example/x",
+            "http://mcp.example.com/m",
+            "https://mcp.example.com:8443/m",
+        ] {
+            assert!(
+                same_origin_endpoint(&base, elsewhere).is_err(),
+                "{elsewhere}"
+            );
+        }
     }
 }
