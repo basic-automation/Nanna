@@ -9627,8 +9627,12 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       entirely. `Nanna.stat` now returns the `path` the bridge resolved and permitted, and all five
       skills pass that on (a refused or missing file answers "Error: cannot read …"). Test
       `stat_returns_the_resolved_permitted_path`.
-      **Filed from the same audit, not fixed this run:** the `python` tool's default workdir is
-      the daemon's cwd (and a given one `os.chdir`s the whole process); GUI user tools execute
+      *(same run)* The `python` tool's documented default workdir ("the session workspace") was
+      never passed: unset, the interpreter ran in the daemon's own cwd. The skill now sends
+      `Nanna.workdir()` when none is given.
+      **Filed from the same audit, not fixed this run:** a given python workdir is applied with
+      `os.chdir`, which RustPython applies to the whole daemon process (every tool's relative
+      paths move with it, concurrently); GUI user tools execute
       with no workspace, services or session (`user_tools.rs` passes `None, None`).
       *(same run)* **`web_fetch` threw on a network error and buffered any body whole.** A refused
       host, DNS failure or timeout became a thrown script error instead of a result; it now
