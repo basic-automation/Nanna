@@ -9300,9 +9300,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `T`): a session renamed at 15:00 listed below one touched at 09:00 the same day, and the
       first row is the default session on boot. Every session list now orders by
       `datetime(updated_at)`, ties on `id` (test `sessions_sort_by_time_not_by_timestamp_text`).
-      **Filed from the same audit, not fixed this run:** `update_content` NULLs `memories.embedding`
-      without the zero-then-checkpoint the other vector-clearing paths do; the usage/daily windows
-      cover `days + 1` calendar days.
+      *(same run)* `MemoryRepository::update_content` (every dream rewrite) NULLed
+      `memories.embedding` without the zero-then-checkpoint the bucket and chunk paths do, so the
+      superseded vector — invertible back to the replaced text — stayed in the WAL and free pages.
+      It now zeroes in place, rewrites, and truncates the WAL under one guard (test
+      `a_content_rewrite_removes_the_old_embedding_from_disk`).
+      **Filed from the same audit, not fixed this run:** the usage/daily windows cover `days + 1`
+      calendar days.
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).

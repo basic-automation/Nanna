@@ -1868,6 +1868,17 @@ impl MemoryRepository {
     /// Returns [`StorageError::Database`] if the update fails.
     pub async fn update_content(&self, memory_id: &str, content: &str) -> Result<bool, StorageError> {
         let conn = self.conn.lock().await;
+        // The superseded vector is zeroed in place before it is dropped, and
+        // the WAL truncated after — what the bucket and chunk paths already do
+        // (`clear_memory_buckets`): an embedding is invertible back to the
+        // text it was computed from, and a NULL alone leaves the old bytes in
+        // the WAL and, after a checkpoint, in free page space.
+        conn.execute(
+            "UPDATE memories SET embedding = zeroblob(octet_length(embedding)) \
+             WHERE memory_id = ?1 AND embedding IS NOT NULL",
+            turso::params![memory_id],
+        )
+        .await?;
         let result = conn
             .execute(
                 "UPDATE memories SET content = ?1, embedding = NULL, embedding_model = NULL, \
@@ -1875,6 +1886,9 @@ impl MemoryRepository {
                 turso::params![content, memory_id],
             )
             .await?;
+        Self::checkpoint_truncate(&conn).await;
+        // Held from the zeroing through the checkpoint: the guard is the
+        // transaction.
         drop(conn);
         Ok(result > 0)
     }
