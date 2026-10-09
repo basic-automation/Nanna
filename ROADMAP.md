@@ -9401,9 +9401,10 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       sender is now cleared first (requests answer "Not connected to daemon" at once) and a
       failed send removes its own entry (test
       `a_request_after_the_daemon_dropped_is_refused_and_leaves_nothing`; fails without it).
-      **Filed from the same audit, not fixed this run:** `relay_output` reads sidecar output
-      with no line-length cap (an MCP server's `\r` progress bar grows one line for a whole
-      download before `fit_line` trims it).
+      *(same run)* `relay_output` read sidecar output with no line-length cap (an MCP server's
+      `\r` progress bar on the shared stderr grew one line for a whole download before
+      `fit_line` trimmed it); it now reads at most `BOOT_LOG_LINE_BYTES` at a time and relays a
+      longer line in pieces (test `output_without_line_endings_is_relayed_in_bounded_pieces`).
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
