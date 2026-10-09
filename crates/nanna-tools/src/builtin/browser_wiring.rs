@@ -121,15 +121,13 @@ impl BrowserManager {
 
         if let Some(sel) = selector {
             // Extract from specific selector
+            // A JSON string is a valid JS string literal with every quote,
+            // backslash and line break escaped; escaping only `'` broke a
+            // selector with a backslash (`#a\\:b`) or let one end the literal.
+            let literal = serde_json::to_string(sel).map_err(|e| e.to_string())?;
             let script = match mode {
-                "html" => format!(
-                    "document.querySelector('{}')?.outerHTML || ''",
-                    sel.replace('\'', "\\'")
-                ),
-                _ => format!(
-                    "document.querySelector('{}')?.textContent || ''",
-                    sel.replace('\'', "\\'")
-                ),
+                "html" => format!("document.querySelector({literal})?.outerHTML || ''"),
+                _ => format!("document.querySelector({literal})?.textContent || ''"),
             };
             let result = page.evaluate(&script).await.map_err(|e| e.to_string())?;
             Ok(result.as_str().unwrap_or("").to_string())
@@ -350,8 +348,8 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Counts the pages it opens and the ones closed.
-    struct FakePage(Arc<AtomicUsize>);
+    /// Counts the pages it opens and the ones closed, and records scripts.
+    struct FakePage(Arc<AtomicUsize>, std::sync::Mutex<Vec<String>>);
 
     #[async_trait]
     impl BrowserPage for FakePage {
@@ -365,7 +363,10 @@ mod tests {
         async fn fill(&self, _s: &str, _t: &str) -> Result<(), BrowserError> { Ok(()) }
         async fn press(&self, _s: &str, _k: &str) -> Result<(), BrowserError> { Ok(()) }
         async fn wait_for_selector(&self, _s: &str) -> Result<(), BrowserError> { Ok(()) }
-        async fn evaluate(&self, _s: &str) -> Result<Value, BrowserError> { Ok(Value::Null) }
+        async fn evaluate(&self, s: &str) -> Result<Value, BrowserError> {
+            self.1.lock().map_err(|_| BrowserError::NotInitialized)?.push(s.to_string());
+            Ok(Value::Null)
+        }
         async fn get_attribute(&self, _s: &str, _a: &str) -> Result<Option<String>, BrowserError> { Ok(None) }
         async fn exists(&self, _s: &str) -> Result<bool, BrowserError> { Ok(true) }
         async fn query_all_text(&self, _s: &str) -> Result<Vec<String>, BrowserError> { Ok(Vec::new()) }
@@ -388,7 +389,7 @@ mod tests {
         }
         async fn navigate(&self, _url: &str) -> Result<Arc<dyn BrowserPage>, BrowserError> {
             self.open.fetch_add(1, Ordering::SeqCst);
-            Ok(Arc::new(FakePage(Arc::clone(&self.open))))
+            Ok(Arc::new(FakePage(Arc::clone(&self.open), std::sync::Mutex::default())))
         }
         async fn close(&self) -> Result<(), BrowserError> { Ok(()) }
         fn config(&self) -> &BrowserConfig { &self.config }
@@ -417,6 +418,21 @@ mod tests {
         assert_eq!(waited, "Waited 20ms");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(open.load(Ordering::SeqCst), 0, "no tab left open");
+    }
+
+    /// A selector reaches the page as one intact JS string literal.
+    #[tokio::test]
+    async fn an_extract_selector_is_a_safe_string_literal() {
+        let page = FakePage(Arc::new(AtomicUsize::new(1)), std::sync::Mutex::default());
+        let selector = r"#a\:b, a[title='x']";
+        let params = HashMap::from([("selector".to_string(), Value::from(selector))]);
+        BrowserManager::extract_on(&page, &params).await.expect("extracts");
+        let scripts = page.1.lock().expect("lock").clone();
+        let expected = format!(
+            "document.querySelector({})?.textContent || ''",
+            serde_json::to_string(selector).expect("json")
+        );
+        assert_eq!(scripts, [expected]);
     }
 
     #[test]

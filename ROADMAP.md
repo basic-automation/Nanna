@@ -9364,7 +9364,9 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       (`ensure_launched` only checks the slot); `browser_action` cannot act on the page a
       previous call opened (each call is a fresh tab, so type-then-click loses the text); the
       screenshot's `width`/`height`/`selector`/`quality` are accepted and ignored by the CDP
-      backend; the extract selector script escapes only `'`.
+      backend. *(same run)* The extract selector script escaped only `'` (a backslash in a
+      selector broke the script); it is now a JSON string literal (test
+      `an_extract_selector_is_a_safe_string_literal`).
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
