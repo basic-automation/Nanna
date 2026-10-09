@@ -303,6 +303,9 @@ impl ControlPlane {
         // Deserialize back to config
         match serde_json::from_value::<Config>(config_value) {
             Ok(mut new_config) => {
+                if let Some(refusal) = unknown_path_refusal(&new_config, &path, &value) {
+                    return refusal;
+                }
                 // The Ollama token is bound to the server it was saved for;
                 // edited in place, the config would carry the old server's
                 // token to a new `memory.ollama_host`. Dropped here, under the
@@ -618,6 +621,37 @@ const RETIRED_KEYS: [(&str, &str); 1] = [(
      `ollama/` summarization model uses chat's one Ollama server and its token. Set \
      memory.ollama_host to move it.",
 )];
+
+/// The refusal for a `set` that wrote a key `Config` does not have, or `None`.
+///
+/// `set_nested` inserts any key and serde drops the unknown ones on the way
+/// back into `Config`, so `config.set {path: "llm.modle"}` answered `updated`,
+/// announced `ConfigChanged` and changed nothing (`config.get` of the same
+/// path then said `path_not_found`). Judged on the round trip itself: a value
+/// that survives it is somewhere in `Config`. An empty value (`null`, `""`,
+/// `[]`, `{}`) may legitimately leave nothing behind — optional and
+/// `skip_serializing_if` empty fields are not written — and secrets are not
+/// serialized at all, so none of those is judged here.
+fn unknown_path_refusal(config: &Config, path: &str, value: &Value) -> Option<Value> {
+    let empty = is_blank(value)
+        || value.as_array().is_some_and(Vec::is_empty)
+        || value.as_object().is_some_and(serde_json::Map::is_empty);
+    if empty || Config::names_a_secret(path) {
+        return None;
+    }
+    let written = serde_json::to_value(config).ok()?;
+    let landed = path
+        .split('.')
+        .try_fold(&written, |node, part| node.get(part))
+        .is_some();
+    (!landed).then(|| {
+        json!({
+            "error": "unknown_path",
+            "message": format!("'{path}' is not a configuration key; nothing was changed"),
+            "path": path,
+        })
+    })
+}
 
 /// What replaced the retired key a `set` of `value` at `path` would write, or
 /// `None` when it writes none.

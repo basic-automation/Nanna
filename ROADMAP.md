@@ -9223,6 +9223,14 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       reset only when a frame (a pong included) arrives. `pump_incoming` is generic over the
       stream so a test can drive it: `a_silent_peer_is_dropped_at_the_read_deadline` (paused
       clock, a never-yielding stream).
+- [x] *(found 2026-10-09, same audit)* **`config.set` of an unknown path answered `updated`.**
+      `set_nested` inserts any key and serde drops the unknown ones on the way back into `Config`,
+      so `llm.modle` replied `updated`, fired `ConfigChanged` and changed nothing (`config.get`
+      said `path_not_found`); `RETIRED_KEYS` guarded exactly one such key. `unknown_path_refusal`
+      now judges the round trip itself: a non-empty, non-secret value that did not survive it is
+      refused (`unknown_path`) before anything is applied or saved. Empty values (optional and
+      `skip_serializing_if` fields) and secrets (never serialized) are not judged. Every GUI
+      `config_set` path checked present. Test `config_set_of_an_unknown_path_is_refused`.
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).

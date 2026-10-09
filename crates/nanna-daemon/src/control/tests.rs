@@ -255,6 +255,24 @@ async fn a_saved_ollama_token_reaches_the_running_embedder_but_the_model_waits()
 /// address (the agent can send one) used to re-read the store for the new
 /// address, find no record, and hand the old server's token to the new one:
 /// chat, embeddings and the probe would all have sent it there.
+/// A typo'd path is refused, not answered `updated` while serde drops it.
+#[tokio::test]
+async fn config_set_of_an_unknown_path_is_refused() {
+    let cp = Arc::new(ControlPlane::new(Arc::new(SessionManager::new())));
+    let set = |path: &str, value: Value| {
+        let cp = Arc::clone(&cp);
+        let action = Action::Config(ConfigAction::Set {
+            path: path.into(),
+            value,
+        });
+        async move { cp.handle("test", action).await }
+    };
+    let typo = set("llm.modle", json!("x")).await;
+    assert_eq!(typo["error"], "unknown_path", "{typo}");
+    let nested_typo = set("memory.no_such.key", json!(1)).await;
+    assert_eq!(nested_typo["error"], "unknown_path", "{nested_typo}");
+}
+
 #[tokio::test]
 async fn config_set_does_not_hand_a_legacy_ollama_token_to_a_new_address() {
     let dir = tempfile::tempdir().expect("tempdir");
