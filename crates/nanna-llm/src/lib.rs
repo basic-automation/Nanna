@@ -170,7 +170,14 @@ pub enum LlmError {
     Stream(String),
     #[error("Missing API key for provider: {0}")]
     MissingApiKey(String),
-    #[error("Rate limit exceeded: {message}")]
+    /// The display carries `retry_after` as `(retry-after: N)`: the chat path
+    /// and the card cooldown read the wait back from the rendered text, and
+    /// without it a header-published wait reached neither (only the dream
+    /// summarizer read the field).
+    #[error(
+        "Rate limit exceeded{}: {message}",
+        .retry_after.map_or_else(String::new, |secs| format!(" (retry-after: {secs})"))
+    )]
     RateLimit {
         message: String,
         /// Seconds until rate limit resets (if available)

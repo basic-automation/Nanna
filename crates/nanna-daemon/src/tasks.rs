@@ -10679,6 +10679,15 @@ mod card_run_tests {
             std::time::Duration::from_secs(120),
             "the provider's own wait"
         );
+        let header = nanna_llm::LlmError::RateLimit {
+            message: "slow down".to_string(),
+            retry_after: Some(90),
+        };
+        assert_eq!(
+            super::rate_limit_cooldown(&format!("step error: LLM error: {header}")),
+            std::time::Duration::from_secs(90),
+            "a header's wait reaches the card through the error text"
+        );
         assert_eq!(
             super::rate_limit_cooldown("Rate limit exceeded: retry-after: 999999"),
             default,

@@ -9575,10 +9575,17 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       call open as a 502; a text-only reply with no terminator still ends as before, with a warning
       (some compatible servers omit both). 2 tests.
       **Filed, not fixed this run:** usage on streamed OpenAI-compatible turns is never requested
-      (`stream_options.include_usage`) nor parsed, so those turns record 0/0 tokens; the
-      rate-limit wait from headers survives only in `LlmError::RateLimit.retry_after`, while the
-      chat path and card cooldown re-parse the *display* text (and read "try again in 452ms" as
-      452 s); and `parse_reset_secs` ignores an HTTP-date `Retry-After`.
+      (`stream_options.include_usage`) nor parsed, so those turns record 0/0 tokens; and
+      `parse_reset_secs` ignores an HTTP-date `Retry-After`.
+- [x] *(found 2026-10-09, same audit)* **A provider's published wait never reached the chat or the
+      card run.** `from_response` put the header's wait in `LlmError::RateLimit.retry_after`, but
+      the display was `Rate limit exceeded: {message}`, and the chat path
+      (`AgentService::parse_retry_after`) and the card cooldown (`rate_limit_cooldown`) read the
+      wait back from the *text* — so an Anthropic 429 with `retry-after: 45` waited the 10 s
+      default. And the chat parser read OpenAI's "try again in 452ms" as 452 s. The display now
+      carries `(retry-after: N)`, the chat parser reads that first and honours a unit (ms round up
+      to 1 s; minutes). Tests: two new cases in `parse_retry_after_extracts_seconds`, one in the card
+      cooldown test.
 - [x] *(found 2026-10-09, same audit)* **A poor lifetime record retired a model for good.**
       `model_health` answered `Unhealthy` (never usable, no expiry) for a lifetime error rate above
       50 % over 5+ requests; `health_sorted_models` then never called the model, so the rate could
