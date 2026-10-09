@@ -4,7 +4,7 @@
 //! Tuning knobs that have a config home are persisted to `config.toml` and
 //! pushed to the daemon; knobs the daemon manages internally are no-ops.
 
-use crate::state::{AppState, backend_handle};
+use crate::state::{backend_handle, AppState};
 use serde::Serialize;
 use std::sync::Arc;
 use tauri::State;
@@ -44,10 +44,7 @@ pub async fn set_auto_remember_messages(
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
     state_guard.config.memory.auto_remember_messages = enabled;
-    state_guard
-        .config
-        .save()
-        .map_err(|e| format!("Failed to save config: {e}"))?;
+    state_guard.config.save().map_err(|e| format!("Failed to save config: {e}"))?;
     let _ = state_guard
         .backend
         .config_set("memory.auto_remember_messages", serde_json::json!(enabled))
@@ -74,10 +71,7 @@ pub async fn set_max_compression_ratio(
     let mut state_guard = state.write().await;
     let clamped = ratio.clamp(0.1, 0.9);
     state_guard.config.memory.max_compression_ratio = clamped;
-    state_guard
-        .config
-        .save()
-        .map_err(|e| format!("Failed to save config: {e}"))?;
+    state_guard.config.save().map_err(|e| format!("Failed to save config: {e}"))?;
     let _ = state_guard
         .backend
         .config_set("memory.max_compression_ratio", serde_json::json!(clamped))
@@ -104,10 +98,7 @@ pub async fn set_min_remaining_memories(
     let mut state_guard = state.write().await;
     let clamped = count.max(5);
     state_guard.config.memory.min_remaining_memories = clamped;
-    state_guard
-        .config
-        .save()
-        .map_err(|e| format!("Failed to save config: {e}"))?;
+    state_guard.config.save().map_err(|e| format!("Failed to save config: {e}"))?;
     let _ = state_guard
         .backend
         .config_set("memory.min_remaining_memories", serde_json::json!(clamped))
@@ -203,11 +194,7 @@ pub async fn trigger_consolidation(
         errors: result
             .get("errors")
             .and_then(|v| v.as_array())
-            .map_or_default(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            }),
+            .map_or_default(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()),
     })
 }
 
@@ -235,49 +222,19 @@ fn memory_item_from_json(m: &serde_json::Value) -> Option<MemoryItem> {
     Some(MemoryItem {
         id: m.get("id")?.as_str()?.to_string(),
         content: m.get("content")?.as_str()?.to_string(),
-        fact_type: m
-            .get("fact_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("stated")
-            .to_string(),
-        importance: score_to_f32(
-            m.get("importance")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(3.0),
-        ),
-        state: m
-            .get("state")
-            .and_then(|v| v.as_str())
-            .unwrap_or("active")
-            .to_string(),
-        weight: score_to_f32(
-            m.get("weight")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(1.0),
-        ),
-        retrievability: score_to_f32(
-            m.get("retrievability")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(1.0),
-        ),
+        fact_type: m.get("fact_type").and_then(|v| v.as_str()).unwrap_or("stated").to_string(),
+        importance: score_to_f32(m.get("importance").and_then(serde_json::Value::as_f64).unwrap_or(3.0)),
+        state: m.get("state").and_then(|v| v.as_str()).unwrap_or("active").to_string(),
+        weight: score_to_f32(m.get("weight").and_then(serde_json::Value::as_f64).unwrap_or(1.0)),
+        retrievability: score_to_f32(m.get("retrievability").and_then(serde_json::Value::as_f64).unwrap_or(1.0)),
         // Saturates where `as` wrapped; an access count past u32::MAX is unreachable.
         access_count: m
             .get("access_count")
             .and_then(serde_json::Value::as_u64)
             .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX)),
-        created_at: m
-            .get("created_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        session_id: m
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        workspace_id: m
-            .get("workspace_id")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        created_at: m.get("created_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        session_id: m.get("session_id").and_then(|v| v.as_str()).map(String::from),
+        workspace_id: m.get("workspace_id").and_then(|v| v.as_str()).map(String::from),
     })
 }
 

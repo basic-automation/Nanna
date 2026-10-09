@@ -73,10 +73,7 @@ async fn backend_and_registry(
     state: &RwLock<AppState>,
 ) -> (Arc<Backend>, Arc<RwLock<WorkspaceRegistry>>) {
     let state_guard = state.read().await;
-    (
-        Arc::clone(&state_guard.backend),
-        Arc::clone(&state_guard.workspaces),
-    )
+    (Arc::clone(&state_guard.backend), Arc::clone(&state_guard.workspaces))
 }
 
 /// List all registered workspaces, read through to the daemon.
@@ -135,11 +132,7 @@ pub async fn list_workspaces(
     }
 
     let registry = workspaces.read().await;
-    Ok(registry
-        .list()
-        .iter()
-        .map(|ws| WorkspaceInfo::from(*ws))
-        .collect())
+    Ok(registry.list().iter().map(|ws| WorkspaceInfo::from(*ws)).collect())
 }
 
 /// Open a workspace by path
@@ -172,14 +165,14 @@ pub async fn open_workspace(
 
     // Create and load new workspace
     let mut workspace = Workspace::new(&path);
-    workspace
-        .load_context()
-        .await
+    workspace.load_context().await
         .map_err(|e| format!("Failed to load workspace: {e}"))?;
 
     // The daemon owns persistence (nanna.db): open the workspace there first and
     // adopt ITS id locally, so both registries agree and it survives a restart.
-    let result = backend.workspace_open(&path.to_string_lossy()).await?;
+    let result = backend
+        .workspace_open(&path.to_string_lossy())
+        .await?;
     if result.get("error").is_some() {
         let msg = result
             .get("message")
@@ -194,9 +187,9 @@ pub async fn open_workspace(
     let id = registry.register(workspace);
     registry.set_active(&id);
 
-    let ws = registry.get(&id).ok_or_else(|| {
-        format!("Workspace {id} missing from the registry right after registering it")
-    })?;
+    let ws = registry
+        .get(&id)
+        .ok_or_else(|| format!("Workspace {id} missing from the registry right after registering it"))?;
     let info = WorkspaceInfo::from(ws);
     info!("Opened workspace: {} at {:?}", ws.name, path);
 
@@ -245,7 +238,9 @@ pub async fn set_active_workspace(
 ///
 /// Never returns `Err`: a failure to tell the daemon is only logged.
 #[tauri::command]
-pub async fn clear_active_workspace(state: State<'_, Arc<RwLock<AppState>>>) -> Result<(), String> {
+pub async fn clear_active_workspace(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<(), String> {
     let (backend, workspaces) = backend_and_registry(&state).await;
     workspaces.write().await.clear_active();
     info!("Cleared active workspace, now in global mode");
@@ -285,11 +280,9 @@ async fn reload_cached_context(
     registry: &mut WorkspaceRegistry,
     id: &str,
 ) -> Result<WorkspaceInfo, String> {
-    let ws = registry
-        .get_mut(id)
+    let ws = registry.get_mut(id)
         .ok_or_else(|| format!("Workspace not found: {id}"))?;
-    ws.load_context()
-        .await
+    ws.load_context().await
         .map_err(|e| format!("Failed to reload workspace: {e}"))?;
     info!("Reloaded workspace: {}", ws.name);
     Ok(WorkspaceInfo::from(&*ws))
@@ -336,8 +329,7 @@ pub async fn init_workspace(
 ) -> Result<WorkspaceInfo, String> {
     let path = std::path::PathBuf::from(&path);
     if !path.exists() {
-        tokio::fs::create_dir_all(&path)
-            .await
+        tokio::fs::create_dir_all(&path).await
             .map_err(|e| format!("Failed to create directory: {e}"))?;
     }
 
@@ -359,13 +351,10 @@ pub async fn init_workspace(
             if !fp.exists() {
                 let content = match file.as_str() {
                     "README.md" => format!("# {}\n", workspace.name),
-                    "CONTRIBUTING.md" => {
-                        "# Contributing\n\n(How to work in this repo.)\n".to_string()
-                    }
+                    "CONTRIBUTING.md" => "# Contributing\n\n(How to work in this repo.)\n".to_string(),
                     _ => continue,
                 };
-                tokio::fs::write(&fp, content)
-                    .await
+                tokio::fs::write(&fp, content).await
                     .map_err(|e| format!("Failed to write {file}: {e}"))?;
             }
         }
@@ -378,7 +367,9 @@ pub async fn init_workspace(
 
     // Open on the daemon so persistence agrees
     let (backend, workspaces) = backend_and_registry(&state).await;
-    let result = backend.workspace_open(&path.to_string_lossy()).await?;
+    let result = backend
+        .workspace_open(&path.to_string_lossy())
+        .await?;
     if let Some(id) = result.get("id").and_then(|v| v.as_str()) {
         workspace.id = id.to_string();
     }
@@ -405,18 +396,9 @@ pub async fn check_workspace_validity(path: String) -> Result<WorkspaceValidityC
         return Ok(WorkspaceValidityCheck {
             exists: false,
             is_valid: false,
-            orientation: OrientationFiles {
-                has_readme: false,
-                has_agents: false,
-            },
-            process: ProcessFiles {
-                has_contributing: false,
-                has_roadmap: false,
-            },
-            project: ProjectSignals {
-                has_git: false,
-                has_manifest: false,
-            },
+            orientation: OrientationFiles { has_readme: false, has_agents: false },
+            process: ProcessFiles { has_contributing: false, has_roadmap: false },
+            project: ProjectSignals { has_git: false, has_manifest: false },
         });
     }
 
@@ -435,18 +417,9 @@ pub async fn check_workspace_validity(path: String) -> Result<WorkspaceValidityC
     Ok(WorkspaceValidityCheck {
         exists: true,
         is_valid,
-        orientation: OrientationFiles {
-            has_readme,
-            has_agents,
-        },
-        process: ProcessFiles {
-            has_contributing,
-            has_roadmap,
-        },
-        project: ProjectSignals {
-            has_git,
-            has_manifest,
-        },
+        orientation: OrientationFiles { has_readme, has_agents },
+        process: ProcessFiles { has_contributing, has_roadmap },
+        project: ProjectSignals { has_git, has_manifest },
     })
 }
 
@@ -485,14 +458,8 @@ mod tests {
             name: "repo".to_string(),
             path: "/src/repo".to_string(),
             active: true,
-            orientation: OrientationFiles {
-                has_readme: true,
-                has_agents: false,
-            },
-            process: ProcessFiles {
-                has_contributing: true,
-                has_roadmap: false,
-            },
+            orientation: OrientationFiles { has_readme: true, has_agents: false },
+            process: ProcessFiles { has_contributing: true, has_roadmap: false },
             context_chars: 42,
         };
         assert_eq!(serde_json::to_string(&info).expect("serializes"), flat);
@@ -508,18 +475,9 @@ mod tests {
         let check = WorkspaceValidityCheck {
             exists: true,
             is_valid: true,
-            orientation: OrientationFiles {
-                has_readme: false,
-                has_agents: true,
-            },
-            process: ProcessFiles {
-                has_contributing: false,
-                has_roadmap: true,
-            },
-            project: ProjectSignals {
-                has_git: true,
-                has_manifest: false,
-            },
+            orientation: OrientationFiles { has_readme: false, has_agents: true },
+            process: ProcessFiles { has_contributing: false, has_roadmap: true },
+            project: ProjectSignals { has_git: true, has_manifest: false },
         };
         assert_eq!(
             serde_json::to_string(&check).expect("serializes"),
