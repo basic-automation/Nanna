@@ -1196,6 +1196,42 @@ async fn consolidate_with_dreaming_passes_the_gate_and_stops_at_the_llm() {
     );
 }
 
+/// Closing the active workspace leaves global mode behind it: the tools'
+/// default working directory goes with the workspace, as `ClearActive` does.
+#[tokio::test]
+async fn closing_the_active_workspace_clears_the_tool_cwd() {
+    let registry = Arc::new(nanna_tools::ToolRegistry::new());
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.tools = Some(Arc::clone(&registry));
+    let cp = Arc::new(cp);
+    let dir = tempfile::tempdir().expect("dir");
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let opened = ask(serde_json::json!({
+        "type": "workspace", "action": "open", "path": dir.path().display().to_string(),
+    }))
+    .await;
+    let id = opened["id"].as_str().expect("an id").to_string();
+    ask(serde_json::json!({"type": "workspace", "action": "set_active", "id": id})).await;
+    assert!(
+        registry.default_workdir().await.is_some(),
+        "the active workspace is the cwd"
+    );
+
+    let closed = ask(serde_json::json!({"type": "workspace", "action": "close", "id": id})).await;
+    assert_eq!(closed["status"], "closed", "{closed}");
+    assert_eq!(
+        registry.default_workdir().await,
+        None,
+        "no cwd in a closed project"
+    );
+}
+
 #[tokio::test]
 async fn enable_disable_reconciles_live_registry() {
     use crate::user_tools::UserToolManager;

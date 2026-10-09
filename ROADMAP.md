@@ -8750,6 +8750,14 @@ as its turn (`TurnAdmission`, scope default `session`).
             on a card from board B while A was open computed the verdict against A's files. Both now
             share `card_workspace_root` (explicit > the card's board > active). Control-plane test
             `a_cards_acceptance_is_judged_in_its_own_boards_workspace`.
+      - [x] *(found 2026-10-09, same audit)* **Closing the active workspace left it as the tool
+            cwd.** `workspace.close` removed it from the registry (clearing the active id) but never
+            reset the tools' default workdir as `clear_active` does, so tool calls kept resolving
+            paths inside a project that was no longer open — against "only a registered, active
+            workspace sets the tool cwd". It also discarded the DB delete's error and reported
+            `closed` for a row that would bring the workspace back on restart; that now answers
+            `persisted: false` with the reason. Test
+            `closing_the_active_workspace_clears_the_tool_cwd`.
 - [ ] Delete: session table + `SessionManager`, `ChatAction::*`, `chat_harness.rs` continuation
       loop, empty-bubble gating, per-session pinned model, GUI chat pages and commands, channel
       adapters + `channel_secrets` + per-channel pinned models, `scheduler.target_channel/
