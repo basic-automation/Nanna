@@ -69,13 +69,37 @@ fn print_credentials_status(
 ///
 /// The `SecureStore` is the durable home — `Config::save` strips secrets from
 /// config.toml, so a login that only touches the config dies with the process.
+/// The config file as it is, to change a field of and save back — or `None`
+/// when it cannot be read, which is said, and nothing is saved.
+///
+/// This used `Config::load().unwrap_or_default()`: a `config.toml` with one
+/// TOML typo loaded as the DEFAULTS, and the save then wrote them over the
+/// user's file — provider, models, channels, MCP servers and `data_dir` gone,
+/// to set one OAuth field.
+fn loaded_config_to_edit() -> Option<Config> {
+    config_to_edit(Config::load())
+}
+
+fn config_to_edit<E: std::fmt::Display>(loaded: Result<Config, E>) -> Option<Config> {
+    match loaded {
+        Ok(config) => Some(config),
+        Err(e) => {
+            warn!("Not rewriting a config file that does not load: {e}");
+            println!("⚠ config.toml could not be read ({e}); it was left as it is — fix it and re-run");
+            None
+        }
+    }
+}
+
 fn persist_oauth_credential(credential: &nanna_config::OAuthCredential) {
     if let Err(e) = nanna_config::SecureStore::new().save_anthropic_oauth(credential) {
         warn!("Failed to persist OAuth token to secure store: {}", e);
         println!("⚠ Could not persist token to the secure store: {e}");
     }
 
-    let mut config = Config::load().unwrap_or_default();
+    let Some(mut config) = loaded_config_to_edit() else {
+        return;
+    };
     config.llm.anthropic_oauth_token = Some(credential.access_token.clone());
     config.llm.anthropic_use_oauth = true;
     if let Err(e) = config.save() {
@@ -252,7 +276,9 @@ fn clear_credentials() {
         println!("⚠ Could not remove the token from the secure store: {e}");
     }
 
-    let mut config = Config::load().unwrap_or_default();
+    let Some(mut config) = loaded_config_to_edit() else {
+        return;
+    };
     config.llm.anthropic_oauth_token = None;
     config.llm.anthropic_use_oauth = false;
     if let Err(e) = config.save() {
@@ -280,4 +306,20 @@ pub async fn handle_credentials_command(action: CredentialsAction) -> anyhow::Re
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod config_edit_tests {
+    use super::config_to_edit;
+    use nanna_config::Config;
+
+    /// A config that does not load is never replaced by the defaults.
+    #[test]
+    fn a_config_that_does_not_load_is_not_rewritten() {
+        assert!(config_to_edit::<String>(Err("expected `=` at line 3".to_string())).is_none());
+        let mut mine = Config::default();
+        mine.llm.model = "my-model".to_string();
+        let kept = config_to_edit::<String>(Ok(mine)).expect("a loaded config is edited");
+        assert_eq!(kept.llm.model, "my-model");
+    }
 }

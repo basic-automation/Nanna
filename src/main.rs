@@ -460,7 +460,9 @@ async fn main() -> anyhow::Result<()> {
             if generate {
                 println!("{}", nanna_config::generate_default_config());
             } else {
-                let path = Config::default_config_path()?;
+                // The file this config came from: under `--config` the
+                // default path labelled another file's settings.
+                let path = doctor_config_path(cli.config.as_ref())?;
                 println!("Config path: {}", path.display());
                 println!("\n{}", toml::to_string_pretty(&config)?);
             }

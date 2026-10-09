@@ -9367,6 +9367,21 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       backend. *(same run)* The extract selector script escaped only `'` (a backslash in a
       selector broke the script); it is now a JSON string literal (test
       `an_extract_selector_is_a_safe_string_literal`).
+- [x] *(found 2026-10-09, audit of the CLI)* **`nanna credentials` could replace a broken
+      config with the defaults.** `import`/`refresh`/`setup`/`clear` loaded the config with
+      `Config::load().unwrap_or_default()` and saved it back: one TOML typo and the user's
+      provider, models, channels, MCP servers and `data_dir` were overwritten to set one OAuth
+      field. A config that does not load is now left alone and the command says so
+      (`config_to_edit`, test `a_config_that_does_not_load_is_not_rewritten`).
+      *(same run)* `nanna chat` treated end of input (Ctrl-D, an empty pipe) as an empty line and
+      re-prompted forever at full CPU; it now exits. `nanna config` labelled `--config`'s
+      settings with the default path; it prints the file it loaded (checked live).
+      **Filed from the same audit, not fixed this run:** `main` turns a config that does not parse
+      into the defaults (logged at info), and quick setup then prompts for a key and saves the
+      defaults over the file — and saves to the default path, not `--config`'s, which
+      `is_first_run` also ignores (so `--config alt.toml chat` runs the wizard whenever the
+      default file is missing); credential commands print ❌ and exit 0 on failure, and
+      `persist_oauth_credential` only warns when the secure-store save fails.
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
