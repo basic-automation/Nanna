@@ -357,6 +357,16 @@ async fn run_mcp(config: &Config, action: McpAction) -> anyhow::Result<()> {
     }
 }
 
+
+/// The file `nanna doctor` reports on: the one the config was loaded from
+/// (`--config`), not always the default path.
+fn doctor_config_path(given: Option<&PathBuf>) -> anyhow::Result<PathBuf> {
+    Ok(match given {
+        Some(path) => path.clone(),
+        None => Config::default_config_path()?,
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -407,7 +417,7 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some(Commands::Doctor { online }) => {
-            let path = Config::default_config_path()?;
+            let path = doctor_config_path(cli.config.as_ref())?;
             let worst = commands::doctor::run(&config, &path, online).await;
             // Non-zero on a real fault so this is usable from a script or a
             // health probe, not just by eye.

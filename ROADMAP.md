@@ -9931,8 +9931,12 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       template `standard` does not exist (only `minimal` and `project` do) — the default is
       `project`. Tests `a_context_file_is_read_only_inside_the_project_and_only_so_far`,
       `an_existing_file_is_kept_not_replaced`.
-      **Filed from the same audit, not fixed this run:** `nanna doctor` checks the defaults (and
-      says all passed) when `config.toml` does not parse; `nanna daemon restart` can end with no
+      *(same run)* `nanna doctor` judged the built-in defaults — and said "All checks passed" —
+      when `config.toml` did not parse (the CLI falls back to defaults on a load error); the
+      `config.file` check now parses the file the same way the loader does and FAILs with the
+      parser's message, and doctor reports the `--config` file it was given rather than always the
+      default path. Test `a_config_file_that_does_not_parse_fails`.
+      **Filed from the same audit, not fixed this run:** `nanna daemon restart` can end with no
       daemon (500 ms wait vs a multi-second drain) and exit 0; `daemon status` / export probe the
       default port whatever `--port` started; `nanna mcp serve` fails tool calls over 30 s and
       never reconnects; `nanna-daemon install` ignores `systemctl`/`launchctl` failures and drops

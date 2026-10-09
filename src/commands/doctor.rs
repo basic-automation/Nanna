@@ -93,6 +93,31 @@ impl Check {
     }
 }
 
+/// The config file exists — does it parse?
+///
+/// The CLI falls back to the built-in defaults when `config.toml` fails to
+/// load, so every other check then judged the DEFAULTS, and a file with a
+/// syntax error reported "All checks passed" — while the daemon refuses it.
+/// Parsed with `toml` alone: loading through `Config` also files secrets into
+/// the secure store, which a diagnostic must not do.
+fn config_file_check(config_path: &Path) -> Check {
+    let parsed = std::fs::read_to_string(config_path)
+        .map_err(|e| e.to_string())
+        .and_then(|text| toml::from_str::<Config>(&text).map(drop).map_err(|e| e.to_string()));
+    match parsed {
+        Ok(()) => Check::ok("config.file", format!("{}", config_path.display())),
+        Err(why) => Check::fail(
+            "config.file",
+            format!(
+                "{} does not load ({why}); every other check below judged the built-in \
+                 defaults instead",
+                config_path.display()
+            ),
+            "fix the file (the message names the line), or move it aside to start from defaults",
+        ),
+    }
+}
+
 /// Run every offline check against `config`.
 ///
 /// `config_path` is reported rather than read again, so the caller stays the
@@ -102,7 +127,7 @@ pub fn run_checks(config: &Config, config_path: &Path) -> Vec<Check> {
     let mut checks = Vec::new();
 
     checks.push(if config_path.exists() {
-        Check::ok("config.file", format!("{}", config_path.display()))
+        config_file_check(config_path)
     } else {
         Check::warn(
             "config.file",
@@ -1068,6 +1093,19 @@ pub fn report(checks: &[Check], online: bool) -> Severity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config file that does not parse fails the check: every other check
+    /// is then judging the built-in defaults the CLI fell back to.
+    #[test]
+    fn a_config_file_that_does_not_parse_fails() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[llm\nmodel = ").expect("write");
+        let check = config_file_check(&path);
+        assert_eq!(check.severity, Severity::Fail, "{check:?}");
+        std::fs::write(&path, "[general]\n").expect("write");
+        assert_eq!(config_file_check(&path).severity, Severity::Ok);
+    }
 
     fn cfg() -> Config {
         Config::default()
