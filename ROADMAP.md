@@ -9897,9 +9897,10 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       run's token; `run_shell` kills the check's tree on cancel (the timeout path's
       `kill_check_tree`) and the verdict is unknown, never a failure (test
       `stop_interrupts_a_running_check`).
-      **Filed from the same audit, not fixed this run:** salvaged
-      prose tool calls can be stored without a paired `tool_result` on the cancel/budget and
-      wrap-up paths (no observed 400 yet — every path rebuilds its context).
+      *(same run)* Salvaged prose tool calls were stored as `tool_use` blocks but the cancel/budget
+      exit paired only the structured calls, and the wrap-up exit paired none — history held calls
+      with no `tool_result`. Both exits now pair the salvaged calls too (test
+      `a_salvaged_call_cut_off_by_the_budget_is_paired`, scripted Ollama; fails without it).
 
 **Stage 4 — the board client and what it must not port:**
 - [x] The Tauri layer's lock discipline: never hold `AppState` across a daemon round trip

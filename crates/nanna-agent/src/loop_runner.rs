@@ -4680,17 +4680,22 @@ impl Agent {
         if !result.text.is_empty() {
             state.final_text = result.text;
         }
-        if let Some(exit) = self
-            .stop_after_stored_reply(
-                state,
-                options,
-                &result.tool_uses,
-                &result.error_tool_results,
+        // The stored turn carries the salvaged calls as `tool_use` blocks
+        // too, so an exit before they run pairs them as well.
+        let unrun: std::borrow::Cow<'_, [(String, String, Value)]> = if salvage.uses.is_empty() {
+            std::borrow::Cow::Borrowed(&result.tool_uses)
+        } else {
+            std::borrow::Cow::Owned(
+                result.tool_uses.iter().chain(&salvage.uses).cloned().collect(),
             )
+        };
+        if let Some(exit) = self
+            .stop_after_stored_reply(state, options, &unrun, &result.error_tool_results)
             .await
         {
             return ControlFlow::Break(exit);
         }
+        drop(unrun);
 
         // If no tool calls, check for narration loop before exiting.
         // A round whose structured calls ALL had malformed JSON
@@ -6188,6 +6193,15 @@ impl Agent {
         // the report is quotation, not intent). Guarantee the report
         // is never silence.
         if state.wrap_up.engaged {
+            // Salvage never runs here, but the stored turn already carries
+            // its synthesized `tool_use` blocks: pair them, or the next
+            // request has calls with no results.
+            self.pair_unrun_calls(
+                &salvage.uses,
+                &[],
+                "tools are off on the step's wrap-up iteration",
+            )
+            .await;
             if state.final_text.trim().is_empty() {
                 state.final_text = step_activity_digest(&state.tool_records);
             }
