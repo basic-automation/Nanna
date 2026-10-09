@@ -1313,6 +1313,24 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       skipped). It also caught `ChannelStatusLive`'s `interval_ms` (Tauri wants `intervalMs`).
       Mutation-checked: the old `code` keys fail it.
 
+- [x] *(found 2026-10-09, same audit)* **GUI commands said "done" for things the daemon declined.**
+      The daemon reports a refusal inside an `Ok` reply; `trigger_consolidation`, `update_memory`,
+      `delete_memory` and `set_active_workspace` checked only the transport result — so Dream with no
+      model configured said "Dream cycle finished", an edit of a memory a dream had merged said
+      "Memory saved", and activating a workspace another client had closed showed it Active while
+      the daemon's tool cwd never moved (the GUI now asks the daemon first and changes its own view
+      only on success). New shared `commands::daemon_refusal` (1 test).
+      **Filed from the same audit, not fixed this run — the first is serious:** the GUI loads its
+      config copy once at boot and every local settings setter (`set_agent_name`,
+      `set_streaming_enabled`, `set_max_tokens`, the iteration policy, the memory setters) saves
+      that whole stale copy over `config.toml`, which the daemon's watcher then loads — so a tool
+      disabled on the Tools page (written by the daemon) is silently re-enabled by the next
+      settings change, and hand edits are reverted; the fix is to route setters through
+      `config.set`. Also: the Memory page's Workspace tab with no workspace open sends the literal
+      `"workspace"` (lists globals, clears nothing, says cleared); `init_workspace` re-registers the
+      active workspace as inactive; clearing an Agent Loop number field saves `1`;
+      `set_embedding_config` reports success on a failed save and never tells the daemon.
+
 ##### UI / UX bugfix (known + sweep)
 - [x] **Empty / loading / error / offline** states for every page (chat, logs, memory, tools, channels, stats,
       scheduler, workspaces, agents) — no silent blank panels; retry or next-step where recovery exists.
