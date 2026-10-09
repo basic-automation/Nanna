@@ -9305,8 +9305,10 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       superseded vector — invertible back to the replaced text — stayed in the WAL and free pages.
       It now zeroes in place, rewrites, and truncates the WAL under one guard (test
       `a_content_rewrite_removes_the_old_embedding_from_disk`).
-      **Filed from the same audit, not fixed this run:** the usage/daily windows cover `days + 1`
-      calendar days.
+      *(same run)* The usage and daily tool-stats windows cut at `now - days` rounded to midnight —
+      `days + 1` calendar days (eight bars for "7 days"). Both now start at `window_first_day`,
+      today and the `days - 1` before it (tests `a_window_of_n_days_spans_n_calendar_days`,
+      `a_one_day_usage_window_excludes_yesterday`).
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
