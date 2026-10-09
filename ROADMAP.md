@@ -9282,6 +9282,11 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       (live: one WebSocket client connected → `clients: 1`). **Filed, not fixed:**
       `set_last_error` still has no caller (`last_error` is always null), and a failed config save
       on a tool toggle / `config.set` still replies success.
+- [x] *(found 2026-10-09, audit of storage/timeline)* **A card's folded story kept only its start.**
+      `compress::is_mandatory` counted an event as a salience peak when it was `>=` both neighbours
+      — every comment is written at 0.5, exactly `PEAK_FLOOR` — so a flat run of 40 comments made
+      all 40 mandatory, the overflow branch kept the earliest ~22 and elided the rest. A peak must
+      now rise above at least one neighbour. Test `a_flat_run_is_decimated_evenly_not_truncated`.
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
