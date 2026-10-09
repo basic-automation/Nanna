@@ -648,6 +648,12 @@ pub struct VectorStore {
     /// then a memory exists but no similarity search can find it. A bounded
     /// ring of the last [`SEARCHABLE_LATENCY_SAMPLES_MAX`] waits, in seconds.
     searchable_latency: std::sync::Mutex<std::collections::VecDeque<u64>>,
+    /// Held across "snapshot an entry, then upsert it" and across every
+    /// delete, so the two cannot interleave. A backfill that cloned an entry,
+    /// released the entries lock and only then saved it would re-insert a row
+    /// a delete removed in that gap — the memory came back on the next
+    /// restart. Taken before `entries`, never the other way round.
+    persist_serial: tokio::sync::Mutex<()>,
 }
 
 /// Samples kept for the queue-to-searchable percentiles.
@@ -718,6 +724,7 @@ impl VectorStore {
             seeded_models: std::sync::Mutex::new(std::collections::HashSet::new()),
             active_model: RwLock::new(None),
             searchable_latency: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            persist_serial: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -757,6 +764,7 @@ impl VectorStore {
                             searchable_latency: std::sync::Mutex::new(
                                 std::collections::VecDeque::new(),
                             ),
+                            persist_serial: tokio::sync::Mutex::new(()),
                         }
                     }
                     Err(e) => {
@@ -1278,6 +1286,7 @@ impl VectorStore {
     /// Returns `MemoryError::NotFound` if no entry with the given ID exists,
     /// and the backend's error if it could not delete the row.
     pub async fn remove(&self, id: &str) -> Result<(), MemoryError> {
+        let _serial = self.persist_serial.lock().await;
         if !self.entries.read().await.iter().any(|e| e.id == id) {
             return Err(MemoryError::NotFound(id.to_string()));
         }
@@ -1306,6 +1315,7 @@ impl VectorStore {
         if ids.is_empty() {
             return DurableRemoval::default();
         }
+        let _serial = self.persist_serial.lock().await;
         let mut failed = 0usize;
         let mut first_error = None;
         let confirmed: Vec<&str> = match self.db {
@@ -1366,6 +1376,7 @@ impl VectorStore {
         }
         let requested = ids.len();
         let id_set: std::collections::HashSet<&str> = ids.iter().copied().collect();
+        let _serial = self.persist_serial.lock().await;
 
         let mut entries = self.entries.write().await;
         let before = entries.len();
@@ -1573,7 +1584,9 @@ impl VectorStore {
         // Normalize for cosine similarity, matching `add`.
         normalize_f32(&mut embedding);
 
-        // Update the in-memory entry, snapshot it, then release the lock.
+        // Update the in-memory entry, snapshot it, then release the lock. The
+        // serial guard is held until the snapshot is saved.
+        let serial = self.persist_serial.lock().await;
         let mut entries = self.entries.write().await;
         let entry = entries
             .iter_mut()
@@ -1614,6 +1627,7 @@ impl VectorStore {
                 // Non-fatal: in-memory cache already updated.
             }
         }
+        drop(serial);
 
         self.write_chunks(
             id,
@@ -1956,6 +1970,7 @@ impl VectorStore {
                 got: embedding.len(),
             });
         }
+        let serial = self.persist_serial.lock().await;
         let mut entries = self.entries.write().await;
         let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
             return Err(MemoryError::NotFound(id.to_string()));
@@ -1998,6 +2013,7 @@ impl VectorStore {
         {
             warn!("Failed to persist backfilled embedding for {}: {}", snapshot.id, e);
         }
+        drop(serial);
         debug_assert!(snapshot.embeddings.contains_key(model), "the bucket was written");
         Ok(true)
     }
@@ -2711,6 +2727,79 @@ mod tests {
         async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
             Ok(vec![health_test_entry("ok")])
         }
+    }
+
+    /// A backing store whose first `save_entry` waits at a gate, holding the
+    /// rows it has, so a test can line a delete up inside the save's gap.
+    struct GatedDb {
+        rows: std::sync::Mutex<std::collections::HashSet<String>>,
+        gate: tokio::sync::Notify,
+        waiting: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl MemoryPersistence for GatedDb {
+        async fn save_entry(&self, e: &MemoryEntry) -> Result<(), MemoryError> {
+            self.waiting.notify_one();
+            self.gate.notified().await;
+            self.rows.lock().unwrap().insert(e.id.clone());
+            Ok(())
+        }
+        async fn remove_entry(&self, id: &str) -> Result<(), MemoryError> {
+            self.rows.lock().unwrap().remove(id);
+            Ok(())
+        }
+        async fn update_entry_fsrs(&self, _id: &str, _f: &FsrsState) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_entry_content(&self, _id: &str, _c: &str) -> Result<(), MemoryError> { Ok(()) }
+        async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> { Ok(Vec::new()) }
+    }
+
+    /// A delete that lands while a backfill is saving its snapshot stays
+    /// deleted: it used to run in the gap between the snapshot and the
+    /// upsert, and the upsert put the row back — the memory returned on the
+    /// next restart.
+    #[tokio::test]
+    async fn a_delete_during_a_vector_install_is_not_undone() {
+        let db = Arc::new(GatedDb {
+            rows: std::sync::Mutex::new(std::collections::HashSet::from(["m".to_string()])),
+            gate: tokio::sync::Notify::new(),
+            waiting: tokio::sync::Notify::new(),
+        });
+        let store = Arc::new(
+            VectorStore::new(VectorStoreConfig {
+                dimension: std::sync::atomic::AtomicUsize::new(4),
+                chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+                use_f16: false,
+            })
+            .with_persistence(db.clone()),
+        );
+        store
+            .entries
+            .write()
+            .await
+            .push(chunked_entry("m", "text", Vec::new(), None));
+
+        let installing = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                store
+                    .set_embedding_for_model("m", "prov:a", vec![1.0, 0.0, 0.0, 0.0], true)
+                    .await
+            })
+        };
+        db.waiting.notified().await; // the install is inside its save
+        let removing = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move { store.remove("m").await })
+        };
+        // Give the delete every chance to run inside the gap.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        db.gate.notify_one();
+        installing.await.expect("join").expect("install");
+        removing.await.expect("join").expect("remove");
+        assert!(db.rows.lock().unwrap().is_empty(), "the deleted row was resurrected");
+        assert!(store.entries.read().await.is_empty());
     }
 
     /// Records every chunk-set replacement so a test can assert what the

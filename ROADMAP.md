@@ -9214,9 +9214,12 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       was never re-queued) — findable by words it no longer contains. New
       `VectorStore::set_embedding_if_content` compares the content under the same write guard that
       installs; a changed row stays queued. Test `a_vector_of_edited_text_is_not_installed`.
-      **Filed from the same audit, not fixed this run:** `set_embedding_for_model` / `update_content_and_embedding_if` clone under the
-      lock and `save_entry` after it, so a delete in that gap is resurrected by the upsert;
-      `search_in_scope_with_coverage` takes the global top `3·k` before filtering, so a small
+      *(same run)* `set_embedding_for_model` / `update_content_and_embedding_if` cloned under the
+      entries lock and `save_entry`d after releasing it, so a delete in that gap was resurrected by
+      the upsert on the next restart. `VectorStore::persist_serial` is now held across
+      snapshot-and-save and across every delete (test
+      `a_delete_during_a_vector_install_is_not_undone`, gated backing store; fails without it).
+      **Filed from the same audit, not fixed this run:** `search_in_scope_with_coverage` takes the global top `3·k` before filtering, so a small
       workspace's matches can be crowded out while coverage reports complete; and the card fold
       (`memory_write_through`) reads only a card's oldest 1 000 episodes and never re-folds past it.
 - [x] *(found 2026-10-09, audit of scheduling)* **Cron matched day-of-month AND day-of-week.**
