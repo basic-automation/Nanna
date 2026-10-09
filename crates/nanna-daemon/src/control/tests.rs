@@ -1232,6 +1232,54 @@ async fn closing_the_active_workspace_clears_the_tool_cwd() {
     );
 }
 
+/// `needs_shell` on `tool.update` sets the grant both ways and keeps the
+/// tool's other scopes: `false` used to change nothing (the reply still said
+/// `updated`), and `true` replaced the whole permission set.
+#[tokio::test]
+async fn needs_shell_grants_and_revokes_without_dropping_scopes() {
+    use crate::user_tools::{UserToolManager, UserToolPermissions};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let user_tools = Arc::new(UserToolManager::new(tmp.path().to_path_buf()));
+    let source =
+        "export default { name: \"t_sh\", description: \"sh\", execute(p) { return \"ok\"; } }";
+    let permissions = UserToolPermissions {
+        read: vec!["~/notes".to_string()],
+        run: true,
+        ..UserToolPermissions::default()
+    };
+    user_tools
+        .create_tool(
+            "t_sh".into(),
+            "sh".into(),
+            source.into(),
+            None,
+            None,
+            Some(permissions),
+        )
+        .await
+        .expect("create tool");
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.tools = Some(Arc::new(nanna_tools::ToolRegistry::new()));
+    cp.user_tools = Some(Arc::clone(&user_tools));
+    let cp = Arc::new(cp);
+    for run in [false, true] {
+        let action: Action = serde_json::from_value(serde_json::json!({
+            "type": "tool", "action": "update", "name": "t_sh", "needs_shell": run,
+        }))
+        .expect("parses");
+        let reply = cp.handle("test", action).await;
+        assert_eq!(reply["status"], "updated", "{reply}");
+        let meta = user_tools.get_tool("t_sh").await.expect("still there");
+        assert_eq!(meta.permissions.run, run);
+        assert_eq!(
+            meta.permissions.read,
+            ["~/notes"],
+            "the read scope survives"
+        );
+    }
+}
+
 #[tokio::test]
 async fn enable_disable_reconciles_live_registry() {
     use crate::user_tools::UserToolManager;

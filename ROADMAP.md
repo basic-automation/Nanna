@@ -9516,6 +9516,11 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `validate_source` now requires the declared name to equal the tool's name (which is never
       bundled). GUI user tools (`UserToolManager::create_tool`, registered under their own name)
       now refuse a bundled name too. Test `a_source_declaring_another_name_is_refused`.
+- [x] *(found 2026-10-09, audit of the control plane)* **`tool.update {needs_shell}` could not
+      revoke shell access.** `false` mapped to "no change" — the reply said `updated` and
+      `permissions.run` stayed `true` — and `true` replaced the tool's whole permission set with a
+      default one, dropping its read/write/net scopes. It now sets `run` on the tool's current
+      permissions either way. Test `needs_shell_grants_and_revokes_without_dropping_scopes`.
 - [x] Tool authoring: `tools.update` refuses bundled names and runs `check_syntax`; GUI
       `update_skill` validates the name (`tool_authoring.rs:99,236`, `gui/.../tools.rs:458`). Both
       move with the `default-skills` → tools rename.

@@ -265,16 +265,24 @@ impl ControlPlane {
             return json!({ "error": "user_tools_unavailable", "message": "User tool manager not configured" });
         };
 
-        let permissions = needs_shell.and_then(|ns| {
-            if ns {
-                Some(crate::user_tools::UserToolPermissions {
-                    run: true,
-                    ..Default::default()
-                })
-            } else {
-                None
-            }
-        });
+        // `needs_shell` sets the shell grant on the tool's CURRENT permissions.
+        // `false` used to map to "no change" (so shell access could not be
+        // revoked here while the reply said `updated`), and `true` replaced
+        // the whole set with a default one, dropping its read/write scopes.
+        let permissions = match needs_shell {
+            Some(run) => user_tools.get_tool(&name).await.map(|meta| {
+                let mut permissions = meta.permissions;
+                permissions.run = run;
+                permissions
+            }),
+            None => None,
+        };
+        debug_assert!(
+            permissions
+                .as_ref()
+                .is_none_or(|p| Some(p.run) == needs_shell),
+            "the grant asked for is the grant written"
+        );
 
         match user_tools.update_tool(&name, description, code, None, permissions, None).await {
             Ok(meta) => {
