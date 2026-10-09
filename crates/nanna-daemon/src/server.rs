@@ -4525,6 +4525,8 @@ impl DaemonServer {
             let sessions_for_health = self.sessions.clone();
             let ipc_for_health = Arc::clone(&self.ipc);
             let health_state_clone = health_state.clone();
+            // Detached: it ends when the bus closes, with the daemon.
+            drop(Arc::clone(&health_state).record_errors_from(self.ipc.event_sender().subscribe()));
             tokio::spawn(async move {
                 loop {
                     let count = sessions_for_health.count().await;
