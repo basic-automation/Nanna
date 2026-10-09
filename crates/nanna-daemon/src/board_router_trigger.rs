@@ -738,7 +738,7 @@ mod tests {
                 .unwrap();
             tasks.complete(card.id, Some(creator), None).await.unwrap();
             let done = tasks.get(card.id).await.unwrap();
-            assert!(crate::tasks::reopen_for_next_round(&tasks, &done).await);
+            assert!(crate::tasks::reopen_for_next_round(&tasks, &done, None).await);
             let wake = Wake {
                 task_id: card.id,
                 reason: WakeReason::RecurringReopened,

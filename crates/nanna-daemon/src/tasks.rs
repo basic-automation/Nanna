@@ -5363,9 +5363,10 @@ pub async fn sweep_recurrences(storage: &Arc<Storage>) -> usize {
             .as_deref()
             .and_then(parse_db_time)
             .unwrap_or(now);
-        if expr.next(&completed).is_some_and(|next| next <= now)
-            && reopen_for_next_round(&repo, &task).await
-        {
+        let Some(occurrence) = expr.next(&completed).filter(|next| *next <= now) else {
+            continue;
+        };
+        if reopen_for_next_round(&repo, &task, Some(occurrence)).await {
             info!(task_id = task.id, "recurring task reopened");
             reopened += 1;
         }
@@ -5383,9 +5384,29 @@ pub async fn sweep_recurrences(storage: &Arc<Storage>) -> usize {
 pub(crate) async fn reopen_for_next_round(
     repo: &nanna_storage::TaskRepository,
     task: &Task,
+    occurrence: Option<chrono::DateTime<chrono::Utc>>,
 ) -> bool {
     use crate::board_router_trigger::{RECURRENCE_ACTOR, created_by_board_client};
     debug_assert!(task.recurrence.is_some(), "only recurring cards come round");
+    // The round's dates move with it. `reopen` clears the announcement
+    // markers but never moved the dates, so a card with last round's
+    // deadline was announced overdue again in the same sweep, every round,
+    // with its dates stuck further in the past each time.
+    if let Some((due_at, deadline_at)) = occurrence
+        .and_then(|at| next_round_dates(task.due_at.as_deref(), task.deadline_at.as_deref(), at))
+    {
+        let dates = TaskPatch {
+            due_at: Some(due_at),
+            deadline_at: Some(deadline_at),
+            ..TaskPatch::default()
+        };
+        if let Err(e) = repo.update(task.id, dates, Some(RECURRENCE_ACTOR)).await {
+            tracing::warn!(
+                task_id = task.id,
+                "recurring card kept last round's dates: {e}"
+            );
+        }
+    }
     if task.assignee.is_some() && task.scope != "session" {
         match created_by_board_client(repo, task.id).await {
             Ok(true) => {
@@ -5405,6 +5426,48 @@ pub(crate) async fn reopen_for_next_round(
         }
     }
     repo.reopen(task.id, Some(RECURRENCE_ACTOR)).await.is_ok()
+}
+
+/// A recurring card's dates for the round starting at `occurrence`: both
+/// shifted by the whole days that move the earlier of them (the defer date,
+/// else the deadline) onto the occurrence's day, each kept in the form it was
+/// stored in (`YYYY-MM-DD`, or a timestamp keeping its time of day). `None`
+/// when the card has no dates, one is unreadable, or the occurrence is not
+/// after them (dates never move backwards).
+fn next_round_dates(
+    due_at: Option<&str>,
+    deadline_at: Option<&str>,
+    occurrence: chrono::DateTime<chrono::Utc>,
+) -> Option<(Option<String>, Option<String>)> {
+    let day_of =
+        |stored: &str| chrono::NaiveDate::parse_from_str(stored.get(..10)?, "%Y-%m-%d").ok();
+    let anchor = day_of(due_at.or(deadline_at)?)?;
+    let shift = occurrence.date_naive().signed_duration_since(anchor);
+    if shift <= chrono::TimeDelta::zero() {
+        return None;
+    }
+    let moved = |stored: Option<&str>| -> Option<Option<String>> {
+        let Some(stored) = stored else {
+            return Some(None);
+        };
+        if stored.len() == 10 {
+            return Some(Some(
+                (day_of(stored)? + shift).format("%Y-%m-%d").to_string(),
+            ));
+        }
+        let at = parse_db_time(stored)? + shift;
+        Some(Some(if stored.contains('T') {
+            at.to_rfc3339()
+        } else {
+            at.format("%Y-%m-%d %H:%M:%S").to_string()
+        }))
+    };
+    let dates = (moved(due_at)?, moved(deadline_at)?);
+    debug_assert!(
+        dates.0.is_some() == due_at.is_some() && dates.1.is_some() == deadline_at.is_some(),
+        "a date is moved, never added or dropped"
+    );
+    Some(dates)
 }
 
 /// Parse a stored timestamp: RFC3339 first, then turso's
@@ -5809,17 +5872,91 @@ mod tests {
     async fn a_board_cards_next_round_goes_back_to_the_router_unassigned() {
         let storage = Storage::in_memory().await.unwrap();
         let card = finished_recurring_card(&storage, "gui").await;
-        assert!(reopen_for_next_round(&storage.tasks(), &card).await);
+        assert!(reopen_for_next_round(&storage.tasks(), &card, None).await);
         let next = storage.tasks().get(card.id).await.unwrap();
         assert_eq!(next.status, "pending");
         assert_eq!(next.assignee, None, "released for the router");
+    }
+
+    #[test]
+    fn a_rounds_dates_move_to_its_occurrence() {
+        let at = |text: &str| {
+            chrono::DateTime::parse_from_rfc3339(text)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        // Weekly: last round dated Mon 10-05, deadline Wed 10-07; next round Mon 10-12.
+        assert_eq!(
+            next_round_dates(
+                Some("2026-10-05"),
+                Some("2026-10-07"),
+                at("2026-10-12T09:00:00Z")
+            ),
+            Some((
+                Some("2026-10-12".to_string()),
+                Some("2026-10-14".to_string())
+            ))
+        );
+        // A deadline alone anchors; a timestamp keeps its time and form.
+        assert_eq!(
+            next_round_dates(
+                None,
+                Some("2026-10-05 17:00:00"),
+                at("2026-10-12T09:00:00Z")
+            ),
+            Some((None, Some("2026-10-12 17:00:00".to_string())))
+        );
+        // No dates, a date not behind the occurrence, or an unreadable one: unchanged.
+        assert_eq!(
+            next_round_dates(None, None, at("2026-10-12T09:00:00Z")),
+            None
+        );
+        assert_eq!(
+            next_round_dates(Some("2026-10-20"), None, at("2026-10-12T09:00:00Z")),
+            None
+        );
+        assert_eq!(
+            next_round_dates(Some("soon"), None, at("2026-10-12T09:00:00Z")),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reopened_round_is_not_announced_overdue_on_last_rounds_deadline() {
+        let storage = Storage::in_memory().await.unwrap();
+        let tasks = storage.tasks();
+        let card = tasks
+            .create(NewTask {
+                scope: "global".to_string(),
+                title: "Weekly report".to_string(),
+                priority: 3,
+                recurrence: Some("0 9 * * 1".to_string()),
+                due_at: Some("2026-10-05".to_string()),
+                deadline_at: Some("2026-10-07".to_string()),
+                created_by: Some("harness".to_string()),
+                ..NewTask::default()
+            })
+            .await
+            .unwrap();
+        tasks.complete(card.id, None, None).await.unwrap();
+        let done = tasks.get(card.id).await.unwrap();
+        let occurrence = chrono::DateTime::parse_from_rfc3339("2026-10-12T09:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(reopen_for_next_round(&tasks, &done, Some(occurrence)).await);
+        let next = tasks.get(card.id).await.unwrap();
+        assert_eq!(next.due_at.as_deref(), Some("2026-10-12"));
+        assert_eq!(next.deadline_at.as_deref(), Some("2026-10-14"));
+        // The same sweep then announces: the date has come, nothing is overdue.
+        let (due, overdue) = tasks.announce_due("2026-10-12T09:05:00Z").await.unwrap();
+        assert_eq!((due, overdue), (1, 0));
     }
 
     #[tokio::test]
     async fn the_chat_harness_recurring_card_keeps_its_assignee() {
         let storage = Storage::in_memory().await.unwrap();
         let card = finished_recurring_card(&storage, "harness").await;
-        assert!(reopen_for_next_round(&storage.tasks(), &card).await);
+        assert!(reopen_for_next_round(&storage.tasks(), &card, None).await);
         let next = storage.tasks().get(card.id).await.unwrap();
         assert_eq!(next.status, "pending");
         assert_eq!(

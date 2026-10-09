@@ -9166,6 +9166,15 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       run. Same parser for scheduler jobs and card recurrences. Now OR when neither field starts
       with `*` (so `*/2` counts as starred, like Vixie), AND otherwise. Test
       `restricted_day_and_weekday_fire_on_either`.
+- [x] *(found 2026-10-09, same audit)* **A recurring card came back with last round's dates.**
+      `reopen` clears the `due`/`overdue` announcement markers but never moved `due_at` or
+      `deadline_at`, and the same sweep then runs `announce_due` — so a weekly card with a deadline
+      was announced *overdue* the moment each new round opened, its dates sliding further into the
+      past every week. `reopen_for_next_round` now takes the occurrence the sweep found and moves
+      both dates by the whole days that put the earlier one on the occurrence's day (form kept:
+      bare day or timestamp; never backwards). Tests `a_rounds_dates_move_to_its_occurrence`,
+      `a_reopened_round_is_not_announced_overdue_on_last_rounds_deadline` (1 due, 0 overdue; was
+      overdue on the old reopen).
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
