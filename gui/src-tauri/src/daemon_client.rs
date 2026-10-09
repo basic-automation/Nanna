@@ -477,6 +477,12 @@ impl DaemonClient {
             info!("Disconnected from daemon");
         }
 
+        // The dead connection's sender goes first: left in place, every
+        // request while the daemon was down was registered, then failed with
+        // "channel closed" — or, sent in the moment before the message task
+        // exited, was buffered, dropped, and waited out its whole timeout.
+        *shared.msg_tx.write().await = None;
+
         // Fail all pending requests
         {
             let mut pending = shared.pending.write().await;
@@ -660,7 +666,8 @@ impl DaemonClient {
     ///
     /// - `"Not connected to daemon"` when the client is not in daemon mode
     ///   (it never connected, or the reconnection loop gave up);
-    /// - `"No message sender"` when no connection has been installed yet;
+    /// - `"Not connected to daemon"` too when no connection is installed (none
+    ///   yet, or the last one dropped and a reconnect is pending);
     /// - `"Send error: …"` when the connection's message pump has already
     ///   ended;
     /// - `"Disconnected"` when the connection drops before the reply arrives
@@ -694,7 +701,7 @@ impl DaemonClient {
 
         let msg_tx = {
             let guard = self.msg_tx.read().await;
-            guard.clone().ok_or_else(|| "No message sender".to_string())?
+            guard.clone().ok_or_else(|| "Not connected to daemon".to_string())?
         };
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -712,9 +719,12 @@ impl DaemonClient {
             pending.insert(id.clone(), PendingRequest { tx });
         }
 
-        // Send request
-        msg_tx.send(Message::Text(json.into())).await
-            .map_err(|e| format!("Send error: {e}"))?;
+        // Send request. A send that fails leaves nothing that will answer
+        // the entry just registered, so it goes too.
+        if let Err(e) = msg_tx.send(Message::Text(json.into())).await {
+            self.pending.write().await.remove(&id);
+            return Err(format!("Send error: {e}"));
+        }
 
         Ok((id, rx))
     }

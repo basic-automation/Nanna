@@ -9393,6 +9393,16 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       failure, and `persist_oauth_credential` only warned when the secure-store save failed
       before printing "✅ Token refreshed!"; each failure is now the command's error (non-zero
       exit), the store save included.
+- [x] *(found 2026-10-09, audit of the GUI's IPC client)* **A dropped daemon connection left its
+      sender installed.** `handle_disconnect` failed the pending requests but kept the dead
+      connection's `msg_tx`, so while the daemon was down every GUI request registered itself,
+      failed with "channel closed" and stayed in the pending map; one sent just before the
+      message task exited was buffered, dropped and waited out its whole timeout (5 min). The
+      sender is now cleared first (requests answer "Not connected to daemon" at once) and a
+      failed send removes its own entry.
+      **Filed from the same audit, not fixed this run:** `relay_output` reads sidecar output
+      with no line-length cap (an MCP server's `\r` progress bar grows one line for a whole
+      download before `fit_line` trims it).
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
