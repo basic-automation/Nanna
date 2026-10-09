@@ -71,12 +71,18 @@ pub async fn handle_daemon_command(
             if pid_file.state()?.live_daemon().is_some() {
                 println!("Stopping current daemon...");
                 stop_daemon_process(&pid_file)?;
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                await_stopped(
+                    || Ok(pid_file.state()?.live_daemon()),
+                    RESTART_STOP_DEADLINE,
+                    RESTART_POLL_STEP,
+                )
+                .await?;
             }
             println!("Starting daemon...");
             if let Some(pid) = pid_file.state()?.live_daemon() {
-                println!("⚠️  Daemon is already running (PID {pid})");
-                return Ok(());
+                // Another daemon claimed the role while this one stopped: the
+                // restart did not happen, so it must not exit 0.
+                anyhow::bail!("another daemon started in the meantime (PID {pid}); not restarted");
             }
             let (pid, _) = spawn_daemon_process(&host, port, &data_dir, config_path)?;
             println!("✅ Daemon restarted!");
@@ -86,6 +92,50 @@ pub async fn handle_daemon_command(
     }
 
     Ok(())
+}
+
+/// How long `restart` waits for the stopped daemon to exit before it gives up.
+///
+/// A SIGTERM'd daemon drains before it exits: in-flight turns are cancelled,
+/// MCP servers get [`nanna_daemon::mcp_startup::MCP_SHUTDOWN_DEADLINE`] (3 s)
+/// to close, and the store is flushed. That takes seconds, not the 500 ms
+/// `restart` used to sleep — after which it found the old daemon still
+/// running, printed "already running", started nothing and exited 0, leaving
+/// no daemon once the old one finished. Ten times the one bounded component
+/// leaves room for the flush on a loaded disk; a daemon still alive past that
+/// is wedged, and the command fails saying so instead of claiming success.
+const RESTART_STOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often `restart` re-reads the PID file while it waits.
+const RESTART_POLL_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Wait until `live` (the PID file's live daemon) reports none, re-reading it
+/// every `step` for at most `deadline`.
+///
+/// # Errors
+///
+/// When `live` fails, or a daemon is still alive at the deadline.
+async fn await_stopped(
+    mut live: impl FnMut() -> anyhow::Result<Option<u32>>,
+    deadline: std::time::Duration,
+    step: std::time::Duration,
+) -> anyhow::Result<()> {
+    assert!(!step.is_zero(), "a zero step would spin");
+    assert!(step <= deadline, "the deadline allows at least one re-read");
+    let until = tokio::time::Instant::now() + deadline;
+    loop {
+        let Some(pid) = live()? else {
+            return Ok(());
+        };
+        if tokio::time::Instant::now() >= until {
+            anyhow::bail!(
+                "the daemon (PID {pid}) is still running {}s after it was told to stop; \
+                 not restarted — run 'nanna daemon start' once it exits",
+                deadline.as_secs()
+            );
+        }
+        tokio::time::sleep(step).await;
+    }
 }
 
 /// Spawn a daemon process in the background. Returns (PID, log file path).
@@ -280,7 +330,42 @@ fn stale_note(state: &PidFileState) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A daemon that takes a while to drain is waited for, not raced: the
+    /// restart starts its successor only once the old one is gone.
+    #[tokio::test]
+    async fn restart_waits_out_a_slow_drain() {
+        let mut reads = 0_u32;
+        let waited = await_stopped(
+            || {
+                reads += 1;
+                Ok((reads < 40).then_some(7))
+            },
+            Duration::from_secs(30),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(waited.is_ok(), "{waited:?}");
+        assert_eq!(reads, 40, "re-read until the PID file named no live daemon");
+    }
+
+    /// A daemon still alive at the deadline fails the restart; it never
+    /// reports success with nothing started.
+    #[tokio::test]
+    async fn restart_fails_when_the_old_daemon_never_exits() {
+        let waited = await_stopped(
+            || Ok(Some(7)),
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        )
+        .await;
+        let message = waited.expect_err("a wedged daemon is an error").to_string();
+        assert!(message.contains("PID 7"), "{message}");
+        assert!(message.contains("still running"), "{message}");
+        assert!(message.contains("not restarted"), "{message}");
+    }
     use super::*;
+    use std::time::Duration;
 
     /// A relocated install's daemon keeps its PID file under `[general]
     /// data_dir`. `status` and `stop` must read it there, not in the platform

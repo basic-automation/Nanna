@@ -9945,8 +9945,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `config.file` check now parses the file the same way the loader does and FAILs with the
       parser's message, and doctor reports the `--config` file it was given rather than always the
       default path. Test `a_config_file_that_does_not_parse_fails`.
-      **Filed from the same audit, not fixed this run:** `nanna daemon restart` can end with no
-      daemon (500 ms wait vs a multi-second drain) and exit 0; `daemon status` / export probe the
+      *(same run)* `nanna daemon restart` slept 500 ms after the SIGTERM, found the old daemon
+      still draining, printed "already running", started nothing and exited 0 — no daemon once the
+      drain finished. It now re-reads the PID file until the old daemon is gone (bounded by
+      `RESTART_STOP_DEADLINE`, 30 s) and fails, not succeeds, when it is still alive or another
+      daemon won the role (tests `restart_waits_out_a_slow_drain`,
+      `restart_fails_when_the_old_daemon_never_exits`).
+      **Filed from the same audit, not fixed this run:** `daemon status` / export probe the
       default port whatever `--port` started; `nanna mcp serve` fails tool calls over 30 s and
       never reconnects; `nanna-daemon install` ignores `systemctl`/`launchctl` failures and drops
       `--data-dir`/`--port`/`NANNA_CONFIG_PATH` from the unit.
