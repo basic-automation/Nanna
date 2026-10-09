@@ -177,11 +177,7 @@ impl ControlPlane {
         *config = reset;
 
         // Save to disk
-        if let Some(ref config_path) = self.config_path
-            && let Err(e) = config.save_to(config_path)
-        {
-            warn!("Failed to save config: {}", e);
-        }
+        let unsaved = self.save_config(&config);
 
         // Propagate to agent service
         if let Some(ref agent) = self.agent {
@@ -197,6 +193,9 @@ impl ControlPlane {
             .await;
         self.propagate_committed(&snapshot).await;
 
+        if let Some(message) = unsaved {
+            return not_persisted("reset", &message);
+        }
         json!({ "status": "reset" })
     }
 
@@ -225,11 +224,7 @@ impl ControlPlane {
         *config = imported;
 
         // Save to disk
-        if let Some(ref config_path) = self.config_path
-            && let Err(e) = config.save_to(config_path)
-        {
-            warn!("Failed to save config: {}", e);
-        }
+        let unsaved = self.save_config(&config);
 
         info!("Config imported");
 
@@ -247,6 +242,9 @@ impl ControlPlane {
             .await;
         self.propagate_committed(&snapshot).await;
 
+        if let Some(message) = unsaved {
+            return not_persisted("imported", &message);
+        }
         json!({ "status": "imported" })
     }
 
@@ -342,13 +340,7 @@ impl ControlPlane {
                 *config = new_config;
 
                 // Save to disk if we have a path
-                if let Some(ref config_path) = self.config_path {
-                    if let Err(e) = config.save_to(config_path) {
-                        warn!("Failed to save config: {}", e);
-                    } else {
-                        info!("Config saved to {:?}", config_path);
-                    }
-                }
+                let unsaved = self.save_config(&config);
 
                 // Propagate LLM config changes to agent service.
                 // Whole-`[llm]` push, not just the model fields: a
@@ -371,6 +363,11 @@ impl ControlPlane {
                     .await;
                 self.propagate_committed(&snapshot).await;
 
+                if let Some(message) = unsaved {
+                    let mut reply = not_persisted("updated", &message);
+                    reply["path"] = json!(path);
+                    return reply;
+                }
                 if still_supplied {
                     let note = format!(
                         "{path} is deleted from the secure store, but the environment still \
@@ -382,6 +379,23 @@ impl ControlPlane {
                 json!({ "status": "updated", "path": path })
             }
             Err(e) => json!({ "error": "invalid_config", "message": e.to_string() })
+        }
+    }
+
+    /// Save `config` to the daemon's config file, if it has one. `Some` is
+    /// the reason a save failed: the change is live but will not survive a
+    /// restart, which the caller must say rather than reply a clean success.
+    pub(super) fn save_config(&self, config: &Config) -> Option<String> {
+        let config_path = self.config_path.as_ref()?;
+        match config.save_to(config_path) {
+            Ok(()) => {
+                info!("Config saved to {}", config_path.display());
+                None
+            }
+            Err(e) => {
+                warn!("Failed to save config to {}: {e}", config_path.display());
+                Some(e.to_string())
+            }
         }
     }
 
@@ -700,4 +714,21 @@ fn set_nested(obj: &mut Value, parts: &[&str], value: Value) -> Result<(), Strin
             },
         )
     }
+}
+
+/// The reply for a change that is live but was not saved: an `error` (so a
+/// client that checks only for one cannot show it as saved), the `status` the
+/// change reached, and why the save failed. Every config write used to log
+/// the failure and reply success — a setting that silently reverted at the
+/// next restart.
+pub(super) fn not_persisted(status: &str, reason: &str) -> Value {
+    debug_assert!(!reason.is_empty(), "a failed save has a reason");
+    json!({
+        "error": "not_persisted",
+        "status": status,
+        "message": format!(
+            "applied for this run, but not saved to the config file ({reason}); \
+             it will be lost on restart"
+        ),
+    })
 }

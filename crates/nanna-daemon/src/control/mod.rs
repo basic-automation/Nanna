@@ -748,7 +748,7 @@ impl ControlPlane {
         // lock acquisition, then release it BEFORE awaiting the registry. The
         // policy is computed from the same lists that were just written, so the
         // file on disk and the live gate cannot disagree.
-        let policy = {
+        let (policy, unsaved) = {
             let mut config = self.config.write().await;
             if enabled {
                 config.tools.disabled.retain(|n| n != &canonical);
@@ -767,19 +767,15 @@ impl ControlPlane {
                 "the derived policy must agree with the toggle that produced it"
             );
 
-            if let Some(ref config_path) = self.config_path
-                && let Err(e) = config.save_to(config_path)
-            {
-                // The live gate below still applies, so the toggle is honoured
-                // for this run — it just will not survive a restart. Say which
-                // it is rather than reporting a clean success.
-                warn!("Tool toggle for {canonical} not persisted: {e}");
-            }
+            // The live gate below still applies, so a toggle whose save fails
+            // is honoured for this run — it just will not survive a restart,
+            // which the reply says rather than reporting a clean success.
+            let unsaved = self.save_config(&config);
             // Released only now: mutate, derive and persist are one critical
             // section, so a concurrent toggle cannot interleave with the save.
             drop(config);
 
-            policy
+            (policy, unsaved)
         };
 
         tools.set_policy(policy).await;
@@ -791,6 +787,11 @@ impl ControlPlane {
 
         let status = if enabled { "enabled" } else { "disabled" };
         info!("{status} tool: {canonical}");
+        if let Some(message) = unsaved {
+            let mut reply = config::not_persisted(status, &message);
+            reply["name"] = json!(canonical);
+            return reply;
+        }
         json!({ "status": status, "name": canonical })
     }
 

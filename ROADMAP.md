@@ -9280,8 +9280,12 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `tags_can_be_replaced_and_removed`. *(same run)* `/status` always said `clients: 0` —
       `set_client_count` had no caller; the health loop now feeds it the IPC server's count
       (live: one WebSocket client connected → `clients: 1`). **Filed, not fixed:**
-      `set_last_error` still has no caller (`last_error` is always null), and a failed config save
-      on a tool toggle / `config.set` still replies success.
+      `set_last_error` still has no caller (`last_error` is always null). *(same run)* A failed
+      config save on a tool toggle, `config.set`, reset or import logged a warning and replied
+      success — a setting that silently reverted at the next restart. All four now go through
+      `save_config` and reply `error: "not_persisted"` (with the `status` the live change reached)
+      when the save fails; the change still applies for the run (test
+      `a_config_change_that_cannot_be_saved_says_so`).
 - [x] *(found 2026-10-09, audit of storage/timeline)* **A card's folded story kept only its start.**
       `compress::is_mandatory` counted an event as a salience peak when it was `>=` both neighbours
       — every comment is written at 0.5, exactly `PEAK_FLOOR` — so a flat run of 40 comments made

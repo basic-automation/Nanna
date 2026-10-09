@@ -3121,3 +3121,39 @@ async fn a_quick_add_line_with_a_parent_becomes_its_sub_card() {
     .await;
     assert_eq!(missing["error"], "task_not_found", "{missing}");
 }
+
+/// A change whose save fails is live for this run and says it was not saved:
+/// every config write used to log the failure and reply a clean success, so a
+/// setting silently reverted at the next restart.
+#[tokio::test]
+async fn a_config_change_that_cannot_be_saved_says_so() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut cp, _store) = persisting_control_plane(dir.path());
+    // A directory where the file should be: every save fails.
+    let unwritable = dir.path().join("config-is-a-directory");
+    std::fs::create_dir(&unwritable).expect("mkdir");
+    cp.config_path = Some(unwritable);
+    let cp = Arc::new(cp);
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "llm.model".into(),
+                value: json!("nanna-test-unsaved-model"),
+            }),
+        )
+        .await;
+    assert_eq!(resp["error"], "not_persisted", "{resp}");
+    assert_eq!(resp["status"], "updated", "{resp}");
+    assert_eq!(resp["path"], "llm.model", "{resp}");
+    assert_eq!(
+        cp.config.read().await.llm.model,
+        "nanna-test-unsaved-model",
+        "the change still applies for this run"
+    );
+
+    let reset = cp.handle("test", Action::Config(ConfigAction::Reset { path: None })).await;
+    assert_eq!(reset["error"], "not_persisted", "{reset}");
+    assert_eq!(reset["status"], "reset", "{reset}");
+}
