@@ -9376,10 +9376,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       *(same run)* `nanna chat` treated end of input (Ctrl-D, an empty pipe) as an empty line and
       re-prompted forever at full CPU; it now exits. `nanna config` labelled `--config`'s
       settings with the default path; it prints the file it loaded (checked live).
-      **Filed from the same audit, not fixed this run:** `main` turns a config that does not parse
-      into the defaults (logged at info), and quick setup then prompts for a key and saves the
-      defaults over the file — and saves to the default path, not `--config`'s, which
-      `is_first_run` also ignores (so `--config alt.toml chat` runs the wizard whenever the
+      *(same run)* `main` turned a default config that does not parse into the defaults (logged at
+      info), and quick setup then prompted for a key and saved the defaults over the file. Every
+      command but `doctor` now stops with the parse error instead (`config_or_refusal`, test
+      `a_config_that_does_not_parse_is_refused_not_defaulted`; live: `run` exits 1, `doctor`
+      reports the file, the file is untouched).
+      **Filed from the same audit, not fixed this run:** quick setup saves to the default path,
+      not `--config`'s, which `is_first_run` also ignores (so `--config alt.toml chat` runs the wizard whenever the
       default file is missing); credential commands print ❌ and exit 0 on failure, and
       `persist_oauth_credential` only warns when the secure-store save fails.
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with

@@ -388,6 +388,31 @@ async fn run_mcp(config: &Config, action: McpAction) -> anyhow::Result<()> {
 }
 
 
+/// The default config file as loaded, or — when it exists but cannot be read
+/// — an error, except for `doctor`, which runs on the defaults to report it.
+///
+/// A file that did not parse used to become the DEFAULTS, logged at info
+/// level, and every command ran on them: the first one that saved (quick
+/// setup asking for an API key, a credentials command) wrote the defaults
+/// over the user's file. A missing file is not an error (`Config::load`
+/// answers the defaults for it).
+fn config_or_refusal<E: std::fmt::Display>(
+    loaded: Result<Config, E>,
+    diagnosing: bool,
+) -> anyhow::Result<Config> {
+    match loaded {
+        Ok(config) => Ok(config),
+        Err(e) if diagnosing => {
+            info!("Using default config ({e}) — doctor reports why");
+            Ok(Config::default())
+        }
+        Err(e) => anyhow::bail!(
+            "config.toml could not be read: {e}. Fix it (`nanna doctor` checks it) — \
+             running on the defaults instead could write them over your file"
+        ),
+    }
+}
+
 /// The file `nanna doctor` reports on: the one the config was loaded from
 /// (`--config`), not always the default path.
 fn doctor_config_path(given: Option<&PathBuf>) -> anyhow::Result<PathBuf> {
@@ -429,10 +454,7 @@ async fn main() -> anyhow::Result<()> {
     let config = if let Some(path) = &cli.config {
         Config::load_from(path)?
     } else {
-        Config::load().unwrap_or_else(|e| {
-            info!("Using default config ({})", e);
-            Config::default()
-        })
+        config_or_refusal(Config::load(), matches!(cli.command, Some(Commands::Doctor { .. })))?
     }
     .with_env_overrides();
 
@@ -613,6 +635,18 @@ mod tests {
             daemon_of(&["--daemon", "ws://127.0.0.1:6001"]).as_deref(),
             Some("ws://127.0.0.1:6001")
         );
+    }
+
+    /// A config file that does not parse stops every command but `doctor`.
+    #[test]
+    fn a_config_that_does_not_parse_is_refused_not_defaulted() {
+        let broken = || Err::<Config, &str>("TOML parse error at line 3");
+        let refused = config_or_refusal(broken(), false).expect_err("refused");
+        assert!(refused.to_string().contains("line 3"), "{refused}");
+        assert!(config_or_refusal(broken(), true).is_ok(), "doctor runs to report it");
+        let mut mine = Config::default();
+        mine.llm.model = "mine".to_string();
+        assert_eq!(config_or_refusal::<&str>(Ok(mine), false).expect("ok").llm.model, "mine");
     }
 
     /// A daemon is never given its config file as `--config`, which only part
