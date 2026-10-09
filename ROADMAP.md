@@ -9511,6 +9511,14 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       backend's `wait_for_selector` (`is_visible` answers at once, like the old CDP one) — the
       feature is off and its crate is not even fetched here, so it cannot be verified.
 
+- [x] *(found 2026-10-09, audit of the provider plumbing)* **Healing truncated tool arguments
+      closed brackets in the wrong order.** `close_unbalanced` counted `{` and `[` separately and
+      always appended every `]` before every `}`, so `{"edits":[{"old":"x"` became
+      `{"edits":[{"old":"x"]}}` — not JSON — and `heal_tool_args` fell back to `{}`: any truncated
+      call with an object inside an array lost all its arguments. Closers now come from a stack of
+      the openers seen (innermost first), and a dangling `\` at the cut no longer escapes the
+      closing quote. 2 tests.
+
 **Stage 4 — the board client and what it must not port:**
 - [x] The Tauri layer's lock discipline: never hold `AppState` across a daemon round trip
       (`scheduler.rs:28`, `settings.rs:454,519,550` and siblings); no `unsafe set_var` from
