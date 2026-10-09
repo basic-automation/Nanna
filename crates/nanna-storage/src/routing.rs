@@ -310,7 +310,12 @@ pub async fn apply_decision(
             task.status
         )));
     }
-    if run_is_live && !matches!(decision, RouterDecision::Park { .. }) {
+    // The card is read here, AFTER the router's model call, and a card picked
+    // up meanwhile is `in_progress`: the caller's `run_is_live` was judged
+    // before that call (which can take minutes), so on its own it let an
+    // `assign`/`split` land on a card a run had started working.
+    let worked = run_is_live || task.status == "in_progress";
+    if worked && !matches!(decision, RouterDecision::Park { .. }) {
         return Err(StorageError::Invalid(format!(
             "card #{task_id} has a live run; the router may only park it (never reassign a card \
              that is being worked)"
@@ -889,6 +894,41 @@ mod tests {
             post.contains(&format!("#{} → unassigned: client", applied.created[1])),
             "{post}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_card_picked_up_while_the_router_thought_can_only_be_parked() {
+        let (_s, tasks, members) = board().await;
+        let task = card(&tasks, "ship the board").await;
+        // A run started on it after the router's wake judged it free.
+        tasks
+            .update(
+                task.id,
+                TaskPatch {
+                    status: Some("in_progress".to_string()),
+                    ..TaskPatch::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let assign = RouterDecision::Assign {
+            member: "agent:coder".to_string(),
+            reason: "it writes Rust".to_string(),
+            labels: Vec::new(),
+            acceptance: None,
+        };
+        let refused = apply_decision(&tasks, &members, ROUTER, task.id, &assign, false)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("may only park"), "{refused}");
+        assert_eq!(tasks.get(task.id).await.unwrap().assignee, None);
+        let park = RouterDecision::Park {
+            reason: "it is being worked".to_string(),
+        };
+        apply_decision(&tasks, &members, ROUTER, task.id, &park, false)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

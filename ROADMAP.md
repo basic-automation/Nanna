@@ -8725,6 +8725,14 @@ as its turn (`TurnAdmission`, scope default `session`).
             never routed. Every named assignee is now checked against the roster before the first
             write; a refusal names the sub-task and creates nothing. Test
             `a_split_naming_a_stranger_creates_nothing`.
+      - [x] *(found 2026-10-09, same audit)* **The router could reassign or split a card a run had
+            just picked up.** `route_one` always passed `run_is_live = false` ("not being worked:
+            `card_to_route` just said so"), but that was judged *before* the model call, and the
+            same `unblocked` event wakes the card-run worker too — so the run could start while
+            the router thought, and its `assign agent:b`/`split` then landed on a live card,
+            breaking decision 7. `apply_decision` already re-reads the card after the call; it now
+            treats `in_progress` there as worked (park only). Test
+            `a_card_picked_up_while_the_router_thought_can_only_be_parked`.
 - [ ] Delete: session table + `SessionManager`, `ChatAction::*`, `chat_harness.rs` continuation
       loop, empty-bubble gating, per-session pinned model, GUI chat pages and commands, channel
       adapters + `channel_secrets` + per-channel pinned models, `scheduler.target_channel/
