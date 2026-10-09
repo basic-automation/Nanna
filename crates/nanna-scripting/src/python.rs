@@ -466,9 +466,21 @@ _nanna_json = _nj.dumps(_nanna_result)
 
 /// Build wrapper Python code that captures stdout, stderr, and exceptions.
 fn build_wrapper(user_code: &str, workdir: Option<&str>) -> String {
+    // `os.chdir` in this embedded interpreter moves the whole daemon's
+    // working directory. It used to stay moved after the run — every later
+    // relative path in the process resolved against the last python
+    // workdir — so the previous directory is restored in the `finally` below.
     let chdir = workdir.map_or_else(String::new, |wd| {
-        format!("import os; os.chdir({})\n", python_string_literal(wd))
+        format!(
+            "import os\n_nanna_prev_cwd = os.getcwd()\nos.chdir({})\n",
+            python_string_literal(wd)
+        )
     });
+    let restore = if workdir.is_some() {
+        "    try:\n        os.chdir(_nanna_prev_cwd)\n    except Exception:\n        pass\n"
+    } else {
+        ""
+    };
 
     // Escape the user code for embedding in a triple-quoted string
     // We use exec() with the code as a variable to avoid any escaping issues
@@ -539,7 +551,7 @@ finally:
     sys.stderr = _nanna_orig_stderr
     _nanna_result["stdout"] = _nanna_stdout_buf.getvalue()
     _nanna_result["stderr"] = _nanna_stderr_buf.getvalue()
-"#
+{restore}"#
     )
 }
 

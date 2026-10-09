@@ -9676,9 +9676,12 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       *(same run)* The `python` tool's documented default workdir ("the session workspace") was
       never passed: unset, the interpreter ran in the daemon's own cwd. The skill now sends
       `Nanna.workdir()` when none is given.
-      **Filed from the same audit, not fixed this run:** a given python workdir is applied with
-      `os.chdir`, which RustPython applies to the whole daemon process (every tool's relative
-      paths move with it, concurrently); GUI user tools get no skill services (the control plane
+      *(same run)* A given python workdir was applied with `os.chdir` — process-wide in the
+      embedded interpreter — and never undone, so after one run the whole daemon's relative paths
+      resolved against that directory. The wrapper now restores the previous directory in its
+      `finally` (test `a_python_workdir_does_not_move_the_daemon`, its own binary).
+      **Filed from the same audit, not fixed this run:** while a python run with a workdir lasts,
+      the move is still process-wide (concurrent relative paths see it); GUI user tools get no skill services (the control plane
       holds no service map). *(same run)* GUI user tools ran with no workspace or session, so
       their relative paths resolved against the daemon's own directory; `UserToolManager` now
       keeps the registry it registers with and each run reads the active workspace's directory
