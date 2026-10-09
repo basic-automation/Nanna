@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use nanna_config::Config;
 use nanna_config::credentials::{ClaudeCredentialManager, OAuthCredential};
+use nanna_daemon::exit_reason::{ExitReasonFile, ExitState, PreviousExit};
 use nanna_daemon::llm_router::ProviderId;
 use nanna_llm::{OllamaProbe, probe_ollama};
 
@@ -92,6 +93,35 @@ impl Check {
     }
 }
 
+/// The config file exists — does it parse?
+///
+/// The CLI falls back to the built-in defaults when `config.toml` fails to
+/// load, so every other check then judged the DEFAULTS, and a file with a
+/// syntax error reported "All checks passed" — while the daemon refuses it.
+/// Parsed with `toml` alone: loading through `Config` also files secrets into
+/// the secure store, which a diagnostic must not do.
+fn config_file_check(config_path: &Path) -> Check {
+    let parsed = std::fs::read_to_string(config_path)
+        .map_err(|e| e.to_string())
+        .and_then(|text| {
+            toml::from_str::<Config>(&text)
+                .map(drop)
+                .map_err(|e| e.to_string())
+        });
+    match parsed {
+        Ok(()) => Check::ok("config.file", format!("{}", config_path.display())),
+        Err(why) => Check::fail(
+            "config.file",
+            format!(
+                "{} does not load ({why}); every other check below judged the built-in \
+                 defaults instead",
+                config_path.display()
+            ),
+            "fix the file (the message names the line), or move it aside to start from defaults",
+        ),
+    }
+}
+
 /// Run every offline check against `config`.
 ///
 /// `config_path` is reported rather than read again, so the caller stays the
@@ -101,7 +131,7 @@ pub fn run_checks(config: &Config, config_path: &Path) -> Vec<Check> {
     let mut checks = Vec::new();
 
     checks.push(if config_path.exists() {
-        Check::ok("config.file", format!("{}", config_path.display()))
+        config_file_check(config_path)
     } else {
         Check::warn(
             "config.file",
@@ -119,6 +149,7 @@ pub fn run_checks(config: &Config, config_path: &Path) -> Vec<Check> {
     checks.push(check_tools_dir(config));
     checks.push(check_embeddings(config));
     checks.push(check_summarization_models(config));
+    checks.push(check_last_exit(config));
     checks.push(check_mcp_servers(config, command_resolves, |key| {
         nanna_config::credentials::SecureStore::new().get(key).ok()
     }));
@@ -130,6 +161,94 @@ pub fn run_checks(config: &Config, config_path: &Path) -> Vec<Check> {
         "every non-ok check must carry a remedy — a verdict without one is the thing this replaces"
     );
     checks
+}
+
+/// How the last daemon on this data directory ended, from its exit record.
+///
+/// A daemon that died uncleanly says so once, as a WARN line at its next
+/// boot, which nobody reads. That is how a week of `SIGBUS` deaths under an
+/// `AppImage` went unnoticed (2026-09-28). The record now also carries the
+/// exit status the GUI saw, so this check can name the signal.
+fn check_last_exit(config: &Config) -> Check {
+    let Ok(data_dir) = config.resolve_data_dir() else {
+        return Check::warn(
+            "daemon.last_exit",
+            "the data directory could not be resolved, so its exit record was not read",
+            "fix `[general] data_dir` (see the data check), then run doctor again",
+        );
+    };
+    let previous = ExitReasonFile::new(&data_dir).read_previous();
+    let logs = nanna_daemon::log_file::resolve_log_dir(None, &data_dir);
+    judge_last_exit(&previous, &logs, daemon_process_alive)
+}
+
+/// The verdict on `previous`. `alive` says whether the process with a PID
+/// is a live daemon (`None`: this platform cannot tell). Pure.
+fn judge_last_exit(
+    previous: &PreviousExit,
+    logs: &Path,
+    alive: impl Fn(u32) -> Option<bool>,
+) -> Check {
+    const NAME: &str = "daemon.last_exit";
+    let read_the_log = format!(
+        "read the end of the daemon log in {}; on Linux, `coredumpctl list nanna-daemon` shows \
+         whether it dumped core",
+        logs.display()
+    );
+    let record = match previous {
+        PreviousExit::Absent => {
+            return Check::ok(NAME, "no daemon has run with this data directory yet");
+        }
+        PreviousExit::Corrupt(_) => return Check::warn(NAME, previous.describe(), read_the_log),
+        PreviousExit::Record(record) => record,
+    };
+    match record.state {
+        ExitState::Running => match alive(record.pid) {
+            Some(true) => Check::ok(
+                NAME,
+                format!(
+                    "a daemon is running (PID {}, since {})",
+                    record.pid, record.at
+                ),
+            ),
+            Some(false) => Check::warn(NAME, previous.describe(), read_the_log),
+            None => Check::warn(
+                NAME,
+                format!(
+                    "the daemon with PID {} marked itself running at {}; this platform cannot \
+                     tell whether it still is",
+                    record.pid, record.at
+                ),
+                format!(
+                    "if no nanna-daemon process has PID {}, it died uncleanly: {read_the_log}",
+                    record.pid
+                ),
+            ),
+        },
+        ExitState::Exited => match record.reason.as_deref() {
+            Some("panic" | "ipc_server_error") => {
+                Check::warn(NAME, previous.describe(), read_the_log)
+            }
+            _ => Check::ok(NAME, previous.describe()),
+        },
+    }
+}
+
+/// Whether `pid` is a live daemon process. On Linux the process's name is
+/// read too, so a PID that a dead daemon left and another program got since
+/// is not taken for the daemon. `nanna` is the legacy `--daemon-mode` host.
+#[cfg(target_os = "linux")]
+fn daemon_process_alive(pid: u32) -> Option<bool> {
+    match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+        Ok(name) => Some(matches!(name.trim(), "nanna-daemon" | "nanna")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn daemon_process_alive(_pid: u32) -> Option<bool> {
+    None
 }
 
 /// The clustering invariant, checked against the configuration the daemon will
@@ -979,6 +1098,19 @@ pub fn report(checks: &[Check], online: bool) -> Severity {
 mod tests {
     use super::*;
 
+    /// A config file that does not parse fails the check: every other check
+    /// is then judging the built-in defaults the CLI fell back to.
+    #[test]
+    fn a_config_file_that_does_not_parse_fails() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[llm\nmodel = ").expect("write");
+        let check = config_file_check(&path);
+        assert_eq!(check.severity, Severity::Fail, "{check:?}");
+        std::fs::write(&path, "[general]\n").expect("write");
+        assert_eq!(config_file_check(&path).severity, Severity::Ok);
+    }
+
     fn cfg() -> Config {
         Config::default()
     }
@@ -1495,6 +1627,100 @@ mod tests {
             "must report the effective bar: {}",
             check.detail
         );
+    }
+
+    fn exit_record(
+        state: ExitState,
+        reason: Option<&str>,
+        observed: Option<nanna_core::exit_record::ObservedExit>,
+    ) -> PreviousExit {
+        PreviousExit::Record(nanna_daemon::exit_reason::ExitReasonRecord {
+            state,
+            pid: 4242,
+            reason: reason.map(str::to_string),
+            detail: None,
+            at: "2026-09-28T15:31:00.000Z".to_string(),
+            observed_exit: observed,
+        })
+    }
+
+    #[test]
+    fn the_last_exit_check_tells_a_live_daemon_from_a_dead_one() {
+        let logs = Path::new("/data/logs");
+        let running = exit_record(ExitState::Running, None, None);
+
+        let live = judge_last_exit(&running, logs, |_| Some(true));
+        assert_eq!(live.severity, Severity::Ok);
+        assert!(live.detail.contains("PID 4242"), "{}", live.detail);
+
+        let dead = judge_last_exit(&running, logs, |_| Some(false));
+        assert_eq!(dead.severity, Severity::Warn);
+        assert!(dead.detail.contains("UNCLEAN"), "{}", dead.detail);
+        assert!(
+            dead.remedy
+                .as_deref()
+                .is_some_and(|r| r.contains("/data/logs"))
+        );
+
+        let unknown = judge_last_exit(&running, logs, |_| None);
+        assert_eq!(unknown.severity, Severity::Warn);
+        assert!(unknown.detail.contains("cannot tell"), "{}", unknown.detail);
+    }
+
+    #[test]
+    fn the_last_exit_check_names_the_signal_the_app_saw() {
+        let observed = nanna_core::exit_record::ObservedExit {
+            code: None,
+            signal: Some(7),
+            observer: "the app".to_string(),
+            killed_by_observer: false,
+            at: "2026-09-28T15:31:02.000Z".to_string(),
+        };
+        let dead = exit_record(ExitState::Running, None, Some(observed));
+        let check = judge_last_exit(&dead, Path::new("/l"), |_| Some(false));
+        assert_eq!(check.severity, Severity::Warn);
+        assert!(
+            check.detail.contains("the app saw it end by signal 7"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn a_clean_or_signalled_stop_is_fine_and_a_panic_is_not() {
+        let logs = Path::new("/l");
+        let never = |_| panic!("an exited record needs no process lookup");
+        for reason in ["clean_shutdown", "signal", "parent_exited"] {
+            let check = judge_last_exit(
+                &exit_record(ExitState::Exited, Some(reason), None),
+                logs,
+                never,
+            );
+            assert_eq!(check.severity, Severity::Ok, "{reason}");
+        }
+        for reason in ["panic", "ipc_server_error"] {
+            let check = judge_last_exit(
+                &exit_record(ExitState::Exited, Some(reason), None),
+                logs,
+                never,
+            );
+            assert_eq!(check.severity, Severity::Warn, "{reason}");
+            assert!(check.detail.contains(reason), "{}", check.detail);
+        }
+        assert_eq!(
+            judge_last_exit(&PreviousExit::Absent, logs, never).severity,
+            Severity::Ok
+        );
+        let torn = judge_last_exit(&PreviousExit::Corrupt("eof".to_string()), logs, never);
+        assert_eq!(torn.severity, Severity::Warn);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_live_pid_of_another_program_is_not_the_daemon() {
+        // The test binary is alive and is not named nanna-daemon.
+        assert_eq!(daemon_process_alive(std::process::id()), Some(false));
+        assert_eq!(daemon_process_alive(u32::MAX), Some(false));
     }
 
     #[test]

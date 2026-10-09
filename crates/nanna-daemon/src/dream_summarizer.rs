@@ -164,10 +164,27 @@ pub fn summarize_with_failover(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
 + Send
 + Sync {
+    complete_with_failover(router, models, "Dream summarization")
+}
+
+/// The failover walk behind [`summarize_with_failover`], for any one-shot caller.
+///
+/// `purpose` names the caller in every log line and in the final error, so a
+/// failing board-router call does not read as a dream cycle.
+pub fn complete_with_failover(
+    router: Arc<LlmRouter>,
+    models: Vec<String>,
+    purpose: &'static str,
+) -> impl Fn(
+    String,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
++ Send
++ Sync {
     debug_assert!(
         !models.is_empty(),
-        "a failover summarizer needs at least one model"
+        "a failover completion needs at least one model"
     );
+    debug_assert!(!purpose.is_empty(), "every walk names its caller");
 
     move |prompt: String| {
         let router = Arc::clone(&router);
@@ -185,7 +202,7 @@ pub fn summarize_with_failover(
             // Congestion is a throughput limit, not a failure. Waiting spreads
             // the cycle over a few minutes, which is the correct price. Only a
             // model that is genuinely broken gets failed over.
-            let mut last_error = String::from("no summarization models configured");
+            let mut last_error = format!("no {purpose} models configured");
             let mut wait_secs = 0u64;
             for round in 0..=BACKOFF_SECS.len() {
                 if wait_secs > 0 {
@@ -216,15 +233,13 @@ pub fn summarize_with_failover(
                         // already guards its own result (enrichment must
                         // contain the original).
                         Ok(summary) if summary.trim().is_empty() => {
-                            tracing::warn!(
-                                "Dream summarization model {model} answered with no text"
-                            );
+                            tracing::warn!("{purpose} model {model} answered with no text");
                             last_error = format!("{model}: answered with no text");
                         }
                         Ok(summary) => {
                             if round > 0 {
                                 tracing::info!(
-                                    "Dream summarization cleared congestion after {round} wait(s)"
+                                    "{purpose} cleared congestion after {round} wait(s)"
                                 );
                             }
                             return Ok(summary);
@@ -240,7 +255,7 @@ pub fn summarize_with_failover(
                             last_error = format!("{model}: {e}");
                         }
                         Err(e) => {
-                            tracing::warn!("Dream summarization model {model} failed: {e}");
+                            tracing::warn!("{purpose} model {model} failed: {e}");
                             last_error = format!("{model}: {e}");
                         }
                     }
@@ -253,7 +268,7 @@ pub fn summarize_with_failover(
                     break;
                 };
                 tracing::info!(
-                    "Dream summarization congested on all {} model(s) — waiting {}s",
+                    "{purpose} congested on all {} model(s) — waiting {}s",
                     models.len(),
                     next
                 );
@@ -261,7 +276,7 @@ pub fn summarize_with_failover(
             }
 
             Err(format!(
-                "all {} summarization model(s) failed; last error — {last_error}",
+                "all {} {purpose} model(s) failed; last error — {last_error}",
                 models.len()
             ))
         })

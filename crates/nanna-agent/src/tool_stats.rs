@@ -68,6 +68,10 @@ pub struct ToolStats {
     pub last_called: Option<u64>,
     /// Common error messages with occurrence counts
     pub errors: Vec<(String, u64)>,
+    /// Every executed call's latency since the daemon started, bucketed for
+    /// `/metrics` (not persisted; see [`crate::histogram`]).
+    #[serde(skip)]
+    pub latency_histogram: crate::histogram::LatencyHistogram,
 }
 
 /// Per-session aggregate statistics.
@@ -129,6 +133,10 @@ pub struct ToolStatsSummary {
     pub avg_output_size: usize,
     pub last_called: Option<u64>,
     pub top_errors: Vec<(String, u64)>,
+    /// See [`ToolStats::latency_histogram`]; read by `/metrics`, not sent to
+    /// clients.
+    #[serde(skip)]
+    pub latency_histogram: crate::histogram::LatencyHistogram,
 }
 
 /// Global dashboard summary.
@@ -212,6 +220,9 @@ impl ToolStatsTracker {
             stats.latencies_ms.remove(0);
         }
         stats.latencies_ms.push(obs.duration_ms);
+        stats
+            .latency_histogram
+            .observe(&crate::histogram::TOOL_LATENCY_BOUNDS_MS, obs.duration_ms);
 
         // Ring-buffer output size
         if stats.output_sizes.len() >= MAX_OUTPUT_SAMPLES {
@@ -473,6 +484,7 @@ impl ToolStats {
             output_sizes: Vec::with_capacity(MAX_OUTPUT_SAMPLES),
             last_called: None,
             errors: Vec::new(),
+            latency_histogram: crate::histogram::LatencyHistogram::default(),
         }
     }
 
@@ -517,6 +529,7 @@ impl ToolStats {
             avg_output_size,
             last_called: self.last_called,
             top_errors,
+            latency_histogram: self.latency_histogram,
         }
     }
 }
@@ -561,6 +574,31 @@ fn now_epoch_ms() -> u64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Executed calls reach the `/metrics` histogram, failures included; a
+    /// short-circuit (never dispatched) does not, and the histogram is not
+    /// part of what is exported or sent to clients.
+    #[tokio::test]
+    async fn executed_calls_feed_the_latency_histogram_and_replays_do_not() {
+        let t = ToolStatsTracker::new();
+        for (success, short_circuited, duration_ms) in [(true, false, 40), (false, false, 900), (false, true, 0)] {
+            t.record(ToolObservation {
+                tool_name: "exec".into(),
+                success,
+                short_circuited,
+                duration_ms,
+                output_size: 10,
+                error: None,
+                session_id: None,
+            })
+            .await;
+        }
+        let summary = t.summary("exec").await.expect("recorded");
+        assert_eq!(summary.latency_histogram.count(), 2, "the replay is not an execution");
+        assert_eq!(summary.latency_histogram.sum_ms(), 940);
+        let wire = serde_json::to_value(&summary).expect("summary serializes");
+        assert!(wire.get("latency_histogram").is_none(), "not sent to clients: {wire}");
+    }
 
     #[tokio::test]
     async fn import_tolerates_bad_tool_entry() {

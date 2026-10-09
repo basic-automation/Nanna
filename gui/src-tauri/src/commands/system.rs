@@ -9,21 +9,6 @@ use tauri::{AppHandle, Manager, State};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-/// Show the main window (called from system tray)
-///
-/// # Errors
-///
-/// Returns the window error's text when showing or focusing the main window
-/// fails. A missing main window is not an error.
-#[tauri::command]
-pub async fn show_window(app: AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("main") {
-        window.show().map_err(|e| e.to_string())?;
-        window.set_focus().map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
 /// Hide the main window to tray
 ///
 /// # Errors
@@ -41,69 +26,6 @@ pub async fn hide_to_tray(app: AppHandle) -> Result<(), String> {
 // =============================================================================
 // Notification Commands
 // =============================================================================
-
-/// Send a native notification
-///
-/// # Errors
-///
-/// Returns `Failed to send notification: …` when the notification plugin cannot
-/// show the notification on this platform.
-#[tauri::command]
-pub async fn send_notification(
-    app: AppHandle,
-    title: String,
-    body: String,
-) -> Result<(), String> {
-    use tauri_plugin_notification::NotificationExt;
-
-    app.notification()
-        .builder()
-        .title(&title)
-        .body(&body)
-        .show()
-        .map_err(|e| format!("Failed to send notification: {e}"))?;
-
-    info!("Sent notification: {} - {}", title, body);
-    Ok(())
-}
-
-/// Request notification permission (needed on some platforms)
-///
-/// # Errors
-///
-/// Returns `Failed to request permission: …` when the notification plugin
-/// cannot ask the platform. A refusal is `Ok(false)`.
-#[tauri::command]
-pub async fn request_notification_permission(app: AppHandle) -> Result<bool, String> {
-    use tauri_plugin_notification::NotificationExt;
-
-    let permission = app.notification()
-        .request_permission()
-        .map_err(|e| format!("Failed to request permission: {e}"))?;
-
-    Ok(matches!(permission, tauri_plugin_notification::PermissionState::Granted))
-}
-
-/// Check if notifications are permitted
-///
-/// # Errors
-///
-/// Returns `Failed to check permission: …` when the notification plugin cannot
-/// read the platform's permission state.
-#[tauri::command]
-pub async fn check_notification_permission(app: AppHandle) -> Result<String, String> {
-    use tauri_plugin_notification::NotificationExt;
-
-    let permission = app.notification()
-        .permission_state()
-        .map_err(|e| format!("Failed to check permission: {e}"))?;
-
-    Ok(match permission {
-        tauri_plugin_notification::PermissionState::Granted => "granted",
-        tauri_plugin_notification::PermissionState::Denied => "denied",
-        _ => "unknown",
-    }.to_string())
-}
 
 // =============================================================================
 // Model Status Commands
@@ -138,32 +60,6 @@ pub async fn get_model_status(
         fallback_reason: None,
         rate_limited_models: still_limited,
     })
-}
-
-/// Clear rate limit for a specific model (or all if model is None)
-///
-/// # Errors
-///
-/// Never returns `Err`; the `Result` is what Tauri requires of an async command
-/// that borrows `State`.
-#[tauri::command]
-pub async fn clear_rate_limit(
-    state: State<'_, Arc<RwLock<AppState>>>,
-    model: Option<String>,
-) -> Result<(), String> {
-    // Only this map is mutated, and its own lock serializes that; nothing
-    // else needs the app-state lock held meanwhile.
-    let rate_limited_models = Arc::clone(&state.read().await.rate_limited_models);
-
-    if let Some(model_id) = model {
-        rate_limited_models.write().await.remove(&model_id);
-        info!("Cleared rate limit for model: {}", model_id);
-    } else {
-        rate_limited_models.write().await.clear();
-        info!("Cleared all rate limits");
-    }
-
-    Ok(())
 }
 
 /// Get detailed model performance statistics

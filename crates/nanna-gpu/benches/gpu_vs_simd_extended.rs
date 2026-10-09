@@ -124,7 +124,7 @@ fn main() {
             2,
         );
 
-        let ratio = gpu_mean.as_secs_f64() * 1e9 / simd_mean.as_secs_f64() * 1e9;
+        let ratio = gpu_mean.as_secs_f64() / simd_mean.as_secs_f64();
         let winner = if ratio < 1.0 { "GPU ✓" } else { "SIMD" };
 
         println!("  {:>7} │ {} │ {} │ {:>6.2}× │ {winner}",
@@ -159,7 +159,7 @@ fn main() {
             2,
         );
 
-        let ratio = gpu_mean.as_secs_f64() * 1e9 / simd_mean.as_secs_f64() * 1e9;
+        let ratio = gpu_mean.as_secs_f64() / simd_mean.as_secs_f64();
         let winner = if ratio < 1.0 { "GPU ✓" } else { "SIMD" };
 
         println!("  {:>7} │ {} │ {} │ {:>6.2}× │ {winner}",

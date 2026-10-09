@@ -28,6 +28,11 @@ pub struct ServiceConfig {
     /// `executable`. **Platform-dependent** — see `Default`.
     pub arguments: Vec<String>,
     pub working_directory: Option<PathBuf>,
+    /// Variables the supervisor sets for the daemon (systemd `Environment=`,
+    /// launchd `EnvironmentVariables`) — `NANNA_CONFIG_PATH` when the install
+    /// ran with one, so the service reads the config file the operator chose.
+    /// Not applied on Windows, whose SCM has no per-service environment.
+    pub environment: Vec<(String, String)>,
 }
 
 /// The subcommand a service supervisor must invoke to start the daemon.
@@ -49,6 +54,7 @@ impl Default for ServiceConfig {
             executable: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nanna-daemon")),
             arguments: vec![DEFAULT_SERVICE_ARGUMENT.to_string()],
             working_directory: None,
+            environment: Vec::new(),
         }
     }
 }
@@ -56,6 +62,32 @@ impl Default for ServiceConfig {
 /// Platform-specific service operations
 pub struct ServiceManager {
     config: ServiceConfig,
+}
+
+/// Run a service-manager command and fail unless it exits zero.
+///
+/// `status()` only reported whether the program could be spawned: a `systemctl
+/// --user enable` refused for a bad unit (or with no user session bus) printed
+/// its error and `install` still reported success, so the operator learned the
+/// daemon would not start at login only at the next login. The error carries
+/// the command, its exit status and its stderr.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn run_checked(command: &mut std::process::Command) -> Result<(), String> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let output = command
+        .output()
+        .map_err(|e| format!("could not run {program}: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    debug_assert!(!output.status.success());
+    Err(if stderr.is_empty() {
+        format!("{program} failed ({})", output.status)
+    } else {
+        format!("{program} failed ({}): {stderr}", output.status)
+    })
 }
 
 impl ServiceManager {
@@ -70,8 +102,9 @@ impl ServiceManager {
     ///
     /// Returns an error when the platform has no service backend, or the
     /// backend step fails: on Linux, creating or writing the systemd user unit
-    /// or spawning `systemctl`; on macOS, writing the launchd plist or spawning
-    /// `launchctl`; on Windows, connecting to the service manager or creating
+    /// or running `systemctl`; on macOS, writing the launchd plist or running
+    /// `launchctl` (a non-zero exit is a failure); on Windows, connecting to
+    /// the service manager or creating
     /// the service.
     pub fn install(&self) -> Result<(), String> {
         #[cfg(windows)]
@@ -117,8 +150,7 @@ impl ServiceManager {
     /// Returns an error when the platform has no service backend, or the
     /// service command could not be issued: spawning `systemctl` (Linux) or
     /// `launchctl` (macOS) failed, or the Windows service manager could not be
-    /// reached or refused the start. A spawned command's non-zero exit status is
-    /// not checked.
+    /// reached or refused the start, or the command exited non-zero.
     pub fn start(&self) -> Result<(), String> {
         #[cfg(windows)]
         return self.start_windows();
@@ -140,8 +172,7 @@ impl ServiceManager {
     /// Returns an error when the platform has no service backend, or the
     /// service command could not be issued: spawning `systemctl` (Linux) or
     /// `launchctl` (macOS) failed, or the Windows service manager could not be
-    /// reached or refused the stop. A spawned command's non-zero exit status is
-    /// not checked.
+    /// reached or refused the stop, or the command exited non-zero.
     pub fn stop(&self) -> Result<(), String> {
         #[cfg(windows)]
         return self.stop_windows();
@@ -217,18 +248,14 @@ impl ServiceManager {
         let plist_path = self.launchd_plist_path();
         let plist_content = self.generate_launchd_plist();
         
-        std::fs::create_dir_all(plist_path.parent().unwrap())
-            .map_err(|e| e.to_string())?;
+        if let Some(parent) = plist_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
         std::fs::write(&plist_path, plist_content)
             .map_err(|e| e.to_string())?;
         
         // Load the service
-        std::process::Command::new("launchctl")
-            .args(["load", plist_path.to_str().unwrap()])
-            .status()
-            .map_err(|e| e.to_string())?;
-        
-        Ok(())
+        run_checked(std::process::Command::new("launchctl").arg("load").arg(&plist_path))
     }
     
     #[cfg(target_os = "macos")]
@@ -237,7 +264,8 @@ impl ServiceManager {
         
         // Unload first
         let _ = std::process::Command::new("launchctl")
-            .args(["unload", plist_path.to_str().unwrap()])
+            .arg("unload")
+            .arg(&plist_path)
             .status();
         
         // Remove plist
@@ -250,20 +278,18 @@ impl ServiceManager {
     
     #[cfg(target_os = "macos")]
     fn start_macos(&self) -> Result<(), String> {
-        std::process::Command::new("launchctl")
-            .args(["start", &format!("com.nanna.{}", self.config.name)])
-            .status()
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        run_checked(
+            std::process::Command::new("launchctl")
+                .args(["start", &format!("com.nanna.{}", self.config.name)]),
+        )
     }
     
     #[cfg(target_os = "macos")]
     fn stop_macos(&self) -> Result<(), String> {
-        std::process::Command::new("launchctl")
-            .args(["stop", &format!("com.nanna.{}", self.config.name)])
-            .status()
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        run_checked(
+            std::process::Command::new("launchctl")
+                .args(["stop", &format!("com.nanna.{}", self.config.name)]),
+        )
     }
     
     #[cfg(target_os = "macos")]
@@ -286,35 +312,57 @@ impl ServiceManager {
             .join(format!("com.nanna.{}.plist", self.config.name))
     }
     
-    #[cfg(target_os = "macos")]
+    /// The launchd job. Built on every host so its escaping is tested here,
+    /// not only on a Mac.
+    #[cfg(any(target_os = "macos", test))]
     fn generate_launchd_plist(&self) -> String {
-        let exe = self.config.executable.display();
+        // Every interpolated string is XML-escaped: a plist is XML, so an
+        // install path or argument with `&` or `<` (legal in both) produced a
+        // file launchd refused to load — or, with a crafted `</string>`, a
+        // different program list.
+        let name = xml_escape(&self.config.name);
+        let exe = xml_escape(&self.config.executable.to_string_lossy());
         let args: String = self.config.arguments.iter()
-            .map(|a| format!("        <string>{}</string>", a))
+            .map(|a| format!("        <string>{}</string>", xml_escape(a)))
             .collect::<Vec<_>>()
             .join("\n");
+        let environment = if self.config.environment.is_empty() {
+            String::new()
+        } else {
+            let pairs = self.config.environment.iter().fold(String::new(), |mut out, (k, v)| {
+                use std::fmt::Write as _;
+                let _ = writeln!(
+                    out,
+                    "        <key>{}</key>\n        <string>{}</string>",
+                    xml_escape(k),
+                    xml_escape(v)
+                );
+                out
+            });
+            format!("    <key>EnvironmentVariables</key>\n    <dict>\n{pairs}    </dict>\n")
+        };
         
         format!(r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.nanna.{}</string>
+    <string>com.nanna.{name}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{}</string>
-{}
+        <string>{exe}</string>
+{args}
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
-    <key>StandardOutPath</key>
+{environment}    <key>StandardOutPath</key>
     <string>/tmp/nanna-daemon.log</string>
     <key>StandardErrorPath</key>
     <string>/tmp/nanna-daemon.err</string>
 </dict>
-</plist>"#, self.config.name, exe, args)
+</plist>"#)
     }
     
     // =========================================================================
@@ -326,24 +374,19 @@ impl ServiceManager {
         let unit_path = self.systemd_unit_path();
         let unit_content = self.generate_systemd_unit();
         
-        std::fs::create_dir_all(unit_path.parent().unwrap())
-            .map_err(|e| e.to_string())?;
+        if let Some(parent) = unit_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
         std::fs::write(&unit_path, unit_content)
             .map_err(|e| e.to_string())?;
         
         // Reload systemd
-        std::process::Command::new("systemctl")
-            .args(["--user", "daemon-reload"])
-            .status()
-            .map_err(|e| e.to_string())?;
+        run_checked(std::process::Command::new("systemctl").args(["--user", "daemon-reload"]))?;
         
         // Enable the service
-        std::process::Command::new("systemctl")
-            .args(["--user", "enable", &self.config.name])
-            .status()
-            .map_err(|e| e.to_string())?;
-        
-        Ok(())
+        run_checked(
+            std::process::Command::new("systemctl").args(["--user", "enable", &self.config.name]),
+        )
     }
     
     #[cfg(target_os = "linux")]
@@ -360,30 +403,21 @@ impl ServiceManager {
         }
         
         // Reload systemd
-        std::process::Command::new("systemctl")
-            .args(["--user", "daemon-reload"])
-            .status()
-            .map_err(|e| e.to_string())?;
-        
-        Ok(())
+        run_checked(std::process::Command::new("systemctl").args(["--user", "daemon-reload"]))
     }
     
     #[cfg(target_os = "linux")]
     fn start_linux(&self) -> Result<(), String> {
-        std::process::Command::new("systemctl")
-            .args(["--user", "start", &self.config.name])
-            .status()
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        run_checked(
+            std::process::Command::new("systemctl").args(["--user", "start", &self.config.name]),
+        )
     }
     
     #[cfg(target_os = "linux")]
     fn stop_linux(&self) -> Result<(), String> {
-        std::process::Command::new("systemctl")
-            .args(["--user", "stop", &self.config.name])
-            .status()
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        run_checked(
+            std::process::Command::new("systemctl").args(["--user", "stop", &self.config.name]),
+        )
     }
     
     #[cfg(target_os = "linux")]
@@ -428,6 +462,12 @@ impl ServiceManager {
             .map(|arg| systemd_quote(arg))
             .collect::<Vec<_>>()
             .join(" ");
+        // One quoted `Environment="K=V"` line each, quoted like ExecStart.
+        let environment = self.config.environment.iter().fold(String::new(), |mut out, (k, v)| {
+            use std::fmt::Write as _;
+            let _ = writeln!(out, "Environment={}", systemd_quote(&format!("{k}={v}")));
+            out
+        });
         
         format!(r"[Unit]
 Description={}
@@ -435,7 +475,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart={} {}
+{environment}ExecStart={} {}
 Restart=on-failure
 RestartSec=5
 
@@ -467,9 +507,46 @@ fn systemd_quote(word: &str) -> String {
     quoted
 }
 
+/// `text` as XML character data or attribute content: the five characters
+/// XML reserves become entity references, everything else passes through.
+#[cfg(any(target_os = "macos", test))]
+fn xml_escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(c),
+        }
+    }
+    debug_assert!(escaped.len() >= text.len(), "escaping only ever adds");
+    debug_assert!(!escaped.contains('<'), "no markup survives");
+    escaped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A service command that runs but refuses is a failure, with its stderr.
+    #[cfg(unix)]
+    #[test]
+    fn a_service_command_that_exits_non_zero_fails() {
+        let refused = run_checked(
+            std::process::Command::new("sh").args(["-c", "echo 'Unit not found.' >&2; exit 5"]),
+        );
+        let message = refused.expect_err("exit 5 is a failure");
+        assert!(message.contains("Unit not found."), "{message}");
+        assert!(message.starts_with("sh failed"), "{message}");
+        assert_eq!(run_checked(std::process::Command::new("sh").args(["-c", "exit 0"])), Ok(()));
+        assert!(
+            run_checked(&mut std::process::Command::new("/nonexistent/systemctl"))
+                .is_err_and(|e| e.starts_with("could not run"))
+        );
+    }
 
     #[test]
     fn exec_start_words_survive_spaces_quotes_and_specifiers() {
@@ -484,6 +561,48 @@ mod tests {
         );
         assert_eq!(systemd_quote(r#"a"b\c"#), r#""a\"b\\c""#);
         assert_eq!(systemd_quote("100%"), "\"100%%\"", "no specifier expansion");
+    }
+
+    /// The unit and the plist carry the service's environment, quoted for
+    /// each format.
+    #[test]
+    fn the_service_environment_reaches_the_unit_and_the_plist() {
+        let manager = ServiceManager::new(ServiceConfig {
+            environment: vec![("NANNA_CONFIG_PATH".to_string(), "/home/a b/c&d.toml".to_string())],
+            ..ServiceConfig::default()
+        });
+        let plist = manager.generate_launchd_plist();
+        assert!(plist.contains("<key>EnvironmentVariables</key>"), "{plist}");
+        assert!(plist.contains("<key>NANNA_CONFIG_PATH</key>"));
+        assert!(plist.contains("<string>/home/a b/c&amp;d.toml</string>"));
+        #[cfg(target_os = "linux")]
+        {
+            let unit = manager.generate_systemd_unit();
+            assert!(
+                unit.contains("Environment=\"NANNA_CONFIG_PATH=/home/a b/c&d.toml\"\n"),
+                "{unit}"
+            );
+        }
+    }
+
+    #[test]
+    fn plist_strings_are_xml_escaped() {
+        assert_eq!(xml_escape("/Applications/Nanna.app"), "/Applications/Nanna.app");
+        assert_eq!(xml_escape(r#"a&b<c>d"e'f"#), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+
+        let manager = ServiceManager::new(ServiceConfig {
+            name: "R&D".to_string(),
+            executable: PathBuf::from("/Users/u/Tools & Apps/nanna-daemon"),
+            arguments: vec!["run".to_string(), "</string><string>/bin/sh".to_string()],
+            ..ServiceConfig::default()
+        });
+        let plist = manager.generate_launchd_plist();
+        assert!(plist.contains("<string>com.nanna.R&amp;D</string>"));
+        assert!(plist.contains("<string>/Users/u/Tools &amp; Apps/nanna-daemon</string>"));
+        assert!(plist.contains("<string>&lt;/string&gt;&lt;string&gt;/bin/sh</string>"));
+        // One <string> per program word plus the label and two log paths:
+        // an argument cannot open a new array element.
+        assert_eq!(plist.matches("<string>").count(), 6);
     }
 
     /// The bug this guards: Windows needs the `service` subcommand (the SCM

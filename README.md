@@ -4,10 +4,12 @@
 
 **A personal AI presence that runs entirely on your machine.** Nanna is a calm, capable assistant written in Rust — not a chatbot, but a *presence*. It runs as a headless daemon on your own hardware, thinks with a small open model on a single consumer GPU, remembers across sessions, and reaches you on any channel.
 
-[![Download for Windows](https://img.shields.io/badge/Download-Windows%20x64-blue?style=for-the-badge&logo=windows)](https://github.com/basic-automation/Nanna/releases/latest)
-[![Build from Source](https://img.shields.io/badge/Build-from%20Source-green?style=for-the-badge&logo=rust)](https://github.com/basic-automation/Nanna#building-from-source)
+[![Download](https://img.shields.io/github/v/release/basic-automation/Nanna?include_prereleases&style=for-the-badge&label=Download&logo=github)](https://github.com/basic-automation/Nanna/releases)
+[![Build from Source](https://img.shields.io/badge/Build-from%20Source-green?style=for-the-badge&logo=rust)](#building-from-source)
+[![Tests](https://img.shields.io/github/actions/workflow/status/basic-automation/Nanna/test-compile.yml?branch=master&style=for-the-badge&label=build)](https://github.com/basic-automation/Nanna/actions/workflows/test-compile.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
 
-**Status:** 🧪 Public Beta · v0.2.1 · Windows x64 (macOS/Linux build from source)
+**Status:** 🧪 Public Beta (0.3.x) · Windows x64 and Linux x64 installers · macOS builds from source
 
 ---
 
@@ -20,13 +22,17 @@ ollama pull qwen3.5:9b
 ```
 
 ### 2. Download Nanna
-Get the latest installer from [Releases](https://github.com/basic-automation/Nanna/releases):
-- **Windows:** `Nanna_x.y.z_x64-setup.exe` or `.msi`
+Get the latest installer from [Releases](https://github.com/basic-automation/Nanna/releases)
+(every release is currently marked *Pre-release* — take the newest one):
+- **Windows:** `Nanna_x.y.z_x64-setup.exe`
+- **Linux:** `Nanna_x.y.z_amd64.AppImage` or `Nanna_x.y.z_amd64.deb`
 
 ### 3. Run It
 Launch Nanna. On first run, it seeds its default tools into the user data directory —
 `~/.local/share/nanna/tools` on Linux, `~/Library/Application Support/nanna/tools` on macOS,
-`%APPDATA%\nanna\data\tools` on Windows.
+`%APPDATA%\nanna\data\tools` on Windows. To keep Nanna's data somewhere else, choose a folder in
+**Settings → Data → Data location**; it applies when the daemon next starts, and existing data is
+not moved.
 
 > **Note:** Binaries are not yet code-signed. Windows SmartScreen will warn — click *More info → Run anyway*.
 
@@ -42,13 +48,13 @@ A fully local run needs none.
 
 | Component | Minimum | Recommended |
 |-----------|---------|-------------|
-| **OS** | Windows 10 x64 | Windows 11 x64 |
+| **OS** | Windows 10 x64 / Linux x64 | Windows 11 x64 / recent Linux x64 |
 | **RAM** | 8 GB | 16 GB |
 | **GPU** | — | 8+ GB VRAM (for local inference) |
 | **Disk** | 500 MB | 2 GB (with models) |
 | **Runtime** | [Ollama](https://ollama.com) | Ollama + GPU drivers |
 
-**Other platforms:** macOS and Linux build from source (see [Building from Source](#building-from-source)).
+**macOS:** build from source (see [Building from Source](#building-from-source)).
 
 ---
 
@@ -69,7 +75,7 @@ A fully local run needs none.
 
 | Feature | Status | Requires |
 |---------|--------|----------|
-| **Desktop GUI** | ✅ Stable | Windows x64 (macOS/Linux: build from source) |
+| **Desktop GUI** | ✅ Stable | Windows x64, Linux x64 (macOS: build from source) |
 | **CLI Chat** | ✅ Stable | Terminal |
 | **Fully Local Inference** | 🚧 In Development | GPU with 8+ GB VRAM (P12 milestone) |
 | **Ollama Backend** | ✅ Stable | [Ollama](https://ollama.com) installed |
@@ -88,6 +94,19 @@ A fully local run needs none.
 
 ## What Works Today
 
+- **The board (early)** — each workspace has a card board (To do, Waiting, In progress, Done). One
+  line adds a card: `Ship the fix #release p2 @builder friday {march 30}` sets the label, priority,
+  assignee, date and deadline, and the rest is the title. The board's router completes what you
+  left out, an agent assigned a card works it in the background, and the card's thread shows its
+  progress, questions and verdict as they are posted. From a card you can post on its thread,
+  reassign it, edit its fields, see what it waits on and add sub-cards, start, stop or resume an
+  agent's run, and mark it done (it stays open if its acceptance check fails, and says why).
+  **Inbox** and **Upcoming** list what is assigned to you across every board; **Members** is where
+  you add agents and give them models and capabilities; and a card that comes due, goes overdue,
+  or is handed to you with a question shows up in your notifications. Cards are not left stuck:
+  one an agent stops working on goes back to the router after half an hour, a rejected API key
+  becomes a question to you instead of a failed card, and a rate-limited run waits and tries
+  again without counting as a failure.
 - **Long-horizon autonomy** — Mission mode drives multi-hour builds from a single prompt with automatic recovery from failures
 - **Headless daemon + GUI** — Runs as a Windows service with WebSocket IPC; the Tauri GUI attaches as a client
 - **Streaming chat** — Real-time responses with tool calling, thinking visualization, and context compression.
@@ -188,7 +207,7 @@ chmod +x Nanna_x.y.z_amd64.AppImage
 
 **Debian/Ubuntu:**
 ```bash
-sudo dpkg -i nanna_x.y.z_amd64.deb
+sudo apt install ./Nanna_x.y.z_amd64.deb
 ```
 
 **Uninstall:**
@@ -210,8 +229,10 @@ Checks the configuration and, for anything it finds, prints the fix rather than
 just the verdict — a missing tools directory, a `[infer]` section that names no
 model, a clustering configuration that would merge unrelated memories, a
 hand-edited summarization model with no provider prefix that will be sent to the
-wrong provider (and how to write it, e.g. `ollama/qwen3`). Exits non-zero when
-something is actually broken, so it also works from a script or a health probe.
+wrong provider (and how to write it, e.g. `ollama/qwen3`). It also says how the
+last daemon ended: still running, stopped cleanly, or died, and by which signal
+when the app saw it (`daemon.last_exit`). Exits non-zero when something is
+actually broken, so it also works from a script or a health probe.
 
 By default it is **offline**: no provider call, no network probe, no keyring
 read. That makes it fast and safe to run anywhere, and it means a clean report
@@ -245,7 +266,7 @@ ollama serve
 
 ### Daemon Not Responding
 ```bash
-# Check if the daemon is running
+# Check if the daemon is running (add --port N if you started it with one)
 nanna daemon status
 
 # Restart the daemon
@@ -410,15 +431,14 @@ pnpm run tauri:build    # Production
 ```
 
 **Requirements:**
-- Rust 1.85+ (2024 edition)
-- Node.js 18+
-- pnpm
+- Rust via [rustup](https://rustup.rs) — the pinned nightly toolchain in `rust-toolchain.toml`
+  is installed automatically on the first `cargo` command
+- Node.js 22+ and pnpm (for the GUI)
 
-**Linux:** the workspace builds and its test suite passes on Linux as of 2026-09-07 — before that it
-did not compile there at all (a Windows-only `exec` code path was compiled on every platform, and
-`libc >= 0.2.187` breaks the vendored Python runtime; both are fixed/pinned). The **Tauri GUI on
-Linux is not yet verified** — `cargo build` and `cargo test` are. Building the GUI additionally needs
-WebKitGTK (`webkit2gtk-4.1`) and its development headers.
+**Linux:** building the GUI additionally needs WebKitGTK (`webkit2gtk-4.1`) and its development
+headers — see [Linux WebKitGTK Missing](#linux-webkitgtk-missing). `libc` is pinned below 0.2.187
+because newer versions break the vendored Python runtime; leave that pin in place when updating
+dependencies.
 
 ---
 
@@ -432,7 +452,8 @@ See [PRIVACY.md](PRIVACY.md) for full details.
 - Credentials: OS keyring (encrypted)
 
 **Taking your data with you:** `nanna export <session-id>` (Markdown, or `--format json`
-for the complete stored session) and `nanna export --memories` — the daemon must be running.
+for the complete stored session) and `nanna export --memories` — the daemon must be running
+(`--daemon ws://host:port` for one not on the default port).
 
 **What's sent externally (when configured):**
 - Chat messages → your chosen LLM provider
@@ -444,9 +465,12 @@ for the complete stored session) and `nanna export --memories` — the daemon mu
 
 ---
 
-## Contributing
+## Contributing & Community
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+- **Questions and ideas** → [Discussions](https://github.com/basic-automation/Nanna/discussions)
+- **Bugs and feature requests** → [Issues](https://github.com/basic-automation/Nanna/issues/new/choose)
+- **Security reports** → privately, per [SECURITY.md](SECURITY.md) — never in a public issue
+- **Code** → see [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ---
 
@@ -455,7 +479,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 <details>
 <summary>Click to expand technical details</summary>
 
-17 workspace crates + Tauri app, layered by dependency:
+21 workspace crates + Tauri app, layered by dependency:
 
 ```
 nanna/
@@ -467,7 +491,7 @@ nanna/
 │   ├── nanna-storage/       # Turso persistence (embedded SQLite-compatible)
 │   ├── nanna-llm/           # Inference routing: local + cloud
 │   ├── nanna-tools/         # Tool system (filesystem JS/TS skills)
-│   ├── nanna-scripting/     # Boa (JS) + Deno (TS) engines
+│   ├── nanna-scripting/     # Boa (JS) engine + embedded Python
 │   ├── nanna-workspace/     # Workspace detection + context
 │   ├── nanna-channels/      # Channel listeners + router
 │   ├── nanna-browser/       # Browser control (CDP/Playwright)
@@ -477,7 +501,11 @@ nanna/
 │   ├── nanna-client/        # Daemon client library
 │   ├── nanna-server/        # HTTP server + webhooks
 │   ├── nanna-config/        # TOML config + credentials
-│   └── nanna-core/          # Orchestration, scheduler, registry
+│   ├── nanna-core/          # Orchestration, scheduler, registry
+│   ├── nanna-numeric/       # Lossless numeric conversions (no `as` casts)
+│   ├── nanna-proc/          # Child-process containment (tree kills, Job Objects)
+│   ├── nanna-timeline/      # Episodic event timeline for memory
+│   └── nanna-bench/         # Criterion benchmark harness
 └── gui/                     # Tauri 2 + Nuxt 4 frontend
 ```
 

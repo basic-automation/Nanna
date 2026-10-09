@@ -438,6 +438,56 @@ fn log_excerpt(text: &str) -> String {
     format!("{}…", &line[..end])
 }
 
+/// Run `work`'s future to completion on a fresh current-thread runtime in its
+/// own OS thread — a script's native call is synchronous, but the bridge is
+/// async, and the calling thread may already be inside a runtime.
+///
+/// A runtime that cannot be built (no file descriptor left for its epoll, say)
+/// is a JS error for the calling script, never a panic: under the release
+/// profile's `panic = "abort"`, the `expect` this replaced took the whole
+/// daemon down with it, and the `join` that "caught" it never ran.
+fn run_on_own_runtime<T, F, Fut>(work: F) -> JsResult<T>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T>,
+    T: Send + 'static,
+{
+    let outcome = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("could not start the I/O runtime for this call: {e}"))?;
+        Ok::<T, String>(runtime.block_on(work()))
+    })
+    .join()
+    .map_err(|e| {
+        // Reachable only in an unwinding build (tests); release aborts first.
+        tracing::error!(target: "script", "Thread panicked: {:?}", e);
+        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
+    })?;
+    outcome.map_err(|e| {
+        tracing::warn!(target: "script", "{e}");
+        boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.as_str())))
+    })
+}
+
+/// A script's `exec` timeout in whole seconds, or `None` for the bridge's
+/// auto-detected default.
+///
+/// The truncating conversion turned `0`, a negative, `NaN` or a fraction under
+/// one second into `Some(0)` — a deadline that killed the command on its first
+/// poll, which the `exec` skill then reported as "killed at the auto-detected
+/// deadline". Below one second is no usable request, so it means "default";
+/// a fraction above it rounds UP, never short of what was asked.
+fn exec_timeout_from_script(secs: f64) -> Option<u64> {
+    if secs.is_nan() || secs < 1.0 {
+        return None;
+    }
+    let whole = crate::f64_to_u64(secs.ceil());
+    debug_assert!(whole >= 1, "a requested deadline is at least a second");
+    Some(whole)
+}
+
 fn nanna_exec(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let command = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
     let workdir = args.get(1)
@@ -447,7 +497,7 @@ fn nanna_exec(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<
     let timeout_secs = args.get(2)
         .filter(|v| !v.is_undefined() && !v.is_null())
         .and_then(|v| v.to_number(context).ok())
-        .map(crate::f64_to_u64);
+        .and_then(exec_timeout_from_script);
     
     tracing::info!(target: "script", "Nanna.exec called with command: {}", command);
     
@@ -462,18 +512,7 @@ fn nanna_exec(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<
     
     // Execute synchronously using a new thread with its own runtime
     // (we're in a blocking task but need async for the bridge)
-    let result = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create runtime");
-        rt.block_on(bridge.exec_with_timeout(&command, workdir.as_deref(), timeout_secs))
-    })
-    .join()
-    .map_err(|e| {
-        tracing::error!(target: "script", "Thread panicked: {:?}", e);
-        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
-    })?;
+    let result = run_on_own_runtime(move || async move { bridge.exec_with_timeout(&command, workdir.as_deref(), timeout_secs).await })?;
     
     match result {
         Ok(response) => {
@@ -527,17 +566,7 @@ fn nanna_read_file(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsRe
             boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
         })?;
 
-    let result = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create runtime");
-        rt.block_on(bridge.read_file(&path))
-    })
-    .join()
-    .map_err(|_| {
-        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
-    })?;
+    let result = run_on_own_runtime(move || async move { bridge.read_file(&path).await })?;
 
     match result {
         Ok(text) => Ok(JsValue::from(js_string!(text.as_str()))),
@@ -554,17 +583,7 @@ fn nanna_write_file(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsR
             boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
         })?;
 
-    let result = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create runtime");
-        rt.block_on(bridge.write_file(&path, &text))
-    })
-    .join()
-    .map_err(|_| {
-        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
-    })?;
+    let result = run_on_own_runtime(move || async move { bridge.write_file(&path, &text).await })?;
 
     match result {
         Ok(()) => Ok(JsValue::undefined()),
@@ -592,17 +611,7 @@ fn nanna_list_dir(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
             boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
         })?;
 
-    let result = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create runtime");
-        rt.block_on(bridge.list_dir(&path, recursive, max_entries))
-    })
-    .join()
-    .map_err(|_| {
-        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
-    })?;
+    let result = run_on_own_runtime(move || async move { bridge.list_dir(&path, recursive, max_entries).await })?;
 
     match result {
         Ok(entries) => {
@@ -630,21 +639,12 @@ fn nanna_stat(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<
             boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
         })?;
 
-    let result = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create runtime");
-        rt.block_on(bridge.stat(&path))
-    })
-    .join()
-    .map_err(|_| {
-        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
-    })?;
+    let result = run_on_own_runtime(move || async move { bridge.stat(&path).await })?;
 
     match result {
         Ok(stat) => {
             let obj = boa_engine::object::JsObject::with_object_proto(context.intrinsics());
+            obj.set(js_string!("path"), JsValue::from(js_string!(stat.path.to_string_lossy().as_ref())), false, context)?;
             obj.set(js_string!("size"), JsValue::from(crate::u64_to_f64(stat.size)), false, context)?;
             obj.set(js_string!("is_file"), JsValue::from(stat.is_file), false, context)?;
             obj.set(js_string!("is_dir"), JsValue::from(stat.is_dir), false, context)?;
@@ -673,17 +673,7 @@ fn nanna_fetch(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult
             boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
         })?;
 
-    let result = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create runtime");
-        rt.block_on(bridge.fetch(&url, options))
-    })
-    .join()
-    .map_err(|_| {
-        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
-    })?;
+    let result = run_on_own_runtime(move || async move { bridge.fetch(&url, options).await })?;
 
     match result {
         Ok(response) => {
@@ -753,17 +743,7 @@ fn nanna_service(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResu
             boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
         })?;
 
-    let result = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create runtime");
-        rt.block_on(bridge.call_service(&name, params))
-    })
-    .join()
-    .map_err(|_| {
-        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
-    })?;
+    let result = run_on_own_runtime(move || async move { bridge.call_service(&name, params).await })?;
 
     match result {
         Ok(value) => json_to_js(&value, context).map_err(|e| {
@@ -916,16 +896,40 @@ fn js_to_json_bounded(
 }
 
 /// Transpile TypeScript to JavaScript
-/// Note: Boa doesn't support TypeScript natively. If actual TS syntax is present,
-/// execution will fail and trigger Deno fallback (which has real TS support).
+/// Note: Boa doesn't support TypeScript natively, and there is no other
+/// engine: a `tool.ts` with real TS syntax fails to parse, which
+/// `check_syntax` catches for every shipped skill before it can ship.
 fn transpile_typescript(source: &str) -> String {
-    // Just pass through - Boa handles plain JS, Deno handles TS
+    // Pass through: shipped `tool.ts` files are plain JS by construction.
     source.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unusable_exec_timeout_means_the_default_not_an_instant_kill() {
+        for unusable in [0.0, -5.0, 0.5, f64::NAN] {
+            assert_eq!(exec_timeout_from_script(unusable), None, "{unusable}");
+        }
+        assert_eq!(exec_timeout_from_script(1.0), Some(1));
+        assert_eq!(exec_timeout_from_script(2.2), Some(3), "rounded up");
+        assert_eq!(exec_timeout_from_script(600.0), Some(600));
+    }
+
+    /// A native call runs its async bridge work on its own runtime and hands
+    /// back the value — also from a thread already inside a runtime, which is
+    /// where a tool script's natives are called from.
+    #[tokio::test]
+    async fn a_native_call_runs_on_its_own_runtime_inside_another() {
+        let owned = String::from("moved into the future");
+        let got = run_on_own_runtime(move || async move {
+            tokio::task::yield_now().await;
+            owned.len()
+        });
+        assert_eq!(got.ok(), Some(21));
+    }
 
     /// A cyclic or explosively shared result used to recurse until the stack
     /// overflowed, aborting the daemon. Both are refused as errors now.

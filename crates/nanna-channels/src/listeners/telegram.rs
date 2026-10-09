@@ -86,7 +86,7 @@ impl TelegramListener {
                 ("timeout", LONG_POLL_TIMEOUT.to_string()),
                 (
                     "allowed_updates",
-                    r#"["message","edited_message","stopped_message_generation"]"#.to_string(),
+                    r#"["message","stopped_message_generation"]"#.to_string(),
                 ),
             ])
             .send()
@@ -120,7 +120,10 @@ impl TelegramListener {
         if let Some(stopped) = &update.stopped_message_generation {
             return self.stop_request(stopped);
         }
-        let message = update.message.as_ref().or(update.edited_message.as_ref())?;
+        // New messages only: an edit is not a new request. Treating one as
+        // a message ran the agent a second time for a fixed typo — a
+        // duplicate reply, and any tool side effects again.
+        let message = update.message.as_ref()?;
 
         // Check if chat is allowed
         if !self.allowed_chats.is_empty() && !self.allowed_chats.contains(&message.chat.id) {
@@ -373,7 +376,6 @@ struct TelegramApiResponse<T> {
 struct TelegramUpdate {
     update_id: i64,
     message: Option<TelegramMessage>,
-    edited_message: Option<TelegramMessage>,
     /// The user pressed the stop button on a streamed draft (Bot API 10.3).
     stopped_message_generation: Option<MessageGenerationStopped>,
 }
@@ -513,6 +515,29 @@ mod tests {
         }))
         .expect("parses");
         assert!(listener.convert_update(&group).is_none());
+    }
+
+    /// Editing a message is not a new request: it used to run the agent a
+    /// second time (a duplicate reply, tool side effects again).
+    #[test]
+    fn an_edited_message_does_not_start_a_turn() {
+        let listener = TelegramListener::new("123:ABC");
+        let message = serde_json::json!({
+            "message_id": 5,
+            "chat": { "id": 4242, "type": "private" },
+            "from": { "id": 4242, "is_bot": false, "first_name": "A" },
+            "date": 0,
+            "text": "hello"
+        });
+        let new: TelegramUpdate =
+            serde_json::from_value(serde_json::json!({ "update_id": 1, "message": message }))
+                .expect("parses");
+        assert!(listener.convert_update(&new).is_some(), "a new message is a turn");
+        let edited: TelegramUpdate = serde_json::from_value(
+            serde_json::json!({ "update_id": 2, "edited_message": message }),
+        )
+        .expect("an edit still parses");
+        assert!(listener.convert_update(&edited).is_none());
     }
 
     #[test]

@@ -11,7 +11,6 @@ use crate::ipc::{IpcServer, IpcServerConfig};
 use crate::llm_router::LlmRouter;
 use crate::memory_persistence::TursoMemoryPersistence;
 use crate::persistence::PersistenceManager;
-use crate::protocol::Response;
 use crate::session::SessionManager;
 use crate::webhook::{DEFAULT_WEBHOOK_PORT, WebhookConfig, WebhookServer};
 use async_trait::async_trait;
@@ -3134,6 +3133,13 @@ async fn deliver_scheduled_reminder(
     }
 }
 
+/// The card-run queue's two ends, parked between the task store's creation
+/// and the control plane's (see `board_runs`).
+type CardRunQueue = (
+    tokio::sync::mpsc::Sender<crate::card_run_trigger::RunWake>,
+    tokio::sync::mpsc::Receiver<crate::card_run_trigger::RunWake>,
+);
+
 /// The main daemon server
 pub struct DaemonServer {
     config: DaemonConfig,
@@ -3189,6 +3195,15 @@ pub struct DaemonServer {
     /// memory service exists (P25 Stage 1). Left `None` — and so dropped —
     /// when memory is disabled, which the sink reads as "no copies owed".
     board_copies: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<nanna_storage::TaskEvent>>>,
+    /// The board router's route queue, created with the task event
+    /// sink and taken by `init_services` once the LLM router and the agent
+    /// config exist (P25 Stage 2).
+    board_routes:
+        std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<crate::board_router_trigger::Wake>>>,
+    /// The card-run queue (P25 Stage 3), created with the task event sink:
+    /// its sender is also handed to the run manager (a freed member) and its
+    /// receiver to the worker, both by `build_control_plane`.
+    board_runs: std::sync::Mutex<Option<CardRunQueue>>,
     /// Terminal reason file: a durable record of WHY this process stopped, so
     /// the next boot can tell a clean shutdown from a hard death whose only
     /// other evidence is a log that simply ends (2026-08-10 ministral leg).
@@ -3345,6 +3360,8 @@ impl DaemonServer {
             memory_recovery: None,
             storage_error: None,
             board_copies: std::sync::Mutex::new(None),
+            board_routes: std::sync::Mutex::new(None),
+            board_runs: std::sync::Mutex::new(None),
             exit_reason,
         }
     }
@@ -3410,14 +3427,29 @@ impl DaemonServer {
                 let (copies_tx, copies_rx) = tokio::sync::mpsc::channel(
                     crate::memory_write_through::WRITE_THROUGH_QUEUE_MAX,
                 );
+                let (routes_tx, routes_rx) =
+                    tokio::sync::mpsc::channel(crate::board_router_trigger::ROUTE_QUEUE_MAX);
+                let (runs_tx, runs_rx) =
+                    tokio::sync::mpsc::channel(crate::card_run_trigger::RUN_QUEUE_MAX);
                 if storage.set_task_events(Arc::new(
                     crate::task_event_bridge::TaskEventBridge::new(self.ipc.event_sender())
-                        .with_memory_write_through(copies_tx),
+                        .with_memory_write_through(copies_tx)
+                        .with_router_queue(routes_tx)
+                        .with_run_queue(runs_tx.clone()),
                 )) {
+                    *self
+                        .board_runs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some((runs_tx, runs_rx));
                     *self
                         .board_copies
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(copies_rx);
+                    *self
+                        .board_routes
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(routes_rx);
                 } else {
                     warn!("task event sink was already attached; keeping the existing one");
                 }
@@ -3858,6 +3890,8 @@ impl DaemonServer {
 
         self.spawn_sub_agent_checkin();
 
+        release_boot_heap();
+
         // The configured address: with port 0 the real port is only known once
         // the IPC task binds, and its own "listening" line reports that.
         info!(
@@ -4210,6 +4244,13 @@ impl DaemonServer {
             activity_clock,
             dreaming,
         } = deps;
+        // Taken once: one run manager is told when members free, one worker
+        // starts the runs.
+        let card_runs = self
+            .board_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
 
         // Create control plane with all services (including router for consolidation).
         // The data dir is the one this daemon resolved (`[general] data_dir`,
@@ -4235,7 +4276,12 @@ impl DaemonServer {
         .with_turn_baselines(turn_baselines)
         .with_scheduler(scheduler)
         .with_mcp_status(Arc::clone(&self.mcp_status))
-        .with_task_runs(Arc::new(crate::tasks::TaskRunManager::new()))
+        .with_task_runs(Arc::new(match &card_runs {
+            Some((member_free, _)) => {
+                crate::tasks::TaskRunManager::new().with_member_free(member_free.clone())
+            }
+            None => crate::tasks::TaskRunManager::new(),
+        }))
         .with_memory_recovery(self.memory_recovery.clone())
         .with_live_embedding(self.live_embedding())
         .with_chat_runs(chat_runs.clone())
@@ -4296,6 +4342,13 @@ impl DaemonServer {
         }
 
         let control = Arc::new(control);
+        if let (Some((_, queue)), Some(storage)) = (card_runs, self.storage.as_ref()) {
+            tokio::spawn(crate::card_run_trigger::run(
+                queue,
+                Arc::clone(&control),
+                Arc::clone(storage),
+            ));
+        }
         // Hand edits of config.toml apply without a restart.
         control.spawn_config_watcher(self.shutdown_tx.subscribe());
         *self.control_slot.write().await = Some(control.clone());
@@ -4328,6 +4381,11 @@ impl DaemonServer {
                                 );
                             }
                             registry.register(ws);
+                            // A workspace saved before `upsert` ensured its
+                            // router has none; heal it here, once per boot.
+                            if let Err(e) = storage.members().ensure_router(Some(&record.id)).await {
+                                warn!("Workspace {} has no board router: {}", record.id, e);
+                            }
                             if record.active {
                                 active_id = Some(record.id.clone());
                             }
@@ -4461,13 +4519,20 @@ impl DaemonServer {
             }));
             let health_state = Arc::new(state);
 
-            // Update session count
+            // Update the session and client counts. The client count had no
+            // writer at all, so `/status` always said `clients: 0` with the
+            // GUI connected.
             let sessions_for_health = self.sessions.clone();
+            let ipc_for_health = Arc::clone(&self.ipc);
             let health_state_clone = health_state.clone();
+            // Detached: it ends when the bus closes, with the daemon.
+            drop(Arc::clone(&health_state).record_errors_from(self.ipc.event_sender().subscribe()));
             tokio::spawn(async move {
                 loop {
                     let count = sessions_for_health.count().await;
                     health_state_clone.set_session_count(count).await;
+                    let clients = ipc_for_health.client_count().await;
+                    health_state_clone.set_client_count(clients).await;
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             });
@@ -4615,6 +4680,14 @@ impl DaemonServer {
                     debug!("Webhook event from {}: {:?}", event.source, event.message);
 
                     if let Some(ref msg) = event.message {
+                        let allowed = control_for_webhooks.telegram_allowed_users().await;
+                        if !webhook_chat_allowed(&event.source, &msg.chat_id, allowed.as_deref()) {
+                            debug!(
+                                "Ignoring {} webhook message from non-allowed chat {}",
+                                event.source, msg.chat_id
+                            );
+                            continue;
+                        }
                         // Convert WebhookMessage → IncomingMessage
                         let incoming = IncomingMessage {
                             id: msg
@@ -4751,9 +4824,8 @@ impl DaemonServer {
 
                     tokio::spawn(async move {
                         let request_id = request.id.clone();
-                        let result = control.handle(&client_id, request.action).await;
-                        let response = Response::success(request_id, result);
-                        if let Err(e) = ipc.send_response(&client_id, response).await {
+                        let reply = control.handle_reply(&client_id, request.action).await;
+                        if let Err(e) = ipc.send_reply(&client_id, &request_id, &reply).await {
                             warn!("Failed to send response to client {}: {}", client_id, e);
                         }
                     });
@@ -4787,6 +4859,7 @@ impl DaemonServer {
                     sessions: Arc::clone(&self.sessions),
                     events: self.ipc.event_sender(),
                     chat_runs: Arc::clone(chat_runs),
+                    storage: self.storage.clone(),
                 },
             })),
         )
@@ -4888,6 +4961,7 @@ impl DaemonServer {
         // staleness that ran a whole benchmark series on the wrong summarizer
         // (2026-08-15).
         let shared_agent_config = Arc::new(tokio::sync::RwLock::new(self.config.agent.clone()));
+        self.start_board_router(&router, &shared_agent_config);
 
         // Shared session history for the recall_messages tool service
         let session_history: SharedSessionHistory = Arc::new(tokio::sync::RwLock::new(Vec::new()));
@@ -4930,14 +5004,20 @@ impl DaemonServer {
         // Register discover_tools (JS/TS skill with registry access)
         if let Some(ref dir) = tools_dir {
             if let Some(source) = nanna_tools::skills::defaults::load_discover_tools_source(dir) {
-                let wrapper = nanna_tools::skills::ScriptedToolWrapper::from_source(
+                // The tools directory is the user's to edit, so a skill that
+                // no longer parses is a skipped tool, not an aborted boot.
+                match nanna_tools::skills::ScriptedToolWrapper::from_source(
                     "discover_tools",
                     &source,
-                )
-                .expect("discover_tools skill must parse")
-                .with_registry(Arc::downgrade(&tools));
-                tools.register(wrapper).await;
-                info!("Registered discover_tools skill from {:?}", dir);
+                ) {
+                    Ok(wrapper) => {
+                        tools
+                            .register(wrapper.with_registry(Arc::downgrade(&tools)))
+                            .await;
+                        info!("Registered discover_tools skill from {:?}", dir);
+                    }
+                    Err(e) => warn!("discover_tools in {:?} does not parse; not registered: {}", dir, e),
+                }
             } else {
                 warn!("discover_tools not found in tools directory");
             }
@@ -5090,6 +5170,7 @@ impl DaemonServer {
                 sessions: Arc::clone(&self.sessions),
                 events: self.ipc.event_sender(),
                 chat_runs: Arc::clone(chat_runs),
+                storage: self.storage.clone(),
             }),
         });
         // Fill the slot before any skill can be executed. `set` returning
@@ -5222,6 +5303,30 @@ impl DaemonServer {
                 memory_copies = memory.is_some(),
                 "Board write-through running: cards and posts feed the timeline and memory"
             );
+        }
+    }
+
+    /// Start routing the cards the board client creates (P25 Stage 2).
+    ///
+    /// Runs at most once: the receiver is taken. Without storage there is no
+    /// board, and the receiver is dropped here.
+    fn start_board_router(
+        &self,
+        router: &Arc<LlmRouter>,
+        agent_config: &Arc<tokio::sync::RwLock<AgentServiceConfig>>,
+    ) {
+        let queue = self
+            .board_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let (Some(queue), Some(storage)) = (queue, self.storage.as_ref()) {
+            tokio::spawn(crate::board_router_trigger::run(
+                queue,
+                Arc::clone(storage),
+                Arc::clone(router),
+                Arc::clone(agent_config),
+            ));
         }
     }
 
@@ -5612,8 +5717,7 @@ impl DaemonServer {
             false
         };
 
-        if should_migrate {
-            let path = json_path.unwrap();
+        if should_migrate && let Some(path) = json_path {
             info!(
                 "Migrating memories from {:?} to Turso (one-time migration)",
                 path
@@ -6551,6 +6655,43 @@ impl Default for DaemonBuilder {
 /// Fields that exist in `nanna_config` but not in the daemon-local type are
 /// silently dropped — the local type only covers what `ChannelManager` actually
 /// needs at runtime.
+/// Whether a webhook message from `chat_id` on `source` may start a turn.
+///
+/// Telegram's `allowed_users` reached only the polling listener's chat
+/// filter; with a `webhook_url` set the listener is off and the webhook path
+/// had no filter, so any Telegram user who found the bot got a full agent
+/// turn with tools (the webhook secret proves the POST came from Telegram,
+/// not who wrote it). The same rule as the listener: an empty or absent list
+/// admits every chat, otherwise the chat id must be listed. Other providers
+/// have no allowlist here.
+fn webhook_chat_allowed(source: &str, chat_id: &str, telegram_allowed: Option<&[i64]>) -> bool {
+    if source != "telegram" {
+        return true;
+    }
+    match telegram_allowed {
+        None | Some([]) => true,
+        Some(allowed) => chat_id
+            .trim()
+            .parse::<i64>()
+            .is_ok_and(|id| allowed.contains(&id)),
+    }
+}
+
+#[cfg(test)]
+mod webhook_allowlist_tests {
+    use super::webhook_chat_allowed;
+
+    #[test]
+    fn telegram_webhook_messages_honour_allowed_users() {
+        assert!(webhook_chat_allowed("telegram", "42", Some(&[42])));
+        assert!(!webhook_chat_allowed("telegram", "7", Some(&[42])), "a stranger is refused");
+        assert!(!webhook_chat_allowed("telegram", "not-a-number", Some(&[42])));
+        assert!(webhook_chat_allowed("telegram", "7", None), "no list admits everyone");
+        assert!(webhook_chat_allowed("telegram", "7", Some(&[])));
+        assert!(webhook_chat_allowed("slack", "C1", Some(&[42])), "Telegram's list only");
+    }
+}
+
 fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsConfig {
     use crate::channels::{
         DiscordConfig as DaemonDiscord, SlackConfig as DaemonSlack,
@@ -6579,6 +6720,21 @@ fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsC
             })
         }),
     }
+}
+
+
+/// Return the heap the boot freed to the OS, once, just before serving.
+///
+/// Boot is the daemon's allocation peak: `bulk_load` builds every memory and
+/// its vectors through temporaries, and glibc keeps the freed pages in its
+/// arenas indefinitely. Measured on a copy of a real 105 MB store (2026-10-04,
+/// system allocator since mimalloc was switched off): without this, ~214 MB at
+/// ready grew to ~237 MB a minute later; with it, ~213 MB at both — the work
+/// after ready reuses the returned pages instead of growing the arenas.
+/// Mimalloc, which purges on its own, idled at ~185 MB. Large IPC replies
+/// get the same treatment, rate-limited (see `crate::heap`).
+fn release_boot_heap() {
+    crate::heap::release_freed_heap();
 }
 
 #[cfg(test)]

@@ -190,7 +190,7 @@ async function startPolling() {
     })
     
     // Start backend polling
-    await invoke('subscribe_channel_status', { interval_ms: 30000 })
+    await invoke('subscribe_channel_status', { intervalMs: 30000 })
     isPolling.value = true
   } catch (e) {
     console.error('Failed to start status polling:', e)

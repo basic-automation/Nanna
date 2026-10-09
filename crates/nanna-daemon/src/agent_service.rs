@@ -2163,21 +2163,23 @@ impl AgentService {
     }
 
     /// Parse retry-after seconds from an error message.
-    /// Looks for patterns like "retry after X seconds", "try again in X", "retry-after: X"
+    ///
+    /// The structured `retry-after: N` (the provider's header, carried in
+    /// `LlmError::RateLimit`'s text) is read first; only without it do the
+    /// prose forms count: "try again in X", "retry after X", "wait X". A unit
+    /// after the number is honoured — `OpenAI`'s "try again in 452 ms" is under a
+    /// second, not 452 s — and a sub-second wait rounds UP to one second.
     fn parse_retry_after(error: &str) -> Option<u64> {
         let lower = error.to_lowercase();
 
-        // Pattern: "try again in X seconds" / "retry after X seconds" / "wait X seconds"
-        for prefix in &["try again in ", "retry after ", "wait ", "retry-after: "] {
+        for prefix in &["retry-after: ", "try again in ", "retry after ", "wait "] {
             if let Some(pos) = lower.find(prefix) {
                 // Slice `lower` (where `pos` was found), NOT `error`: lowercasing
                 // can change byte length, so `pos` may not be a char boundary in
                 // `error` — indexing it there could panic on a non-ASCII message.
                 // Digits are ASCII, so reading them from `lower` is equivalent.
                 let after = &lower[pos + prefix.len()..];
-                // Extract digits
-                let num_str: String = after.chars().take_while(char::is_ascii_digit).collect();
-                if let Ok(secs) = num_str.parse::<u64>() {
+                if let Some(secs) = Self::duration_secs(after) {
                     return Some(secs);
                 }
             }
@@ -2185,6 +2187,24 @@ impl AgentService {
 
         // Pattern: "Please try again later" (generic — use default)
         None
+    }
+
+    /// Whole seconds from a leading `<digits>[ ]<unit>`: `ms`/`millisecond…`
+    /// round up to a second, `m`/`min…` are minutes, anything else (`s`,
+    /// `sec…`, nothing) is seconds.
+    fn duration_secs(text: &str) -> Option<u64> {
+        let digits: String = text.chars().take_while(char::is_ascii_digit).collect();
+        let value = digits.parse::<u64>().ok()?;
+        let unit = text[digits.len()..].trim_start();
+        let secs = if unit.starts_with("ms") || unit.starts_with("milli") {
+            value.div_ceil(1000).max(1)
+        } else if unit.starts_with("min") || (unit.starts_with('m') && !unit.starts_with("ms")) {
+            value.saturating_mul(60)
+        } else {
+            value
+        };
+        debug_assert!(value == 0 || secs > 0, "a real wait never rounds to nothing");
+        Some(secs)
     }
     
     /// Cancel an active chat. Abortive: waking the token drops the
@@ -2614,6 +2634,24 @@ mod tests {
             Some(12)
         );
         assert_eq!(AgentService::parse_retry_after("please WAIT 60 s"), Some(60));
+        // OpenAI's body form: milliseconds, rounded up to a whole second.
+        assert_eq!(
+            AgentService::parse_retry_after("Please try again in 452ms."),
+            Some(1)
+        );
+        assert_eq!(
+            AgentService::parse_retry_after("try again in 2 minutes"),
+            Some(120)
+        );
+        // The header's wait, carried in the error text, wins over the prose.
+        let header = nanna_llm::LlmError::RateLimit {
+            message: "Please try again in 452ms.".to_string(),
+            retry_after: Some(45),
+        };
+        assert_eq!(
+            AgentService::parse_retry_after(&header.to_string()),
+            Some(45)
+        );
         // No number / no recognized pattern → None (caller uses a default).
         assert_eq!(AgentService::parse_retry_after("Please try again later"), None);
         assert_eq!(AgentService::parse_retry_after("try again in soon"), None);

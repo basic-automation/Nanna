@@ -77,15 +77,33 @@ impl ControlPlane {
             WorkspaceAction::Open { path } => self.workspace_open(path).await,
             WorkspaceAction::Close { id } => {
                 let mut registry = self.workspaces.write().await;
+                let was_active = registry.active().is_some_and(|ws| ws.id == id);
                 if let Some(ws) = registry.remove(&id) {
                     info!("Closed workspace: {} ({})", ws.name, id);
                     drop(registry);
-                    // Remove from database
-                    if let Some(ref storage) = self.storage {
-                        let _ = storage.workspaces().delete(&id).await;
+                    // Closing the active workspace is global mode, like
+                    // ClearActive: tools stop resolving paths in a project
+                    // that is no longer open (only a registered, active
+                    // workspace sets the tool cwd).
+                    if was_active && let Some(ref tools) = self.tools {
+                        tools.set_default_workdir(None).await;
                     }
+                    // Remove from database — and say so when that failed:
+                    // the row would bring the workspace back on restart.
+                    let deleted = match self.storage {
+                        Some(ref storage) => storage.workspaces().delete(&id).await.err(),
+                        None => None,
+                    };
                     self.notify_workspaces_changed();
-                    json!({ "status": "closed", "id": id })
+                    deleted.map_or_else(
+                        || json!({ "status": "closed", "id": id }),
+                        |e| {
+                            json!({
+                                "status": "closed", "id": id, "persisted": false,
+                                "message": format!("closed for now, but it will reopen on restart: {e}"),
+                            })
+                        },
+                    )
                 } else {
                     json!({ "error": "not_found", "id": id })
                 }

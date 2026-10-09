@@ -190,7 +190,8 @@
               <div class="glass-strong rounded-lg px-2 py-1 text-[10px] text-nanna-text whitespace-nowrap">
                 <div class="font-mono">{{ b.period }}</div>
                 <div>{{ b.call_count }} calls · {{ formatLatency(b.avg_duration_ms) }} avg</div>
-                <div>P95: {{ formatLatency(b.p95_duration_ms) }}</div>
+                <!-- The bucket's column keeps the MAX of its calls, not a percentile. -->
+                <div>Slowest: {{ formatLatency(b.p95_duration_ms) }}</div>
               </div>
             </div>
             <!-- Call count bar -->

@@ -540,6 +540,19 @@ impl Backend {
                         active_model.write().await.clone_from(model);
                     }
                 }
+                if matches!(event, DaemonEvent::ConfigChanged)
+                    && let Some(state) = app.try_state::<Arc<RwLock<AppState>>>()
+                {
+                    // Before the views hear `config-changed`, so what they
+                    // re-read is the daemon's change and not the boot copy —
+                    // and so the next local setter saves on top of it rather
+                    // than reverting it. Read off the runtime: the keyring
+                    // can block.
+                    match tokio::task::spawn_blocking(crate::load_gui_config).await {
+                        Ok(fresh) => state.write().await.config = fresh,
+                        Err(e) => warn!("Could not refresh the config copy: {e}"),
+                    }
+                }
                 if let Some((name, payload)) = tauri_event_for(&event) {
                     let _ = app.emit(name, payload);
                 }
@@ -652,6 +665,16 @@ fn tauri_event_for(event: &DaemonEvent) -> Option<(&'static str, Value)> {
         // the config slice it renders instead of showing whatever it read at
         // mount.
         DaemonEvent::ConfigChanged => ("config-changed", Value::Null),
+        // The board re-reads its cards; the payload says which board, so a
+        // board showing another workspace can ignore it.
+        DaemonEvent::TaskEvent { kind, task_id, scope, scope_id, actor } => ("board-event", serde_json::json!({
+            "kind": kind,
+            "task_id": task_id,
+            "scope": scope,
+            "scope_id": scope_id,
+            "actor": actor,
+        })),
+        DaemonEvent::MembersChanged => ("members-changed", Value::Null),
         DaemonEvent::ContextUsage { session_id, used, window } => ("context-usage", serde_json::json!({
             "session_id": session_id,
             "used": used,
@@ -933,7 +956,7 @@ daemon_proxies! {
 
     // --- Task store operations ---
     /// List tasks in a scope
-    task_list(scope: &str, session_id: Option<&str>, include_closed: Option<bool>);
+    task_list(scope: &str, session_id: Option<&str>, include_closed: Option<bool>, workspace_id: Option<&str>);
     /// Create a new task
     task_create(title: &str, scope: &str, session_id: Option<&str>, parent_id: Option<i64>, description: Option<&str>, priority: Option<i64>);
     /// Update a task with a partial patch
@@ -944,6 +967,30 @@ daemon_proxies! {
     task_delete(id: i64);
     /// Reorder a task by updating its priority
     task_reorder(id: i64, new_priority: i64);
+
+    // --- Board (P25 Stage 4) ---
+    /// One quick-add line becomes one card
+    task_quick_add(text: &str, scope: Option<&str>, parent_id: Option<i64>, workspace_id: Option<&str>);
+    /// One card with its thread
+    task_get(id: i64);
+    /// The human posts on a card's thread
+    task_note(id: i64, content: &str);
+    /// One board's roster
+    member_list(workspace_id: Option<&str>);
+    /// A member's open cards on every board
+    task_assigned(member_id: Option<&str>);
+    /// Add an agent to a roster
+    member_create(name: &str, workspace_id: Option<&str>, personal: bool, profile: Option<Value>);
+    /// Change a member's name or profile
+    member_update(id: &str, name: Option<&str>, profile: Option<Value>);
+    /// Remove an agent from the roster
+    member_delete(id: &str);
+    /// Start or resume a card's run
+    card_run_start(card_id: i64);
+    /// Whether a run works a card now
+    card_run_status(card_id: i64);
+    /// Stop a card's run (the card pauses)
+    card_run_cancel(card_id: i64);
 }
 
 impl Default for Backend {
@@ -1336,6 +1383,35 @@ mod tests {
 
     /// Payload-free events used to be emitted with `()`; the table carries JSON
     /// `null` instead, which is the same bytes on the wire.
+    /// The board refreshes on these two, so their wire shapes — exactly as
+    /// `nanna_daemon::protocol::Event` serializes them — must parse into a
+    /// variant rather than fall into `Unknown`.
+    #[test]
+    fn board_events_reach_the_frontend() {
+        let wire = serde_json::json!({
+            "event": "task_event", "kind": "assigned", "task_id": 7,
+            "scope": "workspace", "scope_id": "ws-1", "actor": "router:ws-1",
+            "detail": { "assignee": "agent:builder" },
+        });
+        let event: DaemonEvent = serde_json::from_value(wire).expect("a task event parses");
+        let (name, payload) = tauri_event_for(&event).expect("forwarded");
+        assert_eq!(name, "board-event");
+        assert_eq!(payload["task_id"], 7);
+        assert_eq!(payload["kind"], "assigned");
+        assert_eq!(payload["scope_id"], "ws-1");
+
+        // A global card's event carries no `scope_id` or `actor` at all.
+        let global = serde_json::json!({
+            "event": "task_event", "kind": "created", "task_id": 8, "scope": "global", "detail": null,
+        });
+        let event: DaemonEvent = serde_json::from_value(global).expect("parses without the optionals");
+        assert!(matches!(event, DaemonEvent::TaskEvent { scope_id: None, actor: None, .. }));
+
+        let members: DaemonEvent =
+            serde_json::from_value(serde_json::json!({ "event": "members_changed" })).expect("parses");
+        assert_eq!(tauri_event_for(&members), Some(("members-changed", Value::Null)));
+    }
+
     #[test]
     fn payload_free_events_forward_null() {
         assert_eq!(

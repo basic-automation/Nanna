@@ -215,7 +215,7 @@ fn main() {
                 );
 
                 let speedup =
-                    simd_result.mean.as_secs_f64() * 1e9 / gpu_result.mean.as_secs_f64() * 1e9;
+                    simd_result.mean.as_secs_f64() / gpu_result.mean.as_secs_f64();
                 let gpu_faster = speedup > 1.0;
 
                 if gpu_faster && !prev_gpu_faster && crossover_point.is_none() {

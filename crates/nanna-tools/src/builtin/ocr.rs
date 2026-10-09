@@ -1,4 +1,4 @@
-//! OCR tools - extract text from images and describe image contents
+//! OCR tool - extract text from images
 //!
 //! # Tiered OCR Pipeline
 //!
@@ -330,102 +330,7 @@ fn run_ocrs_sync(
 }
 
 // ---------------------------------------------------------------------------
-// DescribeImageTool  (unchanged)
-// ---------------------------------------------------------------------------
-
-/// Tool for describing image contents in detail.
-pub struct DescribeImageTool {
-    vision_fn: Option<OcrVisionFn>,
-}
-
-impl DescribeImageTool {
-    #[must_use]
-    pub fn new() -> Self {
-        Self { vision_fn: None }
-    }
-
-    /// Set the vision function callback.
-    #[must_use]
-    pub fn with_vision_fn(mut self, f: OcrVisionFn) -> Self {
-        self.vision_fn = Some(f);
-        self
-    }
-}
-
-impl Default for DescribeImageTool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-const DESCRIBE_PROMPT: &str = r"Provide a comprehensive description of this image.
-
-Include:
-1. **Overview**: What type of image is this? (photo, diagram, chart, screenshot, etc.)
-2. **Main Subject**: What is the primary focus or subject matter?
-3. **Details**: Describe specific elements, objects, people, text, colors, etc.
-4. **Context**: What setting, environment, or situation is depicted?
-5. **Notable Features**: Any interesting, unusual, or important details
-6. **Text Content**: If there's any text, summarize what it says
-7. **Quality/Style**: Image quality, artistic style, or technical aspects if relevant
-
-Be thorough but organized. Use clear structure.";
-
-#[async_trait]
-impl Tool for DescribeImageTool {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition::new("describe_image", "Get a detailed description of an image's contents")
-            .string_param("image", "Path to image file, URL, or base64-encoded image data", true)
-            .string_param("media_type", "MIME type (image/jpeg, image/png, etc.) - required for base64", false)
-            .string_param("focus", "What to focus on (e.g., 'people', 'text', 'objects', 'colors')", false)
-            .bool_param("brief", "Return a brief 1-2 sentence description instead of detailed", false)
-    }
-
-    async fn execute(&self, params: HashMap<String, Value>) -> Result<ToolResult, ToolError> {
-        let image = params
-            .get("image")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParams("Missing 'image' parameter".to_string()))?;
-
-        let media_type = params
-            .get("media_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("image/jpeg");
-
-        let focus = params.get("focus").and_then(|v| v.as_str());
-
-        let brief = params
-            .get("brief")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-
-        let vision_fn = self.vision_fn.as_ref().ok_or_else(|| {
-            ToolError::ExecutionFailed("Vision model not configured".to_string())
-        })?;
-
-        // Prepare the image
-        let (image_data, actual_media_type) = prepare_image(image, media_type).await?;
-
-        // Build prompt based on options
-        let prompt = if brief {
-            "Describe this image in 1-2 sentences. Be concise but capture the essential content."
-                .to_string()
-        } else if let Some(f) = focus {
-            format!("{DESCRIBE_PROMPT}\n\nFocus especially on: {f}")
-        } else {
-            DESCRIBE_PROMPT.to_string()
-        };
-
-        let result = vision_fn(image_data, prompt, actual_media_type)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Image description failed: {e}")))?;
-
-        Ok(ToolResult::success(result))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Shared image-preparation helper
+// Image-preparation helper
 // ---------------------------------------------------------------------------
 
 /// Prepare image data — handles file paths, URLs, and base64.
@@ -481,13 +386,6 @@ mod tests {
         let tool = OcrTool::new();
         let def = tool.definition();
         assert_eq!(def.name, "ocr");
-    }
-
-    #[tokio::test]
-    async fn test_describe_image_tool_definition() {
-        let tool = DescribeImageTool::new();
-        let def = tool.definition();
-        assert_eq!(def.name, "describe_image");
     }
 
     #[tokio::test]

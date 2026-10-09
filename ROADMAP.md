@@ -37,7 +37,7 @@ corrupt-Turso-memories salvage + `/status` surfacing, real tool-failure logs, Wi
 normalization, and the heartbeat `HEARTBEAT.md` read. Detailed dated notes collapsed to a one-line ledger
 (full rationale in each commit).
 **Repo:** local Cargo workspace, branch `master` — one Rust workspace + a Tauri 2 / Nuxt 4 GUI.
-**Stack:** Rust 2024 (rustc 1.85+) · Tokio · **Burn** (wgpu + ndarray) for on-device inference · wgpu 24 · Tauri 2 · Nuxt 4 / Vue 3 / Tailwind 4 · **Turso** (embedded, SQLite-compatible) · Boa + Deno scripting.
+**Stack:** Rust 2024 (rustc 1.85+) · Tokio · **Burn** (wgpu + ndarray) for on-device inference · wgpu 24 · Tauri 2 · Nuxt 4 / Vue 3 / Tailwind 4 · **Turso** (embedded, SQLite-compatible) · Boa scripting.
 
 > **Direction (2026-07-06 pivot) — local-first by default.** A small open model running on a single
 > consumer GPU *is* the agent and does the whole job — full agentic reasoning, tools, and memory —
@@ -93,7 +93,7 @@ Tier 1  nanna-infer*      Burn model runner: local LLM inference (wgpu + ndarray
         nanna-llm         Inference routing: local (nanna-infer) first · cloud APIs optional
           |
 Tier 2  nanna-tools       Tool system (all tools are filesystem JS/TS skills)
-        nanna-scripting   Boa (pure-Rust JS) + Deno (V8/TS) engines; embedded Python
+        nanna-scripting   Boa (pure-Rust JS) engine; embedded Python
         nanna-workspace   Workspace detection, .nanna/ context files (SOUL/USER/AGENTS/…)
         nanna-channels    Channel listeners + unified message router
         nanna-browser     Browser control (CDP / Playwright)
@@ -157,7 +157,8 @@ Concretely, today Nanna:
 - Has a **cognitive memory** system (FSRS-6 spaced repetition, semantic recall with testing-effect
   reinforcement, consolidation/"dreaming", duplicate detection) persisted to **Turso**.
 - Ships **all tools as filesystem JS/TS skills** (39 default skills) executed by the Boa engine, plus
-  **MCP client** integration and an **embedded/tiered OCR** pipeline (pure-Rust `ocrs` → vision-model fallback).
+  **MCP client** integration and **model OCR** (the `ocr` skill and `read_pdf`'s scanned pages go to a
+  vision model; the pure-Rust `ocrs` tier is built but not wired — see the dead-subsystems item in P25).
 - Connects **five channels** (Telegram, Discord, Slack, Signal, WhatsApp) with a webhook server and a
   unified router that delivers agent responses back to the originating channel.
 - Presents a **Tauri 2 + Nuxt 4** desktop GUI: streaming chat, Tiptap+Monaco rich editor, session
@@ -329,6 +330,22 @@ Remaining: capture real screenshots to replace the README placeholders.
       `no_configured_data_dir_means_the_platform_default`,
       `a_configured_data_dir_wins_over_the_platform_default`, `a_blank_data_dir_is_treated_as_unset`,
       `a_data_dir_survives_a_save_load_round_trip`.
+      *(2026-10-03)* **The "place to choose it" did not exist until now** — `get_data_dir` /
+      `set_data_dir` were registered and nothing in the app called them (found by the dead-command
+      triage, P4). Settings → Data now has a **Data location** section: the folder, "Platform
+      default" / "Custom location", *Choose folder…* (native folder picker, then a confirm naming
+      both folders and saying nothing is moved) and *Use the default*. It tells the truth about
+      timing by asking the daemon rather than remembering: `system.status` now reports the
+      `data_dir` the daemon opened its store in, and both commands return it as `in_use`, so the
+      notice "Nanna keeps using X until the daemon restarts, then uses Y. Existing data is not
+      moved" shows exactly while a saved change waits — including one saved earlier, which a
+      page-open snapshot (the first draft) got wrong. Wording in `app/lib/dataDir.ts`, 4 vitest;
+      Playwright mock answers both commands. **Verified in the real app over WebDriver**
+      (isolated HOME/config, daemon on :51990): the section renders the live folder; a relative
+      path is refused with the validator's reason; a saved folder shows "Custom location" and the
+      notice after the page is reopened; *Use the default* opens the in-app confirm and saves;
+      then `restart_daemon` brings up a new daemon that opens `nanna.db` **in the chosen
+      folder**, `in_use` equals the setting and the notice is gone.
 - [ ] Model/backend status dashboard.
 - [~] Cost tracking for cloud models.
       *(See P6)* Core shipped — `CostTracker` with per-model pricing table, `estimate_cost_usd`,
@@ -383,6 +400,20 @@ Remaining: capture real screenshots to replace the README placeholders.
        time. Each test's wall-clock then tracks its solo cost (~2.4 s, well under the smallest 10 s guard)
        regardless of `--test-threads`. Verified: 13/13 green in 31.2 s, clippy clean (no new warnings), and it is
        test-only — production `python.exec` sets its own per-call timeout and is untouched.
+- [x] *(2026-10-09)* **Every declared dependency is used, and CI checks it.** `cargo shear` found 16
+       unused dependencies and one misplaced one across 8 manifests: `anyhow` (agent, core, daemon),
+       `flume` (core), `half` (gpu, memory), `criterion` (gpu — its four benches have custom mains, so
+       the dev-dep was dead and its "0.8 → 0.7" downgrade row in every sweep was noise from a crate
+       nothing used; `nanna-bench` keeps the real one), `serde` + `async-trait` (client), `thiserror` +
+       `reqwest` + a non-dev `tower` (server — the test's `tower` with `util` stays in dev-deps), and in
+       the GUI a whole PKCE stack (`base64`, `sha2`, `rand`, `urlencoding`) plus `directories`, left
+       behind when OAuth moved to the daemon. Each verified by grep, not taken on the tool's word; its
+       `--fix` was **not** used as-is: it rewrote `nanna-core/Cargo.toml` from CRLF to LF and replaced
+       the server's commented `tower = { …, features = ["util"] }` dev-dep with a bare one (the test
+       needs `util`), so both were edited by hand. Lockfile: 16 dependency edges gone, no version moved.
+       New `dependency-hygiene.yml` runs `cargo shear` (metadata + source scan, no build, ~1 min) on
+       every PR; a real false positive goes in the crate's `[package.metadata.cargo-shear] ignored`
+       with a reason. Verified: workspace clippy clean, GUI crate clippy clean + 103/103.
 
 ### P1 — Core Infrastructure
 SIMD vector ops (AVX/AVX2), GPU compute (wgpu), Turso persistence (embedded, SQLite-compatible),
@@ -509,10 +540,40 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       none fixable from this tree; npm: 4 low/moderate. The gate was checked to have eyes: the
       same pnpm audit at `moderate` exits 1. Thresholds are deliberate: failing on warnings would
       leave the job permanently red, i.e. ignored.
-      - [ ] **`lru 0.16.4` is unsound (RUSTSEC-2026-0253, use-after-free when a key's `Drop` panics
+      - [x] **`lru 0.16.4` is unsound (RUSTSEC-2026-0253, use-after-free when a key's `Drop` panics
             inside `pop()`), patched in ≥ 0.18.2** — reached only via `tantivy 0.26` under turso's
             exact `=0.7.2` pin, so it moves when turso does. Not reachable in shipped builds: it
             needs unwinding plus `catch_unwind`, and the release profile is `panic = "abort"`.
+            *(2026-10-03)* **Gone from the graph** — the turso 0.8.1 move turns off turso's `fts`
+            feature, which was the only path to `tantivy`, so `lru` left the lockfile with it.
+      - [ ] *(2026-10-03)* **`braces` GHSA-vfj7-8cjw-p6xm (high, stack-exhaustion DoS) is exempted,
+            not fixed** — it turned the npm audit job red on the nightly PR with no lockfile change of
+            ours (master carries the same `braces 3.0.3`; the advisory is new). No fix exists:
+            `braces` 3.0.3 is the latest and the patched range is empty. Path: `nuxt →
+            @nuxt/nitro-server → nitropack → globby → micromatch → braces`, i.e. Nitro's build-time
+            globbing; the shipped static bundle contains no braces code (the word appears only in
+            Monaco/TypeScript message strings). Exempted by id beside node-forge, reasoning in
+            `audit.yml`'s header. **Remove the entry when `braces` or `micromatch` ships a fix.**
+      - [ ] *(2026-10-08)* **Four `simple-git` advisories (two critical) are exempted, not fixed** —
+            GHSA-v5rq-49vh-5v5c, GHSA-x6jw-m9v5-85vh, GHSA-g4wm-2vf7-vfgr, GHSA-858h-whjf-mvg5,
+            all `<4.0.1`, all about attacker-controlled git options/env. Published after the
+            10-05 audit, so master's gate is red against today's database too. Path: `nuxt →
+            @nuxt/devtools 3.4.2 → simple-git 3.36.0`, used only to name a build analysis with
+            fixed arguments on our own root; devtools is off in production. **An override to 4.x
+            is not a fix:** simple-git 4 has no default export and devtools does `import Git from
+            'simple-git'`, so `nuxt dev` would fail at link time (checked against 4.0.2). Drop the
+            ids from `pnpm.auditConfig.ignoreGhsas` when devtools moves to simple-git 4 (its
+            `4.0.0-beta` line is the place to watch). DOMPurify's two new *lows* stay below the
+            `moderate` gate (monaco pins 3.4.15).
+      - [ ] *(2026-10-02)* **`node-forge` GHSA-86w9-cpqp-85rv (high) is exempted, not fixed.** No
+            release fixes it (1.4.0 is the latest; the advisory lists no patched version); it
+            comes through `nuxt → listhen`, the dev server's cert helper, which the shipped static
+            bundle never runs. Exempted by id in `gui/package.json` `pnpm.auditConfig.ignoreGhsas`
+            (reasoning in `audit.yml`'s header). **Remove the entry as soon as node-forge ships a
+            fix.** Same night: `devalue 5.9.1 → 5.9.4` (six advisories, three high, through Nuxt's
+            payload serializer) — these were published after the 2026-10-01 merge, so master's
+            gate was red against today's database too. DOMPurify 3.4.16 (one *low*) cannot be
+            taken: `monaco-editor 0.57.0` pins 3.4.15 exactly.
       - [x] *(2026-09-26 — `monaco-editor 0.57.0` vendors DOMPurify 3.4.15; `pnpm audit` reports
             nothing at any level, and the gate is now `--audit-level=moderate`.)*
             **Monaco vendors DOMPurify 3.4.8** (`monaco-editor/esm/vs/base/browser/dompurify/`) —
@@ -521,9 +582,16 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
             the package-level `dompurify` it would bump is not the code monaco runs. Re-check on the
             next monaco release; exposure is monaco's own hover/markdown rendering of local content.
 
-- [ ] No GitHub secret scanning enabled.
+- [x] No GitHub secret scanning enabled.
       *(2026-07-24)* Dependabot shipped (see above). Secret scanning itself is still a repo-admin
       toggle on GitHub and is not something a PR can flip — left open.
+      *(2026-10-03, checked)* **On, since the move to `basic-automation/Nanna` (public).**
+      `gh api repos/basic-automation/Nanna` reports `secret_scanning`, `secret_scanning_push_protection`
+      and `dependabot_security_updates` all `enabled`, and the secret-scanning alerts list is **empty
+      (0)**. GitHub scans a public repo's whole history with its provider patterns, so that 0 also
+      covers the history for known token formats. Still off, and an owner toggle:
+      `secret_scanning_non_provider_patterns` (generic secrets such as private keys and passwords)
+      and `secret_scanning_validity_checks`.
 - [x] Store all secrets in OS keychain by default; remove secret fields from config.toml.
       *(2026-07-24)* **Done** as part of the onboarding/GUI keyring work above. `Config::save_to`
       always strips `llm.{api_key,openai_api_key,openrouter_api_key,github_token,ollama_api_key,
@@ -889,6 +957,15 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
 - [x] Unify ProjectDirs namespaces — config and credentials must use the same ("com", "nanna", "nanna") (or equivalent) namespace.
       *(2026-07-24)* Done — see the namespace-unification item above.
 - [ ] Run gitleaks detect --source . and trufflehog git file://. across full git history.
+      *(2026-10-03)* Partly answered: GitHub secret scanning (provider patterns, whole history) reports
+      0 alerts — see the item above. What is left is the **generic** patterns (keys, passwords,
+      high-entropy strings) that neither GitHub's default scan nor this host covers: neither
+      `gitleaks` nor `trufflehog` is installed here, and installing one is an owner step (a Go binary
+      or container from outside the Rust toolchain). A pattern pass over every added line in all 1776
+      commits (`git log -p --all`, grepping the Anthropic/OpenAI/OpenRouter/GitHub/AWS/Slack/Telegram
+      token shapes and PEM private-key headers) found only three test fixtures:
+      `sk-ant-from-the-environment`, `sk-ant-oat01-roundtrip-access`, `xoxb-1234567890-`. Not a
+      substitute for gitleaks' entropy rules, but nothing real in the common shapes.
 - [x] Remove or gitignore .claude/settings.local.json (committed with machine paths and broad agent permissions).
       *(2026-07-24)* **Untracked and gitignored.** It was committed in a **public** repo carrying 77 lines
       of Claude Code permission allowances — including `Bash(curl:*)`, `Bash(taskkill:*)`,
@@ -920,7 +997,7 @@ with send/react/edit/delete/pin/threads/media where supported. **Shipped.**
 MCP client (stdio + HTTP/SSE transports, tool discovery, adapter into nanna-tools), background task
 spawning, agent-to-agent messaging (mailbox), Erlang/OTP-style supervisors (RestartPolicy, strategies,
 health checks). **Shipped**, except:
-- [~] **Verify or build MCP *server* mode** — doc claims `crates/nanna-server/src/mcp.rs`; that file does
+- [x] **Verify or build MCP *server* mode** — doc claims `crates/nanna-server/src/mcp.rs`; that file does
       not exist and no MCP refs found under `nanna-server/src`.
       *(2026-07-23)* **Located: the server lives at `crates/nanna-mcp/src/server.rs`** (532 lines —
       `McpServer` with tool/resource/prompt registration, `handle_request` covering initialize/tools/
@@ -948,8 +1025,11 @@ health checks). **Shipped**, except:
       `initialize` result, a `tools/list` advertising all **39** skills (every one carrying an
       `inputSchema`), and a `tools/call` of `list_dir` that really executed and returned directory
       contents — with **stdout containing exactly the 2/2 protocol lines and every log on stderr**.
-      Remaining: memory/agent-backed tools (`remember`/`recall`/`reflect`/`task`) need the daemon's script
-      services, which this standalone path does not build — see the new item below.
+      *(2026-09-28)* **Closed.** The only remainder named here — memory/agent-backed tools on the
+      standalone path — is the item below, and that item is done: `nanna mcp serve` proxies to the
+      running daemon, so `remember`/`recall`/`reflect`/`task` execute there rather than in a second
+      process. The server also answers `server/discover` for the 2026-07-28 revision. Nothing in this
+      item is still open.
 - [x] *(2026-07-23)* **Give `nanna mcp serve` the memory/agent-backed tools.** It loads skills via
       `ToolRegistry::load_skills` (no services), so the tools that need `build_script_services` —
       `remember`, `recall`, `reflect`, `task` — load but cannot reach memory or spawn sub-agents. Options:
@@ -1175,7 +1255,7 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       `gui/e2e/tauri-driver.md` (launch → Settings → Logs → close hygiene). Soft-skips when binary/driver missing
       so web CI stays hermetic; armed via `NANNA_TAURI_E2E=1` once a packaged binary is present. Wire full
       WebDriverIO session when nightly hosts a display + driver pair.
-- [ ] *(measured 2026-09-08)* **GUI WebDriver verification is unavailable on the Linux host, and
+- [x] *(measured 2026-09-08)* **GUI WebDriver verification is unavailable on the Linux host, and
       NOT because a package is merely uninstalled.** The routine's own host notes say
       `WebKitWebDriver` arrives with `pacman -S webkit2gtk-4.1`. That is wrong for Arch:
       **`webkit2gtk-4.1` 2.52.6-1 IS installed** here and its 416-file manifest ships
@@ -1197,6 +1277,10 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       verification** — headless checks plus "needs on-device verification" is the honest ceiling.
       `cargo-tauri` and `tauri-driver` are also not installed, but those are `cargo install`-able
       and are not the blocker.
+      *(2026-10-08 — closed, superseded.)* The alternative provider landed: `e2e-webdriver` +
+      `tauri-webdriver` (P0.3 Linux host section) needs no `WebKitWebDriver`, has worked since
+      2026-09-18, and drove the built GUI again this run. The shared `.sh` harness still targets
+      `tauri-driver`; that stays its own item.
 - [x] **Critical-path scenarios** *(2026-07-22)* — `e2e/critical-path.spec.ts`: first-run/no-key empty state;
       chat send → stream → Stop (mock LLM); session create/rename/delete/switch; backend disconnect toast +
       reconnect affordance; Settings API-key round-trip; Logs Live/Paused, Clear, Copy all.
@@ -1217,6 +1301,45 @@ bugs and improvements here; do not bury them only in the backlog bullet.
 - [x] **Crash / error boundaries** *(2026-07-22)* — `ErrorBoundary.vue` wraps shell + chat via `onErrorCaptured`;
       recoverable alert panel + Try again/Reload; e2e force hook `__NANNA_FORCE_ERROR__` asserted in
       `e2e/error-boundary.spec.ts`.
+
+- [x] *(found 2026-10-09, audit of the GUI)* **The Tools page could not create a tool, and "saved"
+      code edits it never sent.** `tools.vue` passed `code` to `create_user_tool` /
+      `update_user_tool`, which take `source`; Tauri ignores unknown keys, so create failed on the
+      missing required `source` and update changed only the description while the page marked the
+      code saved. Fixed, and the class is now guarded: `tests/unit/invokeArguments.spec.ts` reads
+      every `#[tauri::command]` signature (camelCase keys, `Option` = optional, injected
+      `State`/`AppHandle`/`Window` skipped) and checks every literal `invoke('x', {…})` passes
+      only known keys and every required one (calls with a non-literal or spread argument are
+      skipped). It also caught `ChannelStatusLive`'s `interval_ms` (Tauri wants `intervalMs`).
+      Mutation-checked: the old `code` keys fail it.
+
+- [x] *(found 2026-10-09, same audit)* **GUI commands said "done" for things the daemon declined.**
+      The daemon reports a refusal inside an `Ok` reply; `trigger_consolidation`, `update_memory`,
+      `delete_memory` and `set_active_workspace` checked only the transport result — so Dream with no
+      model configured said "Dream cycle finished", an edit of a memory a dream had merged said
+      "Memory saved", and activating a workspace another client had closed showed it Active while
+      the daemon's tool cwd never moved (the GUI now asks the daemon first and changes its own view
+      only on success). New shared `commands::daemon_refusal` (1 test).
+      *(same run)* **The GUI's settings setters reverted the daemon's config changes.** The GUI
+      loaded its config copy once at boot and every local setter (`set_agent_name`,
+      `set_streaming_enabled`, `set_max_tokens`, the iteration policy, the memory setters) saves
+      that whole copy over `config.toml` — so a tool disabled on the Tools page (the daemon writes
+      that) was silently re-enabled by the next unrelated setting, and `nanna config set` / hand
+      edits were reverted. The event forwarder now reloads the copy (`load_gui_config`, the boot
+      path, off the runtime) on every `ConfigChanged` before the views hear it. **Verified in the
+      real GUI over WebDriver** (isolated daemon): `set_tool_enabled web_fetch false` →
+      `set_agent_name Verifier` → `config.toml` holds both `name = "Verifier"` and
+      `disabled = ["web_fetch"]`. Residual: a setter racing the event by milliseconds; routing
+      setters through `config.set` is the full fix. *(same run)* `set_embedding_config` logged a
+      failed save and still answered "Embedding settings updated"; it now returns the error.
+      *(same run)* `init_workspace` re-registered the active workspace as inactive (a fresh
+      `Workspace` under the same id); `WorkspaceRegistry::register` now takes the flag from the
+      registry's own selection (test `re_registering_the_active_workspace_keeps_it_active`).
+      *(same run)* Two fixed: the Memory page's Workspace tab with no workspace open forwarded the
+      literal `"workspace"` (listed the globals under that label; Clear matched nothing and said
+      "cleared") — `resolve_memory_scope` now refuses it with a reason (1 test); and clearing an
+      Agent Loop number field saved `1` (`Math.max(1, Math.round(""))`, capping every run at one
+      iteration) — the save now refuses anything but a whole number ≥ 1.
 
 ##### UI / UX bugfix (known + sweep)
 - [x] **Empty / loading / error / offline** states for every page (chat, logs, memory, tools, channels, stats,
@@ -1378,6 +1501,52 @@ bugs and improvements here; do not bury them only in the backlog bullet.
             `update_skill`/`delete_skill`/`list_skills`, `test_all_channels`, `clear_rate_limit`, …).
             Each is either a feature with no UI or a leftover; triage into "wire up" vs "delete" rather
             than leaving an unaudited command surface exposed to the webview.
+            *(2026-10-03)* **Re-measured and the first cut made: 191 registered, 42 never named in
+            `app/`; 15 deleted.** Gone (no caller in the app, no Rust caller, no test): the workspace
+            file and path commands `save_workspace_file`, `read_workspace_file`,
+            `discover_workspaces_in_path`, `find_workspace_root_from_path`, `get_workspace_context`,
+            `get_active_workspace`; the skill-directory CRUD `list_skills`, `create_skill`,
+            `update_skill`, `delete_skill` (code written to disk from the webview) plus
+            `list_user_tools_cmd`, `test_user_tool`; `check_env_var` (an environment probe); and the
+            no-op `apply_memory_updates` / `save_memories`. Their helpers went with them
+            (`get_skills_path`, `validate_existing_skill_name` + its test, `registry_handle`,
+            `SkillInfo`, `SkillListResult`), and so did the GUI's **whole dependency on `nanna-tools`**
+            (its only use was skill discovery): the GUI's normal dependency graph is **862 → 740**
+            crates, and the Boa/Deno/Python scripting engines no longer link into the GUI.
+            **Kept on purpose:** the chat/session ones (`archive_and_delete_session`,
+            `set_session_workspace`, `set_session_tools`) and the sub-session / agent-registry ones go
+            with the Stage 4 chat and sub-agent deletion; `get_credential_status` /
+            `refresh_oauth_token` belong to the open OAuth item; `get_data_dir` / `set_data_dir` were
+            a built feature with **no UI** — wired the same day (Settings → Data → Data location, see
+            P0.1 "Data storage location selection").
+            *(2026-10-03, later)* **The rest triaged — 10 more deleted, 25 in all; 166 registered.**
+            Deleted: `search_memory` (a GUI-side substring search over every session's history, with
+            its char-safe snippet code and test), `get_memory_stats` (the app reads
+            `get_cognitive_memory_stats`), `get_memory`; the three notification commands (the app
+            notifies through `@tauri-apps/plugin-notification` directly); `show_window` (the tray
+            never called it); `clear_rate_limit`; `delete_cron_jobs_by_name`; and
+            `set_extraction_model` — whose config field `[memory] extraction_model` **nothing in the
+            daemon reads** (a dead field, filed below rather than removed, since dropping a config key
+            needs a migration story). What is left unused is exactly the deliberate keep-list:
+            chat/session (3), sub-session (5) and agent-registry (5) commands, which go with the Stage
+            4 cut-over and the sub-agent deletion, and the OAuth pair. Leave this item open until the
+            cut-over removes those.
+      - [x] *(found 2026-10-03)* **`[memory] extraction_model` is a dead config field.** Declared and
+            defaulted in `nanna-config` (`extraction_model: String`, "empty = use chat model"), saved
+            and loaded, and read by nothing in the daemon — its only writer, the GUI's
+            `set_extraction_model`, had no caller and is deleted. Either wire it (the extraction step
+            would run on it) or remove it with a load-time tolerance for old configs; do not build on
+            it as if it worked.
+            *(2026-10-03, same run)* **Removed.** Wiring it would have been a new feature (an
+            extraction-model choice nobody asked for, with a hard-coded 2024 model list); removing
+            it costs nothing because no `Config` struct uses `deny_unknown_fields`, so an old
+            `config.toml` carrying the key still loads — pinned by
+            `legacy_extraction_model_key_still_loads`, which also checks the stale key is not
+            written back on save. Gone with it: the GUI settings wire's `extraction_model` /
+            `available_extraction_models` (the frontend never read them; the wire-shape test now
+            pins the smaller shape). Still to triage: `search_memory`, `get_memory_stats`, `get_memory`,
+            `set_extraction_model`, the three notification commands, `show_window`,
+            `clear_rate_limit`, `delete_cron_jobs_by_name`.
       *(2026-07-24)* **Verified in the real Tauri shell over WebDriver** (`cargo tauri build` release,
       `nanna-gui.exe` 16 MB, built under the pinned toolchain): `document.title === "Nanna"`, `#__nuxt`
       attached, `typeof window.__TAURI_INTERNALS__ === "object"` (so this is the real IPC shell, not the
@@ -1727,7 +1896,7 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
             on *every* attempt is a configuration fault, not a transient one, and deserves to
             surface (health endpoint degradation, or a once-per-boot loud notice) rather than
             scroll past. Needs a decision on where operator-visible faults belong.
-- [~] **Prometheus metrics** — new `nanna-metrics` crate (`NannaMetrics`: llm_request_duration,
+- [x] **Prometheus metrics** — new `nanna-metrics` crate (`NannaMetrics`: llm_request_duration,
       llm_tokens_total, tool_execution_duration, channel_messages/errors_total, queue_depth,
       active_sessions, memory_entries); expose via `/metrics` on the Axum health server + a GUI event.
       *(2026-09-17)* **`GET /metrics` landed on the health server (5148), no new crate or
@@ -1744,6 +1913,20 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
       and `nanna_channel_send_failures_total{channel}`, counted where a channel message crosses the
       daemon boundary (inbound + immediate replies in `process_message`, turn answers and reminders
       in the reply forwarder); names bounded at 16 then folded into `other`. Only histograms remain.
+      *(2026-10-08)* **Histograms landed — the item's last piece.** `nanna_tool_duration_milliseconds`
+      (per tool, executed calls only — a breaker replay never ran) and
+      `nanna_model_request_duration_milliseconds` (per model, failures included: a 120 s timeout is
+      exactly the latency a scrape should see), as standard `_bucket{le}`/`_sum`/`_count` families.
+      `nanna_agent::histogram::LatencyHistogram` is 13 saturating counters + a sum (112 B) beside
+      each tool's and model's stats, with fixed bounds (tools 10 ms–120 s, under `exec`'s 180 s
+      ceiling; models 250 ms–10 min), so series stay bounded by configuration. It is
+      `#[serde(skip)]` on the stats and their summaries: no client wire or stored format changes,
+      and it describes the running process (resets on restart, which scrapers handle as a counter
+      reset). `_count` is the `+Inf` bucket by construction. 6 tests (bucketing incl. inclusive
+      `le`, saturation, rendering, the trackers' real `record` paths, not exported, not restored).
+      **Not live-scraped with data:** tool and model stats are recorded inside agent turns, and a
+      direct `tool.execute` (tried on an isolated daemon) records none; `/metrics` itself served
+      200 there. Kept the `p95` gauges for existing dashboards.
 - [x] **Structured tracing spans** — hierarchy Session → Agent Loop → LLM/Tool Call, capturing
       name/duration/IO-size/success via `#[tracing::instrument]` + `info_span!`.
       *(2026-09-21)* The daemon had **zero** spans, so two overlapping turns interleaved their
@@ -2123,9 +2306,14 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
                   as `��`. Both now frame raw bytes first (`listeners::sse::take_event`, shared) and
                   decode one complete event at a time; tests over every split point. Not
                   live-verified — no Signal/WhatsApp bridge on this host.
-            - [ ] **PR #344's new `nanna-mcp/src/sse_legacy.rs` reads `bytes_stream()` too** — check it
+            - [x] **PR #344's new `nanna-mcp/src/sse_legacy.rs` reads `bytes_stream()` too** — check it
                   for the same per-chunk decode once #344 merges (it is not on master, so it could
                   not be fixed here).
+                  *(2026-10-04 — checked: not affected.)* It feeds raw chunks to the shared
+                  `SseParser`, which buffers bytes and decodes one complete line at a time (the
+                  `\n` delimiter is ASCII, so a whole line is whole characters). Pinned rather
+                  than asserted: `a_multibyte_event_survives_every_chunk_split` splits an event
+                  carrying 2-, 3- and 4-byte characters at every byte offset.
       - [x] *(2026-09-21)* **The e2e suite now gates PRs: `.github/workflows/e2e.yml`.** CI compiled
             the test suite (`test-compile.yml`, `--no-run`) but ran almost none of it — only three
             budget-gate subsets — so the conversation path was exercised by nightly runs alone. The new
@@ -2540,6 +2728,11 @@ and ships TLS, QR address output, abuse defense, and client authorization out of
       and record the decision here so the next sweep stops re-deriving it. Sources:
       [Arti 2.6.0](https://blog.torproject.org/arti_2_6_0_released/),
       [onyums](https://crates.io/crates/onyums).
+      *(research 2026-10-04 — corrects "onyums did not move")* **`onyums 0.5.0` (2026-09-24) moved
+      to `arti-client`/`tor-hsservice` `^0.46`**, one minor behind `arti-client 0.47.0` (2026-10-01).
+      The lag is about a week, not open-ended, which weakens the case for bypassing it; the
+      decision still wants making, but the evidence now leans to keeping `onyums` and re-checking
+      its lag when P9 starts.
 
 ### P10 — Token Efficiency & Cost Optimization ✅ (mostly)
 Done: Anthropic + OpenAI native prompt caching + hit tracking, cross-provider model routing with
@@ -2779,7 +2972,7 @@ so neither CI nor any prior run could have caught them:
       and the presence of `discover_tools/tool.ts` rather than the spelling of the path. 1728
       workspace tests green.
 
-- [ ] *(measured 2026-09-13)* **GUI WebDriver verification is blocked on this host, and every
+- [x] *(measured 2026-09-13)* **GUI WebDriver verification is blocked on this host, and every
       published install instruction for it names the wrong Arch package.** The shared harness's
       `ensure` reports `MISS WebKitWebDriver` and advises `sudo pacman -S --needed webkit2gtk-4.1` —
       but `webkit2gtk-4.1 2.52.6-1` **is already installed here and does not contain the binary**.
@@ -2792,6 +2985,9 @@ so neither CI nor any prior run could have caught them:
       verification as unavailable rather than skipped — the Linux WebDriver harness has still never
       had a successful `exec`. Sources: [Tauri WebDriver](https://v2.tauri.app/develop/tests/webdriver/),
       [WebdriverIO Tauri platform support](https://webdriver.io/docs/desktop-testing/tauri/platform-support/).
+      *(2026-10-08 — closed, superseded.)* The plugin route (`e2e-webdriver` + `tauri-webdriver`,
+      below under the WebKitWebDriver item) needs no `WebKitWebDriver` and has worked since
+      2026-09-18; this run drove the built GUI with it again (memory page over a scratch daemon).
 - [ ] *(2026-09-13)* **Correct the harness's own remedy string** once the package above is confirmed:
       `~/.claude/scheduled-tasks/_shared/tauri-webdriver.sh` prints the `webkit2gtk-4.1` advice, which
       sends the reader to a package they already have. It lives outside this repo, so a run cannot
@@ -4205,6 +4401,15 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             set. Worth measuring before pulling in a search crate, since it keeps the "Turso-only" invariant.
             This is also the cheapest path for the **tool-description keyword search** noted in P6/P11
             (tool descriptions currently need literal keywords because there is no lexical search at all).
+            *(2026-10-03)* **Not available on the current pin without work.** turso 0.8.1's `fts` feature
+            does not compile on our nightly (`DynVec::new_in(DynAllocator)` in
+            `index_method/fts/directory.rs` needs `--cfg nightly`), so the 0.8.1 move turned it off and
+            the FTS index method is no longer built. Taking this path means either building turso with
+            `RUSTFLAGS=--cfg nightly` (turning on its whole allocator_api code path, not just FTS) or
+            waiting for the upstream fix —
+            [turso#9463](https://github.com/tursodatabase/turso/issues/9463), open since 2026-10-02,
+            reports exactly this on nightly c36f14571 (our pin) and on beta, and says stable builds
+            it — and re-weigh a small BM25 crate against it.
       - [ ] *(research 2026-08-21 — settles HOW to fuse, which was the unstated hard part)* **Use
             Reciprocal Rank Fusion, not a weighted sum of scores.** RRF has the two properties this
             problem needs and a weighted sum does not: it is **score-independent** (only ranks enter the
@@ -5412,6 +5617,9 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             first time — so nothing we share with the TypeScript SDK misreads the spec where rmcp
             reads it differently, at least on these paths. Live suite 11/11; runs in `mcp-interop`.
             (b), whether nanna-mcp should sit on `rmcp`, stays open.
+            *(2026-10-08)* Both interop fixtures moved to their latest: `rmcp =3.4.0 → =3.5.1` and
+            the TypeScript SDK `@modelcontextprotocol/{client,server} 2.0.0 → 2.3.1`. Live suite
+            `dual_era_live -- --ignored` **11/11** on each step (rmcp first, then the TS SDK).
       - [x] *(found 2026-09-18)* `cargo clippy -p nanna-mcp --no-default-features --features stdio`
             warns on two unused imports (`adapter.rs` `RwLock`, `server.rs` `ToolContent`) — the
             feature-gated build nobody gates. Trivial; gate the imports on their features.
@@ -7733,13 +7941,25 @@ as its turn (`TurnAdmission`, scope default `session`).
       on-disk paths make a card non-portable, content-addressed storage needs a GC story that
       "threads are permanent" already complicates. Whichever wins, the memory copy of a post
       (Stage 1's write-through) must carry a reference, not the bytes.
-- [ ] **A task→reminder binding** (`deadline_at` → a scheduled nudge). P25 decision 10 says
+- [x] **A task→reminder binding** (`deadline_at` → a scheduled nudge). P25 decision 10 says
       "reminders hang off the deadline by default", but nothing binds the two today:
       `reminder_service` only schedules session-scoped one-shots a human or the model asked for
       explicitly, and it reads no task field. Needs a decision first — who is reminded (the
       assignee's member inbox, not a session, once Stage 4 lands), and whether a deadline nudge is
       a *reminder* or simply the `due`/`overdue` bus event Stage 1 already lists. Do not build it
       before the event list exists, or it will be a second notification path.
+      *(2026-10-02)* **It is the bus event — no second path.** The store already announces `due`
+      (the date arrived) and `overdue` (the deadline passed) once per crossing, and the GUI now
+      parses them (`board-event`). `useBoardNotifications`, mounted by the layout so it hears
+      them on every page, turns them into Notification Center entries (with a toast) **for cards
+      assigned to the human**, and does the same when someone *else* — the router, an agent —
+      creates or assigns a card to them, which is how a clarification question reaches them
+      (decision 6: "A question for you from agent:builder"). The human's own writes (`gui`)
+      never notify; closed cards never do. Rule: `boardNoticeFor` in `lib/board.ts`, 3 vitest;
+      checked live by emitting an `overdue` for a real card from the chat page. Still open:
+      notifying *agents* is meaningless (they are woken by the run trigger instead), and a nudge
+      *before* the deadline (Todoist's default reminder) would need a lead-time setting — owner
+      call.
 - [ ] Default `scope = 'workspace'`; migration promotes `session`-scoped rows (tasks + memories) to
       the session's `workspace_id`, else `global`, and stamps label `promoted`. Delete
       `TurnAdmission` (`crates/nanna-daemon/src/tasks.rs:1210`) and its call sites in
@@ -8036,7 +8256,7 @@ as its turn (`TurnAdmission`, scope default `session`).
             the router's splits and clarifications stamp the router id; IPC create records
             `gui` (as IPC update/complete do); `seed_plan` records `harness`; `tasks.add`
             takes the caller's `actor` param, as `tasks.update` does. 1 test.
-      - [ ] **Wire the trigger — deliberately not yet.** Everything it needs now exists:
+      - [x] **Wire the trigger — deliberately not yet.** Everything it needs now exists:
             wake on `created` in a board scope whose actor is not a router (and on a failed
             `verdict`), via a bounded queue fed from `TaskEventBridge` like the memory
             write-through (drops counted), then `route_card`, the router member's model list
@@ -8045,23 +8265,345 @@ as its turn (`TurnAdmission`, scope default `session`).
             would be routed too, and a `clarify` would block the harness's work on a human card
             mid-mission. Land it with the board client's create (Stage 4) or restricted to
             `created_by = gui` until then — never on every board-scoped card while chat lives.
+            *(2026-09-28)* **Wired, restricted to `created_by = gui`.**
+            `nanna_daemon::board_router_trigger`: `TaskEventBridge::with_router_queue` hands
+            the id of every `created` event in a board scope whose actor is the IPC create's
+            `gui` to a bounded queue (`ROUTE_QUEUE_MAX` = `TASKS_PER_SCOPE_MAX`, 8 B an entry;
+            full = counted + logged, never waited on), and one worker routes them in order on
+            the router member's `profile.model_priority`, else the agent's chat models, read
+            live per card. A card already closed is skipped; an `in_progress` one can only be
+            parked (decision 7, judged from the card's status — conservative until `stalled`
+            exists). The failover walk is now `complete_with_failover(…, purpose)`, so a
+            router failure logs as "Board router", not as a dream cycle. Proven end to end:
+            `a_card_created_on_the_board_is_routed_by_its_router` (e2e, scripted model) creates
+            a global card over IPC and watches the router assign it and post its reason.
+            Known limit: `tasks.add` takes its `actor` from the caller, so a model passing
+            `actor: "gui"` would be routed — the restriction is a convention until Stage 4
+            deletes the chat's own card writes. The failed-verdict wake stays with the
+            Triggers item below (it needs the bounded-retry rule).
 - [ ] Triggers: `created` (skip cards the router itself created), clarification `done`, `verdict`
       failed (bounded retries, then a clarification to the human), recurring reopen, `stalled`
       (`in_progress` with no live run past threshold), heartbeat.
-- [ ] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
+      *(2026-09-28)* **`created` and clarification `done` landed** (both for board-client cards
+      only, see the wiring note above). Clarification `done` rides the derived `unblocked`
+      event: the sink queues every board card that unblocks, and the worker routes it only if
+      its `created` activity row says `gui` (new `TaskRepository::created_by`, looked up by
+      action so it never falls out of a window) and a completed `clarification`-labelled card
+      is among its dependencies. The router's prompt gains an *ANSWERED CLARIFICATIONS*
+      section — the human's newest non-router post on each (≤ 2, 320 B each, ~700 B of the
+      9 216 B budget), or "completed with no answer posted"; the question itself is already
+      on the thread. A card that is `in_progress` or closed is never taken up by a wake.
+      e2e `the_board_router_asks_the_human_then_routes_on_the_answer`: clarify → the human
+      posts + completes over IPC → the second decision's prompt carries the answer → assigned.
+      Still open: failed `verdict` (with its retry bound), recurring reopen, `stalled`,
+      heartbeat.
+      *(2026-09-28, later)* **Recurring reopen landed.** `sweep_recurrences` now reopens through
+      `reopen_for_next_round`: a board-client card's assignee is released *before* the reopen
+      (decision 7 — the router's wake reads a card nobody holds), and the reopen's own
+      `status_changed {reopened: true}` by the `recurrence` actor is the wake. Cards the chat
+      harness made keep their assignee, as before. The router's prompt shows `Recurs (cron):`.
+      **Failed `verdict` deliberately not yet:** a failed acceptance is only an
+      `acceptance_checked` activity row — no event fires — and nothing but the human's own Done
+      can fail one on a board card until Stage 3's runs exist; build it with the run start, so
+      the retry bound has a producer to bound. Still open: failed verdict, `stalled`, heartbeat.
+      *(2026-10-01)* **Failed verdict landed, with its retry bound.** A member's card run that
+      gives up on its card (the harness's `abandon` on the subtree root) no longer cancels the
+      human's card: `TursoTaskSource::hand_back` writes a `handed_back` activity row, posts the
+      failure as the member's `verdict` ("Not done — …"), releases the card (pending,
+      unassigned) and stops serving it. The release — an `agent:` member clearing its own
+      assignment — is the wake (`WakeReason::HandedBack`; the worker confirms it against the
+      activity row, so an agent unassigning for any other reason routes nothing). The router
+      decides again with the failure in the last posts it reads; after `HAND_BACKS_MAX` = 2 in a
+      row it instead applies its own `clarify` model-free — a question card for the human that
+      quotes the last run's reason — and logs `hand_back_limit`, which starts the count over
+      (one retry, as Hermes Kanban's `failure_limit`). Sub-tasks a run gives up on are still
+      cancelled: they are its own scaffolding. e2e
+      `a_card_its_member_cannot_finish_goes_back_to_the_router`. **Not covered:** a run that
+      ends with its card still open for another reason (wall clock or token budget, a cancel) —
+      that card is `in_progress` with no live run, i.e. the `stalled` trigger's. Still open:
+      `stalled`, heartbeat.
+      *(2026-10-03)* **`stalled` landed.** The card-run worker also ticks every
+      `STALL_SWEEP_INTERVAL` = 5 min and runs `card_run_trigger::release_stalled`: an agent's
+      board card that is `in_progress`, board work (`is_board_creator`), **not paused** (its
+      newest run marker is not a `run_ended` with stop `Cancelled` — "Stop = stop"), served by
+      **no live run** (`TaskRunManager::serves_card`: its own `card:<id>` run, an ancestor's —
+      a sub-card worked inside its parent's run has none of its own — or a scope run over its
+      board) and **untouched for `STALL_AFTER` = 30 min** (newest of the row's `updated_at`,
+      its newest activity row and its newest post — new store reads `in_progress_board_cards`
+      and `touch_times`). The threshold is not Hermes' 4 h heartbeat timeout: we see run
+      liveness directly, so a quiet live run is never stalled; 30 min only covers the
+      pick-up/register race and a person moving an agent's card by hand. A stalled card gets,
+      in order: a closing `run_ended {stop: "stalled"}` if a run started and never ended (so the
+      next boot does not also "resume" it), a `stalled` activity row, its member shown idle
+      unless working elsewhere, a router post saying why, and a release to `pending` with nobody
+      on it written as the `stall` actor — **that release is the router's
+      `WakeReason::Stalled`**. Stalls **count toward `HAND_BACKS_MAX` with hand-backs**
+      (`hand_backs_in_a_row`), so a card that keeps stalling ends in a question to the human
+      rather than a reclaim loop — the bug Hermes fixed in
+      [#111446](https://github.com/NousResearch/hermes-agent/pull/111446) ("a claim that never
+      spawns a worker … reclaiming forever"). A stalled card is routed if any board creator made
+      it (the sweep only takes back board work, and a released card nobody routes would sit
+      unowned). Tests: store `the_stall_scan_reads_agents_in_progress_board_cards_and_their_last_touch`,
+      run manager `a_card_is_served_by_its_own_run_an_ancestors_or_its_boards`, wake
+      `the_stall_sweeps_release_wakes_it_and_its_other_writes_do_not`, two pure rules, and
+      `a_card_nobody_is_working_is_taken_back_for_the_router` (lost run released and counted;
+      paused, fresh and chat cards kept; idempotent). **Not proven end to end with a live
+      router:** the e2e rig cannot advance the sweep's wall clock. Still open: heartbeat.
+- [x] *(found 2026-10-05, review of the Stage 3 run code)* **Three ways a card got stuck or was
+      judged wrongly, fixed.** (1) **Stop stopped meaning stop after 64 edits.** The pause marker
+      was searched only within a card's newest 64 activity rows, and every rename or board reorder
+      logs one, so after 64 a paused card read as never run and the stall sweep took it back for the
+      router. New store read `TaskRepository::newest_activity_of(task_id, actions)` (by action,
+      like `created_by`) for the run marker and the rate-limit wait. The extended stall test
+      released the paused card on the old read (2 released, not 1). (2) **A stopped card given to
+      another member stayed `in_progress` with no run, forever.** A run starts only on `pending`,
+      and the sweep spares a paused card. The pause post itself says the card stays "until it is
+      restarted or reassigned", so a pause now holds only for the member it stopped (the
+      `run_ended` row records who held the card). On the reassignment's wake, the card goes back
+      to `pending` as actor `handover` and the new member's run starts. A marker that names nobody
+      is never un-paused on a guess. (3) **`hand_backs_in_a_row` counted across completions**, so
+      a recurring card handed back once in each of two rounds asked the human "2 runs could not
+      finish it" at once. A `completed` row now ends the row. `reopened` deliberately does not,
+      since the harness writes it when a done-claim fails mid-cycle. Not changed: a panicking card
+      run cannot wedge its card in release builds (`panic = "abort"` takes the daemon down, and the
+      boot close-out handles the rest); a narrow race between the sweep's liveness read and a
+      manual Start is still open (a second `serves_card` check just before the release would
+      close most of it).
+      *(2026-10-08)* **The race is closed in both directions, not narrowed.** The sweep's release
+      and a run's registration now happen under the same `runs` write guard: the sweep takes
+      `TaskRunManager::fence_starts()` and re-judges under it (`still_stalled`: no live run on the
+      card's lineage, and the card still `in_progress` with the same member, so a person's edit
+      since the judgement stands too) before writing anything; `claim_slot` re-reads the card
+      under the guard and refuses a claim whose card is no longer assigned to the claiming member.
+      So a Start lands wholly before the release (the card is kept, and no `stalled` row counts
+      against the router's retry bound) or wholly after it (refused: "no longer assigned").
+      The fence is held for the few store writes of one release, never across a model call.
+      Tests `a_start_between_the_judgement_and_the_release_keeps_its_card`,
+      `a_start_after_the_release_is_refused`, `the_fence_holds_starts_and_a_changed_card_is_kept`;
+      each of the two guards, removed, fails its test.
+      *(same run, after review)* The fenced re-judge also re-reads the card's last touch: a post
+      or an edit between the sweep's read and the fence now keeps the card (it was the one input
+      `still_stalled` did not repeat). Mutation-checked like the other two.
+- [x] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
+      *(2026-09-28)* `RouterDecision::Assign` gained optional `labels` and `acceptance`. Labels
+      are **added** to the card's own (≤ `ASSIGN_LABELS_MAX` = 8, one word of ≤ 64 B each, `#`
+      dropped, no duplicates); the check is written **only when the card has none** — decision 5
+      says the router's check "stands unless the human edits it", so the human's always stands
+      (overriding a human's acceptance was judged the wrong half of "may override" to ship
+      first). Assignee, labels and check go in ONE patch, so the store admits all or none; a
+      malformed check is refused at parse time through the store's own
+      `admit_acceptance` (now public) and the model is re-asked with the reason. The post says
+      what was filled (`Labelled:`, `Done when:`); the prompt shows a set check as "keep it" and
+      tells the model the three check shapes. Sub-tasks were already `split`, assignee `assign`,
+      live-run refusal `apply_decision`. Post previews 480 → 400 B so the worst-case prompt
+      still lists three members (`the_roster_keeps_room_in_the_worst_case_prompt`). e2e: the
+      clarify→answer→assign run now also asserts the filled label and check.
+- [x] *(found 2026-09-28)* **`tasks.labels` has no bound in the store.** `create`/`update` admit
+      any number of labels of any length (the router bounds its own additions; IPC, `tasks.add`
+      and `tasks.update` do not). Bound it in `TaskRepository` like titles and notes — count and
+      bytes — derived from what the filter row and the router prompt can show.
+      *(2026-09-28)* `TASK_LABELS_MAX` = 32, `TASK_LABEL_MAX_BYTES` = 64 (a card's set ≤ 2 KiB),
+      enforced on create and on any patch that sets labels — a card stored before the bound
+      stays editable in its other fields. The router's `LABEL_BYTES_MAX` is now the store's
+      constant. Known edge: a router `assign`/`park` that would push a card past 32 is refused
+      whole and the card left as it was. `tool_scope` is the same shape and still unbounded.
+      *(2026-09-29)* `tool_scope` bounded too: `TASK_TOOLS_MAX` = 64 names (the registry serves
+      ~60), `TASK_TOOL_NAME_MAX_BYTES` = 64 (the providers' own tool-name ceiling), on create and
+      on a patch that sets it. The planner's scope never reaches the store (`seed_plan` leaves it
+      empty), so no chat mission can be refused by it.
+- [x] *(found 2026-09-29)* **The roster had no write surface.** `MemberRepository` was reachable
+      from nothing but the migration's seeds, so the router could assign a card to nobody but the
+      human, and a router's own `profile.model_priority` (which `board_router_trigger` reads first)
+      could not be set from anywhere. *(2026-09-29)* `Action::Member` over IPC —
+      `list {workspace_id?}` (the board's roster, `list_for_workspace`), `get`, `create {name,
+      workspace_id? | personal, avatar?, profile?}`, `update {id, name?, avatar?, status?,
+      profile?}`, `delete`. Only agents are created; the id is `agent:<slug of name>` (disjoint
+      from `human`/`router:…`, cut to the 128-byte id bound, a random 8-hex slug when the name has
+      nothing ASCII), so a same-slug create is refused rather than merged. A profile must be a
+      JSON object (the router reads named fields off it); a workspace member needs a registered
+      workspace; ownership, kind and id are not editable. e2e-shaped control-plane test
+      `the_board_roster_is_managed_over_ipc` (create → assignable → status → router model list →
+      five refusals → personal agent → delete). *(later)* Every write that changed the roster
+      announces a payload-free `Event::MembersChanged` (like `WorkspacesChanged`); refusals and a
+      no-op delete announce nothing. The GUI's `DaemonEvent` parses it as `Unknown` until the
+      Stage 4 board client maps it.
+- [x] *(found 2026-09-29)* **Boards opened after migration 017 had no router member.** The
+      migration seeded `router:<id>` for the workspaces that existed then, and `ensure_router` —
+      the path meant for every workspace registered afterwards — had no caller. The router still
+      routed such a board's cards (on the chat models, with a `board router member unreadable`
+      warning), but its `profile.model_priority` had no row to live in and it was missing from
+      the roster. *(2026-09-29)* `WorkspaceRepository::upsert` now ensures the board's router
+      (every open and activation saves through it), and `restore_workspaces` heals persisted
+      workspaces once per boot. Test `registering_a_workspace_gives_its_board_a_router`.
+      Not done: closing a workspace leaves its router row (routers are delete-protected); harmless
+      until a board client lists closed boards.
+      - [ ] *(research 2026-10-03)* **The router's `assign` is a bounded choice — a contrastive
+            selector fits it better than generation.** CLM-8B (Contrastive-LM, Apache-2.0,
+            2026-09-25; frozen Qwen3-8B backbone with separate state/action projection heads)
+            embeds a state and each candidate action and *selects* the best match instead of
+            generating tokens; candidate embeddings cache independently, and it reports up to 9×
+            faster than a generative agent at matched success on tool-calling tasks
+            ([article](https://venturebeat.com/technology/stanford-and-nvidias-open-clm-8b-caches-reusable-agent-actions-and-runs-up-to-9x-faster-than-jev-in-tests),
+            [weights](https://huggingface.co/Contrastive-LM/CLM-v0.1-8B)). Our router asks a chat
+            model to *write* `{"decision":"assign","member":…}` and re-asks on a parse error; member
+            profiles change rarely, so their embeddings would cache across every card. Running the
+            model is Mummu's (a model port); the Nanna half is an `assign`-only fast path that
+            falls back to the generative router for split/clarify/park. Measure on the e2e router
+            fixtures before choosing.
 - [ ] Capability-tag adjustment at verdict time; posts the change on the agent's profile thread.
 - [ ] Heartbeat becomes a recurring card assigned to the router; the `heartbeat_prompt` config and
       the scheduler's chat-turn path are removed.
 
 **Stage 3 — runs started by assignment.**
-- [ ] `assigned` → start a harness run for that member on that card (reuse `AgentStepRunner` and
+- [x] `assigned` → start a harness run for that member on that card (reuse `AgentStepRunner` and
       `TaskRunManager`); progress → `progress` posts; completion → the acceptance check → a
-      `verdict` post. No streaming to the UI.
+      `verdict` post. No streaming to the UI. *(2026-10-01 — landed in three steps below.)*
+      - [x] *(2026-10-01)* **The card run itself, started over IPC.** The two blockers recorded
+            on 09-29 are gone. *Subtree admission:* `TursoTaskSource::within_subtree(card)` serves
+            only the card and its descendants (`subtree_admits`, walked over the scope's parent
+            links incl. closed cards, bounded by `TASK_DEPTH_MAX`), so a card the human adds beside
+            it mid-run is never worked. *Per-card / per-member keys:* `TaskRunManager::start_card`
+            keys the run `card:<id>` and `run_conflict` refuses, under one write guard, a second
+            run on any card above or below a worked one, a scope run over a scope with a card run
+            in it (and vice versa), and a member's second card on any board — one member, one
+            card. `posting_as(member)` turns the run's working notes into `progress` posts and
+            each closing into a `verdict` post ("Done — the acceptance check passed: …" / "…no
+            acceptance check ran"), cut to one post (`truncate_post`); the member is `busy` for
+            the run's life. IPC: `task.start_run {card_id}` (assignee must be an agent, not a
+            router; board scope only; open), `run_status`/`cancel_run {card_id}`; the run walks the
+            member's `profile.model_priority`, else the chat models, and works in the card's own
+            workspace. e2e `an_assigned_card_is_worked_by_its_member_and_closed_with_a_verdict_post`
+            (router assigns → start → verdict post → member idle).
+      - [x] *(2026-10-01, later)* **Assignment starts the run.** `nanna_daemon::card_run_trigger`:
+            the task event sink queues (bounded, `RUN_QUEUE_MAX` = `TASKS_PER_SCOPE_MAX`, drops
+            counted) every board card assigned to an `agent:` member and every card whose date
+            arrives (`due` — decision 10, a date defers a card); one worker starts the run if
+            the card is pending, unblocked, not deferred and board-client-created (the router's
+            rule while chat lives). A member busy on another card refuses the start; when a
+            card run ends the run manager hands the freed member back to the worker
+            (`RunWake::MemberFree`), which starts its best waiting card
+            (`TaskRepository::open_board_cards_assigned_to`, priority then age, ≤ 64 read). So
+            a card assigned to an agent is worked with no further call, one card per member,
+            and a failing card is bounded by the hand-back rule (Triggers). e2e: the assigned
+            and the cannot-finish cards now run with no `start_run`, and
+            `a_member_given_two_cards_works_them_one_after_the_other`. **Known gap:** a card
+            the router *re-assigns to the same member* after a clarification emits no
+            `assigned` (nothing changed), so it starts only when that member next frees or by
+            `task.start_run` — wire `unblocked` too if that shows up in use.
+            *(later the same day)* `unblocked` is wired, closing that gap.
+      - [x] *(2026-10-01)* **A card its run leaves open is settled, never orphaned.** Without
+            this a card outlived its run as `in_progress` with nobody on it — not startable,
+            not the router's. `card_after_run` by stop reason: out of time / tokens / working
+            models, or a store failure → the hand-back (router, bounded); `Cancelled` → a pause
+            (stays `in_progress` with its member, "Stopped on request" posted — so a freed
+            member never restarts what the human stopped; `task.start_run {card_id}` resumes
+            it); plan drained with the card open (it waits on another card) → back to
+            `pending`. The worker now asks `subtree_has_work` (the run source's own choice,
+            without starting) before every start, so an all-waiting subtree is never started,
+            stopped empty and restarted in a loop. e2e
+            `a_cancelled_card_run_leaves_the_card_paused_with_its_member`.
+      - [x] *(2026-10-01)* **A run the daemon died inside resumes at boot.** Every card run
+            leaves `run_started` / `run_ended` on its card (a cancel ends with its marker too,
+            so a pause is never mistaken for a death). When the card-run worker starts it reads
+            the newest `RESUME_SCAN_ROWS` = 1 024 markers (`cards_with_unended` — two per run,
+            at most one interrupted run per member), closes each unmatched start with an end
+            marker, shows its member idle again, puts the card back to `pending` and starts it
+            like an assignment — the store is the checkpoint, as for the run manager's own
+            provider-incident resumes. Proven model-free (`an_interrupted_card_run_is_closed_out_at_boot`,
+            the marker scan in `members.rs`); **not** proven across a real restart — the e2e
+            rig runs the daemon in-process, so an aborted daemon's run task outlives it and
+            would hold the store.
+      - [x] *(research 2026-10-01; all three rules landed 2026-10-03 — stall in Triggers, terminal and rate-limit below)* **Borrow Hermes Kanban's failure and stall rules** when the
+            auto-start lands ([docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban)):
+            its dispatcher auto-blocks a card after `failure_limit` (default 2) consecutive failed
+            runs, requeues a rate-limited run *without* counting a failure and blocks at once on
+            a terminal provider error (bad credentials), and reclaims a card whose worker sent
+            no heartbeat within a stale timeout (default 4 h) — again without counting a failure.
+            Map to P25: failed verdict ×2 → a clarification card to the human (decision 7's
+            "bounded retries"); `StopReason::RunnerErrors` → retry, not a failed verdict; the
+            `stalled` trigger = `in_progress`, no live `card:<id>` run, no `progress` post
+            within the threshold. Also per-member concurrency is a *setting* there
+            (`max_in_progress_per_profile`); ours is fixed at 1 by decision 3.
+            *(2026-10-03)* **The terminal-provider half landed.** A card run the provider
+            refuses outright — HTTP 401 / 402 / 403 or no key configured
+            (`is_terminal_provider_error`, the opposite of `is_transient_llm_error`) — is **not
+            resumed** (the run manager's 8 × 15 s provider-incident loop skips it) and **not
+            handed back**: the member asks the human at once (`ask_human_to_fix` →
+            `routing::ask_on_card`, "Fix the API key, account or model list … then complete this
+            card"), the card goes back to `pending` **with its member**, derived-blocked on the
+            question, and nothing counts toward `HAND_BACKS_MAX` — another member on the same
+            provider would fail the same way. Completing the question unblocks the card and its
+            run starts again. **The e2e probe found the real path:** the refusal never reaches the
+            run's stop — the harness abandons the item after persistent runner errors and the
+            source's `abandon` handed the card back within the same second, so the rule sits in
+            `abandon` as well as in `card_after_run`. New script form `STATUS <code> <body>` in
+            the e2e `ScriptedOllama`; e2e `a_card_run_the_provider_refuses_asks_the_human_at_once`
+            (red before: handed back to the router; green: question in 3.4 s), unit
+            `a_refused_key_asks_the_human_and_keeps_the_card_with_its_member`, classifier cases in
+            `how_a_run_stopped_decides_what_its_open_card_is_owed`.
+            *(2026-10-03, later)* **The rate-limit half landed too — the Hermes item is done.** A card
+            run the provider rate-limits (HTTP 429 / `Rate limit exceeded`, `is_rate_limited_error`)
+            keeps its card: once the in-run waits are spent (the e2e shows ~70 s of them — the
+            existing per-attempt rate-limit wait, unchanged), `wait_out_rate_limit` writes a
+            `rate_limited {until, reason}` row, posts "tries again after HH:MM UTC. Not counted as a
+            failure", and puts the card back to `pending` with its member. Nothing goes to the router
+            or the human, nothing counts toward `HAND_BACKS_MAX`. `until` = the provider's own wait
+            when the error names one (`LlmError::parse_retry_after`, now public), else
+            `RATE_LIMIT_COOLDOWN_DEFAULT` = 5 min (the worker's tick — shorter would not start any
+            sooner), never past `RATE_LIMIT_COOLDOWN_MAX` = 1 h. `try_start` refuses a card still
+            cooling down (`cooling_down_until`: the newest `rate_limited`/`run_started` row is a
+            `rate_limited` whose `until` is ahead), so a freed member does not restart it into the
+            same limit; the worker's 5-minute tick restarts every card whose wait is over
+            (`restart_cooled_down`, candidates from `cards_with_unended(rate_limited, run_started)`).
+            Same two sites as the terminal rule (`abandon` and `card_after_run`). Tests: unit
+            `a_rate_limited_card_waits_with_its_member`, pure
+            `a_rate_limit_holds_a_card_back_until_its_wait_or_its_next_run`, classifier and cooldown
+            cases, e2e `a_rate_limited_card_run_waits_with_its_member` (scripted 429).
 - [ ] Sub-agent spawning is replaced by "create a sub-task assigned to another member". Delete
       `sub_agent`/`task` tool and `SubSessionInfo`.
+      - [x] *(2026-10-01)* **The half that does not need chat deleted: a card run's `todo` works
+            its own card.** From a `card:<id>` tool session, the `tasks.*` services' default
+            (session) scope resolves to the card's board scope (`calling_card` in
+            `resolve_scope`): `add` with no parent makes a sub-card of the card — which the run's
+            subtree admission then serves — `next` never leaves the card's subtree, and `clear`
+            is refused (its scope would be the human's whole board). An explicit
+            `workspace`/`global` scope is honoured as asked. e2e
+            `a_card_runs_todo_adds_sub_cards_under_its_card`.
+      - [x] *(2026-10-01)* **Handing a sub-card to another member.** `todo add {assignee}` from a
+            card run makes a sub-card that is that member's work: `CardTree::serves` keeps a
+            run off any card on whose path up to its root someone else is the assignee (and off
+            everything under it), so the two runs never share a card — which made the old
+            lineage-overlap refusal redundant; `run_conflict` is now one run per card, one card
+            per member, scope runs exclusive (`CardClaim::lineage` and `card_lineage` deleted).
+            The sub-card starts its member's run at once: a card *created* already assigned to
+            an agent wakes the run worker, and board work is now anything the board client, a
+            router (its splits) or an agent member made (`is_board_creator`), so the router's
+            splits assigned to agents start too. The parent's run ends while the handed-on card
+            is open (its claim to be done is deferred with a post, `waits_on_an_answer` now
+            covers open sub-cards too), and a closed card wakes its parent
+            (`RunWake::ChildClosed`). e2e `a_member_hands_a_sub_card_to_another_member`.
+            **Still open:** deleting `sub_agent`/`task` + `SubSessionInfo` — with chat.
 - [ ] `ask_user` becomes "create a clarification card assigned to the human, depended on by this
       card"; the 30-minute wait and the channel broadcast go away.
+      - [x] *(2026-10-01)* **For card runs, it already is.** A card run's tools now execute in a
+            `card:<id>` tool-session scope (`card_run_session_id`, wrapped around the spawned
+            run). That also **fixes a cross-talk bug**: background runs had no scope, so
+            session-scoped tools fell back to the shared slot — a card run's `ask_user` would
+            have posted into, and taken its "answer" from, whichever chat was last active. In
+            that scope `session.ask_user` calls `routing::ask_on_card` (the router's clarify,
+            now public and asked by any member): a clarification card for the human that the
+            card `depends_on`, the question posted by the member, nothing waits. The run ends
+            when nothing else is servable (Waiting → `pending`), `unblocked` restarts it, and
+            the resumed step's notes carry "The human answered your question #N: …"
+            (`answers_for`). A model that claims the card done on its word while it waits is
+            not believed (`waits_on_an_answer`; a verified completion still stands). e2e
+            `a_card_runs_question_becomes_a_clarification_card` (real skill + service). **Still
+            open:** the chat path's 30-minute wait and channel broadcast — they go with chat in
+            Stage 4. *(later the same day)* Background *scope* runs (`task.start_run` without
+            `card_id`) are scoped too (`background_run_session`): a session plan's run is that
+            session, a workspace/global run `run:<scope>:<id>` — no background run reads the
+            shared slot any more.
 - [ ] Skills tier: markdown files with name + description, matched to cards by label and to
       members by allow-list, loaded into the run's context. Rename `default-skills/` → tools
       (directory, `DEFAULT_SKILLS`, build.rs, tests) in one mechanical PR.
@@ -8070,6 +8612,191 @@ as its turn (`TurnAdmission`, scope default `session`).
 - [ ] Board per workspace (columns = states; filters: assignee, label, due, priority; flat/nested
       toggle), Inbox, Upcoming, quick-add with the token parser (reuse `task_filter`; add
       `@member`), card view with thread and profile pages for members.
+      - [x] *(2026-10-02)* **Quick-add, end to end.** `nanna_storage::quick_add::parse` reads
+            decision 1's tokens — `#label`, `p1`..`p4`, `@member`, a defer-date phrase (`today`,
+            `tomorrow`, a weekday = the next one strictly after today, `next week`, `in N
+            days|weeks`, ISO) and Todoist's `{phrase}` for the deadline. A single-valued token
+            given twice keeps the last and gives the earlier one back to the title word for word;
+            a brace group that is not a date is refused rather than guessed. Bounds: 4 KiB of
+            input (a title and 32 labels at their store limits fit), offsets 0..=3 660 days.
+            It is its own parser, not `task_filter`'s: the filter is the *other* Todoist dialect
+            (there `@` is a label, `#` a project). IPC `task.quick_add {text, scope?}` (default:
+            the open workspace's board, else global; session scope refused) resolves `@handle`
+            against that board's roster — id, id without `agent:`, the name's slug, or the name;
+            `me` is the human; a router is refused (decision 4); an unknown handle lists up to 12
+            members — then creates through `task.create`, so the card is `gui`-made and the
+            router completes it. 12 parser tests, 6 resolver tests, control-plane test
+            `a_quick_add_line_becomes_a_board_card`.
+      - [x] *(2026-10-02)* **The board client's first slice** (`gui/app/pages/board.vue`, rail
+            entry "Board", palette entry). One board — the open workspace's, else global — in
+            four columns: *To do*, *Waiting* (derived `blocked`, whatever the stored status),
+            *In progress*, *Done* (newest first, the latest 50 — `DONE_SHOWN_MAX`). Sub-cards sit
+            inside their parent (`↳ open/total`) or on the board (the decision-8 toggle);
+            assignee filter; priority, labels, date (yellow while deferred), deadline (pink when
+            overdue) and a busy dot from the roster. The card view is the thread (posts with
+            member names and kinds), a post box (`task.note` → the human's comment), assign to a
+            member, and *Mark done* — which shows the verdict when the acceptance check fails.
+            Live: the daemon's `Event::TaskEvent` and `MembersChanged` now parse in the GUI
+            (they fell into `Unknown` before) and forward as `board-event` / `members-changed`;
+            the board re-reads its own scope's cards, coalesced to one read per 250 ms burst.
+            New commands `quick_add_card`, `get_card`, `post_on_card`, `list_members`. The
+            arrangement rules live in `app/lib/board.ts` with 15 unit tests.
+            *(later the same day)* Filters: assignee, label (the board's own, listed once
+            each), priority, and dates (startable now / deferred / overdue / no deadline), with a
+            Clear; `applyFilters` in `lib/board.ts`, 4 vitest, checked live.
+            **Not yet:** member profile *threads* (decision 15's
+            capability changes post there), and the Figma `Board` page's visual pass (the Figma
+            connector was unauthenticated this run; built on the `nui` tokens instead).
+      - [ ] *(research 2026-10-02)* **Todoist's own tokens are not decision 1's — owner call
+            before habits form.** Todoist's Quick Add
+            ([help](https://www.todoist.com/help/articles/use-task-quick-add-in-todoist-va4Lhpzz))
+            uses `#` for a *project*, `%label` for labels (`@label` "will be retired by end of
+            2026"), `+person` for the assignee, `/section`, and `!time` for reminders. Decision 1
+            says `#label` and `@member`; it is shipped that way. Either keep it (our boards have
+            no projects, so `#` is free) or accept `+member`/`%label` as aliases so a Todoist
+            user's muscle memory works — aliases cost nothing in the parser. Do not silently
+            change decision 1.
+      - [x] *(research 2026-10-02)* **Brace deadlines take any date phrase in Todoist** —
+            `{march 30}`, `{next friday}`
+            ([deadlines](https://www.todoist.com/help/articles/introduction-to-deadlines-uMqbSLM6U)).
+            Ours refuses both (month names and `next <weekday>` are not phrases yet), with a
+            message naming what works. Add `<month> <day>` (next occurrence, this year or next)
+            and `next <weekday>` (the weekday of next week) to `date_phrase`; both are small and
+            bounded.
+            *(2026-10-02, same run)* Both added, in and out of braces: `next friday` is that day
+            of next week (weeks start Monday); `march 30` / `30 march` / `Dec 25th` / `sept 1` is
+            the next such date, today included, looking ahead at most 8 years so `feb 29` finds
+            the next leap day and `feb 30` stays title text. 14 parser tests.
+      - [x] *(2026-10-02)* **Inbox and Upcoming** (decision 11), as two more views of the Board
+            page. `TaskRepository::assigned_open(member, limit)` reads a member's open cards on
+            **every** board (any scope but `session`), undated first, then by date, priority, id,
+            with `blocked` derived through bounded `IN (…)` status lookups (256 ids a statement —
+            dependencies are scope-local, but loading each board whole would cost up to 10 000
+            rows a board). Bound `ASSIGNED_CARDS_MAX` = 1 000. IPC `task.assigned {member_id?
+            (default the human), limit?}` → `{cards, today}`; `today` is the store's UTC day, so
+            the client splits on the store's clock: Inbox = no date or date ≤ today, Upcoming =
+            later, grouped by day. Each entry names its board. Any `board-event` refreshes them
+            (they span boards). The card chip is now `BoardCardChip.vue`, shared by all three
+            views. Tests: store `a_members_open_cards_are_read_across_every_board`, control
+            plane `a_members_cards_are_read_across_boards_over_ipc`, 2 vitest.
+      - [x] *(2026-10-02)* **Members, and editing a card.** A fourth view, *Members*
+            (`BoardMembers.vue`): the board's roster with kind (human / agent / your agent /
+            router) and busy state; *Add an agent* (name, models best-first →
+            `profile.model_priority`, capabilities → `profile.capabilities`, notes for the router,
+            "personal — follows you to every board"); edit an agent's name and profile, or the
+            router's model list; remove an agent. Writes go through new commands `create_member`,
+            `update_member`, `delete_member` and re-read on `members-changed`. The profile form
+            owns three keys and keeps every other one (`profileFromForm` merges; an emptied field
+            is removed, lists are trimmed, de-duplicated and bounded at `PROFILE_LIST_MAX` = 32).
+            The card view now edits priority, date, deadline and labels in place; a closed card's
+            fields are read-only. Daemon: in a `task.update` patch an **empty string clears**
+            `due_at`/`deadline_at` (`null` still skips, as for every field) — there was no way to
+            remove a date. Tests: 4 vitest, control plane
+            `an_empty_date_in_a_patch_clears_it_and_null_skips_it`.
+      - [x] *(2026-10-02)* **The card view explains where a card sits.** *Part of #N* (its
+            parent), *Waiting on* (each dependency with its assignee, struck through once
+            closed — so a card in the Waiting column leads straight to the clarification that
+            holds it), its sub-cards (`open/total`) and an *Add a sub-card* line with the
+            quick-add tokens: `task.quick_add` takes `parent_id` and puts the card on the
+            parent's board whatever `scope` says (a session parent is refused). The description
+            is editable; in a patch an empty string now clears `description` as it does the
+            dates. Tests: control plane `a_quick_add_line_with_a_parent_becomes_its_sub_card`,
+            the Playwright board spec adds a sub-card; checked live.
+      - [x] *(2026-10-02)* **Run controls and markdown posts.** An agent's card shows *Start
+            now* (open, unblocked, its date come — start instead of waiting for the member's
+            turn), *Stop* while a run works it (the card pauses with its member — "Stop = stop",
+            nothing restarts it by itself) and *Resume* on a paused card; humans' and the
+            router's cards show none (`runActionFor`, 2 vitest). Commands `start_card_run`,
+            `card_run_status`, `stop_card_run` over the existing `task.start_run/run_status/
+            cancel_run {card_id}`. Thread posts render as markdown through the sanitizing
+            `renderMarkdown` (verdicts quote commands and output). Playwright: start → stop →
+            resume on the mock; live: a markdown post rendered, `card_run_status` answered.
+            **Not verified live:** a real run start/stop — this host has no model to run one
+            (see *No embedder on this host*).
+      - [x] **The Board view is only addressable while its workspace is active.**
+            `task.list/quick_add` resolve `workspace` scope to the daemon's *active* workspace, so
+            the board shows the workspace the top bar selected and nothing else. Fine while the
+            top bar drives it; a second window or a link to another board needs `scope_id` on
+            these verbs. (Inbox/Upcoming did not need it — `task.assigned` is cross-board.)
+            *(2026-10-03)* **It was a correctness bug, not just addressability:** the GUI's active
+            workspace is *its own* view state, while the daemon's is whatever any client last
+            chose — so with two clients a board could list, and quick-add onto, a board it was
+            not showing. `task.list` and `task.quick_add` take `workspace_id`;
+            `ControlPlane::resolve_board_scope` honours it for a `workspace` scope (refusing an
+            unregistered id with a reason) and otherwise defers to `resolve_task_scope`. Quick-add
+            hands the board it resolved through `CreateTask::workspace_id`, or `task_create` would
+            have re-resolved "workspace" to the active one. The board page passes its own
+            `workspaceId` to both. Test `a_board_named_by_workspace_id_is_used_whatever_is_active`
+            (red without it: the card landed on the active board). **Live over WebDriver:** with
+            workspace A active, `quick_add_card {workspaceId: B}` put the card on B, each
+            `list_tasks` returned only its own board's card, an unknown id was refused, and the
+            Board page showed A's card and not B's.
+      - [x] *(found 2026-10-09, audit of the board client)* **Five ways the board showed the wrong
+            thing.** (1) **Opening or closing any workspace, from any client, closed the card view
+            and cleared the filters**: `watch(board)` watched a computed that builds a new object
+            whenever the layout re-reads the workspace list, so a same-board rebuild looked like a
+            switch — it now watches `boardKey(board)`. (2) **A slow read of the board just left
+            could land after the new board's** (the daemon answers each request on its own task):
+            `loadCards`, `loadRoster` and `loadCard` take a ticket and apply only the newest
+            reply. (3) **Nested view + a filter that matched only sub-cards showed "Nothing
+            here"**: `arrangeColumns` hid every sub-card, including ones whose parent the filter
+            had dropped; a sub-card whose parent is not on the board is now shown on its own.
+            (4) Inbox/Upcoming counts in the nav went stale on the Board view (other boards'
+            events were dropped) — they now refresh on their own coalesced timer. (5) A `listen()`
+            resolving after unmount was never undone; it is now unlistened at once. 2 vitest
+            (`boardKey`, the orphaned sub-card). **Not changed — owner call:** the board's dates
+            are store (UTC) days while the date picker means a local day, so in UTC−5 after 19:00
+            a deadline set "today" already reads overdue and `friday` typed on Thursday evening
+            resolves a week out. Which clock a board's "today" is belongs with decision 10.
+      - [x] *(found 2026-10-09, audit of the P25 store/daemon)* **A card deferred by quick-add or
+            the date picker started at once.** Both store `due_at` as a bare `YYYY-MM-DD`;
+            `card_run_trigger::is_deferred` read it with `parse_db_time` (RFC 3339 or
+            `%Y-%m-%d %H:%M:%S` only), and an unreadable date defers nothing by design — so
+            `Ship docs @builder next friday` started builder's run immediately while the board said
+            "Deferred until …". A bare date now arrives at 00:00 UTC of its day, the same day the
+            store's `due` announcement (the run worker's wake) uses. 2 cases added to
+            `only_an_open_unblocked_agent_card_whose_date_has_come_starts`.
+      - [x] *(found 2026-10-09, same audit)* **A split naming one stranger left the others behind.**
+            `validate` refused only router assignees; `apply_split` then created children one at a
+            time, so `{"subtasks":[{…"agent:coder"},{…"agent:typo"}]}` wrote child 1, failed on
+            child 2's `ensure_member_exists`, and returned — child 1 stayed on the board with no post
+            naming it (the post comes last), already starting coder's run, under a card that was
+            never routed. Every named assignee is now checked against the roster before the first
+            write; a refusal names the sub-task and creates nothing. Test
+            `a_split_naming_a_stranger_creates_nothing`.
+      - [x] *(found 2026-10-09, same audit)* **The router could reassign or split a card a run had
+            just picked up.** `route_one` always passed `run_is_live = false` ("not being worked:
+            `card_to_route` just said so"), but that was judged *before* the model call, and the
+            same `unblocked` event wakes the card-run worker too — so the run could start while
+            the router thought, and its `assign agent:b`/`split` then landed on a live card,
+            breaking decision 7. `apply_decision` already re-reads the card after the call; it now
+            treats `in_progress` there as worked (park only). Test
+            `a_card_picked_up_while_the_router_thought_can_only_be_parked`.
+      - [x] *(found 2026-10-09, same audit)* **`TaskRepository::update` and `delete` could undo a
+            concurrent write.** Both read the row(s) *before* taking the connection guard and then
+            rewrote every column from that copy — the code's own "the mutex is the transaction"
+            held only from the checks on. With the IPC handlers, the router and the run worker
+            writing at once, a board reorder (`sort_order` patch) read a card `in_progress`, a run's
+            `complete` marked it done, and the reorder's write put it back to `in_progress` with
+            `completed_at` cleared; `delete` likewise rewrote dependents' `depends_on` from a stale
+            copy, and a child created in the gap survived its deleted parent. The read (and
+            `update`'s blocking snapshot) now happens under the same guard as the write
+            (`get_raw_with`). No deterministic test: the window is between two awaits with no hook,
+            so the fix is by construction; the storage suites stay green.
+      - [x] *(found 2026-10-09, audit of the control plane)* **`task.done` judged a card in the
+            wrong project.** It ran the acceptance check in the *active* workspace (or the daemon's
+            `.`), while `start_card_run` in the same file already used the card's own board: done
+            on a card from board B while A was open computed the verdict against A's files. Both now
+            share `card_workspace_root` (explicit > the card's board > active). Control-plane test
+            `a_cards_acceptance_is_judged_in_its_own_boards_workspace`.
+      - [x] *(found 2026-10-09, same audit)* **Closing the active workspace left it as the tool
+            cwd.** `workspace.close` removed it from the registry (clearing the active id) but never
+            reset the tools' default workdir as `clear_active` does, so tool calls kept resolving
+            paths inside a project that was no longer open — against "only a registered, active
+            workspace sets the tool cwd". It also discarded the DB delete's error and reported
+            `closed` for a row that would bring the workspace back on restart; that now answers
+            `persisted: false` with the reason. Test
+            `closing_the_active_workspace_clears_the_tool_cwd`.
 - [ ] Delete: session table + `SessionManager`, `ChatAction::*`, `chat_harness.rs` continuation
       loop, empty-bubble gating, per-session pinned model, GUI chat pages and commands, channel
       adapters + `channel_secrets` + per-channel pinned models, `scheduler.target_channel/
@@ -8236,6 +8963,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       (`tasks.rs`). No critical section awaits. 1 test (a write meeting a held guard lands; a
       poisoned buffer still reads); daemon 637 + e2e 44 green. **Still open:**
       `SubSessionInfo` overwrite on other paths.
+- [x] *(found 2026-10-09, audit of the control plane)* **Forking a channel conversation sent the
+      fork's replies to the channel's user.** `SessionManager::fork` copied all `metadata`,
+      including the `reply_channel` route, and the channel bridge forwards every reply of a
+      session carrying one — so forking a Telegram chat in the GUI and talking in the fork
+      messaged (and showed typing to) the Telegram user. The fork keeps its settings but drops the
+      route. Test `a_fork_of_a_channel_session_does_not_inherit_its_reply_route`. (Fixed rather
+      than left for the P25 deletion: it leaks the owner's words to a third party today.)
 - [ ] `chat_harness.rs` park-waiter hot loop and the continuation loop; GUI
       `subscribe_channel_status` task leak, per-channel pinned model, `daemon_client.rs` dead
       "not connected" path.
@@ -8261,6 +8995,57 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       which the context and the root crate use, stay. And the multi-agent module (`multi.rs`,
       1 098 lines: `AgentCoordinator`, `SwarmCoordinator` and eleven more re-exported types —
       the review's `MultiAgent`) — no caller; sub-agents are sub-tasks now.
+      *(2026-10-08 — the Rust built-in tools, audited type by type.)* Of 37 `impl Tool` types in
+      `nanna-tools/src/builtin`, the daemon builds exactly one (`AskParentTool`, `server.rs`); 16
+      more are registered only by the root `nanna` CLI/`serve` path (`src/setup.rs`
+      `init_components`) and stay while that path exists. **Deleted, no constructor anywhere
+      outside their own files (~1 490 lines):** `code.rs` (`CodeOutlineTool`, `CodeSearchTool`,
+      `ProjectStructureTool` — the live ones of those names are `tool.ts`), `authoring.rs`
+      (`CreateToolTool`/`ListToolsTool`/`DeleteToolTool`/`ScriptToolExecutor`/`ToolStore`; the
+      daemon's authoring is the `tools.*` script service), `browser.rs` (four browser tools, built
+      only by `create_browser_tools`, which had no caller), `task.rs` (`TaskTool`; sub-agents are
+      sub-tasks), `WebSearchBatchTool`, and the stub `ScreenshotTool` that returned "not yet
+      implemented". `glob` left with them. `AgentSpawner` stays (the daemon implements it).
+      **Still open:** test-only Tool structs whose *functions* are live (`AnalyzeImageTool`,
+      `TextToSpeechTool`/`TranscribeTool` and their `create_*_tool` factories, `OcrTool`,
+      `DescribeImageTool`, `ReadPdfTool` — the daemon calls the `create_*_fn` closures and the
+      pdf/ocr functions, never the structs); the CLI path's 16 tools (an owner call: is the
+      `nanna` CLI/`serve` path still wanted beside the daemon?).
+      *(2026-10-09 — the test-only structs.)* `AnalyzeImageTool` and the audio structs had already
+      gone with the 10-08 cut. Deleted now: `ReadPdfTool` (with `PdfVisionFn`, its only user, and
+      the two markdown-appending passes behind it) and `DescribeImageTool` — **~440 lines**, built
+      by nothing but their own definition tests. `pdf.read` keeps running exactly as before:
+      `read_pdf_text` → `ocr_empty_pages` with the `OcrFn` bound in `vision_service`. The module
+      docs no longer claim the daemon wires an `OcrTool` pipeline into PDFs (it never did).
+      **Still open:** `OcrTool` alone, which is the OCR owner call below.
+      *(2026-10-08, same run — the Deno path.)* `nanna-scripting`'s `deno` feature was enabled by
+      no crate (only its own unused `full`), so the V8 engine was never compiled into anything we
+      ship and every script already ran on Boa: with `deno` off, both engine orders resolved to
+      Boa with no fallback. Deleted `deno_impl.rs`, `EngineKind::Deno`, the fallback machinery
+      (`prefer_deno`, `no_fallback`, `ExecutionResult::{used_fallback, primary_error}`), the
+      "needs an advanced engine" routing, and the `deno`/`full` features — **~1 320 lines, and
+      the lockfile drops the whole V8/swc stack** (`deno_core`, `deno_ast`, `deno_v8`,
+      `serde_v8`, `bindgen`, …). No runtime change: nothing that ran before runs differently.
+      - [ ] *(found 2026-10-08)* **Decide: wire the embedded OCR tier or delete it.** The
+            "Current State" said Nanna ships an embedded/tiered OCR pipeline (`ocrs` → vision
+            model). It does not: `embedded_ocr`/`run_ocrs_sync` (`nanna-tools` `ocr.rs`) are
+            reached only through `OcrTool`, which only its own tests construct; the bundled `ocr`
+            skill and `read_pdf`'s scanned-page fallback go to the vision-model service
+            (`vision_service.rs`), and with no vision model configured they are withheld. So
+            `ocrs` + `rten` (an ONNX runtime, and the reason `rten 0.27`/dependabot #411 cannot
+            land) compile into every build for nothing. **Wire it** (local-first fits the North
+            Star: OCR with no model and no key; but it downloads two `.rten` models from the
+            network on first use, so the first call needs a bounded, announced fetch) **or delete
+            it** (drops `ocrs`, `rten`, `rten-imageproc` and their tree). Owner call, like the GPU
+            search path. Also test-only, same audit: the `AnalyzeImageTool`,
+            `TextToSpeechTool`/`TranscribeTool`, `DescribeImageTool` and `ReadPdfTool` structs —
+            their closures/functions are live, the Tool wrappers are not.
+            *(same run)* `AnalyzeImageTool`, `TextToSpeechTool`, `TranscribeTool` and their
+            `create_*_tool`/`create_audio_tools` factories deleted (~350 lines; only "it constructs"
+            tests used them). The daemon's closures (`create_vision_fn`, `create_tts_fn`,
+            `create_transcribe_tool_fn`) are untouched. `DescribeImageTool` and `ReadPdfTool` stay
+            with the OCR decision: `ReadPdfTool` also describes a PDF's embedded images, which the
+            daemon's `pdf.read` service does not.
 
 **Stage 1 — store, memory, storage:**
 - [x] `VectorStore::update_content` must also clear `memories.embedding`/`embedding_model` and
@@ -8385,6 +9170,241 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       another. The existing reassembly tests cover the path unchanged.
 
 **Stage 2 — router, scheduler, IPC, config:**
+- [x] *(found 2026-10-09, audit of the memory write path)* **Ingest folded memories across a
+      workspace boundary.** The write paths picked their dedup neighbour with the READ scope:
+      `remember_scoped` used `search_scoped` (the workspace's rows plus the global ones), and
+      `smart_ingest` / `remember_with_importance` — which write global rows — searched everything.
+      So a workspace's private detail at cosine > 0.75 to a global fact was folded INTO the global
+      row (now recalled by every other workspace), and a global fact near one workspace's private
+      row was folded into it or "reinforced" away (hidden from every other workspace). Dreaming
+      already refused such pairs (`consolidation::same_scope`). New
+      `VectorStore::search_owned_by(emb, k, owner)` returns only neighbours owned exactly like the
+      write; all three paths use it. Test `an_ingest_never_folds_across_a_workspace_boundary`
+      (fails on the old neighbour search).
+- [x] *(found 2026-10-09, same audit)* **The two global ingest paths dropped a new detail in the
+      top similarity band.** `remember_with_importance` and `smart_ingest` returned at once on
+      `Reinforce` (cosine > 0.92) — "dog Rex is a beagle, allergic to chicken" next to "dog Rex is a
+      beagle" was logged as a reinforcement and written nowhere — and `smart_ingest` also returned
+      on `FoldResult::Subset`, which is the byte bound declining the append as often as a true
+      subset. `remember_scoped` already kept the invariant "discard only what is provably present".
+      Both paths now reinforce-and-return only when the neighbour contains the text verbatim;
+      otherwise a `Reinforce`-band text gets a row of its own (its embedding is already in hand —
+      a fold would re-embed the merged text, a second round-trip the write-path baseline
+      `write_path_round_trips_baseline` caught: 15 calls for 8 facts) and dreaming folds the pair
+      later; the `Update` band folds as before, and falls through to a row when the fold lands
+      nothing. Test `a_new_detail_in_the_reinforce_band_is_kept` (both paths; fails with the old
+      `Reinforce` arm).
+- [x] *(found 2026-10-09, same audit)* **A huge `Retry-After` could abort the daemon.**
+      `embedding_router::demote` computed `Instant::now() + cooldown` with the cooldown taken
+      straight from a provider's published retry (no upstream cap); `Instant + Duration` panics on
+      overflow and `panic = "abort"` turns that into a dead daemon. Same shape in `nanna-llm`'s
+      rate-limit `learn` (`reset_in` from a header epoch). Now `bench_until` uses `checked_add`
+      and treats an unrepresentable horizon as none (the standard `DEMOTION_SECS`); `learn` keeps
+      its last window. 1 test.
+- [x] *(found 2026-10-09, same audit)* **`VectorStore::add` reported success for a memory it
+      had not saved.** A failed write-through was logged and the entry kept in RAM, so the caller
+      handed out an id a restart silently took back — the exact shape `save_entry`'s own comment
+      calls a bug, and the one asymmetric path left after `remove` became "durable or refused".
+      `add` now returns the backend's error and keeps nothing; every caller already propagates
+      it (consolidation adds before it removes, so a refused add leaves the sources). Test
+      `an_add_that_could_not_be_saved_is_refused_and_not_kept`.
+      *(same run)* **`backfill_embeddings` installed an old text's vector on edited content.** It
+      embeds a content snapshot and installed the vector with no compare-and-swap, so an edit
+      landing mid-embed got the OLD text's vector permanently (the bucket then existed, so the row
+      was never re-queued) — findable by words it no longer contains. New
+      `VectorStore::set_embedding_if_content` compares the content under the same write guard that
+      installs; a changed row stays queued. Test `a_vector_of_edited_text_is_not_installed`.
+      *(same run)* `set_embedding_for_model` / `update_content_and_embedding_if` cloned under the
+      entries lock and `save_entry`d after releasing it, so a delete in that gap was resurrected by
+      the upsert on the next restart. `VectorStore::persist_serial` is now held across
+      snapshot-and-save and across every delete (test
+      `a_delete_during_a_vector_install_is_not_undone`, gated backing store; fails without it).
+      *(same run)* `search_in_scope_with_coverage` filtered the store's global top `3·k`, so a
+      small workspace's matches ranked below other rows were cut before the filter saw them (none
+      returned, coverage "complete"); `search_owned_by` filtered once more after that. Both now go
+      through `search_admitting`, which widens the window ×4 until `k` are admitted or it covers
+      every comparable row (test `a_small_scope_is_not_starved_by_the_rest_of_the_store`).
+      *(same run)* The card fold (`memory_write_through`) read only a card's oldest 1 000
+      episodes, recorded that as covered, and never re-folded however many came after. It now
+      counts every episode (`count_for_source`) for the covered mark, and a card past one page is
+      folded from its oldest and newest half-pages (`newest_for_source`) — test
+      `a_long_card_folds_from_both_ends_and_refolds_when_it_grows`.
+- [x] *(found 2026-10-09, audit of scheduling)* **Cron matched day-of-month AND day-of-week.**
+      `CronExpr::matches` required both, while standard (Vixie) cron fires on EITHER when both are
+      restricted — so `0 9 1,15 * 1` ran only on a Monday that was the 1st or 15th, and
+      `0 0 29 2 1` (Feb 29 or any Monday) could fall outside `next`'s four-year search and never
+      run. Same parser for scheduler jobs and card recurrences. Now OR when neither field starts
+      with `*` (so `*/2` counts as starred, like Vixie), AND otherwise. Test
+      `restricted_day_and_weekday_fire_on_either`.
+- [x] *(found 2026-10-09, same audit)* **A recurring card came back with last round's dates.**
+      `reopen` clears the `due`/`overdue` announcement markers but never moved `due_at` or
+      `deadline_at`, and the same sweep then runs `announce_due` — so a weekly card with a deadline
+      was announced *overdue* the moment each new round opened, its dates sliding further into the
+      past every week. `reopen_for_next_round` now takes the occurrence the sweep found and moves
+      both dates by the whole days that put the earlier one on the occurrence's day (form kept:
+      bare day or timestamp; never backwards). Tests `a_rounds_dates_move_to_its_occurrence`,
+      `a_reopened_round_is_not_announced_overdue_on_last_rounds_deadline` (1 due, 0 overdue; was
+      overdue on the old reopen).
+- [x] *(found 2026-10-09, same audit)* **A card's recurrence was never checked and could not be
+      removed.** Every write stored the string as given; `CronExpr` parsed it only inside the
+      sweep — so `recurrence: "daily"` was accepted, never recurred, and logged a warning every
+      five minutes — and recurrence was not `clearable` like the dates, so `""` was stored as
+      `""` (still `NOT NULL`) and no write could remove it. New `admit_recurrence` (blank clears,
+      anything else must parse; stored trimmed) on all four ingress points: `tasks.add`,
+      `tasks.update`, IPC `task.create`, `task.update` (`bad_recurrence`). Test
+      `a_recurrence_is_checked_on_write_and_can_be_cleared`.
+- [x] *(found 2026-10-09, audit of scheduling)* **"Run now" on a reminder delivered it twice.**
+      `Scheduler::run_now` bumped `run_count` in memory only: the delivered reminder stayed listed
+      but never fired at its time (`run_count` 1), came back at 0 after a restart and was delivered
+      again; it also skipped the in-flight claim, so it could overlap the loop's own run.
+      `run_now` now takes the shared claim and settles through the same `settle_run` as a
+      scheduled run (one-shot removed on success, disabled on failure, persisted). Test
+      `run_now_delivers_a_reminder_once_and_for_good`.
+      **Filed, not fixed:** a cron job whose time passed while the daemon was down is skipped
+      silently (`job_to_task` recomputes `next_run` from now and ignores the stored one), while
+      one-shots and intervals catch up — "missed-job handling on startup" is a backlog feature,
+      so the catch-up policy (once? never?) is an owner call.
+- [x] *(found 2026-10-09, audit of the control plane)* **The IPC read deadline never fired.**
+      `pump_incoming` wrapped `ws_rx.next()` in a fresh `timeout(45 s)` on every pass through its
+      `select!`, and the 15 s ping tick ends a pass — so the deadline restarted before it could
+      expire, and a peer that went silent without a FIN (network drop, laptop sleep) held its
+      connection until the kernel's TCP retransmission gave up, many minutes later. Now one timer,
+      reset only when a frame (a pong included) arrives. `pump_incoming` is generic over the
+      stream so a test can drive it: `a_silent_peer_is_dropped_at_the_read_deadline` (paused
+      clock, a never-yielding stream).
+- [x] *(found 2026-10-09, same audit)* **`config.set` of an unknown path answered `updated`.**
+      `set_nested` inserts any key and serde drops the unknown ones on the way back into `Config`,
+      so `llm.modle` replied `updated`, fired `ConfigChanged` and changed nothing (`config.get`
+      said `path_not_found`); `RETIRED_KEYS` guarded exactly one such key. `unknown_path_refusal`
+      now judges the round trip itself: a non-empty, non-secret value that did not survive it is
+      refused (`unknown_path`) before anything is applied or saved. Empty values (optional and
+      `skip_serializing_if` fields) and secrets (never serialized) are not judged. Every GUI
+      `config_set` path checked present. Test `config_set_of_an_unknown_path_is_refused`.
+- [x] *(found 2026-10-09, audit of the control plane)* **Two replies for things that did not
+      happen.** `memory.update` destructured `tags` as `_`: with content it said `updated` and
+      dropped the tags, with tags alone it said `no_changes` — the GUI's edit sends both. New
+      `VectorStore::set_tags` / `MemoryService::set_tags` (comma-joined `metadata["tags"]`, the
+      form `memory.create` writes; empty removes; written through) and the handler applies both
+      fields. `system.restart` answered `{"status":"restarting"}` and did nothing; it now says
+      `unsupported`, as `system.shutdown` does when it cannot act (nothing calls it). Test
+      `tags_can_be_replaced_and_removed`. *(same run)* `/status` always said `clients: 0` —
+      `set_client_count` had no caller; the health loop now feeds it the IPC server's count
+      (live: one WebSocket client connected → `clients: 1`).
+      *(same run)* `set_last_error` had no caller, so `/status` said `last_error: null`
+      through any failure; `HealthState::record_errors_from` now keeps it at the newest
+      `Event::Error` on the bus (test `status_reports_the_last_error_event`). A failed
+      config save on a tool toggle, `config.set`, reset or import logged a warning and replied
+      success — a setting that silently reverted at the next restart. All four now go through
+      `save_config` and reply `error: "not_persisted"` (with the `status` the live change reached)
+      when the save fails; the change still applies for the run (test
+      `a_config_change_that_cannot_be_saved_says_so`).
+- [x] *(found 2026-10-09, audit of storage/timeline)* **A card's folded story kept only its start.**
+      `compress::is_mandatory` counted an event as a salience peak when it was `>=` both neighbours
+      — every comment is written at 0.5, exactly `PEAK_FLOOR` — so a flat run of 40 comments made
+      all 40 mandatory, the overflow branch kept the earliest ~22 and elided the rest. A peak must
+      now rise above at least one neighbour. Test `a_flat_run_is_decimated_evenly_not_truncated`.
+- [x] *(found 2026-10-09, same audit)* **Tool-stats time series: an unweighted average, a "P95"
+      that is the maximum, and no order within a second.** The all-tools rows averaged each tool's
+      average (`AVG(avg_duration_ms)`: one 1 s call of one tool beside 99 × 10 ms of another read
+      505 ms instead of ~20 ms) — now `SUM(total)/SUM(calls)`, hourly and daily (test
+      `the_all_tools_average_is_weighted_by_calls`). The buckets' `p95_duration_ms` column is
+      maintained as `MAX(...)`, so the daily tooltip now says "Slowest" rather than "P95" (the
+      table's P95 comes from the live tracker and is a real percentile). The tool-call log sorted
+      on one-second `created_at` alone; it now breaks ties on `id`.
+      *(same run)* `sessions.updated_at` is written as RFC 3339 by the daemon's paths and as
+      `datetime('now')` by rename/workspace/touch, and was sorted as text (a space sorts below
+      `T`): a session renamed at 15:00 listed below one touched at 09:00 the same day, and the
+      first row is the default session on boot. Every session list now orders by
+      `datetime(updated_at)`, ties on `id` (test `sessions_sort_by_time_not_by_timestamp_text`).
+      *(same run)* `MemoryRepository::update_content` (every dream rewrite) NULLed
+      `memories.embedding` without the zero-then-checkpoint the bucket and chunk paths do, so the
+      superseded vector — invertible back to the replaced text — stayed in the WAL and free pages.
+      It now zeroes in place, rewrites, and truncates the WAL under one guard (test
+      `a_content_rewrite_removes_the_old_embedding_from_disk`).
+      *(same run)* The usage and daily tool-stats windows cut at `now - days` rounded to midnight —
+      `days + 1` calendar days (eight bars for "7 days"). Both now start at `window_first_day`,
+      today and the `days - 1` before it (tests `a_window_of_n_days_spans_n_calendar_days`,
+      `a_one_day_usage_window_excludes_yesterday`).
+- [x] *(found 2026-10-09, audit of channels and webhooks)* **Telegram's `allowed_users` did not
+      apply in webhook mode.** It reached only the polling listener's chat filter; with a
+      `webhook_url` the listener is off and the daemon's webhook processor ran every message, so
+      any Telegram user who found the bot got a full agent turn with tools (the webhook secret
+      proves the POST came from Telegram, not who wrote it). The processor now applies the same
+      rule from the live config (`webhook_chat_allowed`, test
+      `telegram_webhook_messages_honour_allowed_users`). *(same run)* An edited Telegram message
+      started a second turn — `message.or(edited_message)` in the listener and both webhook
+      handlers — so fixing a typo ran the agent again (a duplicate reply, tool side effects
+      again). Edits are now acknowledged and ignored, and the listener no longer subscribes to
+      them (test `an_edited_message_does_not_start_a_turn`). *(same run)* The daemon's Discord
+      interaction webhook handed the agent the command's NAME (`/ask question:"…"` arrived as
+      `ask`) and answered with a deferred response it never completed, so Discord marked every
+      command failed; the string options are now the message and the interaction is answered at
+      once ("Working on it…"), the reply following as a channel message (test
+      `a_slash_command_carries_what_the_user_typed`).
+      *(same run)* Telegram replies went out as legacy `Markdown` with no fallback, so an
+      unmatched `_` (a file name) made Telegram refuse the whole reply; a refused parse is now
+      resent once as plain text (test `a_reply_telegram_cannot_parse_is_resent_as_plain_text`).
+      **Filed from the same audit, not fixed this run:** model text is not converted to
+      Telegram's MarkdownV2/HTML (it arrives unformatted when refused); `nanna serve`'s Slack and Discord handlers return the
+      reply in the HTTP body (Slack ignores it and retries the event up to 3 times; Discord needs
+      an answer within 3 s).
+- [x] *(found 2026-10-09, audit of browser tools)* **Every browser call leaked a tab.**
+      `BrowserManager::get_page` opened a fresh tab per call and cached it over the last one,
+      and nothing ever closed one (dropping a chromiumoxide `Page` closes nothing), so a long
+      session held one live tab per call until Chromium ran out of memory. Each call now closes
+      its own page when it is done, failed calls included; the unused page cache is gone; a
+      `wait` action is held to the browser's operation deadline (it slept whatever `wait_ms` the
+      model asked). Test `every_call_closes_the_tab_it_opened` (fake browser counting tabs).
+      *(same run)* The four browser skills returned every failure as a SUCCESSFUL plain string
+      blaming the service ("Browser service not available") whatever went wrong; they now
+      return `{content, success: false}` with the real error. `browser_action` read
+      `result.message` (the service answers `result`), and `browser_screenshot` claimed a base64
+      PNG it never returned instead of the saved file's path; both fixed.
+      *(same run)* A crashed Chromium was never relaunched: `ensure_launched` only checked the
+      slot, and the event handler kept polling a dead connection (chromiumoxide yields its error
+      on every poll rather than ending). A per-launch liveness flag is cleared when the
+      connection errors; the next call drops the dead browser and launches anew (test
+      `a_browser_that_died_is_relaunched`, ignored by default — it launches Chromium; run here:
+      the kill seen and the relaunch done in 0.6 s).
+      **Filed from the same audit, not fixed this run:** `browser_action` cannot act on the page a
+      previous call opened (each call is a fresh tab, so type-then-click loses the text); the
+      screenshot's `width`/`height`/`selector`/`quality` are accepted and ignored by the CDP
+      backend. *(same run)* The extract selector script escaped only `'` (a backslash in a
+      selector broke the script); it is now a JSON string literal (test
+      `an_extract_selector_is_a_safe_string_literal`).
+- [x] *(found 2026-10-09, audit of the CLI)* **`nanna credentials` could replace a broken
+      config with the defaults.** `import`/`refresh`/`setup`/`clear` loaded the config with
+      `Config::load().unwrap_or_default()` and saved it back: one TOML typo and the user's
+      provider, models, channels, MCP servers and `data_dir` were overwritten to set one OAuth
+      field. A config that does not load is now left alone and the command says so
+      (`config_to_edit`, test `a_config_that_does_not_load_is_not_rewritten`).
+      *(same run)* `nanna chat` treated end of input (Ctrl-D, an empty pipe) as an empty line and
+      re-prompted forever at full CPU; it now exits. `nanna config` labelled `--config`'s
+      settings with the default path; it prints the file it loaded (checked live).
+      *(same run)* `main` turned a default config that does not parse into the defaults (logged at
+      info), and quick setup then prompted for a key and saved the defaults over the file. Every
+      command but `doctor` now stops with the parse error instead (`config_or_refusal`, test
+      `a_config_that_does_not_parse_is_refused_not_defaulted`; live: `run` exits 1, `doctor`
+      reports the file, the file is untouched).
+      *(same run)* Quick setup and the wizard saved to the default path, not `--config`'s, and
+      `is_first_run` checked the default path too (so `--config alt.toml chat` ran the wizard
+      whenever the default file was missing); the loaded file's path is now threaded through
+      (live: no wizard, no default file created, `alt.toml` untouched). *(same run)* Credential commands printed ❌ and exited 0 on every
+      failure, and `persist_oauth_credential` only warned when the secure-store save failed
+      before printing "✅ Token refreshed!"; each failure is now the command's error (non-zero
+      exit), the store save included.
+- [x] *(found 2026-10-09, audit of the GUI's IPC client)* **A dropped daemon connection left its
+      sender installed.** `handle_disconnect` failed the pending requests but kept the dead
+      connection's `msg_tx`, so while the daemon was down every GUI request registered itself,
+      failed with "channel closed" and stayed in the pending map; one sent just before the
+      message task exited was buffered, dropped and waited out its whole timeout (5 min). The
+      sender is now cleared first (requests answer "Not connected to daemon" at once) and a
+      failed send removes its own entry (test
+      `a_request_after_the_daemon_dropped_is_refused_and_leaves_nothing`; fails without it).
+      *(same run)* `relay_output` read sidecar output with no line-length cap (an MCP server's
+      `\r` progress bar on the shared stderr grew one line for a whole download before
+      `fit_line` trimmed it); it now reads at most `BOOT_LOG_LINE_BYTES` at a time and relays a
+      longer line in pieces (test `output_without_line_endings_is_relayed_in_bounded_pieces`).
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
@@ -8446,6 +9466,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       space started the wrong program. **Still open:** the launchd plist (`cfg(target_os =
       "macos")`, XML-escape its strings) and `windows_service` Running-after-exit — neither
       compiles on this Linux host, so neither is changed blind.
+      *(2026-10-04 — the plist.)* `generate_launchd_plist` now compiles on every host
+      (`cfg(any(target_os = "macos", test))`) so its escaping is tested here: the label, the
+      executable and every argument go through `xml_escape` (the five reserved characters). An
+      install path with `&` or `<` produced a plist launchd refused to load, and an argument
+      holding `</string><string>…` added a program word. Test `plist_strings_are_xml_escaped`
+      counts the `<string>` elements to pin the second. **Still open:** `windows_service`
+      Running-after-exit (does not compile here; not changed blind).
 - [x] Config: `file_encryption_key` must pick one key source and stick to it; `SecureStore::set`
       must remove the file copy like `delete` does; `save_to` writes atomically (tmp + rename)
       because the daemon watches the file; document env precedence (`credentials.rs:639,224`,
@@ -8674,6 +9701,112 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       visited set; `SystemExit` must carry its status; manifest skills with `kill_on_drop`; the
       registry backstop must extend for undeclared timeouts too (`boa_impl.rs:43,779`,
       `python.rs:147,374`, `engine.rs:414,203`, `skills/executable.rs:150`).
+- [x] *(found 2026-10-04, scanning for `expect`/`unwrap` on production paths)* **A tool script's
+      native call could abort the daemon.** Every bridge native in `boa_impl.rs` (`exec`,
+      `readFile`, `writeFile`, `listDir`, `stat`, `fetch`, `callService` — 7 sites) ran its async
+      work on a fresh runtime built with `.expect("Failed to create runtime")` inside a spawned
+      thread. Building a runtime can fail (no fd left for its epoll), and under the release
+      profile's `panic = "abort"` a panic in *any* thread ends the process — the
+      `join().map_err("Thread panicked")` meant to catch it never ran. One helper,
+      `run_on_own_runtime`, now turns that into a JS error for the calling script; test
+      `a_native_call_runs_on_its_own_runtime_inside_another`. Same scan, `server.rs`: a
+      user-edited `discover_tools` that no longer parses aborted the boot (`.expect`), now a
+      skipped tool with a warning; and the JSON-migration path's `json_path.unwrap()` became a
+      `let` chain. A scan of every crate's non-test code for `.unwrap()`/`.expect(` now finds
+      only builder invariants (`nanna-server`'s `AppStateBuilder`), the GPU buffer created
+      mapped, the Windows-only job-object size, and four `unwrap`s in `service.rs`'s
+      macOS-only install/uninstall (`plist_path.parent()`, `to_str()`), left alone because
+      that code does not compile on this host — **still open**, for a run with a macOS check.
+- [x] *(found 2026-10-09, audit of the tool runtime)* **`..` climbed out of a skill's file scope.**
+      `ToolPermissions::allows_read/allows_write` compared the bridge's joined-but-never-normalised
+      path with `Path::starts_with`, which matches components as written — so under the default
+      `~` scope `Nanna.readFile("~/../../etc/passwd")` was allowed while `/etc/passwd` was refused,
+      and a relative `../../..` from a workspace under home wrote outside it. `scope_covers` now
+      checks the lexically normalised path (`.` dropped, `..` resolved, never past the root), the
+      same path the OS opens short of symlinks. Test `dot_dot_cannot_climb_out_of_a_scope`.
+- [x] *(found 2026-10-09, same audit)* **An authored tool could replace a bundled one.**
+      `tools.create`/`tools.update` refused only a bundled *directory* name, but a tool registers
+      under the name its *source* declares (`register_boxed` overwrites by that name), so
+      `create_tool(name: "my_writer", source: "export default { name: 'write_file', … }")` replaced
+      the live `write_file` — shrink floor, `.__prev__` copies and read marks — with unguarded code.
+      `validate_source` now requires the declared name to equal the tool's name (which is never
+      bundled). GUI user tools (`UserToolManager::create_tool`, registered under their own name)
+      now refuse a bundled name too. Test `a_source_declaring_another_name_is_refused`.
+- [x] *(found 2026-10-09, audit of the control plane)* **`tool.update {needs_shell}` could not
+      revoke shell access.** `false` mapped to "no change" — the reply said `updated` and
+      `permissions.run` stayed `true` — and `true` replaced the tool's whole permission set with a
+      default one, dropping its read/write/net scopes. It now sets `run` on the tool's current
+      permissions either way. Test `needs_shell_grants_and_revokes_without_dropping_scopes`.
+- [x] *(found 2026-10-09, audit of the tool runtime)* **`exec(timeout=0)` killed the command on
+      its first poll.** `Nanna.exec`'s timeout went through a truncating conversion, so `0`, a
+      negative, `NaN` or `0.5` became `Some(0)` — a zero-second deadline — which the `exec` skill
+      then misreported as "killed at the auto-detected deadline". Below one second now means the
+      bridge's auto-detected default; fractions round up. Test
+      `an_unusable_exec_timeout_means_the_default_not_an_instant_kill`. **Not capped, on purpose:**
+      a long build legitimately asks for more than the 120 s auto window, and the run's own wall
+      clock already bounds it.
+- [x] *(found 2026-10-09, audit of the tool runtime)* **`read_pdf`, `analyze_image`,
+      `describe_image`, `ocr` and `transcribe` handed the services a raw path.** `pdf.read`,
+      `vision.analyze` and `audio.transcribe` take the path as given, so `read_pdf("docs/spec.pdf")`
+      in a workspace resolved against the daemon's own working directory ("Cannot stat…", reported
+      as "PDF reading service not available") — and the call skipped the skill's read scope
+      entirely. `Nanna.stat` now returns the `path` the bridge resolved and permitted, and all five
+      skills pass that on (a refused or missing file answers "Error: cannot read …"). Test
+      `stat_returns_the_resolved_permitted_path`.
+      *(same run)* The `python` tool's documented default workdir ("the session workspace") was
+      never passed: unset, the interpreter ran in the daemon's own cwd. The skill now sends
+      `Nanna.workdir()` when none is given.
+      *(same run)* A given python workdir was applied with `os.chdir` — process-wide in the
+      embedded interpreter — and never undone, so after one run the whole daemon's relative paths
+      resolved against that directory. The wrapper now restores the previous directory in its
+      `finally` (test `a_python_workdir_does_not_move_the_daemon`, its own binary).
+      **Filed from the same audit, not fixed this run:** while a python run with a workdir lasts,
+      the move is still process-wide (concurrent relative paths see it); GUI user tools get no skill services (the control plane
+      holds no service map). *(same run)* GUI user tools ran with no workspace or session, so
+      their relative paths resolved against the daemon's own directory; `UserToolManager` now
+      keeps the registry it registers with and each run reads the active workspace's directory
+      and the session from it, as bundled skills do (test `a_user_tool_runs_in_the_active_workspace`).
+      *(same run)* **`web_fetch` threw on a network error and buffered any body whole.** A refused
+      host, DNS failure or timeout became a thrown script error instead of a result; it now
+      answers "Error: could not fetch …". And `Nanna.fetch` read the body with `Response::text`
+      before `max_chars` applied, so a fast link could feed gigabytes within the 30 s timeout; it
+      now reads chunk by chunk and refuses past `READ_FILE_BYTES_MAX` (64 MiB, `readFile`'s cap),
+      declared or not. Test `a_fetched_body_is_read_only_up_to_the_cap` (loopback server).
+- [x] *(found 2026-10-09, audit of MCP)* **A legacy SSE MCP server could redirect the bearer
+      token.** `SseLegacyTransport` joined the `endpoint` event's URL onto the base and POSTed every
+      message there with the configured bearer, so a `url` server whose Streamable-HTTP probe fell
+      back to SSE could name `https://attacker.example/x` (or `//attacker.example/x`) and receive
+      the stored credential. `same_origin_endpoint` now refuses an endpoint on another origin, as
+      the TypeScript SDK does. Test `a_message_endpoint_must_stay_on_the_connections_origin`.
+      *(same run)* The encrypted-credentials file had no cross-process lock: a CLI `mcp secret
+      set` racing the daemon lost a key (each wrote back the whole map it read) or renamed an
+      interleaved, corrupt envelope from the shared `credentials.enc.tmp`. Set/delete now hold an
+      OS advisory lock on `credentials.enc.lock`, and every temp file is unique (test
+      `concurrent_writers_on_one_file_lose_no_key` — fails 3/3 with the lock removed).
+      *(same run)* A 404 to a legacy Streamable-HTTP session (the server ended it) was returned to
+      every later call until a reconnect; the spec says the client must initialize again. The
+      transport now keeps the `initialize` that opened the session, and on a 404 to that session
+      replays it without the old id, sends `initialized`, and retries the request once (test
+      `a_lost_legacy_session_is_renewed_and_the_request_retried`, scripted loopback server; fails
+      with the renewal disabled).
+      *(same run)* A dropped legacy SSE GET stream failed the requests already waiting, but every
+      later one was posted and then waited the full 60 s for an answer the dead stream could never
+      carry. The pending map now closes with the stream, and a later request fails at once with
+      `ConnectionClosed` (test `a_request_after_the_stream_ended_fails_at_once`).
+      *(same run)* **Streamable HTTP's 16 MiB cap bounded nothing.** `read_answer` buffered the
+      whole body (`Response::bytes`) before comparing it to `HTTP_BODY_BYTES_MAX`, and the
+      `notify` and legacy-SSE error paths read error bodies with `Response::text`, unbounded. Now
+      `read_body_capped` reads chunk by chunk (declared lengths refused up front) and
+      `read_error_body` reads only the prefix it will show. Test
+      `a_body_past_the_cap_is_refused_and_an_error_body_is_cut` (loopback server).
+      *(same run)* **A stdio MCP server's real process outlived its close.** Servers are usually
+      launched through `npx`/`uvx`/`sh -c`, and `child.kill()` / `kill_on_drop` reached only that
+      launcher — the server itself, a grandchild, kept running after the grace kill, an aborted
+      start or a failed `initialize`. The child now leads its own process group (Unix) or a
+      kill-on-close job (Windows, `nanna_proc::ChildJob`); `close` kills the tree with
+      `nanna_proc::kill_process_tree` before reaping the launcher, and a transport dropped without
+      `close` kills its group while the launcher is still unreaped. Test
+      `close_kills_the_servers_whole_tree` (fails with the tree kill removed).
 - [x] Tool authoring: `tools.update` refuses bundled names and runs `check_syntax`; GUI
       `update_skill` validates the name (`tool_authoring.rs:99,236`, `gui/.../tools.rs:458`). Both
       move with the `default-skills` → tools rename.
@@ -8763,6 +9896,92 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       backend's `wait_for_selector` (`is_visible` answers at once, like the old CDP one) — the
       feature is off and its crate is not even fetched here, so it cannot be verified.
 
+- [x] *(found 2026-10-09, audit of the provider plumbing)* **Healing truncated tool arguments
+      closed brackets in the wrong order.** `close_unbalanced` counted `{` and `[` separately and
+      always appended every `]` before every `}`, so `{"edits":[{"old":"x"` became
+      `{"edits":[{"old":"x"]}}` — not JSON — and `heal_tool_args` fell back to `{}`: any truncated
+      call with an object inside an array lost all its arguments. Closers now come from a stack of
+      the openers seen (innermost first), and a dangling `\` at the cut no longer escapes the
+      closing quote. 2 tests.
+
+- [x] *(found 2026-10-09, same audit)* **An OpenAI-compatible stream cut inside a tool call was
+      run as a finished call.** Both OpenAI-compatible stream paths (OpenAI/OpenRouter/GitHub and
+      the role-checked one) closed every open block and emitted `MessageStop{end_turn}` when the
+      body ended without `[DONE]` or a `finish_reason`, and dropped a last line that lacked its
+      `\n`. A proxy hanging up inside `"content":"def f(` therefore handed the agent half an
+      argument object, which the healer closed and a write tool ran. The Ollama path already
+      reported this as a retryable 502. New `OpenAiStreamState::finish_unterminated` translates
+      the unterminated last line first (it may be the terminator), then ends a cut with a tool
+      call open as a 502; a text-only reply with no terminator still ends as before, with a warning
+      (some compatible servers omit both). 2 tests.
+      *(same run)* Usage on streamed OpenAI-compatible turns was never requested nor parsed, and
+      the stream was dropped at `finish_reason` — before the usage chunk OpenAI sends ahead of
+      `[DONE]` — so those turns recorded 0/0 tokens. Both streamed bodies now send
+      `stream_options.include_usage`; the message stops at `[DONE]` (or the body's end) with the
+      `finish_reason`'s stop reason, and the usage chunk becomes the late `MessageStart` /
+      `MessageDelta` pair the Ollama path already emits, cached prompt tokens split out as cache
+      reads (tests `a_streamed_turn_reports_its_usage_before_it_stops`,
+      `a_streamed_body_asks_for_usage`).
+      *(same run)* `Retry-After` as an HTTP-date (RFC 9110) is now read (`httpdate`, already in
+      the graph via hyper), a unit-less decimal (`"1.5"`) is seconds, and an empty header is no
+      value — it used to read as `0` and win over the `x-ratelimit-reset-*` headers.
+- [x] *(found 2026-10-09, same audit)* **A provider's published wait never reached the chat or the
+      card run.** `from_response` put the header's wait in `LlmError::RateLimit.retry_after`, but
+      the display was `Rate limit exceeded: {message}`, and the chat path
+      (`AgentService::parse_retry_after`) and the card cooldown (`rate_limit_cooldown`) read the
+      wait back from the *text* — so an Anthropic 429 with `retry-after: 45` waited the 10 s
+      default. And the chat parser read OpenAI's "try again in 452ms" as 452 s. The display now
+      carries `(retry-after: N)`, the chat parser reads that first and honours a unit (ms round up
+      to 1 s; minutes). Tests: two new cases in `parse_retry_after_extracts_seconds`, one in the card
+      cooldown test.
+- [x] *(found 2026-10-09, same audit)* **A poor lifetime record retired a model for good.**
+      `model_health` answered `Unhealthy` (never usable, no expiry) for a lifetime error rate above
+      50 % over 5+ requests; `health_sorted_models` then never called the model, so the rate could
+      never fall — five failures and one recovery (5/6), or 2 successes and 3 failures, removed it
+      until restart. The same "deadline never arrives" class the 09-26 cooldown fix closed. Now a
+      model whose last call succeeded is `Degraded` (tried after the healthy ones) and one whose
+      last call failed is held `COOLDOWN_BACKOFF_MAX_MS` (10 min, the cooldown's own cap) from that
+      failure, then tried again. Test `a_poor_record_is_held_for_a_while_never_for_good`.
+
+- [x] *(found 2026-10-09, audit of the agent loop)* **Tool-result dedup wiped results it should
+      have kept — sometimes the newest.** `deduplicate_tool_results` (run after every tool round,
+      before the next model call) recorded a superseded call's *message* and then stubbed EVERY
+      `ToolResult` in it: a re-read of `a.rs` erased the `cargo test` output that shared its batch.
+      And its key was the path alone, so two pages of one file in a single batch
+      (`offset` 0 / 500) "superseded" each other inside the newest message — the model's fresh
+      results were stubbed before it read them. Now only the superseded call's own result is
+      replaced, and the key is the tool plus its whole input. Pure
+      `superseded_tool_results` with test `dedup_supersedes_only_the_repeated_calls_own_result`.
+
+- [x] *(found 2026-10-09, same audit)* **A planned task with a check the store refuses was dropped
+      whole.** `AcceptanceCheck::canonicalize` (the planner's and `tasks.add`'s gate) round-tripped
+      the typed check but never ran the store's `validate_acceptance`, so `file_exists` with an
+      empty path, `command` with an empty command or a `regex` with nothing to match passed the
+      planner and was then refused by `create` — and `seed_plan` dropped the entire task ("no
+      planned task could be created" for a one-task plan), contradicting the planner's own rule
+      that a bad check is dropped from the task, not the task. `canonicalize` now ends in
+      `nanna_storage::admit_acceptance`. Test
+      `a_check_the_store_would_refuse_is_dropped_and_the_task_kept`.
+      *(same run)* An acceptance `command`'s output was buffered whole (`wait_with_output`)
+      before the 4 MiB cut, for up to its 600 s ceiling — a check spamming logs could hold
+      gigabytes in the daemon. `run_shell` now drains both pipes keeping at most
+      `ACCEPTANCE_READ_MAX_BYTES` of each (`read_pipe_capped`, 1 test).
+      *(same run)* Failed model calls never reached `ModelStatsTracker` (only a routed model's
+      pre-escalation failure did), so a model failing on every call kept a 100% success rate; and
+      a call ended by Stop was recorded as a 0-token *success*, resetting the failure streak. Now
+      `record_llm_failure` records every non-cancelled failure, and a cancelled call
+      (`LlmCallMeta::cancelled`) records nothing. With the 10-09 health fix above, a failing
+      model is now actually held back — and released again.
+      *(same run)* Stop did not interrupt an acceptance check already running — it ran on to its
+      timeout (up to 600 s). The harness now runs checks through `run_interruptible` with the
+      run's token; `run_shell` kills the check's tree on cancel (the timeout path's
+      `kill_check_tree`) and the verdict is unknown, never a failure (test
+      `stop_interrupts_a_running_check`).
+      *(same run)* Salvaged prose tool calls were stored as `tool_use` blocks but the cancel/budget
+      exit paired only the structured calls, and the wrap-up exit paired none — history held calls
+      with no `tool_result`. Both exits now pair the salvaged calls too (test
+      `a_salvaged_call_cut_off_by_the_budget_is_paired`, scripted Ollama; fails without it).
+
 **Stage 4 — the board client and what it must not port:**
 - [x] The Tauri layer's lock discipline: never hold `AppState` across a daemon round trip
       (`scheduler.rs:28`, `settings.rs:454,519,550` and siblings); no `unsafe set_var` from
@@ -8818,7 +10037,69 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       and the state flipping, with no deterministic hook). e2e daemon suite: 42/42.
 
 **Independent — fix when in the file:**
-- [~] `nanna-simd` NEON arm has a trailing semicolon and does not compile on aarch64
+- [x] *(review 2026-09-22, "fix when in the file")* **The REST reply returned the session's oldest
+      message.** `POST /api/sessions/{id}/messages` ran the turn, then re-read the session with
+      `get_by_session(id, 1)` — an `ORDER BY created_at ASC LIMIT` query — so every reply after a
+      session's first answered with the session's FIRST message (usually the user's opening line).
+      *(2026-10-09)* `AppState::process_message_reply` hands back the row `create` returned for this
+      turn (`ProcessedReply { text, stored }`); the route answers from it and never re-reads. A failed
+      write is now logged instead of `let _ =`-discarded, and the reply still carries the agent's
+      text with id 0. `process_message` (webhooks, `/api/chat`) keeps its `String` shape. 2 tests.
+      *(same run)* **The same oldest-first read had two more victims.** `GET …/messages` returned
+      a long session's *first* 100 messages, and the CLI's `nanna chat --resume` loaded the *first*
+      50 — so resuming a long conversation dropped exactly the recent context it was resumed for.
+      New `MessageRepository::get_recent_by_session` reads the newest N and returns them oldest
+      first; both callers use it. Both reads now break `created_at` ties (one-second resolution — a
+      turn's question and reply usually share it) on `id`, so "oldest first" is no longer the
+      engine's choice within a second. 2 storage tests (`session_messages.rs`); no caller of the
+      old read wanted the opening.
+- [x] *(found 2026-10-09, audit of the CLI and workspace crate)* **Workspace context files and
+      `workspace init` were careless with the user's files.** `WorkspaceFile::load` read
+      `README.md`/`AGENTS.md`/… whole and through any symlink: a cloned repo whose `README.md` points
+      at `/dev/zero` grew the process until it died, and one pointing at `~/.ssh/id_rsa` was pasted
+      into `nanna chat`'s system prompt and sent to the provider. It now reads only a regular file
+      that resolves inside the project (a symlink within it, like `AGENTS.md -> CLAUDE.md`, still
+      works), up to `WORKSPACE_FILE_BYTES_MAX` (256 KiB). `create_from_template` overwrote existing
+      files (the only guard was "no `AGENTS.md` yet"), replacing a repo's own `ROADMAP.md`; it now
+      creates only missing files. And a bare `nanna workspace init` always failed: its default
+      template `standard` does not exist (only `minimal` and `project` do) — the default is
+      `project`. Tests `a_context_file_is_read_only_inside_the_project_and_only_so_far`,
+      `an_existing_file_is_kept_not_replaced`.
+      *(same run)* `nanna doctor` judged the built-in defaults — and said "All checks passed" —
+      when `config.toml` did not parse (the CLI falls back to defaults on a load error); the
+      `config.file` check now parses the file the same way the loader does and FAILs with the
+      parser's message, and doctor reports the `--config` file it was given rather than always the
+      default path. Test `a_config_file_that_does_not_parse_fails`.
+      *(same run)* `nanna daemon restart` slept 500 ms after the SIGTERM, found the old daemon
+      still draining, printed "already running", started nothing and exited 0 — no daemon once the
+      drain finished. It now re-reads the PID file until the old daemon is gone (bounded by
+      `RESTART_STOP_DEADLINE`, 30 s) and fails, not succeeds, when it is still alive or another
+      daemon won the role (tests `restart_waits_out_a_slow_drain`,
+      `restart_fails_when_the_old_daemon_never_exits`).
+      *(same run)* `daemon status` took no address and probed the default port whatever `--port`
+      started; it now takes `--host`/`--port` with `start`'s defaults (test
+      `daemon_status_takes_the_port_start_was_given`).
+      *(same run)* `nanna export` always dialled the default port; it now takes `--daemon <url>`,
+      as `nanna mcp serve` does (test `export_takes_the_daemon_address`).
+      *(same run)* `nanna mcp serve` cut every proxied tool call at the client's 30 s request
+      window while the daemon was still running it (a long build); it now uses
+      `ToolsApi::execute_until_answered` — no client-side deadline, the tool's own timeout bounds
+      the call, and a dropped connection still ends the wait (test
+      `a_tool_call_waits_for_the_daemons_answer`, slow mock daemon).
+      *(same run)* `nanna mcp serve` never reconnected: after a daemon restart every proxied call
+      failed `NotConnected` for the life of the process. It now goes through
+      `nanna_client::DaemonLink`, which reopens the connection before a call when it has dropped
+      and retries once only a call that was never sent (test
+      `the_next_call_after_a_daemon_restart_works`).
+      *(same run)* `nanna-daemon install` wrote the defaults whatever it was given; the unit/plist/SCM arguments now carry its `--host`/`--port`/`--health-port`/
+      `--data-dir` (absolute), and a set `NANNA_CONFIG_PATH` becomes the unit's `Environment=` /
+      the plist's `EnvironmentVariables` (tests
+      `the_installed_service_runs_the_daemon_install_was_given`,
+      `the_service_environment_reaches_the_unit_and_the_plist`). *(same run)* `systemctl`/`launchctl` exit statuses are now checked: a refused
+      `systemctl --user enable` (bad unit, no user bus) used to print its error while `install`
+      reported success; `run_checked` fails with the status and stderr (test
+      `a_service_command_that_exits_non_zero_fails`), and the unit/plist path `unwrap`s are gone.
+- [x] `nanna-simd` NEON arm has a trailing semicolon and does not compile on aarch64
       (`lib.rs:174,204`); `nanna-gpu` `search` must check buffer limits, `append` dirty index
       off-by-one; `nanna-bench` fixture divides by 24 576 instead of 2^24; `src/installer/windows/
       Cargo.toml` declares a missing `build.rs`.
@@ -8833,6 +10114,32 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       "random" vectors; now `/2^24`, pinned by a range test. It feeds only latency benches, so no
       baseline moves. **Installer manifest:** orphaned (written by an agent run, referenced by
       nothing, not a workspace member) — deleted. **Still open:** `search` buffer limits.
+      *(2026-10-04 — the line is complete.)* **`search` scores in as many dispatches as the
+      device's limits require.** One dispatch over a store past `max_storage_buffer_binding_size`
+      (128 MiB on wgpu's defaults: 87 381 vectors at 384 wide, 21 845 at 1 536) or past
+      `max_compute_workgroups_per_dimension` × 64 invocations (4 194 240 vectors) was a wgpu
+      validation error, which wgpu's default handler turns into a panic — under `panic = "abort"`,
+      the daemon. `vectors_per_dispatch` takes the smallest of the three bounds (vectors' binding,
+      output binding, workgroups) and the query buffer is uploaded once for all dispatches; a
+      vector wider than a binding, and a trailing partial vector (silently dropped before), are
+      refused (`GpuError::InvalidInput`). Proven on the 4070: both GPU regressions
+      (`a_store_past_the_binding_limit_is_scored_in_full`, `…workgroup_limit…`) fail with
+      `Buffer binding 2 range 134217744 exceeds … limit 134217728` / a workgroup validation error
+      on the single-dispatch code and pass with the fix; split scores match a CPU cosine.
+      `gpu_vs_simd_quick`: GPU fixed dispatch 85 µs (was characterized at ~200 µs), so no
+      regression. **Same pass: every GPU bench's ratio was off by 10^18.** The 2026-09-22 lint
+      pass rewrote `as_nanos() as f64` to `as_secs_f64() * 1e9` on both sides of a division, so
+      `a * 1e9 / b * 1e9` = (a/b)·10^18: `ratio < 1.0` could never hold and the four benches'
+      crossover detection could never report a GPU win. 8 sites fixed; real ratios at 768 wide
+      run 238× (10 vectors) down to 4.3× (10 000) — SIMD still wins the whole quick range.
+      (The GPU path has no production caller today: `VectorStore::with_gpu` is never called.)
+      - [ ] *(found 2026-10-04)* **Decide: wire the GPU search path or delete it.** Nothing calls
+            `VectorStore::with_gpu`, so the daemon's `GPU_THRESHOLD = 50_000` branch never runs and
+            `nanna-memory` links `wgpu` for nothing. Wiring it costs a wgpu device on the card the
+            local model needs (VRAM is the scarcest resource) to win only past ~50k memories —
+            the operator's store is 3 730, and the corrected quick bench has SIMD ahead across
+            its whole range (4.3× at 10k). Deleting it keeps `nanna-gpu` for the planned DSP
+            kernels. Product call; until made, the GPU path is tested but dormant.
 - [x] **aarch64 is lint-dirty and nothing looks.** `cargo clippy -p nanna-simd --target
       aarch64-unknown-linux-gnu --all-targets` reports ~24 warnings no x86 run can see — 10 lossy
       `as` casts (owner rule: route through `nanna-numeric`), 4 `mul_add`, doc backticks, a
@@ -9010,6 +10317,25 @@ keep the phases readable; promote individual items into a phase when they become
         docs this run), so the practical workaround — and what the doctor's remedy says — is to
         re-mint rather than to rely on refresh.
 
+### `project_structure`'s budget cut depends on readdir order (found 2026-10-02)
+
+- [x] **Which entries survive a budgeted listing is the filesystem's choice, not the tool's.**
+      `default-skills/project_structure/tool.ts` asks `Nanna.listDir(path, false, budget + 1)`
+      and sorts what comes back, so on a directory larger than the entry budget the *first N in
+      readdir order* are shown — reverse-creation order on tmpfs, creation order on btrfs/ext4.
+      Found when `directories_the_budget_never_reached_are_marked` failed under
+      `TMPDIR=/var/tmp` (btrfs: `aaa_sub/`, created last, was never listed, so it could not be
+      marked "not walked") and passed on `/tmp`. Fix in the bridge, not the test: have
+      `listDir` return a sorted prefix (read the directory's names — cheap — sort, then stat
+      only the first N), so the same tree lists the same way on every host and the test's
+      alphabetical expectation is the product's. Bound stays `MAX_ENTRIES`.
+      *(2026-10-02, same run)* Fixed in `NannaBridge::list_dir`: a capped flat listing reads names
+      only (bounded by `LIST_DIR_NAME_SCAN_MAX` = 2^18, ~8 MiB), sorts them, keeps the first
+      `cap` and `lstat`s just those. Past 2^18 names the prefix is chosen among the first 2^18
+      the filesystem returned — stated in the doc, not hidden. Test
+      `a_bounded_flat_listing_keeps_the_first_names_on_every_filesystem` (alphabetically-first
+      entry created last); the `project_structure` suite now passes on btrfs and tmpfs alike.
+
 ### The workspace is not rustfmt-formatted, and nothing checks (found 2026-09-24)
 
 - [ ] **`cargo fmt --check` reports 3407 hunks across 212 files on a clean `origin/master`**, and
@@ -9163,7 +10489,7 @@ keep the phases readable; promote individual items into a phase when they become
       **4.1**, and WebKitGTK's automation handshake is per-library-generation. **Whether a 6.0 driver
       can drive a 4.1 app is unproven and is the actual open question** — it is not a package the owner
       has simply not installed yet.
-      - [ ] Owner step, in this order. **(a)** `sudo pacman -S --needed webkitgtk-6.0` — seconds, and
+      - [x] Owner step, in this order. **(a)** `sudo pacman -S --needed webkitgtk-6.0` — seconds, and
             the only packaged candidate; if a 6.0 driver can drive a 4.1 app the problem is over.
             **(b)** If it cannot, the community's answer is a **source build of WebKitWebDriver
             matched to the installed `webkit2gtk-4.1`** (`-DENABLE_WEBDRIVER=ON`), which must be
@@ -9173,6 +10499,9 @@ keep the phases readable; promote individual items into a phase when they become
             or WebdriverIO's `@wdio/tauri-service`, whose docs list other Linux providers).
             Until one lands **the Linux WebDriver harness stays UNVALIDATED** and no run may claim
             GUI verification passed.
+            *(2026-10-08 — closed, superseded.)* The plugin route (`e2e-webdriver` + `tauri-webdriver`,
+            below under the WebKitWebDriver item) needs no `WebKitWebDriver` and has worked since
+            2026-09-18; this run drove the built GUI with it again (memory page over a scratch daemon).
       - [x] *(research 2026-09-17 — option (c) above has matured into the cheapest route)*
             **`tauri-plugin-webdriver` 0.2.3 + `tauri-webdriver` 0.2.0 (both 2026-09-01, MIT; the
             plugin has ~119k downloads)** embed a W3C WebDriver server *inside the Tauri app*, so on
@@ -9246,7 +10575,7 @@ keep the phases readable; promote individual items into a phase when they become
             `clean_shutdown`, no process left — where the run before it had to stop the orphan by
             hand. Windows is unchanged (its Job Object already covers this; the flag is accepted
             and ignored).
-      - [ ] *(found 2026-09-18, on the operator's machine)* **In the AppImage, closing the GUI
+      - [x] *(found 2026-09-18, on the operator's machine)* **In the AppImage, closing the GUI
             crashes its daemon (SIGBUS) instead of stopping it.** Seen live, not reproduced:
             the installed `Nanna_0.3.19_amd64.AppImage` daemon dumped core **twice**, each time in
             the same second its GUI's launch scope ended. `nanna-daemon` 342632 died at 09:05:09
@@ -9266,6 +10595,35 @@ keep the phases readable; promote individual items into a phase when they become
             from `ExitRequested`. First, reproduce it deliberately: launch the AppImage, `kill
             -TERM` the GUI, and read `coredumpctl`. Note also that the operator's desktop entry
             still launches **0.3.19**, while beta.30 is published.
+            *(2026-10-05, landed on the owner's go-ahead)* **Shape (1), done at the daemon's end.** A
+            daemon started from inside the mount (`$APPDIR` set and `/proc/self/exe` under it) copies
+            itself and the bundle libraries it has mapped to
+            `$XDG_CACHE_HOME/nanna/appimage-daemon/<version>-<hash>/`, checks that the copy starts
+            (`--version`), and `exec`s it. The PID, parent and stdio stay the same, so the GUI's
+            sidecar handle is unchanged; the copy restores the original `LD_LIBRARY_PATH` for its
+            children; stagings of other builds are pruned. Best-effort: any failure runs from the
+            mount, as before, with a WARN. **Reproduced and verified with a real FUSE mount:** a
+            test AppImage (the 0.3.19 runtime + a squashfs holding this build's daemon) was mounted
+            with `--appimage-mount`, the daemon started from the mount, the runtime (FUSE server)
+            was SIGKILLed, then the daemon got SIGTERM. With staging bypassed
+            (`NANNA_APPIMAGE_STAGED=1`), it **dumped core with SIGBUS**, the reported crash. With
+            staging, it ran from the cache copy and recorded `clean_shutdown`, with no core.
+      - [x] *(2026-10-05)* **A death no daemon hook can see now leaves its exit status on record.**
+            The exit record (`nanna-daemon.exit.json`) said only "it died through a path no hook
+            could see" for exactly the deaths worth explaining: this item's `SIGBUS`, and an
+            unexplained 2026-09-28 15:31Z death with no core, no OOM and no panic. The GUI waits on
+            its sidecar and gets the status, but it only logged it, and its log went when it exited.
+            Now the record type is shared (`nanna_core::exit_record`, re-exported by
+            `nanna_daemon::exit_reason`), and on a sidecar exit the GUI adds an `observed_exit`
+            (code or signal, and whether the GUI sent the kill itself) to the record. It does this
+            only when the record is still that process's `running` marker: same PID, and written
+            after the spawn, so a reused PID never matches. The write happens before the exit is
+            flagged, so no respawn can race it. The record still reads as unclean, and the next
+            boot logs `… never recorded a terminal reason; the app saw it end by signal 7 (SIGBUS)
+            at …`. New `nanna doctor` check `daemon.last_exit` surfaces the same verdict without the
+            log: a live daemon (checked on Linux through `/proc/<pid>/comm`, so a reused PID is not
+            mistaken for the daemon), a clean stop, or a WARN for an unclean death, a panic or an
+            IPC-server failure, with the log path and `coredumpctl` as the remedy. 6 + 1 + 4 tests.
       - [ ] `~/.claude/scheduled-tasks/_shared/tauri-webdriver.sh` prints the wrong package in its
             `ensure` failure text (it names `webkit2gtk-4.1`). Corrected in place on this host
             2026-09-14; the file lives outside this repo, so it is recorded here rather than in the PR.
@@ -9425,6 +10783,10 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            Compiler API, which the Go-native core does not expose until **7.1**; the tracking issue
            is [vuejs/language-tools#5381](https://github.com/vuejs/language-tools/issues/5381).
            Do NOT re-attempt until 7.1 ships or `vue-tsc` publishes a tsgo-backed release.)*
+           *(2026-10-03)* Re-tried once more because a search summary claimed "TS 7 support since
+           vue-tsc 3.3.8": **false for us** — `vue-tsc@3.3.12` + `typescript@7.0.2` dies in
+           `resolveTscPath` with the same `ERR_PACKAGE_PATH_NOT_EXPORTED`. Reverted. The rule
+           above stands; trust a release note, not a summary.
      - [ ] *(research 2026-08-27)* **Evaluate `vue-tsgo` as the TS-7 escape hatch if 7.1 slips.**
            Two independent Go/tsgo-backed Vue SFC type checkers now exist —
            [KazariEX/vue-tsgo](https://github.com/KazariEX/vue-tsgo) (by a Vue Language Tools core
@@ -9438,6 +10800,8 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            are expected to ship native builds "within a release cycle or two" after it. So the
            earliest realistic retry is Q4, and the two version numbers below (npm `typescript`
            `latest` still 7.0.2, `vue-tsc` still 3.3.11 on 2026-09-11) remain the cheap gate.
+           *(2026-10-09)* npm `typescript` `latest` is still 7.0.2; the `dev` channel is
+           publishing daily `7.1.0-dev.2026100x` builds, `vue-tsc` still 3.3.12. Nothing to retry.
            Sources: [DEV Community](https://dev.to/the-modern-web/why-angular-vue-and-eslint-cant-upgrade-to-typescript-70-yet-and-why-ts-71-changes-441g),
            [vuejs/language-tools#6121](https://github.com/vuejs/language-tools/discussions/6121).
      - [ ] *(2026-07-23)* **`typescript 5.9 → 7.0` (GA 2026-07-08, the Go-native `tsgo` port).** Breaking:
@@ -9449,6 +10813,53 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `pnpm outdated` reports `4.1.0 → 2.24.3` — the v4 line is published under `next`, so `latest`
            points at the *older* Vue-2 package. **Never let `pnpm update --latest` "upgrade" this one**;
            it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
+   - *(2026-10-09 sweep)* `cargo update` offered 15: taken **`toml 1.1.8` / `toml_edit 0.25.17` /
+     `toml_parser 1.1.5`** (the lock also re-resolved `cssparser-macros`' `syn` from 3 to 2 — same
+     checksum, the registry's dependency metadata changed). **Held back:** `rustpython-ruff_*
+     0.16.10` (re-checked: `cargo check -p rustpython-codegen` still fails E0026/E0308, so the
+     `get-size2 0.11`/`malachite 0.13`/`char_str` it drags in stay out too), and **`tauri 2.12.2`**
+     (its changes are two `@tauri-apps/api` fixes — awaitable unlisten for drag-drop/focus
+     listeners, `MenuItemOptions` in menu ops; [releases](https://v2.tauri.app/release/))
+     — `cargo update -p tauri` alone re-resolves ~20 Windows-only dependency edges *downwards*
+     (`windows-sys 0.61 → 0.59/0.60` for `rustix`, `tempfile`, `socket2`, `tray-icon`, …;
+     `windows 0.62 → 0.61` for `gpu-allocator`), a Windows-surface change this Linux host cannot
+     build. Take it as its own PR where `release-check`'s Windows job judges it. `cargo upgrade
+     --incompatible`: only `rten 0.27` (still blocked on `ocrs 0.13.1`). GUI: `@tauri-apps/api
+     2.12.2`, `plugin-shell 2.4.1`, `plugin-updater 2.13.2` (matching the Rust plugins already in
+     the lock), `marked 18.1.0`, `@lucide/vue 1.54.0`, `@playwright/test 1.64.0`, `happy-dom
+     20.14.6`; nuxt stays exactly 4.5.2 (the item below), TypeScript 7 still blocked. The pnpm
+     lock moved nuxt's peer set to `rolldown 1.2.13` / `oxc-parser 0.153.0` — `frontend-windows`
+     judges that. Verified: clippy 0 warnings, **2835 Rust tests / 89 binaries, 0 failures**,
+     vitest 437/437, typecheck 0 errors, `pnpm generate` green.
+   - *(2026-10-08 sweep)* `cargo update` → 37 compatible bumps, led by **`turso 0.8.2`** (stable,
+     2026-10-06; the exact pin moved `=0.8.1 → =0.8.2` so `turso` and `turso_core` stay in
+     lockstep) plus `hyper 1.12`, `h2 0.4.20`, `jiff 0.2.38`, `toml 1.1.7`, `zerocopy 0.8.62`,
+     `tauri-plugin-{shell 2.4.1, updater 2.13.2}`. **Held back, with the exact failure:**
+     `rustpython-ruff_* 0.16.5 → 0.16.10` is a semver break for `rustpython-codegen 0.6.0` (still
+     the latest): `ExprCompare` lost `left`/`comparators` and the comprehension `generators` became
+     `Box<[_]>` (E0026/E0308, 10 errors), so all five ruff crates stay at 0.16.5 via
+     `cargo update --precise`. `cargo upgrade --incompatible` offered only `rten 0.26 → 0.27`, and
+     it is the 0.24/0.25 story again: `ocrs 0.13.1` (latest, 2026-09-13) requires `rten ^0.26`, so
+     the bump resolves two `rten`s (dependabot #411 fails CI for the same reason). Not taken.
+     `turso_core 0.8.2` still requires `branches ^0.4.3` and no `branches 0.4.7` exists, so the
+     toolchain pin stays at nightly-2026-10-03. GUI: `nuxt 4.6.0`, `vue-router 5.4.0`,
+     `marked 18.1.0`, `@lucide/vue 1.53.0`, `@playwright/test 1.64.0` and the two Tauri plugin JS
+     halves in lockstep; TypeScript 7 still blocked (`vue-tsc` 3.3.12). Verified: clippy 0
+     warnings, **2828 Rust tests / 89 binaries, 0 failures**, vitest 437/437, typecheck 0 errors,
+     `pnpm generate` green.
+     - [ ] *(2026-10-08, same day)* **The GUI half was reverted: Nuxt 4.6.0 does not generate on
+           Windows.** The release build (`release.yml` run 37778398050) failed in `pnpm generate`:
+           every prerendered route answered 500, "Either manifest or precomputed data must be
+           provided" (nuxt `runtime/server/renderer/build-files.js` → `vue-bundle-renderer`
+           `createRendererContext`), while Linux generated fine locally and in CI. No PR check ran
+           `pnpm generate` on Windows (`release-check`'s Windows job builds only the daemon), so
+           new `frontend-windows.yml` now does, on any change to `gui/package.json`,
+           `pnpm-lock.yaml` or `nuxt.config.ts`. The GUI graph is back to the v0.3.38 lockfile
+           exactly (nuxt 4.5.2, now an exact pin, vite 8.3.2) — only the audit exemptions stay.
+           **Re-try nuxt 4.6.x** (and the other GUI bumps of this sweep) as its own PR, and let
+           `frontend-windows` judge it; check the windows `buildDir`/manifest path handling first
+           (the roadmap's 2026-07 "manifest-race mitigation" pinned `buildDir` for a related
+           Windows-only failure).
    - *(2026-09-27 sweep)* `cargo update` → the Tauri plugin minors (`dialog 2.8.0`, `fs 2.6.0`,
      `notification 2.5.0`, `process 2.4.0`, `shell 2.4.0`, `updater 2.13.0`,
      `tauri-winrt-notification 0.8.1`) plus `notify-rust 4.18.1`; the JS halves bumped in
@@ -9462,6 +10873,8 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            knowing on this Hyprland host, where the tray is a D-Bus client. Do nothing until a
            beta; then one migration item, verified over the `e2e-webdriver` harness.
            ([release](https://github.com/tauri-apps/tauri/releases/tag/tauri-v3.0.0-alpha.3))
+           *(re-checked 2026-10-04)* Still alpha: `tauri 3.0.0-alpha.4` (2026-10-01), `tauri-build
+           3.0.0-alpha.3`; stable line is `tauri 2.12.1` / `tauri-build 2.7.1`. No action.
    - *(2026-09-26 sweep)* `cargo update` → 57 lock changes, driven by **tauri 2.12.0** (`tauri-build`/
      `-codegen`/`-macros`/`-plugin` 2.7.0, `tao 0.37`, `muda 0.20`, `tray-icon 0.25`) plus `aegis 0.9.20`,
      `fancy-regex 0.19`, `brotli 9`. **`tauri-build 2.7.0` is the release carrying tauri#15831, so
@@ -9484,21 +10897,169 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      The updater plugin's 2.12 break (`allowDowngrades` left the JS `check()`) does not touch us:
      `useAppUpdater.ts` never passed it. Re-checked and unchanged: `rustpython-vm` still ends at
      0.5.0 (both pin-backs stay), `vue-tsc` still 3.3.11, TypeScript 7.1 unreleased.
-     - [ ] **`boa_engine 0.22.0` is on crates.io (2026-08-28) and depends on icu `~2.3`** — try
+     - [x] **`boa_engine 0.22.0` is on crates.io (2026-08-28) and depends on icu `~2.3`** — try
            replacing the boa git pin (rev `4f98f644`). The `~` ranges do not mix, so it needs icu
            2.3 across the whole graph; check what `deno_core`/`turso` resolve before starting.
            ([deps](https://crates.io/api/v1/crates/boa_engine/0.22.0/dependencies))
-     - [ ] **`turso` 0.7.2 is the latest stable (2026-07-30); we are exact-pinned at `=0.6.1`.** 0.7.0
+           *(2026-10-05 — already done; closing a stale box.)* `69a68aae` (2026-09-08) retired the
+           git pin for `boa_engine = "0.22"` from crates.io; nothing left to do here.
+     - [ ] *(found 2026-10-05)* **The toolchain pin cannot pass nightly-2026-10-03 until turso takes
+           `branches 0.5`.** nightly-2026-10-04 removed `core::intrinsics::abort`, and `branches 0.4.6`
+           calls it (`E0425` at `branches/src/lib.rs:45`), so no newer nightly compiles the workspace.
+           `branches` comes only through `turso_core`, which requires `^0.4.3` in 0.8.1 and in
+           0.8.2-pre.2 alike; `branches 0.5.1` (2026-10-04) is the fixed line, and a 0.4.x patch would
+           also do. Moved the pin 10-02 → 10-03 (the newest that builds, release 7m51s cold). Probe a
+           nightly with `cargo +nightly-<date> build --release -p branches` (1 s) before the full build.
+           Upstream: [branches#10](https://github.com/fereidani/branches/issues/10), fix in
+           [branches#11](https://github.com/fereidani/branches/pull/11) (the intrinsic was renamed in
+           rust-lang/rust#163574) — a 0.4.x patch release from that PR unblocks us with no turso change.
+           *(re-checked 2026-10-09)* Still blocked: no `branches 0.4.7` on crates.io (0.4.6, then
+           0.5.0/0.5.1), and `turso_core 0.8.3-pre.1` still requires `^0.4.3`. The same chain now
+           breaks docs.rs for 11 **burn 0.22.0** crates (`turso` comes in via `cubecl`'s optional
+           cache), so burn has filed it upstream too —
+           [tracel-ai/burn#6014](https://github.com/tracel-ai/burn/issues/6014) (2026-10-08). Mummu's
+           burn bump inherits this pin; check both trackers before moving either toolchain.
+     - [x] **`turso` 0.7.2 is the latest stable (2026-07-30); we are exact-pinned at `=0.6.1`.** 0.7.0
            brought MVCC passive checkpoints, recovery fixes and an MVCC-safe AUTOINCREMENT
            ([notes](https://github.com/tursodatabase/turso/releases/tag/v0.7.0)); 0.8.0 is in
            pre-release (pre.13, 2026-09-25). Migrate one minor at a time, release-build gated. It does
            **not** retire RUSTSEC-2026-0253: `tantivy 0.26.2` (2026-09-08) still requires
            `lru ^0.16.3`, and the fix is `lru ≥ 0.18.2`.
+           *(2026-10-01)* **`turso 0.8.0` and `0.8.1` (2026-09-29) are now stable**, and the pin
+           has since moved to `=0.7.2` — so this is one minor step, `0.7.2 → 0.8.1`, not two.
+           `cargo upgrade --incompatible` lists it as the only pinned holdout besides
+           `malachite-bigint`. Gate it like 0.7: release build + the storage suites + a boot
+           against a copy of a real `nanna.db`; check the 0.8 default features against
+           [turso#7660](https://github.com/tursodatabase/turso/issues/7660) while there.
+           ([lib.rs](https://lib.rs/crates/turso))
+           *(2026-10-03)* **Moved: `=0.7.2 → =0.8.1`, `default-features = false` + `mimalloc` +
+           `pure-rust-crypto`.** With turso's defaults 0.8.1 **does not compile here**:
+           `turso_core`'s FTS directory (`index_method/fts/directory.rs:345`) calls
+           `DynVec::new_in(DynAllocator)`, which only type-checks under `--cfg nightly`, and
+           without that cfg `DynVec` is a plain `Vec` (E0308). Nanna has no full-text index, so
+           `fts` is off (upstream: [turso#9463](https://github.com/tursodatabase/turso/issues/9463),
+           open) — which also removes `tantivy` and 33 other crates from the lockfile,
+           among them `zstd-sys` (C) and the unsound `lru 0.16.4`. `mimalloc` stays on because
+           it was a default before: turso installs it as the **process-wide
+           `#[global_allocator]`** (`turso/src/lib.rs:36`), so dropping it would swap the whole
+           binary's allocator — a perf change for another day, filed below. Gate: storage 239
+           tests, workspace 2789 passed / 0 failed, clippy 0 warnings, `cargo build --release -p
+           nanna-daemon` 6m52s, and a release boot against a copy of the operator's real 101 MB
+           `nanna.db` + WAL (3730 memories and 23 sessions load, "Daemon ready", no panic).
+           Unblocks the P12 `mummu` integration retry below (the turso split).
+           *(2026-10-08 — closing the box.)* Done since 10-03; the pin moved again today to
+           `=0.8.2` (stable 2026-10-06) in the dependency sweep.
+     - [x] *(found 2026-10-03)* **turso makes `mimalloc` (a C allocator) Nanna's global
+           allocator.** `turso` 0.7 and 0.8 both declare `#[global_allocator] static GLOBAL:
+           mimalloc::MiMalloc` under their default `mimalloc` feature, so every allocation in the
+           daemon — not only the database's — goes through C mimalloc, and nobody chose that.
+           Measure before deciding: idle RSS, the Suite 2/3 benches and a dream cycle with the
+           feature on vs off (system allocator); keep whichever wins, and state it in
+           `nanna-storage/Cargo.toml` as a decision rather than an inherited default.
+           *(2026-10-04 — measured, switched off.)* Release builds, both orders run: the in-RAM
+           recall scan at 50k (every recall and ingest) **11.2 → 4.7 ms** without it; `bulk_load`
+           at 50k (once per boot) **121 → 181 ms**; booting on a copy of the operator's 105 MB
+           store (3 730 memories, isolated, no model): ready in 0.12–0.22 s either way, peak RSS
+           ~295 → ~232 MB, but RSS after 60 s idle **~185 → ~237 MB** (mimalloc hands freed
+           memory back; glibc keeps it). `libmimalloc-sys` (C) leaves the build. Numbers in
+           `bench/BASELINE.md` Suite 2c and the decision in `nanna-storage/Cargo.toml`.
+           Not measured: a dream cycle (no summarizer model on this host).
+           - [x] **Watch the idle RSS over a long-lived daemon.** glibc's per-thread arenas keep
+                 freed memory, and the 60 s reading is already ~50 MB above mimalloc's. Sample
+                 the operator daemon's RSS over a day after this ships; if it climbs, the fix is
+                 cheap (`M_ARENA_MAX`/`malloc_trim` after `bulk_load`, or mimalloc back on with
+                 the scan's layout cost understood) — decide on the curve, not on one reading.
+                 *(2026-10-04, same run)* First step taken: `release_boot_heap` calls
+                 `malloc_trim(0)` once before "Daemon ready" (Linux glibc only). On the same
+                 store copy, RSS a minute after ready went **~237 → ~213 MB** and stopped
+                 growing (mimalloc: ~185 MB). Still open: the day-long curve.
+                 *(research 2026-10-05)* The 2026 fixes for this exact ratchet converge on two
+                 knobs: `mallopt(M_ARENA_MAX, 2..4)` before any thread starts, plus a trim when the
+                 process goes idle rather than on a clock (one report: 226 → 159 MB with
+                 arena_max=2 and a 128 KiB trim threshold). Nanna already has an idle gate (the
+                 dreaming idle check), so "trim on idle" needs no new timer. Still decide on the
+                 curve. ([ctox#248](https://github.com/metric-space-ai/ctox/pull/248),
+                 [ivygrep#409](https://github.com/bvolpato/ivygrep/pull/409),
+                 [scrypted#2027](https://github.com/koush/scrypted/discussions/2027)). No daemon was
+                 running on this host on 2026-10-05, so there is still no day-long sample.
+                 *(2026-10-05, measured)* **Idle, it is flat; under load, it climbs.** The release
+                 daemon ran isolated on a copy of the operator's store (3 730 memories, no model):
+                 idle for 19 min it held at 142.5 MB. Then a light load every 2 min (`memory.list`,
+                 which returns 14.4 MB, plus a keyword search and stats) stepped it up after big
+                 replies and held each step: **142 → 217 MB after one call, ~425 MB after nine,
+                 439 MB after twenty**. That is allocator retention, not a leak: it plateaus between
+                 steps. Two levers, A/B on the same load at nine cycles. **Fixed (shipped):**
+                 `MemoryService::list_all`, `stats` and the consolidation timescale read went
+                 through `all_entries()`, which **cloned every entry whole, including its embedding
+                 and every model bucket**, to read content, FSRS state or a timestamp. They now
+                 project under the read lock (`map_entries`), and the plateau drops to **~292–306
+                 MB**. `MALLOC_ARENA_MAX=2` on the old code reached ~352 MB. Still open: the steps
+                 that remain come from building the 14 MB reply itself (a `serde_json::Value` tree,
+                 then a string, then a frame). The next levers are a trim after a large reply, or
+                 serializing the list without the intermediate `Value`.
+                 *(2026-10-05, same run — decided on the curve.)* **Trim after a large reply.**
+                 `crate::heap::after_large_reply` runs `malloc_trim(0)` on the blocking pool once
+                 a reply of ≥ 1 MiB has been sent (and its string dropped), at most once per 10 s.
+                 Each trim took ~4.5 ms. Same load, four daemons side by side (KB RSS):
+                 | after | old | old + `MALLOC_ARENA_MAX=2` | clone fix | clone fix + trim |
+                 |---|---|---|---|---|
+                 | 9 cycles | ~425 000 | ~352 000 | ~300 000 | **~178 000** |
+                 | later | 608 000 (40, still climbing) | 366 000 (25) | 377 000 (25, climbing) | ~213 000 (15), drifting slowly |
+                 The boot trim moved into the same module. The trimmed daemon is not flat: it
+                 drifts at about a third of the untrimmed rate, which is fragmentation the trim
+                 cannot return. Not measured: a real operator day. Re-check the installed daemon's
+                 RSS after a day of use; the serialize-without-`Value` item below shrinks what is
+                 fragmented in the first place.
+           - [x] *(2026-10-05)* **Serialize `memory.list` without the intermediate `Value`.** The
+                 14 MB reply is built as a `serde_json::Value` tree, then a string, then a frame,
+                 several times the reply in transient heap. A typed `Serialize` struct written
+                 straight to the frame's string removes the tree. The trim already returns the
+                 transient, so this is CPU and peak heap, not retained RSS.
+                 *(2026-10-08)* Shipped. It was worse than the note said: `Response::success`
+                 ran `to_value` on the handler's `Value`, a **deep copy of every reply**, every
+                 request; it now takes the `Value` by move. `memory.list` writes typed rows
+                 (`MemoryListRow`) into a buffer reserved at an estimate of the final size
+                 (`RawJson::to_json`) and the server splices it into a frame allocated once at its
+                 exact size (`Reply::success_text`, sent by `IpcServer::send_reply` from
+                 `ControlPlane::handle_reply`). Same text on the wire: fields declared in the
+                 tree's sorted key order and floats widened to f64 as `json!` did (a first cut
+                 printed `0.9` where the tree printed `0.8999999761581421`; the oracle test now
+                 compares text, with values that have no exact f32). Measured on a 15.8 MB reply
+                 (3 927 memories, release, A/B): **78.8 → 66.7 ms** per call; RSS and VmHWM
+                 unchanged within noise (`bench/BASELINE.md` Suite 5). A first version that grew
+                 two 16 MB strings by doubling ratcheted RSS 107 → 204 MB and was not shipped.
      - [ ] *(P13, research 2026-09-26)* **FSRS-7 exists but is not shippable yet.** ts-fsrs merged it
            ([PR #520](https://github.com/open-spaced-repetition/ts-fsrs/pull/520), 2026-09-18,
            unreleased); `fsrs-rs` is at 6.6.2 with no FSRS-7, and no FSRS-7 default parameters are
            published (srs-benchmark experiments are still open). Re-check when `fsrs-rs` ships it;
            adopting it is the same retention-harness A/B the FSRS-6 weight decision needed.
+           *(re-checked 2026-10-08)* Still unreleased: `fsrs` 6.6.2 is the newest crate, but FSRS-7 has
+           reached fsrs-rs itself as open work ([fsrs-rs#463](https://github.com/open-spaced-repetition/fsrs-rs/pull/463),
+           aligning its training defaults with srs-benchmark). Watch for a 7.x crate.
+     - [ ] *(research 2026-09-29)* **Upstream is moving `turso_core` to pure Rust by default** —
+           [tursodatabase/turso#7660](https://github.com/tursodatabase/turso/issues/7660) proposes
+           putting `aegis` and `simsimd` behind a feature flag. We already select
+           `pure-rust-crypto`; when the 0.8 line lands, check whether the default feature set
+           drops the C builds outright (and whether our feature list can shrink). Also re-checked:
+           `vue-tsc` is still 3.3.11 with no TypeScript 7 support, and TS 7.1 (the stable API)
+           has no date.
+     - [ ] *(P20, research 2026-10-09)* **Liquid's LFM2.5-8B-A1B is an MoE built for tool calling
+           on consumer hardware** — 8.3 B total, ~1.5 B active per token, so it decodes at
+           small-model speed while fitting the 16 GB tier with room for the context. Our LFM
+           history (2026-08-03 paces: the gap was capability, not dialect) is with the dense
+           1.2 B; this is the first LFM with a plausible capability jump at our VRAM budget.
+           Run it through the scripted e2e and one endurance leg before considering it as a
+           default (Ollama tag permitting). Sources:
+           [LocalAI Master — Ollama tool-calling models](https://localaimaster.com/blog/best-ollama-models-tool-calling),
+           [Medium — tiny models for tool calling](https://medium.com/@minhle_0210/5-tiny-language-models-for-tool-calling-part-3-ebcda32c2518).
+     - [ ] *(P20, research 2026-09-28)* **Qwen 3.8 ships no model for the 16 GB tier.** The open
+           weights are 27B dense (2026-08-14, Apache-2.0), Flash-Next (180B-A6B) and 2.4T-A95B —
+           no 4B/8B/14B this generation ([lineup](https://codersera.com/blog/qwen-3-8-model-lineup-2026/),
+           [repo](https://github.com/QwenLM/Qwen3.8)). 27B at Q4 is ~16 GB before the desktop's
+           5–6 GB, so it does not fit the reference card; the local roster stays qwen3.5:9b /
+           ornith. Re-check if a Qwen3.8 small dense model lands. Also noted: turso is now at
+           `0.8.0-pre.14` (2026-09-28), still pre-release — the one-minor-at-a-time item above
+           stands.
      - [ ] *(P20, research 2026-09-26)* **IBM Granite 4.2 8B** (Apache-2.0, card dated 2026-08-25,
            "reasoning-augmented tool calling", 512K context) is the one new tool-calling model in the
            16 GB class this month ([card](https://huggingface.co/ibm-granite/granite-4.2-8b)). No
@@ -9669,9 +11230,14 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            removed on purpose rather than passing forever. **Verified it catches the real
            regression**: re-running `cargo update -p malachite-bigint` makes it report
            `resolved to 2 versions ["0.9.2", "0.10.0"]` plus the pin-back command.
-     - [ ] Drop the `malachite-bigint` lock pin once `rustpython-codegen` accepts 0.10.
+     - [x] Drop the `malachite-bigint` lock pin once `rustpython-codegen` accepts 0.10.
            *(re-checked 2026-08-27: `rustpython-{codegen,stdlib}` still 0.5.0 and `pymath` still
            0.2.0 — unchanged since 2026-08-25, so the pin stays.)*
+           *(2026-10-02)* **Dropped.** `rustpython 0.6.0` is out and every one of its paths
+           resolves `malachite-bigint 0.12.0`, the version `pymath` takes too — one copy in the
+           graph with no pin. The `=0.9.2` req in `nanna-scripting` is deleted; the
+           unification guard stays (it now keeps 0.12.0) because the split returns the day
+           malachite publishes a 0.13 that `pymath`'s `"0"` req accepts.
      - [ ] `criterion 0.8 → "0.7"`: `cargo upgrade --incompatible` reports this every run and it is a
            **downgrade** — 0.8.2 is what resolves and builds. Do not take it.
      - [ ] `lopdf 0.45 → "0.42"`: **same trap, first seen 2026-09-09.** `cargo upgrade
@@ -9690,6 +11256,10 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            remembered pin would have missed. Re-checked both retirement conditions: rustpython-
            {vm,stdlib,codegen} still 0.5.0 (2026-03-31) and pymath still 0.2.0, so both pins stay.
            GUI: `pnpm outdated` clean except the blocked TypeScript 7. 1722 tests green.
+     - [x] *(2026-09-29)* **Toolchain pin moved `nightly-2026-09-20` → `nightly-2026-09-28`**
+           (rustc 1.101.0, d080e7dff). Cold `cargo build --release -p nanna-daemon` green in
+           8m12s; full gate re-run from a cold debug dir: 2731 tests, clippy 0 warnings — no new
+           lints this time. Mirrored into `budget-gate`, `release-check` and `test-compile`.
      - [x] *(2026-09-20)* **Toolchain pin moved `nightly-2026-09-08` → `nightly-2026-09-20`**
            (rustc `feaadeeac`, cargo `495c385d0`). Release-built `-p nanna-daemon` green from a
            cold, isolated target dir in **9m06s** — no tokio ICE, no `turso_core` depth overflow —
@@ -9743,8 +11313,11 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            condition that retires the pin. Verified it fires: re-running
            `cargo update -p libc --precise 0.2.189` makes it report
            `libc resolved to 0.2.189 but must stay at or below 0.2.186`. Runs in 0.00s.
-     - [ ] Drop the `libc` ceiling the moment rustpython publishes anything after 0.5.0 — the fix is
+     - [x] Drop the `libc` ceiling the moment rustpython publishes anything after 0.5.0 — the fix is
            already upstream, so this is a release-watch, not a migration.
+           *(2026-10-02)* **Lifted.** rustpython 0.6.0 compiles against `libc 0.2.189` (the
+           `nanna-scripting --all-features` check, the workspace tests and `cargo build --release -p
+           nanna-daemon` are green); `CEILING_CRATES` is empty, the mechanism kept.
    - *(2026-07-16 sweep)* `cargo update` → 12 compatible bumps (`tokio 1.52.4`, `uuid 1.24.0`,
      `keyring 4.1.5`, `regex 1.13.1`, `clap 4.6.2`, `syn 2.0.119`, `bitflags 2.13.1`, `bstr 1.13.0`,
      `regex-automata 0.4.16`, `simd-adler32 0.3.10`, `which 8.0.5`). `cargo upgrade --incompatible` →
@@ -9849,7 +11422,8 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      errors about `malachite_bigint::BigUint`/`BigInt` ("there are multiple different versions of crate
      `malachite_bigint`"). Pinned back with
      `cargo update -p malachite-bigint@0.10.0 --precise 0.9.2`.
-     - [ ] Drop that pin when `rustpython 0.6` (or any release that moves to malachite 0.10) lands.
+     - [x] Drop that pin when `rustpython 0.6` (or any release that moves to malachite 0.10) lands.
+           *(2026-10-02 — dropped; see the `malachite-bigint` item above.)*
      **Verification:** workspace (excl. `nanna-gui`) builds green, **1555 tests pass / 0 failures**,
      `cargo clippy -p nanna-memory --all-targets` **0 errors**, and — closing the gate hole logged
      below — a **`cargo build --release -p nanna-daemon` was run and is green** on the pinned
@@ -9932,6 +11506,10 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `ocrs::OcrEngineParams`, so bumping our direct req puts two `rten` versions in one graph and
            the two `Model` types stop being the same type. Re-check when `ocrs` ships a release that
            tracks `rten 0.25`.
+           *(2026-10-03)* Same block one step later: we are now on `ocrs 0.13.1` + `rten 0.26`,
+           `rten 0.27.0` shipped 2026-10-02, and `ocrs 0.13.1` (still the latest) requires
+           `rten ^0.26.0` (and `rten-imageproc`/`rten-tensor ^0.26.0`). Not taken; re-check when
+           `ocrs` moves.
      - [ ] **The `turso_core` release build is non-deterministic under the parallel rustc frontend.**
            On the pinned `nightly-2026-08-03`, `cargo build --release -p nanna-daemon` failed once with
            `error: queries overflow the depth limit!` in `turso_core 0.6.1` and then **succeeded on an
@@ -10085,6 +11663,29 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            **(b) A slow run cannot be cut short safely**, because killing a `cargo` mid-flight
            risks corrupting the shared target dir. It has to be waited out.
            Fix: stagger the schedules, or have each routine take a shared cross-repo lock and defer.
+   - *(2026-10-02, toolchain)* **Pin moved `nightly-2026-09-28 → nightly-2026-10-02`** (rustc
+     1.101.0-nightly c36f14571). Cold `cargo build --release -p nanna-daemon` 9m43s, green; two
+     lints newly fire on old code and were fixed on both channels — `items_after_test_module`
+     (`nanna-storage/src/lib.rs` had ~1 000 lines of items after its test module; the module moved
+     to the end, a pure move) and `needless_borrows_for_generic_args` (`.map(&string_vec)` on a
+     capture-free closure). Full gate under it: clippy 0/0 (workspace and `nanna-gui`), **2 789
+     tests passed, 0 failed**. CI mirrors (`budget-gate`, `release-check`, `test-compile`) moved
+     with it.
+   - *(2026-10-02 sweep)* **`rustpython 0.5 → 0.6` (vm/stdlib/pylib), and both of its pins retire.**
+     `cargo upgrade --incompatible` offered it (plus `rten 0.26 → 0.27`, refused: `ocrs 0.13.1`
+     still requires `rten 0.26`, the unification guard's case). 0.6 compiled with **no source
+     change** (`nanna-scripting --all-features --all-targets` check, 50 s), resolves every path to
+     `malachite-bigint 0.12.0` and builds against `libc 0.2.189`, so the `=0.9.2` manifest pin and
+     the libc ceiling are deleted (see the items above) — the first sweep since 2026-08-22 with no
+     pin-back step. `cargo update` otherwise: `cfg-expr 0.20.10`, `libc 0.2.189`. GUI: Tauri npm
+     packages to the patch level the Rust crates already had (`@tauri-apps/api`/`cli` 2.12.1,
+     `plugin-dialog` 2.8.1, `plugin-notification` 2.5.1, `plugin-updater` 2.13.1) and `vue-tsc
+     3.3.12`; `typescript 7.0.2` still declined (blocked, above). Gate: clippy `-D warnings` green,
+     `cargo build --release -p nanna-daemon` green (10 min — the build that used to catch the
+     malachite split), typecheck 0 errors, 403/403 vitest. The workspace test run surfaced one
+     real flake, fixed: `a_card_runs_question_becomes_a_clarification_card` polled for the
+     card's new dependency, but `ask_on_card` writes it *before* posting the question, so a poll
+     between the two writes failed; it now waits for both.
    - *(2026-09-17 sweep)* `cargo update` -> 19 compatible bumps (`aegis 0.9.16`, `syn 3.0.6`,
      `unicode-ident 1.0.26`, `rustix 1.1.5`, `zlib-rs 0.6.8`, `derive-where 1.7.0`, ...; `synstructure`
      dropped out of the tree). `cargo upgrade --incompatible` offered **one real row** -
@@ -10560,6 +12161,23 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
                        item 4 (Mummu's MiniLM embedder behind the memory `embed_fn`) buildable.
                        The 0.8.0-pre watch above is now load-bearing for P12, not just for P13's
                        indexing question.
+                       *(2026-10-03)* **Nanna's half is done** — the pin is `=0.8.1` (see the turso
+                       item in Dependencies). **Mummu's half is not:** its `origin/main` (c49de14)
+                       still pins `burn 0.22.0-pre.3`, so its lockfile still carries
+                       `cubecl-environment 0.11.0-pre.3` → `rusqlite 0.40.2` / `libsqlite3-sys
+                       0.38.2`, and `burn 0.22.0-pre.4` has been on crates.io since 2026-09-22. The
+                       next step is Mummu's burn bump (its routine's item); re-try adding `mummu`
+                       here only after its lockfile is free of `rusqlite`.
+                       *(research 2026-10-08)* **The chain lines up exactly now.** `burn 0.22.0` went
+                       stable on 2026-10-06; `burn-cubecl 0.22.0` → `cubecl ^0.11.0` →
+                       `cubecl-environment 0.11.0`, whose only database dependency is an *optional*
+                       `turso ^0.8.2` — no `rusqlite` — and Nanna's pin moved to `=0.8.2` today, so a
+                       Mummu on burn 0.22.0 should resolve to **one** turso in Nanna's graph.
+                       ([crates.io deps](https://crates.io/api/v1/crates/cubecl-environment/0.11.0/dependencies))
+                       Mummu's `origin/main` (58f8ad2) still pins `0.22.0-pre.3` with `rusqlite 0.40.2`
+                       in its lock, so the step is still Mummu's: pre.3 → 0.22.0 stable (no longer a
+                       pre-release on an exact pin), re-run its parity harness, then add `mummu` here
+                       and read the lockfile.
                  - [ ] **Measure before deciding, if 0.8.0 stays unstable:** add `mummu` at
                        burn 0.22-pre.4 on a scratch branch and read the resolved lockfile. If the
                        guard passes and the second turso is confined to cubecl's autotune cache,

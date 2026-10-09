@@ -14,6 +14,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+/// What one turn through [`AppState::process_message_reply`] produced.
+#[derive(Debug, Clone)]
+pub struct ProcessedReply {
+    /// The agent's reply text.
+    pub text: String,
+    /// The assistant row this turn stored, or `None` when the write failed.
+    pub stored: Option<nanna_storage::Message>,
+}
+
 /// A recently stored memory (for feedback attribution)
 #[derive(Debug, Clone)]
 pub struct RecentMemory {
@@ -554,6 +563,28 @@ impl AppState {
         message: &str,
         system_prompt: Option<&str>,
     ) -> Result<String, nanna_agent::AgentError> {
+        self.process_message_reply(session_id, message, system_prompt)
+            .await
+            .map(|reply| reply.text)
+    }
+
+    /// [`Self::process_message`], also handing back the stored assistant row.
+    ///
+    /// The REST `send_message` route answers with the row's id and timestamp.
+    /// It used to re-read the session for them with an oldest-first query
+    /// limited to one row, so every reply after a session's first answered
+    /// with the session's FIRST message. The row `create` returns is the one
+    /// this turn wrote; `stored` is `None` only when that write failed, and
+    /// the reply text is still the agent's.
+    ///
+    /// # Errors
+    /// Returns the agent's error when the run fails.
+    pub async fn process_message_reply(
+        &self,
+        session_id: &str,
+        message: &str,
+        system_prompt: Option<&str>,
+    ) -> Result<ProcessedReply, nanna_agent::AgentError> {
         // Store user message first
         let _ = self
             .storage
@@ -629,7 +660,7 @@ impl AppState {
         };
 
         // Store assistant response
-        let _ = self
+        let stored = self
             .storage
             .messages()
             .create(nanna_storage::NewMessage {
@@ -642,9 +673,24 @@ impl AppState {
                 tokens_out: Some(i64::from(response.output_tokens)),
                 metadata: None,
             })
-            .await;
+            .await
+            .map_err(|e| tracing::warn!(session_id, "Failed to store assistant reply: {e}"))
+            .ok();
+        debug_assert!(
+            stored
+                .as_ref()
+                .is_none_or(|row| row.session_id == session_id),
+            "the stored reply belongs to this session"
+        );
+        debug_assert!(
+            stored.as_ref().is_none_or(|row| row.role == "assistant"),
+            "the stored reply is the assistant's row"
+        );
 
-        Ok(response.text)
+        Ok(ProcessedReply {
+            text: response.text,
+            stored,
+        })
     }
 }
 

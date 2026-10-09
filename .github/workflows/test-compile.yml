@@ -57,12 +57,12 @@ jobs:
       # rust-toolchain.toml, so the pinned channel is passed explicitly rather
       # than `@nightly`. Keep it in lockstep with rust-toolchain.toml — that
       # file carries the pin's rationale and the condition for removing it.
-      # (The channel below is nightly-2026-09-20; an earlier version of this
+      # (The channel below is nightly-2026-10-03; an earlier version of this
       # comment still named the superseded nightly-2026-07-13 pin.)
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-09-20
+          toolchain: nightly-2026-10-03
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
@@ -113,7 +113,7 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-09-20
+          toolchain: nightly-2026-10-03
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
@@ -152,7 +152,7 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-09-20
+          toolchain: nightly-2026-10-03
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -206,7 +206,7 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-09-20
+          toolchain: nightly-2026-10-03
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -252,7 +252,7 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-09-20
+          toolchain: nightly-2026-10-03
           targets: aarch64-unknown-linux-musl,aarch64-unknown-linux-gnu
           components: clippy
 

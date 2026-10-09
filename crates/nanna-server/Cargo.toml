@@ -8,9 +8,7 @@ tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-thiserror.workspace = true
 anyhow.workspace = true
-reqwest.workspace = true
 
 nanna-core = { path = "../nanna-core" }
 nanna-config = { path = "../nanna-config" }
@@ -22,11 +20,10 @@ nanna-channels = { path = "../nanna-channels" }
 
 # Web framework
 axum = { version = "0.8", features = ["macros"] }
-tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "trace", "compression-gzip"] }
 
 # Utilities
-uuid = { version = "1.26", features = ["v4", "serde"] }
+uuid = { version = "1.27", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # Discord signature verification

@@ -423,14 +423,15 @@ impl MemoryService {
                         debug!("Backfill for '{model}' abandoned — provider changed underneath it");
                         break;
                     }
-                    if let Err(e) = self
+                    match self
                         .store
-                        .set_embedding_for_model(&id, model, embedding, true)
+                        .set_embedding_if_content(&id, model, embedding, &content)
                         .await
                     {
-                        debug!("Backfill could not store embedding for {id}: {e}");
-                    } else {
-                        filled += 1;
+                        Ok(true) => filled += 1,
+                        // Edited mid-embed: this vector is of the old text.
+                        Ok(false) => debug!("Backfill skipped {id}: its content changed"),
+                        Err(e) => debug!("Backfill could not store embedding for {id}: {e}"),
                     }
                 }
                 Err(e) => {
@@ -880,18 +881,29 @@ impl MemoryService {
             }
         };
 
-        // Check for similar existing memories
-        let results = self.store.search(&embedding, 1).await;
+        // Check for similar existing GLOBAL memories: this path writes a
+        // global row, so a workspace's private row is never its neighbour.
+        let results = self.store.search_owned_by(&embedding, 1, None).await;
         
         if let Some((existing, similarity)) = results.first() {
             let action = IngestAction::from_similarity(*similarity);
             
             match action {
-                IngestAction::Reinforce => {
+                // Same rule as `remember_with_importance`: only a neighbour that
+                // already holds this text verbatim may absorb it unwritten.
+                IngestAction::Reinforce if existing.content.trim().contains(content.trim()) => {
                     // Just strengthen existing memory
                     self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
                     info!("Reinforced: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
                     return Ok((existing.id.clone(), action));
+                }
+                // Near-identical but not contained: rate the neighbour, keep the
+                // text as its own row (no second embed; dreaming folds later).
+                IngestAction::Reinforce => {
+                    self.pending_updates
+                        .write()
+                        .await
+                        .push((existing.id.clone(), Rating::Good));
                 }
                 IngestAction::Update => {
                     // Related-but-distinct: fold new information into the existing
@@ -913,7 +925,9 @@ impl MemoryService {
                             );
                             return Ok((existing.id.clone(), IngestAction::Update));
                         }
-                        FoldResult::Subset => {
+                        // `Subset` is also the byte bound declining the append,
+                        // so it discards only what is provably already there.
+                        FoldResult::Subset if existing.content.trim().contains(content.trim()) => {
                             info!(
                                 "Update no-op (subset): {} (sim: {:.3})",
                                 truncate(&existing.content, 30),
@@ -921,9 +935,10 @@ impl MemoryService {
                             );
                             return Ok((existing.id.clone(), IngestAction::Update));
                         }
-                        // The neighbour changed under the fold; the content
-                        // landed nowhere, so it must still become a row.
-                        FoldResult::Contended => {
+                        // The neighbour changed under the fold, or the bound
+                        // declined it: the content landed nowhere, so it must
+                        // still become a row.
+                        FoldResult::Subset | FoldResult::Contended => {
                             debug!(
                                 "Fold contended (memory changed mid-merge); \
                                  storing separately (sim: {:.3})",
@@ -1134,8 +1149,10 @@ impl MemoryService {
             }
         };
 
-        // Check for similar existing memories (duplicate detection)
-        let results = self.store.search(&embedding, 1).await;
+        // Check for similar existing GLOBAL memories (duplicate detection):
+        // this path writes a global row, so a workspace's private row is never
+        // its neighbour.
+        let results = self.store.search_owned_by(&embedding, 1, None).await;
         
         if let Some((existing, similarity)) = results.first() {
             let action = IngestAction::from_similarity(*similarity);
@@ -1145,7 +1162,14 @@ impl MemoryService {
                 || existing.content.contains("Command failed");
 
             match action {
-                IngestAction::Reinforce if !skip_reinforce => {
+                // A near-duplicate that already holds this text verbatim: only
+                // strengthen it. Without the containment check, any new detail
+                // in the top similarity band ("…, allergic to chicken") was
+                // dropped and logged as a reinforcement — the invariant
+                // `remember_scoped` keeps: discard only what is provably present.
+                IngestAction::Reinforce
+                    if !skip_reinforce && existing.content.trim().contains(content.trim()) =>
+                {
                     // Just strengthen existing memory (testing effect)
                     self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
                     // Also boost importance if new fact has higher importance
@@ -1159,6 +1183,17 @@ impl MemoryService {
                     }
                     info!("Reinforced: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
                     return Ok((existing.id.clone(), action));
+                }
+                // Near-identical but NOT contained: the neighbour is rated, and
+                // the text gets a row of its own. Its embedding is already in
+                // hand, so this costs the write path no second round-trip (a
+                // fold would re-embed the merged text); squeezing the pair is
+                // dreaming's job, with the whole corpus in view.
+                IngestAction::Reinforce if !skip_reinforce => {
+                    self.pending_updates
+                        .write()
+                        .await
+                        .push((existing.id.clone(), Rating::Good));
                 }
                 IngestAction::Update if !skip_reinforce => {
                     // Related-but-distinct: fold new information in (dedup) and reinforce.
@@ -1303,8 +1338,8 @@ impl MemoryService {
             }
         };
 
-        // Check for similar existing memories (within same scope)
-        let results = self.store.search_scoped(&embedding, 1, workspace_id.as_deref()).await;
+        let owner = workspace_id.as_deref(); // same-scope neighbours only
+        let results = self.store.search_owned_by(&embedding, 1, owner).await;
         
         if let Some((existing, similarity)) = results.first() {
             let action = IngestAction::from_similarity(*similarity);
@@ -1871,16 +1906,18 @@ impl MemoryService {
 
     /// Get memory statistics
     pub async fn stats(&self) -> MemoryStats {
-        let entries = self.store.all_entries().await;
         let params = &self.config.fsrs;
-        
+        // Projected, not `all_entries`: that clones every vector of every
+        // entry to count four states.
+        let fsrs_states = self.store.map_entries(|entry| entry.fsrs.state(params)).await;
+
         let mut stats = MemoryStats {
-            total: entries.len(),
+            total: fsrs_states.len(),
             ..MemoryStats::default()
         };
-        
-        for entry in entries {
-            match entry.fsrs.state(params) {
+
+        for state in fsrs_states {
+            match state {
                 MemoryState::Active => stats.active += 1,
                 MemoryState::Dormant => stats.dormant += 1,
                 MemoryState::Silent => stats.silent += 1,
@@ -1893,28 +1930,29 @@ impl MemoryService {
     }
 
     /// Get all memories with their FSRS state
+    ///
+    /// Projected under the store's read lock rather than through
+    /// `all_entries`, which clones every entry whole: the current embedding
+    /// and every model bucket (6 KiB per 1536-dim vector per model), none of
+    /// which a list entry carries. On a 3 730-memory store that clone was
+    /// most of a `memory.list` call's transient heap, and glibc kept the high
+    /// water: one call took an idle daemon from ~142 to ~217 MB RSS.
     pub async fn list_all(&self) -> Vec<MemoryListEntry> {
-        let entries = self.store.all_entries().await;
         let params = &self.config.fsrs;
-        
-        entries.into_iter().map(|e| {
-            let weight = e.fsrs.weight(params);
-            let state = e.fsrs.state(params);
-            let retrievability = e.fsrs.retrievability(params);
-            
-            MemoryListEntry {
-                id: e.id,
-                content: e.content,
-                metadata: e.metadata,
+        self.store
+            .map_entries(|e| MemoryListEntry {
+                id: e.id.clone(),
+                content: e.content.clone(),
+                metadata: e.metadata.clone(),
                 timestamp: e.timestamp,
-                state,
-                weight,
-                retrievability,
+                state: e.fsrs.state(params),
+                weight: e.fsrs.weight(params),
+                retrievability: e.fsrs.retrievability(params),
                 importance: e.fsrs.importance,
                 access_count: e.fsrs.access_count,
-                workspace_id: e.workspace_id,
-            }
-        }).collect()
+                workspace_id: e.workspace_id.clone(),
+            })
+            .await
     }
 
     /// Every memory as an export record: content, provenance, workspace, the
@@ -1983,6 +2021,15 @@ impl MemoryService {
         self.note_vector_queued();
         info!("Updated memory content: {} (queued for re-embedding)", id);
         Ok(())
+    }
+
+    /// Replace a memory's tags. See [`crate::VectorStore::set_tags`].
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::VectorStore::set_tags`].
+    pub async fn set_tags(&self, id: &str, tags: &[String]) -> Result<(), MemoryError> {
+        self.store.set_tags(id, tags).await
     }
 
     /// Forget every memory in `ids`, durably. See
@@ -2253,11 +2300,8 @@ impl MemoryService {
     async fn with_store_timescale(&self, config: &ConsolidationConfig) -> ConsolidationConfig {
         let mut config = config.clone();
         let span_minutes = {
-            let all = self.store.all_entries().await;
-            match (
-                all.iter().map(|e| e.timestamp).min(),
-                all.iter().map(|e| e.timestamp).max(),
-            ) {
+            let times = self.store.map_entries(|e| e.timestamp).await;
+            match (times.iter().min(), times.iter().max()) {
                 (Some(first), Some(last)) => (last - first).lossy_f32() / 60.0,
                 _ => 0.0,
             }
@@ -3466,6 +3510,119 @@ mod tests {
             "every byte handed in is a byte stored"
         );
         assert!(stored.content.ends_with("TAIL"), "the tail survived");
+    }
+
+    /// A write folds into, reinforces, or is discarded against only a memory
+    /// owned like the one it writes. The neighbour search used to be the READ
+    /// scope (a workspace's rows plus the global ones, or everything), so a
+    /// workspace's private detail was folded into a global row every other
+    /// workspace recalls, and a global fact was swallowed by one workspace's
+    /// private row.
+    #[tokio::test]
+    async fn an_ingest_never_folds_across_a_workspace_boundary() {
+        use std::sync::Arc;
+
+        // Every text embeds identically: each neighbour is in the Reinforce band.
+        let embed: EmbedFn =
+            Arc::new(|_text: &str| Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0]) }));
+        let config = MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        };
+        let service = MemoryService::new(config).with_embed_fn(embed);
+
+        let (global, _) = service
+            .remember_with_importance("deploy uses port 5149", HashMap::new(), 3.0)
+            .await
+            .expect("global write");
+        let (private, action) = service
+            .remember_scoped(
+                "deploy uses port 5149 behind the A-only VPN",
+                HashMap::new(),
+                3.0,
+                Some("ws-a".into()),
+            )
+            .await
+            .expect("workspace write");
+        assert_ne!(private, global, "the private detail got its own row");
+        assert_eq!(action, IngestAction::Create);
+        let global_row = service.store.get(&global).await.expect("global row");
+        assert_eq!(
+            global_row.content, "deploy uses port 5149",
+            "the global row is untouched"
+        );
+        assert_eq!(global_row.workspace_id, None);
+        let private_row = service.store.get(&private).await.expect("private row");
+        assert_eq!(private_row.workspace_id.as_deref(), Some("ws-a"));
+
+        // And the other way: with only a private neighbour, a global fact is a
+        // global row of its own, not a "reinforcement" of ws-a's memory.
+        let fresh = MemoryService::new(MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        })
+        .with_embed_fn(Arc::new(|_text: &str| {
+            Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0]) })
+        }));
+        let (private, _) = fresh
+            .remember_scoped("a private note", HashMap::new(), 3.0, Some("ws-a".into()))
+            .await
+            .expect("workspace write");
+        let (public, _) = fresh
+            .remember_with_importance("a public note", HashMap::new(), 3.0)
+            .await
+            .expect("global write");
+        assert_ne!(public, private);
+        let public_row = fresh.store.get(&public).await.expect("public row");
+        assert_eq!(public_row.workspace_id, None);
+        assert_eq!(public_row.content, "a public note");
+    }
+
+    /// The top similarity band is "probably the same fact", not "provably the
+    /// same text": a new detail there must land somewhere — folded into the
+    /// neighbour or as its own row — never be dropped as a reinforcement.
+    #[tokio::test]
+    async fn a_new_detail_in_the_reinforce_band_is_kept() {
+        use std::sync::Arc;
+
+        for path in ["smart_ingest", "remember_with_importance"] {
+            let service = MemoryService::new(MemoryServiceConfig {
+                dimension: 3,
+                ..Default::default()
+            })
+            .with_embed_fn(Arc::new(|_text: &str| {
+                Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0]) })
+            }));
+            let ingest = |text: &'static str| {
+                let service = &service;
+                async move {
+                    if path == "smart_ingest" {
+                        service.smart_ingest(text, HashMap::new()).await
+                    } else {
+                        service
+                            .remember_with_importance(text, HashMap::new(), 3.0)
+                            .await
+                    }
+                }
+            };
+            ingest("dog Rex is a beagle").await.expect("first write");
+            // Identical embeddings: cosine 1.0, the Reinforce band.
+            ingest("dog Rex is a beagle, allergic to chicken")
+                .await
+                .expect("second write");
+            let kept = service
+                .store
+                .all_entries()
+                .await
+                .iter()
+                .any(|entry| entry.content.contains("allergic to chicken"));
+            assert!(kept, "{path}: the new detail was dropped");
+
+            // A true restatement is still only a reinforcement.
+            let before = service.store.all_entries().await.len();
+            ingest("dog Rex is a beagle").await.expect("restatement");
+            assert_eq!(service.store.all_entries().await.len(), before, "{path}");
+        }
     }
 
     #[test]

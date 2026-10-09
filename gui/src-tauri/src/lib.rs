@@ -99,11 +99,14 @@ async fn hydrate_workspaces(backend: &Backend, cache: &RwLock<WorkspaceRegistry>
     }
 }
 
-/// Build the thin-client [`AppState`]. All heavy subsystems live in the daemon.
+/// The GUI's copy of the config, read from disk the way the boot reads it.
 ///
-/// Nothing here needs the daemon. The state has to exist before the daemon
-/// answers, which can take minutes, because every command needs it.
-fn setup_state(backend: Arc<Backend>, log_buffer: LogBuffer) -> AppState {
+/// Also how the copy is REFRESHED when the daemon announces a change: the copy
+/// used to be read once at boot, and every local settings setter saves the
+/// whole copy back — so a change the daemon had written in between (a tool
+/// disabled on the Tools page, a `config set`, a hand edit) was silently
+/// reverted by the next unrelated setting.
+pub(crate) fn load_gui_config() -> Config {
     let mut config = Config::load().unwrap_or_default().with_env_overrides();
 
     // `Config::load` already hydrated `llm.anthropic_oauth_token` from the
@@ -118,6 +121,15 @@ fn setup_state(backend: Arc<Backend>, log_buffer: LogBuffer) -> AppState {
         info!("Rehydrated Anthropic OAuth token from Claude CLI credential store");
         config.llm.anthropic_oauth_token = Some(loaded.credential.access_token);
     }
+    config
+}
+
+/// Build the thin-client [`AppState`]. All heavy subsystems live in the daemon.
+///
+/// Nothing here needs the daemon. The state has to exist before the daemon
+/// answers, which can take minutes, because every command needs it.
+fn setup_state(backend: Arc<Backend>, log_buffer: LogBuffer) -> AppState {
+    let config = load_gui_config();
 
     let workspaces = Arc::new(RwLock::new(WorkspaceRegistry::new()));
 
@@ -168,9 +180,6 @@ macro_rules! command_handler {
             commands::sessions::set_session_tools,
             commands::settings::get_config,
             commands::settings::set_model,
-            commands::memory::search_memory,
-            commands::memory::get_memory_stats,
-            commands::system::show_window,
             commands::system::hide_to_tray,
             commands::settings::get_extended_settings,
             commands::settings::set_provider_api_key,
@@ -185,11 +194,9 @@ macro_rules! command_handler {
             commands::settings::get_daemon_providers,
             commands::settings::get_mcp_servers,
             commands::system::get_cost_rollup,
-            commands::settings::check_env_var,
             // Cognitive memory (FSRS-6 + dreaming)
             commands::memory::get_cognitive_memory_stats,
             commands::memory::trigger_consolidation,
-            commands::memory::apply_memory_updates,
             // Memory & scheduling settings
             commands::memory::set_auto_remember_messages,
             commands::memory::set_max_compression_ratio,
@@ -197,7 +204,6 @@ macro_rules! command_handler {
             commands::scheduler::set_scheduler_enabled,
             commands::scheduler::set_heartbeat_enabled,
             commands::scheduler::set_heartbeat_interval,
-            commands::settings::set_extraction_model,
             // Embedding configuration
             commands::settings::set_embedding_config,
             commands::settings::get_ollama_models,
@@ -214,10 +220,8 @@ macro_rules! command_handler {
             commands::settings::set_claude_proxy,
             commands::settings::check_claude_proxy_health,
             // Memory persistence
-            commands::memory::save_memories,
             // Memory management
             commands::memory::list_memories,
-            commands::memory::get_memory,
             commands::memory::delete_memory,
             commands::memory::update_memory,
             commands::memory::clear_memories,
@@ -232,9 +236,6 @@ macro_rules! command_handler {
             commands::channels::save_channel_config,
             commands::channels::test_channel_connection,
             // Notifications
-            commands::system::send_notification,
-            commands::system::request_notification_permission,
-            commands::system::check_notification_permission,
             // System prompt & agent settings
             commands::settings::get_system_prompt,
             commands::settings::set_system_prompt,
@@ -280,21 +281,14 @@ macro_rules! command_handler {
             commands::sessions::kill_sub_session,
             commands::sessions::get_sub_session_status,
             commands::sessions::send_to_sub_session,
-            commands::system::clear_rate_limit,
             // Workspaces
             commands::workspaces::list_workspaces,
             commands::workspaces::open_workspace,
             commands::workspaces::set_active_workspace,
             commands::workspaces::clear_active_workspace,
-            commands::workspaces::get_active_workspace,
-            commands::workspaces::get_workspace_context,
             commands::workspaces::reload_workspace,
             commands::workspaces::close_workspace,
-            commands::workspaces::discover_workspaces_in_path,
-            commands::workspaces::find_workspace_root_from_path,
-            commands::workspaces::save_workspace_file,
             commands::workspaces::init_workspace,
-            commands::workspaces::read_workspace_file,
             commands::workspaces::check_workspace_validity,
             // Agent visualization
             agents::get_agent_clusters,
@@ -307,23 +301,17 @@ macro_rules! command_handler {
             agents::cleanup_completed_agents,
             agents::get_workspace_agents,
             // User tool authoring
-            commands::tools::list_user_tools_cmd,
             commands::tools::get_user_tool,
             commands::tools::get_tool_source,
             commands::tools::create_user_tool,
             commands::tools::update_user_tool,
             commands::tools::delete_user_tool,
-            commands::tools::test_user_tool,
             // All registered tools
             commands::tools::list_tools,
             commands::tools::set_tool_enabled,
             commands::tools::get_tool_audit,
             commands::tools::get_tool,
             // Skill directory tools
-            commands::tools::list_skills,
-            commands::tools::create_skill,
-            commands::tools::update_skill,
-            commands::tools::delete_skill,
             commands::tools::test_skill,
             // Backend mode
             commands::system::get_backend_status,
@@ -347,7 +335,6 @@ macro_rules! command_handler {
             commands::scheduler::update_cron_job,
             commands::scheduler::set_cron_job_enabled,
             commands::scheduler::delete_cron_job,
-            commands::scheduler::delete_cron_jobs_by_name,
             commands::scheduler::run_cron_job_now,
             commands::scheduler::get_cron_job_history,
             commands::scheduler::validate_cron_expression,
@@ -358,6 +345,18 @@ macro_rules! command_handler {
             commands::tasks::complete_task,
             commands::tasks::delete_task,
             commands::tasks::reorder_task,
+            // Board (P25 Stage 4)
+            commands::board::quick_add_card,
+            commands::board::get_card,
+            commands::board::post_on_card,
+            commands::board::list_members,
+            commands::board::list_assigned_cards,
+            commands::board::create_member,
+            commands::board::update_member,
+            commands::board::delete_member,
+            commands::board::start_card_run,
+            commands::board::card_run_status,
+            commands::board::stop_card_run,
         ]
     };
 }

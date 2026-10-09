@@ -148,12 +148,22 @@ fn kept_indices(events: &[MemoryEventRow], budget: usize) -> Vec<usize> {
 
 /// Whether event `i` must survive the fold: an endpoint, a transition, or a
 /// local salience peak at or above [`PEAK_FLOOR`].
+///
+/// A peak rises above at least one neighbour. With `>=` on both sides every
+/// event of a flat run counted — and every comment is written at 0.5, the
+/// floor itself — so a card of 40 plain comments made all 40 mandatory, the
+/// overflow kept the first ~22 and elided the rest: the start of the thread
+/// instead of an even decimation of it.
 fn is_mandatory(events: &[MemoryEventRow], i: usize) -> bool {
     if i == 0 || i + 1 == events.len() || events[i].kind == EventKind::Outcome.as_str() {
         return true;
     }
-    let here = events[i].salience;
-    here >= PEAK_FLOOR && here >= events[i - 1].salience && here >= events[i + 1].salience
+    let (before, here, after) = (
+        events[i - 1].salience,
+        events[i].salience,
+        events[i + 1].salience,
+    );
+    here >= PEAK_FLOOR && here >= before && here >= after && (here > before || here > after)
 }
 
 /// The folded episode's lineage: every kept event's sources, first occurrence
@@ -224,6 +234,26 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// A flat run (every comment is written at the floor's salience) is
+    /// decimated across the whole thread, not cut after its first part.
+    #[test]
+    fn a_flat_run_is_decimated_evenly_not_truncated() {
+        let flat: Vec<MemoryEventRow> = series(3, 40)
+            .into_iter()
+            .map(|mut event| {
+                event.kind = "message".to_string();
+                event.salience = PEAK_FLOOR;
+                event
+            })
+            .collect();
+        let kept = kept_indices(&flat, 24);
+        assert!(kept.len() <= 24, "{kept:?}");
+        assert!(
+            kept.iter().any(|&i| (25..39).contains(&i)),
+            "the second half of the thread is represented: {kept:?}"
+        );
     }
 
     fn contains_event(folded: &CompressedEpisode, i: usize) -> bool {

@@ -537,9 +537,22 @@ impl WorkspaceRegistry {
         Self::default()
     }
 
-    pub fn register(&mut self, workspace: Workspace) -> String {
+    /// Add `workspace`, or replace the one with its id.
+    ///
+    /// Its `active` flag follows the registry's selection, not the value it
+    /// arrived with: the GUI re-registers a freshly built `Workspace`
+    /// (`active: false`) under an existing id when it repairs or adds a file
+    /// to one, which left the active workspace flagged inactive while
+    /// `active_id` still named it.
+    pub fn register(&mut self, mut workspace: Workspace) -> String {
         let id = workspace.id.clone();
+        workspace.active = self.active_id.as_deref() == Some(id.as_str());
         self.workspaces.insert(id.clone(), workspace);
+        debug_assert_eq!(
+            self.workspaces.get(&id).is_some_and(|ws| ws.active),
+            self.active_id.as_deref() == Some(id.as_str()),
+            "the flag agrees with the selection"
+        );
         id
     }
 
@@ -626,6 +639,20 @@ fn chrono_timestamp() -> i64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn re_registering_the_active_workspace_keeps_it_active() {
+        let dir = tempdir().unwrap();
+        let mut registry = WorkspaceRegistry::new();
+        let id = registry.register(Workspace::new(dir.path()));
+        assert!(registry.set_active(&id));
+        let mut rebuilt = Workspace::new(dir.path());
+        rebuilt.id.clone_from(&id);
+        assert!(!rebuilt.active);
+        registry.register(rebuilt);
+        assert!(registry.get(&id).is_some_and(|ws| ws.active));
+        assert_eq!(registry.active().map(|ws| ws.id.clone()), Some(id));
+    }
 
     #[tokio::test]
     async fn test_workspace_creation() {

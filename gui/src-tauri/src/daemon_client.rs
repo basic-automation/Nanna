@@ -203,6 +203,19 @@ pub enum DaemonEvent {
     /// The daemon's config was mutated and committed. Payload-free by design:
     /// each view re-fetches the slice it renders.
     ConfigChanged,
+    /// A card changed on a board (P25 Stage 1's lifecycle events). Mirrors
+    /// `nanna_daemon::protocol::Event::TaskEvent`; `kind` stays a string here
+    /// so a kind this build does not know still reaches the board, which only
+    /// needs to know *that* a card changed.
+    TaskEvent {
+        kind: String,
+        task_id: i64,
+        scope: String,
+        #[serde(default)] scope_id: Option<String>,
+        #[serde(default)] actor: Option<String>,
+    },
+    /// The board roster changed. Payload-free, like `WorkspacesChanged`.
+    MembersChanged,
     /// A well-formed daemon event this build has no variant for.
     ///
     /// The daemon and the GUI ship separately, so the daemon's event set is
@@ -464,6 +477,12 @@ impl DaemonClient {
             info!("Disconnected from daemon");
         }
 
+        // The dead connection's sender goes first: left in place, every
+        // request while the daemon was down was registered, then failed with
+        // "channel closed" — or, sent in the moment before the message task
+        // exited, was buffered, dropped, and waited out its whole timeout.
+        *shared.msg_tx.write().await = None;
+
         // Fail all pending requests
         {
             let mut pending = shared.pending.write().await;
@@ -647,7 +666,8 @@ impl DaemonClient {
     ///
     /// - `"Not connected to daemon"` when the client is not in daemon mode
     ///   (it never connected, or the reconnection loop gave up);
-    /// - `"No message sender"` when no connection has been installed yet;
+    /// - `"Not connected to daemon"` too when no connection is installed (none
+    ///   yet, or the last one dropped and a reconnect is pending);
     /// - `"Send error: …"` when the connection's message pump has already
     ///   ended;
     /// - `"Disconnected"` when the connection drops before the reply arrives
@@ -681,7 +701,7 @@ impl DaemonClient {
 
         let msg_tx = {
             let guard = self.msg_tx.read().await;
-            guard.clone().ok_or_else(|| "No message sender".to_string())?
+            guard.clone().ok_or_else(|| "Not connected to daemon".to_string())?
         };
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -699,9 +719,12 @@ impl DaemonClient {
             pending.insert(id.clone(), PendingRequest { tx });
         }
 
-        // Send request
-        msg_tx.send(Message::Text(json.into())).await
-            .map_err(|e| format!("Send error: {e}"))?;
+        // Send request. A send that fails leaves nothing that will answer
+        // the entry just registered, so it goes too.
+        if let Err(e) = msg_tx.send(Message::Text(json.into())).await {
+            self.pending.write().await.remove(&id);
+            return Err(format!("Send error: {e}"));
+        }
 
         Ok((id, rx))
     }
@@ -1820,13 +1843,20 @@ impl DaemonClient {
     ///
     /// Fails only as [`Self::request`] does. The daemon reports a refused
     /// `task.list` inside the `Ok` reply (an `error` field), not as an `Err`.
-    pub async fn task_list(&self, scope: &str, session_id: Option<&str>, include_closed: Option<bool>) -> Result<Value, String> {
+    pub async fn task_list(
+        &self,
+        scope: &str,
+        session_id: Option<&str>,
+        include_closed: Option<bool>,
+        workspace_id: Option<&str>,
+    ) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "task",
             "action": "list",
             "scope": scope,
             "session_id": session_id,
-            "include_closed": include_closed
+            "include_closed": include_closed,
+            "workspace_id": workspace_id
         })).await
     }
 
@@ -1913,6 +1943,180 @@ impl DaemonClient {
             "action": "update",
             "id": id,
             "patch": { "priority": new_priority }
+        })).await
+    }
+
+    /// One quick-add line → one board card (`task.quick_add`, P25 decision 1).
+    /// `scope` is `workspace` or `global`; `None` lets the daemon choose the
+    /// active board. With `parent_id` the card is that card's sub-card.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. A line the daemon refuses (an
+    /// unknown `@member`, a bad `{deadline}`) comes back inside the `Ok` reply.
+    pub async fn task_quick_add(
+        &self,
+        text: &str,
+        scope: Option<&str>,
+        parent_id: Option<i64>,
+        workspace_id: Option<&str>,
+    ) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "quick_add",
+            "text": text,
+            "scope": scope,
+            "parent_id": parent_id,
+            "workspace_id": workspace_id
+        })).await
+    }
+
+    /// One card with its thread (`notes`) and activity.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn task_get(&self, id: i64) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "get",
+            "id": id
+        })).await
+    }
+
+    /// The human posts `content` on card `id`'s thread (`task.note`).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn task_note(&self, id: i64, content: &str) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "note",
+            "id": id,
+            "content": content
+        })).await
+    }
+
+    /// Every open board card assigned to `member_id` (default: the human),
+    /// on every board — Inbox and Upcoming (`task.assigned`).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn task_assigned(&self, member_id: Option<&str>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "assigned",
+            "member_id": member_id
+        })).await
+    }
+
+    /// Add an agent to a board's roster (`member.create`). `workspace_id`
+    /// `None` is the global board; `personal` makes it the human's own agent,
+    /// which travels between boards.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does; a refused create (a duplicate
+    /// name, a profile that is not an object) comes back inside `Ok`.
+    pub async fn member_create(
+        &self,
+        name: &str,
+        workspace_id: Option<&str>,
+        personal: bool,
+        profile: Option<Value>,
+    ) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "member",
+            "action": "create",
+            "name": name,
+            "workspace_id": workspace_id,
+            "personal": personal,
+            "profile": profile
+        })).await
+    }
+
+    /// Change a member's name or profile (`member.update`); `None` keeps it.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn member_update(&self, id: &str, name: Option<&str>, profile: Option<Value>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "member",
+            "action": "update",
+            "id": id,
+            "name": name,
+            "profile": profile
+        })).await
+    }
+
+    /// Remove an agent from the roster (`member.delete`).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn member_delete(&self, id: &str) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "member",
+            "action": "delete",
+            "id": id
+        })).await
+    }
+
+    /// Start — or resume, for a paused card — its assignee's run on card
+    /// `card_id` (`task.start_run {card_id}`).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does; a refused start (no agent
+    /// assigned, the member busy elsewhere) comes back inside `Ok`.
+    pub async fn card_run_start(&self, card_id: i64) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "start_run",
+            "card_id": card_id
+        })).await
+    }
+
+    /// Whether a run is working card `card_id` now (`task.run_status`).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn card_run_status(&self, card_id: i64) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "run_status",
+            "card_id": card_id
+        })).await
+    }
+
+    /// Stop the run working card `card_id`; the card stays with its member,
+    /// paused (`task.cancel_run`).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn card_run_cancel(&self, card_id: i64) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "cancel_run",
+            "card_id": card_id
+        })).await
+    }
+
+    /// The roster of one board: `workspace_id` `None` is the global board.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does.
+    pub async fn member_list(&self, workspace_id: Option<&str>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "member",
+            "action": "list",
+            "workspace_id": workspace_id
         })).await
     }
 }
@@ -2053,6 +2257,40 @@ mod tests {
         })
         .await
         .expect("the loop ends at once, not after RETRY_INTERVAL");
+    }
+
+    /// After the daemon drops the connection, a request is refused at once
+    /// as "Not connected" and leaves nothing pending. The dead connection's
+    /// sender used to stay installed: every request registered itself, then
+    /// failed "channel closed" and stayed in the pending map.
+    #[tokio::test]
+    async fn a_request_after_the_daemon_dropped_is_refused_and_leaves_nothing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // One connection, closed straight after the handshake; then nothing listens.
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await
+                && let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await
+            {
+                let _ = ws.close(None).await;
+            }
+        });
+        let client = quick_client(port);
+        client.connect().await.expect("the first connection is accepted");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.is_connected().await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the drop is seen");
+
+        let refused = client
+            .request_with_timeout(serde_json::json!({"type": "system", "action": "status"}), Duration::from_secs(5))
+            .await;
+        assert_eq!(refused.unwrap_err(), "Not connected to daemon");
+        assert!(client.pending.read().await.is_empty(), "nothing left pending");
+        client.disconnect();
     }
 
     /// `init` can run more than once. A second `connect` on a live client must

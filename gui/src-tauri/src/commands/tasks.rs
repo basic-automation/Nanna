@@ -10,7 +10,9 @@ use std::sync::Arc;
 use tauri::State;
 use tokio::sync::RwLock;
 
-/// List tasks in a scope ("session" | "workspace" | "global").
+/// List tasks in a scope ("session" | "workspace" | "global"). With
+/// `workspace_id`, a `workspace` scope is that workspace's board rather than
+/// the daemon's active one.
 ///
 /// # Errors
 ///
@@ -23,10 +25,16 @@ pub async fn list_tasks(
     scope: String,
     session_id: Option<String>,
     include_closed: Option<bool>,
+    workspace_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
     backend_handle(&state)
         .await
-        .task_list(&scope, session_id.as_deref(), include_closed)
+        .task_list(
+            &scope,
+            session_id.as_deref(),
+            include_closed,
+            workspace_id.as_deref(),
+        )
         .await
 }
 

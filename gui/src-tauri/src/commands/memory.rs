@@ -11,72 +11,9 @@ use tauri::State;
 use tokio::sync::RwLock;
 use tracing::info;
 
-/// Memory search result
-#[derive(Debug, Clone, Serialize)]
-pub struct MemorySearchResult {
-    pub session_id: String,
-    pub session_name: String,
-    pub message_id: String,
-    pub role: String,
-    pub content: String,
-    pub timestamp: String,
-    pub snippet: String,
-    pub relevance: f32,
-}
-
 /// A count from a daemon reply; 0 when the key is absent or not an unsigned
 /// integer. Lossless on the 64-bit targets this ships for; it saturates where
 /// the former `as usize` would have wrapped.
-/// Characters of context shown on each side of a search match.
-const SNIPPET_CONTEXT_CHARS: usize = 50;
-
-/// The first case-insensitive match of `query_lower` in `content`, with up to
-/// `context_chars` characters either side and `...` where the text continues, or
-/// `None` when there is no match.
-///
-/// Char-safe in both directions. The old code sliced `content` at byte offsets
-/// ±50 from a match, which panics inside a multi-byte character (an em dash
-/// within 50 bytes of a match was enough to abort the GUI), and it found the
-/// match in the LOWERCASED copy and applied that offset to the original —
-/// but lowercasing can change a character's byte length (`İ` is 2 bytes, its
-/// lowercase 3), so the offset could point anywhere. Here every byte of the
-/// lowered copy remembers the original character it came from.
-fn match_snippet(content: &str, query_lower: &str, context_chars: usize) -> Option<String> {
-    if query_lower.is_empty() {
-        return None;
-    }
-    let mut lowered = String::with_capacity(content.len());
-    let mut origin: Vec<usize> = Vec::with_capacity(content.len());
-    for (byte, ch) in content.char_indices() {
-        let before = lowered.len();
-        lowered.extend(ch.to_lowercase());
-        origin.resize(lowered.len(), byte);
-        debug_assert!(
-            lowered.len() > before,
-            "every char lowers to at least one char"
-        );
-    }
-    let found = lowered.find(query_lower)?;
-    let match_start = origin[found];
-    let match_end = origin
-        .get(found + query_lower.len())
-        .copied()
-        .unwrap_or(content.len());
-    let start = content[..match_start]
-        .char_indices()
-        .rev()
-        .nth(context_chars.saturating_sub(1))
-        .map_or(0, |(i, _)| i);
-    let end = content[match_end..]
-        .char_indices()
-        .nth(context_chars)
-        .map_or(content.len(), |(i, _)| match_end + i);
-    debug_assert!(content.is_char_boundary(start) && content.is_char_boundary(end));
-    let prefix = if start > 0 { "..." } else { "" };
-    let suffix = if end < content.len() { "..." } else { "" };
-    Some(format!("{prefix}{}{suffix}", &content[start..end]))
-}
-
 fn count_field(reply: &serde_json::Value, key: &str) -> usize {
     reply
         .get(key)
@@ -84,166 +21,11 @@ fn count_field(reply: &serde_json::Value, key: &str) -> usize {
         .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX))
 }
 
-/// Share of `content_len` taken up by `matches` query hits, capped at 1.
-///
-/// Relevance is `f32` on the wire; both counts are exact in `f32` up to 2^24
-/// (16 MiB of message content), past which the score only loses precision it
-/// cannot display.
-fn match_density(matches: usize, content_len: usize) -> f32 {
-    (nanna_numeric::f32_from_usize(matches) / nanna_numeric::f32_from_usize(content_len.max(1))).min(1.0)
-}
-
 /// Narrow a daemon-reported `f64` score to the `f32` the memory page's wire
 /// type carries. The daemon's scores are `f32` widened to `f64` in its JSON,
 /// so narrowing them back restores the exact value.
 fn score_to_f32(score: f64) -> f32 {
     nanna_numeric::f32_from_f64(score)
-}
-
-/// Search across all sessions (substring match over daemon-stored history).
-///
-/// # Errors
-///
-/// Returns `Failed to list sessions: …` when the daemon cannot be reached or
-/// the `session.list` request is dropped or times out. A session whose
-/// `session.history` request fails is skipped rather than failing the search.
-#[tauri::command]
-pub async fn search_memory(
-    state: State<'_, Arc<RwLock<AppState>>>,
-    query: String,
-    limit: Option<u32>,
-) -> Result<Vec<MemorySearchResult>, String> {
-    let backend = backend_handle(&state).await;
-    let max_results = limit.unwrap_or(50) as usize;
-    let query_lower = query.to_lowercase();
-
-    // Sessions come from the daemon (it owns nanna.db).
-    let sessions: Vec<(String, String)> = {
-        let result = backend
-            .sessions_list()
-            .await
-            .map_err(|e| format!("Failed to list sessions: {e}"))?;
-        result
-            .get("sessions")
-            .and_then(|v| v.as_array())
-            .map_or_default(|arr| {
-                arr.iter()
-                    .filter_map(|s| {
-                        let id = s.get("id")?.as_str()?.to_string();
-                        let name = s
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("Untitled")
-                            .to_string();
-                        Some((id, name))
-                    })
-                    .collect()
-            })
-    };
-
-    let mut results = Vec::new();
-
-    for (session_id, session_name) in &sessions {
-        let messages: Vec<(String, String, String, String)> = backend
-            .session_history(session_id, Some(1000))
-            .await
-            .map_or_else(
-                |_| vec![],
-                |result| {
-                    result
-                        .get("messages")
-                        .and_then(|v| v.as_array())
-                        .map_or_default(|msgs| {
-                            msgs.iter()
-                                .filter_map(|m| {
-                                    Some((
-                                        m.get("id")?.as_str()?.to_string(),
-                                        m.get("role")?.as_str()?.to_string(),
-                                        m.get("content")?.as_str()?.to_string(),
-                                        m.get("timestamp")?.as_str()?.to_string(),
-                                    ))
-                                })
-                                .collect()
-                        })
-                },
-            );
-
-        for (msg_id, role, content, timestamp) in messages {
-            let content_lower = content.to_lowercase();
-            if let Some(snippet) = match_snippet(&content, &query_lower, SNIPPET_CONTEXT_CHARS) {
-                let matches = content_lower.matches(&query_lower).count();
-                let relevance = match_density(matches, content.len());
-
-                results.push(MemorySearchResult {
-                    session_id: session_id.clone(),
-                    session_name: session_name.clone(),
-                    message_id: msg_id,
-                    role,
-                    content,
-                    timestamp,
-                    snippet,
-                    relevance,
-                });
-            }
-        }
-    }
-
-    results.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap_or(std::cmp::Ordering::Equal));
-    results.truncate(max_results);
-
-    Ok(results)
-}
-
-/// Statistics for the memory browser
-#[derive(Debug, Clone, Serialize)]
-pub struct MemoryStats {
-    pub total_sessions: u32,
-    pub total_messages: u32,
-    pub oldest_session: Option<String>,
-    pub newest_session: Option<String>,
-}
-
-/// Session and message totals for the memory browser.
-///
-/// # Errors
-///
-/// Returns `Failed to list sessions: …` when the daemon cannot be reached or
-/// the `session.list` request is dropped or times out.
-#[tauri::command]
-pub async fn get_memory_stats(
-    state: State<'_, Arc<RwLock<AppState>>>,
-) -> Result<MemoryStats, String> {
-    let result = backend_handle(&state)
-        .await
-        .sessions_list()
-        .await
-        .map_err(|e| format!("Failed to list sessions: {e}"))?;
-    let sessions = result
-        .get("sessions")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    let mut total_messages = 0u32;
-    let mut timestamps: Vec<String> = Vec::new();
-    for session in &sessions {
-        // Saturates where `as` wrapped; a count past u32::MAX is unreachable.
-        total_messages += session
-            .get("message_count")
-            .and_then(serde_json::Value::as_u64)
-            .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
-        if let Some(created) = session.get("created_at").and_then(|v| v.as_str()) {
-            timestamps.push(created.to_string());
-        }
-    }
-    timestamps.sort();
-
-    Ok(MemoryStats {
-        total_sessions: u32::try_from(sessions.len()).unwrap_or(u32::MAX),
-        total_messages,
-        oldest_session: timestamps.first().cloned(),
-        newest_session: timestamps.last().cloned(),
-    })
 }
 
 /// Set whether messages are automatically remembered (persisted to config +
@@ -402,6 +184,7 @@ pub async fn trigger_consolidation(
         .memory_consolidate()
         .await
         .map_err(|e| format!("Consolidation failed: {e}"))?;
+    super::daemon_refusal(&result, "Consolidation failed")?;
 
     Ok(ConsolidationResultInfo {
         memories_processed: count_field(&result, "memories_processed"),
@@ -413,34 +196,6 @@ pub async fn trigger_consolidation(
             .and_then(|v| v.as_array())
             .map_or_default(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()),
     })
-}
-
-/// Apply pending FSRS updates. The daemon applies these itself during recall, so
-/// this is a no-op accepted for UI compatibility.
-///
-/// # Errors
-///
-/// Never returns `Err`; the `Result` is what Tauri requires of an async command
-/// that borrows `State`.
-#[tauri::command]
-pub async fn apply_memory_updates(
-    _state: State<'_, Arc<RwLock<AppState>>>,
-) -> Result<(), String> {
-    Ok(())
-}
-
-/// Manually save memories. The daemon persists via Turso write-through on every
-/// mutation, so there is nothing to flush from the client — a no-op.
-///
-/// # Errors
-///
-/// Never returns `Err`; the `Result` is what Tauri requires of an async command
-/// that borrows `State`.
-#[tauri::command]
-pub async fn save_memories(
-    _state: State<'_, Arc<RwLock<AppState>>>,
-) -> Result<(), String> {
-    Ok(())
 }
 
 // =============================================================================
@@ -488,10 +243,21 @@ fn memory_item_from_json(m: &serde_json::Value) -> Option<MemoryItem> {
 /// literal "workspace" plus the active workspace's id — forwarding the
 /// literal matched a workspace named "workspace" (nothing) and showed the
 /// global set on both tabs (observed live).
-fn resolve_memory_scope(scope: Option<String>, workspace_id: Option<String>) -> Option<String> {
+///
+/// With no workspace open the Workspace tab names no workspace at all. It used
+/// to forward the literal `"workspace"` anyway: the list showed the global
+/// memories under the Workspace label, and Clear matched nothing and still
+/// said "Memories cleared". That is now refused with a reason.
+fn resolve_memory_scope(
+    scope: Option<String>,
+    workspace_id: Option<String>,
+) -> Result<Option<String>, String> {
     match scope.as_deref() {
-        Some("workspace") => workspace_id.or(scope),
-        _ => scope,
+        Some("workspace") => workspace_id
+            .filter(|id| !id.trim().is_empty())
+            .map(Some)
+            .ok_or_else(|| "No workspace is open — open one to see its memories".to_string()),
+        _ => Ok(scope),
     }
 }
 
@@ -508,7 +274,7 @@ pub async fn list_memories(
     scope: Option<String>,
     workspace_id: Option<String>,
 ) -> Result<Vec<MemoryItem>, String> {
-    let effective = resolve_memory_scope(scope, workspace_id);
+    let effective = resolve_memory_scope(scope, workspace_id)?;
     let result = backend_handle(&state)
         .await
         .memory_list(effective.as_deref())
@@ -523,43 +289,24 @@ pub async fn list_memories(
     Ok(items)
 }
 
-/// Get a single memory by ID.
-///
-/// # Errors
-///
-/// Returns `Failed to get memory: …` when the daemon cannot be reached or the
-/// `memory.get` request is dropped or times out. An unknown id — a reply
-/// without a usable `memory` object — is `Ok(None)`.
-#[tauri::command]
-pub async fn get_memory(
-    state: State<'_, Arc<RwLock<AppState>>>,
-    id: String,
-) -> Result<Option<MemoryItem>, String> {
-    let result = backend_handle(&state)
-        .await
-        .memory_get(&id)
-        .await
-        .map_err(|e| format!("Failed to get memory: {e}"))?;
-    Ok(result.get("memory").and_then(memory_item_from_json))
-}
-
 /// Delete a memory by ID.
 ///
 /// # Errors
 ///
 /// Returns `Failed to delete memory: …` when the daemon cannot be reached or
-/// the `memory.delete` request is dropped or times out. A refusal the daemon
-/// reports in its reply is not checked.
+/// the `memory.delete` request is dropped or times out, or with the daemon's
+/// own message when it refused.
 #[tauri::command]
 pub async fn delete_memory(
     state: State<'_, Arc<RwLock<AppState>>>,
     id: String,
 ) -> Result<(), String> {
-    backend_handle(&state)
+    let reply = backend_handle(&state)
         .await
         .memory_delete(&id)
         .await
         .map_err(|e| format!("Failed to delete memory: {e}"))?;
+    super::daemon_refusal(&reply, "Failed to delete memory")?;
     info!("Deleted memory: {id}");
     Ok(())
 }
@@ -569,19 +316,20 @@ pub async fn delete_memory(
 /// # Errors
 ///
 /// Returns `Failed to update memory: …` when the daemon cannot be reached or
-/// the `memory.update` request is dropped or times out. A refusal the daemon
-/// reports in its reply is not checked.
+/// the `memory.update` request is dropped or times out, or with the daemon's
+/// own message when it refused.
 #[tauri::command]
 pub async fn update_memory(
     state: State<'_, Arc<RwLock<AppState>>>,
     id: String,
     content: String,
 ) -> Result<(), String> {
-    backend_handle(&state)
+    let reply = backend_handle(&state)
         .await
         .memory_update(&id, Some(&content), None)
         .await
         .map_err(|e| format!("Failed to update memory: {e}"))?;
+    super::daemon_refusal(&reply, "Failed to update memory")?;
     info!("Updated memory: {id}");
     Ok(())
 }
@@ -607,7 +355,7 @@ pub async fn clear_memories(
     scope: Option<String>,
     workspace_id: Option<String>,
 ) -> Result<(), String> {
-    let effective = resolve_memory_scope(scope, workspace_id);
+    let effective = resolve_memory_scope(scope, workspace_id)?;
     let reply = backend_handle(&state)
         .await
         .memory_clear(effective.as_deref())
@@ -625,34 +373,22 @@ pub async fn clear_memories(
     Ok(())
 }
 
-// =============================================================================
-// Similarity Threshold Configuration
-// =============================================================================
-
 #[cfg(test)]
-mod snippet_tests {
-    use super::match_snippet;
+mod tests {
+    use super::resolve_memory_scope;
 
-    /// Both ways the old byte slicing aborted the GUI: a multi-byte character
-    /// inside the context window, and a lowercase whose byte length differs
-    /// from the original's.
     #[test]
-    fn a_snippet_never_splits_a_character() {
-        let dashes = format!("{}needle{}", "—".repeat(60), "—".repeat(60));
-        let snippet = match_snippet(&dashes, "needle", 5).expect("found");
-        assert_eq!(snippet, "...—————needle—————...");
-
-        // `İ` is 2 bytes; its lowercase is 3. Offsets from the lowered copy
-        // would have pointed into the wrong place in the original.
-        let turkish = format!("{}Needle tail", "İ".repeat(40));
-        let snippet = match_snippet(&turkish, "needle", 3).expect("found");
-        assert_eq!(snippet, "...İİİNeedle ta...");
-
+    fn the_workspace_tab_needs_an_open_workspace() {
+        assert!(resolve_memory_scope(Some("workspace".into()), None).is_err());
+        assert!(resolve_memory_scope(Some("workspace".into()), Some(" ".into())).is_err());
         assert_eq!(
-            match_snippet("short", "short", 50).as_deref(),
-            Some("short")
+            resolve_memory_scope(Some("workspace".into()), Some("ws-1".into())),
+            Ok(Some("ws-1".to_string()))
         );
-        assert!(match_snippet("nothing here", "needle", 50).is_none());
-        assert!(match_snippet("anything", "", 50).is_none());
+        assert_eq!(
+            resolve_memory_scope(Some("global".into()), None),
+            Ok(Some("global".to_string()))
+        );
+        assert_eq!(resolve_memory_scope(None, None), Ok(None));
     }
 }

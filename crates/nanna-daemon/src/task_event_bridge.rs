@@ -11,14 +11,22 @@ use nanna_storage::{TaskEvent as StoreTaskEvent, TaskEventSink};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{broadcast, mpsc};
 
-/// Publishes storage task events onto the daemon event bus, and hands the ones
-/// that become memories to the board write-through queue.
+/// Publishes storage task events onto the daemon event bus, hands the ones
+/// that become memories to the board write-through queue, and the ones that
+/// wake the board router to the route queue.
 pub struct TaskEventBridge {
     events: broadcast::Sender<Event>,
     write_through: Option<mpsc::Sender<StoreTaskEvent>>,
     /// Copies the queue refused because it was full. Counted so the loss is
     /// visible (logged with a running total), never silent.
     write_through_dropped: AtomicU64,
+    routes: Option<mpsc::Sender<crate::board_router_trigger::Wake>>,
+    /// Cards the route queue refused because it was full — same contract as
+    /// `write_through_dropped`.
+    routes_dropped: AtomicU64,
+    runs: Option<mpsc::Sender<crate::card_run_trigger::RunWake>>,
+    /// Wakes the card-run queue refused because it was full.
+    runs_dropped: AtomicU64,
 }
 
 impl TaskEventBridge {
@@ -28,6 +36,70 @@ impl TaskEventBridge {
             events,
             write_through: None,
             write_through_dropped: AtomicU64::new(0),
+            routes: None,
+            routes_dropped: AtomicU64::new(0),
+            runs: None,
+            runs_dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// Also queue the cards that wake the board router for
+    /// [`crate::board_router_trigger::run`].
+    #[must_use]
+    pub fn with_router_queue(
+        mut self,
+        queue: mpsc::Sender<crate::board_router_trigger::Wake>,
+    ) -> Self {
+        self.routes = Some(queue);
+        self
+    }
+
+    /// Queue `event`'s card for the router if the event wakes it. Never
+    /// waits, for the same reason as [`Self::queue_copy`].
+    fn queue_route(&self, event: &StoreTaskEvent) {
+        let Some(queue) = self.routes.as_ref() else {
+            return;
+        };
+        let Some(wake) = crate::board_router_trigger::wake_for(event) else {
+            return;
+        };
+        debug_assert_eq!(wake.task_id, event.task_id, "the event's own card");
+        // `Closed` means no worker (no storage-backed router on this daemon),
+        // so nothing is owed a decision.
+        if let Err(mpsc::error::TrySendError::Full(_)) = queue.try_send(wake) {
+            let dropped = self.routes_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::warn!(
+                "board router queue is full; card #{} was not routed ({dropped} dropped so \
+                 far) — the card itself is unaffected and can be assigned by hand",
+                event.task_id
+            );
+        }
+    }
+
+    /// Also queue the cards that may have become workable for
+    /// [`crate::card_run_trigger::run`].
+    #[must_use]
+    pub fn with_run_queue(mut self, queue: mpsc::Sender<crate::card_run_trigger::RunWake>) -> Self {
+        self.runs = Some(queue);
+        self
+    }
+
+    /// Queue `event`'s card for the card-run worker if it may now be
+    /// workable. Never waits, for the same reason as [`Self::queue_copy`].
+    fn queue_run(&self, event: &StoreTaskEvent) {
+        let Some(queue) = self.runs.as_ref() else {
+            return;
+        };
+        let Some(wake) = crate::card_run_trigger::run_wake_for(event) else {
+            return;
+        };
+        if let Err(mpsc::error::TrySendError::Full(_)) = queue.try_send(wake) {
+            let dropped = self.runs_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::warn!(
+                "card run queue is full; card #{} was not started ({dropped} dropped so far) \
+                 — it starts when its member next frees, or by task.start_run",
+                event.task_id
+            );
         }
     }
 
@@ -71,6 +143,8 @@ impl TaskEventSink for TaskEventBridge {
     /// never fail because nothing was listening to its announcement.
     fn publish(&self, event: StoreTaskEvent) {
         self.queue_copy(&event);
+        self.queue_route(&event);
+        self.queue_run(&event);
         let _ = self.events.send(Event::TaskEvent {
             kind: event.kind,
             task_id: event.task_id,
@@ -132,6 +206,42 @@ mod tests {
         drop(rx);
         let bridge = TaskEventBridge::new(tx);
         bridge.publish(store_event(TaskEventKind::Verdict));
+    }
+
+    #[test]
+    fn only_router_waking_events_reach_the_route_queue() {
+        let (tx, _rx) = broadcast::channel(8);
+        let (routes_tx, mut routes_rx) = mpsc::channel(4);
+        let bridge = TaskEventBridge::new(tx).with_router_queue(routes_tx);
+
+        bridge.publish(store_event(TaskEventKind::Created));
+        bridge.publish(store_event(TaskEventKind::Posted));
+        let mut by_harness = store_event(TaskEventKind::Created);
+        by_harness.actor = Some("harness".to_string());
+        bridge.publish(by_harness);
+
+        assert_eq!(
+            routes_rx.try_recv().ok().map(|wake| wake.task_id),
+            Some(7),
+            "the gui's card is queued"
+        );
+        assert!(
+            routes_rx.try_recv().is_err(),
+            "a post and the harness's own card are not"
+        );
+    }
+
+    #[test]
+    fn a_full_route_queue_counts_the_drop_and_never_waits() {
+        let (tx, _rx) = broadcast::channel(8);
+        let (routes_tx, _routes_rx) = mpsc::channel(1);
+        let bridge = TaskEventBridge::new(tx).with_router_queue(routes_tx);
+
+        bridge.publish(store_event(TaskEventKind::Created));
+        bridge.publish(store_event(TaskEventKind::Created));
+        bridge.publish(store_event(TaskEventKind::Created));
+
+        assert_eq!(bridge.routes_dropped.load(Ordering::Relaxed), 2);
     }
 
     #[test]

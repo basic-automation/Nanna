@@ -43,6 +43,59 @@ pub const HTTP_REQUEST_TIMEOUT: Duration = crate::MCP_REQUEST_TIMEOUT;
 /// memory without limit.
 pub const HTTP_BODY_BYTES_MAX: usize = 16 * 1024 * 1024;
 
+/// A response body, read chunk by chunk and refused past `cap` bytes.
+///
+/// `Response::bytes` buffered the whole body before the size check could run,
+/// so the cap bounded nothing: a non-SSE multi-GB body (bounded only by the
+/// 60 s request timeout) was held in memory first. Declared lengths are
+/// refused up front; undeclared ones as soon as they cross the cap.
+///
+/// # Errors
+/// `McpError::Protocol` past the cap, `McpError::Transport` on a read error.
+pub(crate) async fn read_body_capped(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>> {
+    let too_large = || McpError::Protocol(format!("response body exceeded {cap} bytes"));
+    if response
+        .content_length()
+        .is_some_and(|declared| usize::try_from(declared).map_or(true, |len| len > cap))
+    {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| McpError::Transport(e.to_string()))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > cap {
+            return Err(too_large());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    debug_assert!(bytes.len() <= cap, "never more than the cap is held");
+    Ok(bytes)
+}
+
+/// At most the first `max` bytes of an error body, as text — read only that
+/// far. Error bodies are shown in a message, so the rest is never wanted, and
+/// `Response::text` read all of it first, however large.
+pub(crate) async fn read_error_body(mut response: reqwest::Response, max: usize) -> String {
+    let mut bytes = Vec::new();
+    while bytes.len() < max {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = max - bytes.len();
+                bytes.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    debug_assert!(bytes.len() <= max, "never more than asked for");
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// A `subscriptions/listen` stream that has been silent this long is
 /// reopened.
 ///
@@ -424,6 +477,9 @@ pub struct StreamableHttpTransport {
     session_id: Mutex<Option<String>>,
     /// The revision a legacy `initialize` negotiated, for the version header.
     legacy_version: Mutex<Option<String>>,
+    /// The `initialize` that opened the legacy session, replayed to open a
+    /// new one when the server answers 404 to the session it minted.
+    legacy_initialize: Mutex<Option<JsonRpcRequest>>,
     /// `x-mcp-header` parameters by tool name, from the last `tools/list`.
     tool_headers: RwLock<HashMap<String, Vec<HeaderParam>>>,
     /// Marked by the listen task when the server announces a list change.
@@ -458,6 +514,7 @@ impl StreamableHttpTransport {
             bearer_token: bearer_token.filter(|t| !t.is_empty()),
             session_id: Mutex::new(None),
             legacy_version: Mutex::new(None),
+            legacy_initialize: Mutex::new(None),
             tool_headers: RwLock::new(HashMap::new()),
             list_changed: Arc::new(ListChangedFlags::default()),
             listen_stop: tokio::sync::watch::channel(false).0,
@@ -511,15 +568,7 @@ impl StreamableHttpTransport {
         if is_sse && status.is_success() {
             return self.read_sse(request, response).await;
         }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| McpError::Transport(e.to_string()))?;
-        if bytes.len() > HTTP_BODY_BYTES_MAX {
-            return Err(McpError::Protocol(format!(
-                "response body exceeded {HTTP_BODY_BYTES_MAX} bytes"
-            )));
-        }
+        let bytes = read_body_capped(response, HTTP_BODY_BYTES_MAX).await?;
         // A JSON-RPC body is the server's answer whatever the status: modern
         // servers put their era-identifying errors in 400 and 404 bodies.
         if let Some(answer) = json_rpc_answer(&bytes, &request.id) {
@@ -719,11 +768,11 @@ fn json_rpc_answer(bytes: &[u8], id: &crate::RequestId) -> Option<JsonRpcRespons
     serde_json::from_value(value).ok()
 }
 
-#[async_trait]
-impl Transport for StreamableHttpTransport {
-    async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
+impl StreamableHttpTransport {
+    /// Send `request` once, with every header it routes on.
+    async fn send(&self, request: &JsonRpcRequest) -> Result<reqwest::Response> {
         let legacy_version = self.legacy_version.lock().await.clone();
-        let mut headers = routing_headers(&request, legacy_version.as_deref());
+        let mut headers = routing_headers(request, legacy_version.as_deref());
         if request.method == "tools/call" {
             let params = request.params.as_ref();
             if let Some(tool) = params.and_then(|p| p.get("name")).and_then(Value::as_str) {
@@ -734,7 +783,7 @@ impl Transport for StreamableHttpTransport {
                 }
             }
         }
-        let mut builder = self.post(serde_json::to_string(&request)?).await;
+        let mut builder = self.post(serde_json::to_string(request)?).await;
         for (name, value) in &headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
@@ -746,6 +795,56 @@ impl Transport for StreamableHttpTransport {
             }
         })?;
         self.note_session(&response).await;
+        Ok(response)
+    }
+
+    /// Open a new legacy session after the server answered 404 to the one
+    /// it minted: the 2025 revisions say the session is gone and the client
+    /// MUST initialize again, without the old id. Replays the `initialize`
+    /// that opened the first session and its `initialized` notification.
+    /// `false` when there was no session to renew (the 404 is the answer).
+    async fn renew_session(&self, expired: &str) -> Result<bool> {
+        let Some(initialize) = self.legacy_initialize.lock().await.clone() else {
+            return Ok(false);
+        };
+        {
+            let mut session = self.session_id.lock().await;
+            // Another request may have renewed it already; only the expired
+            // id is cleared.
+            if session.as_deref() == Some(expired) {
+                *session = None;
+            } else {
+                return Ok(session.is_some());
+            }
+        }
+        debug!("MCP server ended the legacy session (404); initializing a new one");
+        let response = self.send(&initialize).await?;
+        let answer = self.read_answer(&initialize, response).await?;
+        if answer.result.is_none() || self.session_id.lock().await.is_none() {
+            return Err(McpError::Transport(
+                "the MCP server ended the session and refused a new one".into(),
+            ));
+        }
+        self.notify(JsonRpcNotification::new("notifications/initialized", None))
+            .await?;
+        Ok(true)
+    }
+}
+
+#[async_trait]
+impl Transport for StreamableHttpTransport {
+    async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
+        let sent_session = self.session_id.lock().await.clone();
+        let mut response = self.send(&request).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND
+            && request.method != "initialize"
+            && let Some(expired) = sent_session
+            && self.renew_session(&expired).await?
+        {
+            // Once: a server that 404s the new session too is answered by
+            // that 404, not retried forever.
+            response = self.send(&request).await?;
+        }
         let mut answer = self.read_answer(&request, response).await?;
         if let Some(result) = answer.result.as_mut() {
             if request.method == "tools/list" {
@@ -755,6 +854,9 @@ impl Transport for StreamableHttpTransport {
                 && let Some(version) = result.get("protocolVersion").and_then(Value::as_str)
             {
                 *self.legacy_version.lock().await = Some(version.to_string());
+                if self.session_id.lock().await.is_some() {
+                    *self.legacy_initialize.lock().await = Some(request.clone());
+                }
             }
         }
         Ok(answer)
@@ -777,7 +879,7 @@ impl Transport for StreamableHttpTransport {
         if status.is_success() {
             return Ok(());
         }
-        let body = response.text().await.unwrap_or_default();
+        let body = read_error_body(response, ERROR_BODY_BYTES_MAX).await;
         Err(McpError::HttpStatus {
             status: status.as_u16(),
             body: body.chars().take(ERROR_BODY_BYTES_MAX).collect(),
@@ -831,6 +933,168 @@ impl Transport for StreamableHttpTransport {
 
 #[cfg(test)]
 mod tests {
+    /// Serve one canned HTTP response on a loopback port; its URL.
+    async fn serve_once(head: &'static str, body: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0_u8; 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// A loopback server that answers each request with the next of
+    /// `answers` (`(status line + headers, body)`), one connection per
+    /// request. Returns its URL and, per request, the `Mcp-Session-Id` it
+    /// carried and its JSON-RPC method.
+    async fn serve_script(
+        answers: Vec<(&'static str, &'static str)>,
+    ) -> (String, std::sync::Arc<tokio::sync::Mutex<Vec<(Option<String>, String)>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            for (head, body) in answers {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut raw = Vec::new();
+                let mut buf = [0_u8; 4096];
+                // Headers, then Content-Length bytes of body.
+                loop {
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if raw.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&raw).to_string();
+                let session = text.lines().find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .starts_with("mcp-session-id:")
+                        .then(|| l["mcp-session-id:".len()..].trim().to_string())
+                });
+                let method = text
+                    .split("\r\n\r\n")
+                    .nth(1)
+                    .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                    .and_then(|v| v["method"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                log.lock().await.push((session, method));
+                let response = format!(
+                    "{head}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/"), seen)
+    }
+
+    /// A legacy server that ends its session answers 404 to the old id; the
+    /// client opens a new session (initialize without the id, then
+    /// `initialized`) and retries the request once on it. It used to return
+    /// the 404 to every later call until the server was reconnected.
+    #[tokio::test]
+    async fn a_lost_legacy_session_is_renewed_and_the_request_retried() {
+        use crate::transport::Transport as _;
+        use super::StreamableHttpTransport;
+        use crate::JsonRpcRequest;
+        const JSON: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n";
+        let (url, seen) = serve_script(vec![
+            (
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: s1\r\n",
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"x","version":"1"}}}"#,
+            ),
+            ("HTTP/1.1 404 Not Found\r\n", ""),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: s2\r\n",
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"x","version":"1"}}}"#,
+            ),
+            ("HTTP/1.1 202 Accepted\r\n", ""),
+            (JSON, r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#),
+        ])
+        .await;
+        let transport = StreamableHttpTransport::new(url, None).expect("transport");
+        let initialize = JsonRpcRequest::new(
+            1_i64,
+            "initialize",
+            Some(serde_json::json!({"protocolVersion":"2025-06-18","capabilities":{},
+                "clientInfo":{"name":"nanna","version":"0"}})),
+        );
+        transport.request(initialize).await.expect("initialize");
+        let answer = transport
+            .request(JsonRpcRequest::new(2_i64, "tools/list", None))
+            .await
+            .expect("the request succeeds on the renewed session");
+        assert!(answer.result.is_some(), "{answer:?}");
+        let seen = seen.lock().await.clone();
+        let methods: Vec<&str> = seen.iter().map(|(_, m)| m.as_str()).collect();
+        assert_eq!(
+            methods,
+            ["initialize", "tools/list", "initialize", "notifications/initialized", "tools/list"]
+        );
+        let sessions: Vec<Option<&str>> = seen.iter().map(|(s, _)| s.as_deref()).collect();
+        assert_eq!(sessions, [None, Some("s1"), None, Some("s2"), Some("s2")]);
+    }
+
+    /// The cap bounds what is READ, not what is kept after reading it all.
+    #[tokio::test]
+    async fn a_body_past_the_cap_is_refused_and_an_error_body_is_cut() {
+        let client = reqwest::Client::new();
+        let declared = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n",
+            vec![b'a'; 64],
+        )
+        .await;
+        let response = client.get(&declared).send().await.expect("send");
+        assert!(read_body_capped(response, 16).await.is_err());
+
+        let streamed = serve_once(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+            vec![b'b'; 64],
+        )
+        .await;
+        let response = client.get(&streamed).send().await.expect("send");
+        assert!(read_body_capped(response, 16).await.is_err());
+
+        let error = serve_once(
+            "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n",
+            vec![b'e'; 64],
+        )
+        .await;
+        let response = client.get(&error).send().await.expect("send");
+        assert_eq!(read_error_body(response, 10).await, "e".repeat(10));
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -995,6 +1259,24 @@ mod tests {
             .push(b"\r\n: keep-alive\n\ndata: x\ndata: y\n\n")
             .unwrap();
         assert_eq!(events, ["{\"a\":1}", "x\ny"]);
+    }
+
+    /// Both SSE transports (this one and the 2024 legacy one in
+    /// `sse_legacy.rs`) feed raw network chunks to this parser. A chunk
+    /// boundary may fall inside a multibyte character; the event must come out
+    /// whole wherever it falls — the class that once failed every provider
+    /// stream and silently dropped legacy-MCP replies.
+    #[test]
+    fn a_multibyte_event_survives_every_chunk_split() {
+        let stream = "event: message\r\ndata: {\"text\":\"héllo — 日本 🦀\"}\r\n\r\n".as_bytes();
+        for split in 0..=stream.len() {
+            let mut parser = SseParser::default();
+            let mut events = parser.push_events(&stream[..split]).unwrap();
+            events.extend(parser.push_events(&stream[split..]).unwrap());
+            assert_eq!(events.len(), 1, "split at byte {split}");
+            assert_eq!(events[0].event.as_deref(), Some("message"));
+            assert_eq!(events[0].data, "{\"text\":\"héllo — 日本 🦀\"}", "split at byte {split}");
+        }
     }
 
     #[test]

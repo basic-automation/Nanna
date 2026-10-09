@@ -6,6 +6,7 @@ import { expect, test } from './fixtures/test-base'
  */
 const PAGES: Array<{ path: string; hit: RegExp }> = [
   { path: '/', hit: /Start a new conversation|Welcome|Nanna|type a message/i },
+  { path: '/board', hit: /No cards yet|To do/i },
   { path: '/agents', hit: /Agent Overview|Agents|No agents/i },
   { path: '/channels', hit: /Channels|Telegram|Discord|Slack/i },
   { path: '/memory', hit: /Memory|No memories|memories/i },
@@ -40,6 +41,7 @@ for (const { path, hit } of PAGES) {
  */
 /** The nui rail names every route directly — no overflow flyout. */
 const RAIL_LABELS: Record<string, string> = {
+  '/board': 'Board',
   '/agents': 'Agents',
   '/channels': 'Channels',
   '/memory': 'Memory',

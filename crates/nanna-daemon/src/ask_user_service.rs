@@ -56,6 +56,9 @@ pub struct AskUserDeps {
     pub sessions: Arc<SessionManager>,
     pub events: broadcast::Sender<Event>,
     pub chat_runs: Arc<ChatRunRegistry>,
+    /// The board, for a question asked from a card run (P25 decision 6).
+    /// `None` on a daemon without a task store: such a run cannot exist.
+    pub storage: Option<Arc<nanna_storage::Storage>>,
 }
 
 /// A validated request. Pure to build.
@@ -190,6 +193,9 @@ async fn lift_invariant(deps: &AskUserDeps, params: &Value) -> Result<Value, Str
 
 async fn ask(deps: &AskUserDeps, params: &Value) -> Result<Value, String> {
     let request = parse_request(params)?;
+    if let Some(card_id) = crate::tasks::card_of_run_session(&request.session_id) {
+        return ask_on_the_board(deps, card_id, &request.question).await;
+    }
     deps.sessions
         .post_assistant_message(&deps.events, &request.session_id, request.question.clone())
         .await
@@ -229,6 +235,50 @@ async fn ask(deps: &AskUserDeps, params: &Value) -> Result<Value, String> {
         }
         tokio::time::sleep(ANSWER_POLL_INTERVAL).await;
     }
+}
+
+/// A card run's question (P25 decision 6): a clarification card for the
+/// human that the run's card waits on. Nothing waits — the run works whatever
+/// else it can, ends when only the waiting card is left, and starts again
+/// when the human completes the clarification (`unblocked`), with the answer
+/// in its notes.
+async fn ask_on_the_board(
+    deps: &AskUserDeps,
+    card_id: i64,
+    question: &str,
+) -> Result<Value, String> {
+    debug_assert!(card_id > 0, "store ids start at 1");
+    let storage = deps
+        .storage
+        .as_ref()
+        .ok_or("Nothing was asked: this daemon has no task board.")?;
+    let tasks = storage.tasks();
+    let card = tasks
+        .get(card_id)
+        .await
+        .map_err(|e| format!("Nothing was asked: card #{card_id} is unreadable: {e}"))?;
+    let asker = card
+        .assignee
+        .clone()
+        .ok_or_else(|| format!("Nothing was asked: card #{card_id} has no member working it."))?;
+    let applied = nanna_storage::routing::ask_on_card(
+        &tasks,
+        &asker,
+        &card,
+        question,
+        "The card waits on your answer; its work resumes when you complete that card.",
+    )
+    .await
+    .map_err(|e| format!("Nothing was asked: {e}"))?;
+    let clarification = applied.created.first().copied();
+    Ok(json!({
+        "answered": false,
+        "asked": true,
+        "reason": "asked_on_the_board",
+        "clarification_card": clarification,
+        "note": "The human answers on the board, not now. This card waits on that answer: \
+                 finish any other work you can, then stop — the run resumes with the answer.",
+    }))
 }
 
 /// Put `question` to the user of `session_id` and wait for the reply.
@@ -281,6 +331,7 @@ mod tests {
             sessions: Arc::new(SessionManager::new()),
             events,
             chat_runs: Arc::new(ChatRunRegistry::new()),
+            storage: None,
         };
         (deps, rx)
     }
@@ -503,5 +554,75 @@ mod tests {
         );
         let empty = lift_invariant(&deps, &json!({ "glob": "tests" })).await;
         assert!(empty.is_err(), "no registry, no rule");
+    }
+
+    /// P25 decision 6: asked from a card run, the question is a card for the
+    /// human that the run's card waits on — never a message in whichever
+    /// conversation happened to be active.
+    #[tokio::test]
+    async fn a_card_runs_question_is_a_card_the_card_waits_on() {
+        let storage = Arc::new(nanna_storage::Storage::in_memory().await.unwrap());
+        storage
+            .members()
+            .create(nanna_storage::NewMember {
+                id: "agent:builder".to_string(),
+                name: "Builder".to_string(),
+                avatar: None,
+                kind: nanna_storage::MemberKind::Agent,
+                owner_kind: nanna_storage::MemberOwner::Workspace,
+                owner_id: None,
+                status: nanna_storage::MemberStatus::Busy,
+                profile: json!({}),
+            })
+            .await
+            .unwrap();
+        let tasks = storage.tasks();
+        let card = tasks
+            .create(nanna_storage::NewTask {
+                title: "merge the release".to_string(),
+                scope: "global".to_string(),
+                priority: 3,
+                assignee: Some("agent:builder".to_string()),
+                ..nanna_storage::NewTask::default()
+            })
+            .await
+            .unwrap();
+        let (mut deps, mut bus) = deps();
+        let session = crate::tasks::card_run_session_id(card.id);
+        let without_board = ask(
+            &deps,
+            &json!({ "question": "Which branch?", "session_id": session }),
+        )
+        .await;
+        assert!(without_board.is_err(), "no board, nothing asked");
+
+        deps.storage = Some(Arc::clone(&storage));
+        let reply = ask(
+            &deps,
+            &json!({ "question": "Which branch?", "session_id": session }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["reason"], "asked_on_the_board", "{reply}");
+        let question = reply["clarification_card"].as_i64().expect("a card id");
+        let waiting = tasks.get(card.id).await.unwrap();
+        assert!(
+            waiting.blocked && waiting.depends_on == vec![question],
+            "{waiting:?}"
+        );
+        let clarification = tasks.get(question).await.unwrap();
+        assert_eq!(
+            clarification.assignee.as_deref(),
+            Some(nanna_storage::HUMAN_MEMBER_ID)
+        );
+        let thread = tasks.notes(card.id, 5).await.unwrap();
+        assert!(
+            thread
+                .iter()
+                .any(|n| n.kind == nanna_storage::TaskNoteKind::Question
+                    && n.author_member_id.as_deref() == Some("agent:builder")),
+            "the member asks, on its card: {thread:?}"
+        );
+        assert!(bus.try_recv().is_err(), "no conversation was written to");
     }
 }

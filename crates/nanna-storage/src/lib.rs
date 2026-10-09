@@ -13,6 +13,7 @@
 mod members;
 mod migrations;
 mod models;
+pub mod quick_add;
 mod recovery;
 mod repositories;
 pub mod routing;
@@ -545,6 +546,1066 @@ const fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
     end
 }
 
+// =============================================================================
+// Model Stats Persistence
+// =============================================================================
+
+/// Stored model statistics row (mirrors `nanna-agent::ModelStats` without the dependency)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredModelStats {
+    pub model: String,
+    pub total_requests: u64,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub total_cache_creation_tokens: u64,
+    /// The 1-hour share of `total_cache_creation_tokens` (billed at 2x input, not 1.25x).
+    #[serde(default)]
+    pub total_cache_creation_1h_tokens: u64,
+    pub consecutive_failures: u32,
+    pub last_success_epoch_ms: u64,
+    pub last_failure_epoch_ms: u64,
+    pub tier_successes_simple: u64,
+    pub tier_successes_medium: u64,
+    pub tier_successes_complex: u64,
+    pub tier_failures_simple: u64,
+    pub tier_failures_medium: u64,
+    pub tier_failures_complex: u64,
+    pub escalations: u64,
+    pub latencies_ms: Vec<u64>,
+    pub throughput_tps: Vec<f64>,
+}
+
+impl Storage {
+    /// Save model stats to the database (upsert).
+    ///
+    /// Counters are stored in `INTEGER` columns by bit-reinterpretation
+    /// (`cast_signed`), and [`Self::load_model_stats`] reverses it with
+    /// `cast_unsigned`, so every `u64` round-trips exactly.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if an upsert fails; rows for models
+    /// earlier in `stats` are already saved by then.
+    pub async fn save_model_stats(&self, stats: &[StoredModelStats]) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        for s in stats {
+            let latencies_json = serde_json::to_string(&s.latencies_ms)?;
+            let throughput_json = serde_json::to_string(&s.throughput_tps)?;
+            conn.execute(
+                "INSERT INTO model_stats (
+                    model, total_requests, successful_requests, failed_requests,
+                    total_input_tokens, total_output_tokens,
+                    total_cache_read_tokens, total_cache_creation_tokens,
+                    consecutive_failures, last_success_epoch_ms, last_failure_epoch_ms,
+                    tier_successes_simple, tier_successes_medium, tier_successes_complex,
+                    tier_failures_simple, tier_failures_medium, tier_failures_complex,
+                    escalations, latencies_ms_json, throughput_tps_json, total_cache_creation_1h_tokens, updated_at
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,datetime('now'))
+                ON CONFLICT(model) DO UPDATE SET
+                    total_requests=?2, successful_requests=?3, failed_requests=?4,
+                    total_input_tokens=?5, total_output_tokens=?6,
+                    total_cache_read_tokens=?7, total_cache_creation_tokens=?8,
+                    consecutive_failures=?9, last_success_epoch_ms=?10, last_failure_epoch_ms=?11,
+                    tier_successes_simple=?12, tier_successes_medium=?13, tier_successes_complex=?14,
+                    tier_failures_simple=?15, tier_failures_medium=?16, tier_failures_complex=?17,
+                    escalations=?18, latencies_ms_json=?19, throughput_tps_json=?20, total_cache_creation_1h_tokens=?21, updated_at=datetime('now')",
+                turso::params![
+                    s.model.clone(),
+                    s.total_requests.cast_signed(),
+                    s.successful_requests.cast_signed(),
+                    s.failed_requests.cast_signed(),
+                    s.total_input_tokens.cast_signed(),
+                    s.total_output_tokens.cast_signed(),
+                    s.total_cache_read_tokens.cast_signed(),
+                    s.total_cache_creation_tokens.cast_signed(),
+                    i64::from(s.consecutive_failures),
+                    s.last_success_epoch_ms.cast_signed(),
+                    s.last_failure_epoch_ms.cast_signed(),
+                    s.tier_successes_simple.cast_signed(),
+                    s.tier_successes_medium.cast_signed(),
+                    s.tier_successes_complex.cast_signed(),
+                    s.tier_failures_simple.cast_signed(),
+                    s.tier_failures_medium.cast_signed(),
+                    s.tier_failures_complex.cast_signed(),
+                    s.escalations.cast_signed(),
+                    latencies_json,
+                    throughput_json,
+                    s.total_cache_creation_1h_tokens.cast_signed()
+                ],
+            ).await?;
+        }
+        // Held for the whole batch: the guard is the transaction.
+        drop(conn);
+        Ok(())
+    }
+
+    /// Load all model stats from the database.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a column does
+    /// not decode as the expected type. Unparseable latency/throughput JSON is
+    /// not an error: it loads as an empty series.
+    pub async fn load_model_stats(&self) -> Result<Vec<StoredModelStats>, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(
+            "SELECT model, total_requests, successful_requests, failed_requests,
+                    total_input_tokens, total_output_tokens,
+                    total_cache_read_tokens, total_cache_creation_tokens,
+                    consecutive_failures, last_success_epoch_ms, last_failure_epoch_ms,
+                    tier_successes_simple, tier_successes_medium, tier_successes_complex,
+                    tier_failures_simple, tier_failures_medium, tier_failures_complex,
+                    escalations, latencies_ms_json, throughput_tps_json, total_cache_creation_1h_tokens
+             FROM model_stats",
+            (),
+        ).await?;
+
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let latencies_json: String = row.get::<String>(18)?;
+            let throughput_json: String = row.get::<String>(19)?;
+            result.push(StoredModelStats {
+                model: row.get::<String>(0)?,
+                total_requests: row.get::<i64>(1)?.cast_unsigned(),
+                successful_requests: row.get::<i64>(2)?.cast_unsigned(),
+                failed_requests: row.get::<i64>(3)?.cast_unsigned(),
+                total_input_tokens: row.get::<i64>(4)?.cast_unsigned(),
+                total_output_tokens: row.get::<i64>(5)?.cast_unsigned(),
+                total_cache_read_tokens: row.get::<i64>(6)?.cast_unsigned(),
+                total_cache_creation_tokens: row.get::<i64>(7)?.cast_unsigned(),
+                // The only writer stores `i64::from(u32)`, so the fallback is
+                // unreachable for any row this crate wrote.
+                consecutive_failures: u32::try_from(row.get::<i64>(8)?).unwrap_or(u32::MAX),
+                last_success_epoch_ms: row.get::<i64>(9)?.cast_unsigned(),
+                last_failure_epoch_ms: row.get::<i64>(10)?.cast_unsigned(),
+                tier_successes_simple: row.get::<i64>(11)?.cast_unsigned(),
+                tier_successes_medium: row.get::<i64>(12)?.cast_unsigned(),
+                tier_successes_complex: row.get::<i64>(13)?.cast_unsigned(),
+                tier_failures_simple: row.get::<i64>(14)?.cast_unsigned(),
+                tier_failures_medium: row.get::<i64>(15)?.cast_unsigned(),
+                tier_failures_complex: row.get::<i64>(16)?.cast_unsigned(),
+                escalations: row.get::<i64>(17)?.cast_unsigned(),
+                latencies_ms: serde_json::from_str(&latencies_json).unwrap_or_default(),
+                throughput_tps: serde_json::from_str(&throughput_json).unwrap_or_default(),
+                total_cache_creation_1h_tokens: row.get::<i64>(20)?.cast_unsigned(),
+            });
+        }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        Ok(result)
+    }
+
+    /// Log a single model request observation (detailed per-request log).
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the insert fails.
+    pub async fn log_model_request(&self, request: &NewModelRequest<'_>) -> Result<(), StorageError> {
+        debug_assert!(
+            request.cache_creation_1h_tokens <= request.cache_creation_tokens,
+            "the 1-hour share is a subset of the write total"
+        );
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO model_request_log (model, success, latency_ms, input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens, cache_creation_1h_tokens, tier,
+                escalated, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            turso::params![
+                request.model,
+                i64::from(request.success),
+                request.latency_ms.cast_signed(),
+                i64::from(request.input_tokens),
+                i64::from(request.output_tokens),
+                i64::from(request.cache_read_tokens),
+                i64::from(request.cache_creation_tokens),
+                i64::from(request.cache_creation_1h_tokens),
+                request.tier.unwrap_or(""),
+                i64::from(request.escalated),
+                request.session_id.unwrap_or("")
+            ],
+        ).await?;
+        drop(conn);
+        Ok(())
+    }
+
+    /// Model usage summed per day (`YYYY-MM-DD`) or month (`YYYY-MM`) and
+    /// model, oldest first, over the last `days` days.
+    ///
+    /// Rows are bounded by periods × models: `days` is clamped to 366, and the
+    /// model set is whatever was configured and used.
+    ///
+    /// # Errors
+    ///
+    /// The query failed or a row did not have the expected shape.
+    pub async fn model_usage_buckets(
+        &self,
+        days: u32,
+        by_month: bool,
+    ) -> Result<Vec<ModelUsageBucket>, StorageError> {
+        let period = if by_month {
+            UsagePeriod::Month
+        } else {
+            UsagePeriod::Day
+        };
+        self.model_usage_by(days, period).await
+    }
+
+    /// Model usage over the last `days` days grouped by `period` and model.
+    /// For [`UsagePeriod::Session`] the bucket's `period` is the session id
+    /// (empty for requests made outside any conversation).
+    ///
+    /// # Errors
+    ///
+    /// The query failed or a row did not have the expected shape.
+    pub async fn model_usage_by(
+        &self,
+        days: u32,
+        period: UsagePeriod,
+    ) -> Result<Vec<ModelUsageBucket>, StorageError> {
+        let days = days.clamp(1, USAGE_BUCKET_DAYS_MAX);
+        // `created_at` is `datetime('now')`: `YYYY-MM-DD HH:MM:SS`, so a day or
+        // month is a prefix of it and the cutoff compares as text. The column
+        // is chosen from a closed enum, never from caller text.
+        let group_expr = match period {
+            UsagePeriod::Day => "substr(created_at, 1, 10)",
+            UsagePeriod::Month => "substr(created_at, 1, 7)",
+            UsagePeriod::Session => "COALESCE(session_id, '')",
+        };
+        let since = window_first_day(days).format("%Y-%m-%d 00:00:00").to_string();
+        let sql = format!(
+            "SELECT {group_expr} AS period, model,
+                    CAST(COUNT(*) AS INTEGER),
+                    CAST(SUM(input_tokens) AS INTEGER),
+                    CAST(SUM(output_tokens) AS INTEGER),
+                    CAST(SUM(cache_read_tokens) AS INTEGER),
+                    CAST(SUM(cache_creation_tokens) AS INTEGER),
+                    CAST(SUM(cache_creation_1h_tokens) AS INTEGER)
+             FROM model_request_log
+             WHERE created_at >= ?1
+             GROUP BY period, model
+             ORDER BY period ASC, model ASC"
+        );
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(&sql, turso::params![since]).await?;
+        let mut buckets = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let count = |index: usize| row.get::<i64>(index).map(|n| u64::try_from(n).unwrap_or(0));
+            buckets.push(ModelUsageBucket {
+                period: row.get::<String>(0)?,
+                model: row.get::<String>(1)?,
+                requests: count(2)?,
+                input_tokens: count(3)?,
+                output_tokens: count(4)?,
+                cache_read_tokens: count(5)?,
+                cache_write_tokens: count(6)?,
+                cache_write_1h_tokens: count(7)?,
+            });
+        }
+        drop(rows);
+        drop(conn);
+        Ok(buckets)
+    }
+
+    // =========================================================================
+    // Tool Stats
+    // =========================================================================
+
+    /// Log a single tool call (time-series data for graphs).
+    ///
+    /// `short_circuited` (P22 Tier 4): the harness answered with a breaker
+    /// replay instead of dispatching. The row is still logged (with a
+    /// `[short_circuited]` error marker so it stays distinguishable in the
+    /// time series — the schema has no outcome column), but the hourly
+    /// aggregate counts it as neither success nor failure: the tool never
+    /// ran, and a wall of replays must not read as a broken tool.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the log insert or either
+    /// aggregate upsert fails. The statements are not rolled back, so a
+    /// failure in an aggregate leaves the earlier rows written.
+    pub async fn log_tool_call(&self, call: &NewToolCall<'_>) -> Result<(), StorageError> {
+        let NewToolCall {
+            tool_name,
+            success,
+            short_circuited,
+            duration_ms,
+            output_size,
+            error_message,
+            session_id,
+        } = *call;
+        let conn = self.conn.lock().await;
+        let logged_error = if short_circuited {
+            "[short_circuited]"
+        } else {
+            error_message.unwrap_or("")
+        };
+        conn.execute(
+            "INSERT INTO tool_call_log (tool_name, success, duration_ms, output_size, error_message, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            turso::params![
+                tool_name,
+                i64::from(success),
+                duration_ms.cast_signed(),
+                // A buffer length never exceeds `isize::MAX`, so the fallback
+                // is unreachable.
+                i64::try_from(output_size).unwrap_or(i64::MAX),
+                logged_error,
+                session_id.unwrap_or("")
+            ],
+        ).await?;
+
+        // One instant for both aggregates, so a call at 23:59:59.999 cannot
+        // land in one day's hourly row and the next day's daily row.
+        let now = chrono::Utc::now();
+        let hour = now.format("%Y-%m-%dT%H:00:00").to_string();
+        // A short-circuited call never ran: it is neither a success nor a
+        // failure in EITHER aggregate. The daily one used to count it as
+        // `success`, so the two views disagreed about the same calls.
+        let success_incr = i64::from(success && !short_circuited);
+        let failure_incr = i64::from(!success && !short_circuited);
+        conn.execute(
+            "INSERT INTO tool_stats_hourly (tool_name, hour, call_count, success_count, failure_count, total_duration_ms, avg_duration_ms, p95_duration_ms)
+             VALUES (?1, ?2, 1, ?3, ?4, ?5, ?5, ?5)
+             ON CONFLICT(tool_name, hour) DO UPDATE SET
+                call_count = call_count + 1,
+                success_count = success_count + ?3,
+                failure_count = failure_count + ?4,
+                total_duration_ms = total_duration_ms + ?5,
+                avg_duration_ms = (total_duration_ms + ?5) / (call_count + 1),
+                p95_duration_ms = MAX(p95_duration_ms, ?5)",
+            turso::params![
+                tool_name,
+                hour,
+                success_incr,
+                failure_incr,
+                duration_ms.cast_signed()
+            ],
+        ).await?;
+
+        let day = now.format("%Y-%m-%d").to_string();
+        conn.execute(
+            "INSERT INTO tool_stats_daily (tool_name, day, call_count, success_count, failure_count, total_duration_ms, avg_duration_ms, p95_duration_ms)
+             VALUES (?1, ?2, 1, ?3, ?4, ?5, ?5, ?5)
+             ON CONFLICT(tool_name, day) DO UPDATE SET
+                call_count = call_count + 1,
+                success_count = success_count + ?3,
+                failure_count = failure_count + ?4,
+                total_duration_ms = total_duration_ms + ?5,
+                avg_duration_ms = (total_duration_ms + ?5) / (call_count + 1),
+                p95_duration_ms = MAX(p95_duration_ms, ?5)",
+            turso::params![
+                tool_name,
+                day,
+                success_incr,
+                failure_incr,
+                duration_ms.cast_signed()
+            ],
+        ).await?;
+        // Held across the log row and both aggregates: the guard is the
+        // transaction.
+        drop(conn);
+
+        Ok(())
+    }
+
+    /// Get hourly tool stats for a given time range (for graphs).
+    /// Returns data for the last `hours` hours.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a column does
+    /// not decode as the expected type.
+    pub async fn get_tool_stats_hourly(
+        &self,
+        tool_name: Option<&str>,
+        hours: u32,
+    ) -> Result<Vec<ToolStatsTimeBucket>, StorageError> {
+        let conn = self.conn.lock().await;
+        let since = chrono::Utc::now() - chrono::Duration::hours(i64::from(hours));
+        let since_str = since.format("%Y-%m-%dT%H:00:00").to_string();
+
+        let mut rows = if let Some(name) = tool_name {
+            conn.query(
+                "SELECT tool_name, hour, call_count, success_count, failure_count, 
+                        total_duration_ms, avg_duration_ms, p95_duration_ms
+                 FROM tool_stats_hourly
+                 WHERE tool_name = ?1 AND hour >= ?2
+                 ORDER BY hour ASC",
+                turso::params![name, since_str],
+            ).await?
+        } else {
+            conn.query(
+                "SELECT 'all' as tool_name, hour, 
+                        CAST(SUM(call_count) AS INTEGER),
+                        CAST(SUM(success_count) AS INTEGER),
+                        CAST(SUM(failure_count) AS INTEGER),
+                        CAST(SUM(total_duration_ms) AS INTEGER),
+                        CAST(SUM(total_duration_ms) / MAX(SUM(call_count), 1) AS INTEGER),
+                        CAST(MAX(p95_duration_ms) AS INTEGER)
+                 FROM tool_stats_hourly
+                 WHERE hour >= ?1
+                 GROUP BY hour
+                 ORDER BY hour ASC",
+                turso::params![since_str],
+            ).await?
+        };
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().await? {
+            result.push(ToolStatsTimeBucket {
+                tool_name: row.get::<String>(0)?,
+                period: row.get::<String>(1)?,
+                call_count: row.get::<i64>(2)?.cast_unsigned(),
+                success_count: row.get::<i64>(3)?.cast_unsigned(),
+                failure_count: row.get::<i64>(4)?.cast_unsigned(),
+                total_duration_ms: row.get::<i64>(5)?.cast_unsigned(),
+                avg_duration_ms: row.get::<i64>(6)?.cast_unsigned(),
+                p95_duration_ms: row.get::<i64>(7)?.cast_unsigned(),
+            });
+        }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        Ok(result)
+    }
+
+    /// Get daily tool stats for a given time range (for long-term graphs).
+    /// Returns data for the last `days` days.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a column does
+    /// not decode as the expected type.
+    pub async fn get_tool_stats_daily(
+        &self,
+        tool_name: Option<&str>,
+        days: u32,
+    ) -> Result<Vec<ToolStatsTimeBucket>, StorageError> {
+        let conn = self.conn.lock().await;
+        let since_str = window_first_day(days).format("%Y-%m-%d").to_string();
+
+        let mut rows = if let Some(name) = tool_name {
+            conn.query(
+                "SELECT tool_name, day, call_count, success_count, failure_count,
+                        total_duration_ms, avg_duration_ms, p95_duration_ms
+                 FROM tool_stats_daily
+                 WHERE tool_name = ?1 AND day >= ?2
+                 ORDER BY day ASC",
+                turso::params![name, since_str],
+            ).await?
+        } else {
+            conn.query(
+                "SELECT 'all' as tool_name, day,
+                        CAST(SUM(call_count) AS INTEGER),
+                        CAST(SUM(success_count) AS INTEGER),
+                        CAST(SUM(failure_count) AS INTEGER),
+                        CAST(SUM(total_duration_ms) AS INTEGER),
+                        CAST(SUM(total_duration_ms) / MAX(SUM(call_count), 1) AS INTEGER),
+                        CAST(MAX(p95_duration_ms) AS INTEGER)
+                 FROM tool_stats_daily
+                 WHERE day >= ?1
+                 GROUP BY day
+                 ORDER BY day ASC",
+                turso::params![since_str],
+            ).await?
+        };
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().await? {
+            result.push(ToolStatsTimeBucket {
+                tool_name: row.get::<String>(0)?,
+                period: row.get::<String>(1)?,
+                call_count: row.get::<i64>(2)?.cast_unsigned(),
+                success_count: row.get::<i64>(3)?.cast_unsigned(),
+                failure_count: row.get::<i64>(4)?.cast_unsigned(),
+                total_duration_ms: row.get::<i64>(5)?.cast_unsigned(),
+                avg_duration_ms: row.get::<i64>(6)?.cast_unsigned(),
+                p95_duration_ms: row.get::<i64>(7)?.cast_unsigned(),
+            });
+        }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        Ok(result)
+    }
+
+    /// Get recent tool call log entries (for detail views).
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a column does
+    /// not decode as the expected type.
+    pub async fn get_tool_call_log(
+        &self,
+        tool_name: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<ToolCallLogEntry>, StorageError> {
+        let conn = self.conn.lock().await;
+
+        let mut rows = if let Some(name) = tool_name {
+            conn.query(
+                "SELECT tool_name, success, duration_ms, output_size, error_message, session_id, created_at
+                 FROM tool_call_log
+                 WHERE tool_name = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT ?2",
+                turso::params![name, i64::from(limit)],
+            ).await?
+        } else {
+            conn.query(
+                "SELECT tool_name, success, duration_ms, output_size, error_message, session_id, created_at
+                 FROM tool_call_log
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT ?1",
+                turso::params![i64::from(limit)],
+            ).await?
+        };
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().await? {
+            result.push(ToolCallLogEntry {
+                tool_name: row.get::<String>(0)?,
+                success: row.get::<i64>(1)? != 0,
+                duration_ms: row.get::<i64>(2)?.cast_unsigned(),
+                output_size: row.get::<i64>(3)?.cast_unsigned(),
+                error_message: {
+                    let s: String = row.get::<String>(4)?;
+                    if s.is_empty() { None } else { Some(s) }
+                },
+                session_id: {
+                    let s: String = row.get::<String>(5)?;
+                    if s.is_empty() { None } else { Some(s) }
+                },
+                created_at: row.get::<String>(6)?,
+            });
+        }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        Ok(result)
+    }
+
+    /// Delete raw tool-call rows older than `keep_days`; returns how many.
+    ///
+    /// The cutoff is computed by the database, in the format `created_at` is
+    /// written in (`datetime('now')`, `YYYY-MM-DD HH:MM:SS`). It used to be an
+    /// RFC 3339 string, and `' '` sorts below `'T'`, so every row of the cutoff
+    /// DAY compared as older and the whole day was deleted at any hour. Only
+    /// the raw log is pruned — the hourly and daily aggregates keep history.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the delete fails.
+    pub async fn prune_tool_call_log(&self, keep_days: u32) -> Result<u64, StorageError> {
+        let modifier = format!("-{keep_days} days");
+        let conn = self.conn.lock().await;
+        let deleted = conn
+            .execute(
+                "DELETE FROM tool_call_log WHERE created_at < datetime('now', ?1)",
+                turso::params![modifier],
+            )
+            .await?;
+        drop(conn);
+        Ok(deleted)
+    }
+}
+
+// =========================================================================
+// Checkpoints
+// =========================================================================
+
+impl Storage {
+    /// Save a checkpoint for crash recovery.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the upsert fails.
+    pub async fn save_checkpoint(&self, session_id: &str, data: &str) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO checkpoints (session_id, data, updated_at)
+             VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(session_id) DO UPDATE SET data = ?2, updated_at = datetime('now')",
+            turso::params![session_id, data],
+        ).await?;
+        drop(conn);
+        Ok(())
+    }
+
+    /// Load a checkpoint for a session.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or the stored
+    /// data does not decode as text.
+    pub async fn load_checkpoint(&self, session_id: &str) -> Result<Option<String>, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(
+            "SELECT data FROM checkpoints WHERE session_id = ?1",
+            turso::params![session_id],
+        ).await?;
+        let data = if let Some(row) = rows.next().await? {
+            Some(row.get::<String>(0)?)
+        } else {
+            None
+        };
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        Ok(data)
+    }
+
+    /// Delete a checkpoint after successful completion.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the delete fails.
+    pub async fn delete_checkpoint(&self, session_id: &str) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM checkpoints WHERE session_id = ?1",
+            turso::params![session_id],
+        ).await?;
+        drop(conn);
+        Ok(())
+    }
+
+    /// List all checkpoint session IDs (for recovery at startup).
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a session id
+    /// does not decode as text.
+    pub async fn list_checkpoints(&self) -> Result<Vec<String>, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(
+            "SELECT session_id FROM checkpoints",
+            (),
+        ).await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ids.push(row.get::<String>(0)?);
+        }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        Ok(ids)
+    }
+
+    // =========================================================================
+    // Tool Stats (aggregated — replaces tool-stats.json)
+    // =========================================================================
+
+    /// Save aggregated tool stats to the `tool_stats` table (upsert).
+    ///
+    /// Anything that is not the expected shape is skipped rather than
+    /// rejected: a missing `tools` object saves nothing, and a missing or
+    /// non-integer counter is stored as 0.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if an upsert fails; tools earlier in
+    /// the map are already saved by then.
+    pub async fn save_tool_stats_aggregated(&self, stats: &serde_json::Value) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        // The JSON is expected to be { "tools": { "tool_name": { stats... }, ... }, "sessions": N }
+        if let Some(tools) = stats.get("tools").and_then(|v| v.as_object()) {
+            for (tool_name, tool_data) in tools {
+                let call_count = tool_data.get("call_count").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let success_count = tool_data.get("success_count").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let failure_count = tool_data.get("failure_count").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let total_duration_ms = tool_data.get("total_duration_ms").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let last_called_epoch_ms = tool_data.get("last_called_epoch_ms").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let latencies = tool_data.get("latencies_ms").map_or_else(|| "[]".to_string(), std::string::ToString::to_string);
+                let output_sizes = tool_data.get("output_sizes").map_or_else(|| "[]".to_string(), std::string::ToString::to_string);
+                let errors = tool_data.get("errors").map_or_else(|| "[]".to_string(), std::string::ToString::to_string);
+
+                conn.execute(
+                    "INSERT INTO tool_stats (tool_name, call_count, success_count, failure_count, total_duration_ms, last_called_epoch_ms, latencies_ms_json, output_sizes_json, errors_json, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))
+                     ON CONFLICT(tool_name) DO UPDATE SET
+                        call_count = ?2, success_count = ?3, failure_count = ?4,
+                        total_duration_ms = ?5, last_called_epoch_ms = ?6,
+                        latencies_ms_json = ?7, output_sizes_json = ?8, errors_json = ?9,
+                        updated_at = datetime('now')",
+                    turso::params![
+                        tool_name.as_str(),
+                        call_count,
+                        success_count,
+                        failure_count,
+                        total_duration_ms,
+                        last_called_epoch_ms,
+                        latencies.as_str(),
+                        output_sizes.as_str(),
+                        errors.as_str()
+                    ],
+                ).await?;
+            }
+        }
+        // Held for the whole batch: the guard is the transaction.
+        drop(conn);
+        Ok(())
+    }
+
+    /// Load aggregated tool stats from the `tool_stats` table (returns the JSON format `ToolStatsTracker` expects).
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a column does
+    /// not decode as the expected type. Unparseable stored JSON arrays load as
+    /// empty arrays.
+    pub async fn load_tool_stats_aggregated(&self) -> Result<serde_json::Value, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(
+            "SELECT tool_name, call_count, success_count, failure_count, total_duration_ms, last_called_epoch_ms, latencies_ms_json, output_sizes_json, errors_json
+             FROM tool_stats",
+            (),
+        ).await?;
+
+        let mut tools = serde_json::Map::new();
+        let mut session_count: i64 = 0;
+        while let Some(row) = rows.next().await? {
+            let tool_name: String = row.get(0)?;
+            let call_count: i64 = row.get(1)?;
+            let success_count: i64 = row.get(2)?;
+            let failure_count: i64 = row.get(3)?;
+            let total_duration_ms: i64 = row.get(4)?;
+            let last_called_epoch_ms: i64 = row.get(5)?;
+            let latencies_str: String = row.get(6)?;
+            let output_sizes_str: String = row.get(7)?;
+            let errors_str: String = row.get(8)?;
+
+            let latencies: serde_json::Value = serde_json::from_str(&latencies_str).unwrap_or(serde_json::json!([]));
+            let output_sizes: serde_json::Value = serde_json::from_str(&output_sizes_str).unwrap_or(serde_json::json!([]));
+            let errors: serde_json::Value = serde_json::from_str(&errors_str).unwrap_or(serde_json::json!([]));
+
+            session_count += call_count;
+            tools.insert(tool_name, serde_json::json!({
+                "call_count": call_count,
+                "success_count": success_count,
+                "failure_count": failure_count,
+                "total_duration_ms": total_duration_ms,
+                "last_called_epoch_ms": last_called_epoch_ms,
+                "latencies_ms": latencies,
+                "output_sizes": output_sizes,
+                "errors": errors,
+            }));
+        }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+
+        Ok(serde_json::json!({
+            "tools": tools,
+            "sessions": session_count
+        }))
+    }
+
+    // =========================================================================
+    // Daemon Session Persistence (replaces sessions.json)
+    // =========================================================================
+
+    /// Create or update a daemon session in the database.
+    /// This handles the daemon's Session struct format (different from GUI sessions).
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the upsert fails.
+    pub async fn upsert_daemon_session(
+        &self,
+        session_id: &str,
+        name: Option<&str>,
+        workspace_id: Option<&str>,
+        created_at: &str,
+        updated_at: &str,
+        metadata: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO sessions (session_id, channel, name, workspace_id, created_at, updated_at, metadata)
+             VALUES (?1, 'gui', ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(session_id) DO UPDATE SET
+                name = COALESCE(?2, name),
+                workspace_id = COALESCE(?3, workspace_id),
+                updated_at = ?5,
+                metadata = COALESCE(?6, metadata)",
+            turso::params![session_id, name, workspace_id, created_at, updated_at, metadata],
+        ).await?;
+        drop(conn);
+        Ok(())
+    }
+
+    /// Add a daemon message to the messages table.
+    /// Stores `tool_calls`, attachments, and reasoning in the metadata JSON field.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the insert or the session touch
+    /// fails; a failed touch leaves the message already inserted.
+    pub async fn add_daemon_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        role: &str,
+        content: &str,
+        created_at: &str,
+        metadata: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, content_type, tool_use_id, created_at, metadata)
+             VALUES (?1, ?2, ?3, 'text', ?4, ?5, ?6)",
+            turso::params![session_id, role, content, message_id, created_at, metadata],
+        ).await?;
+        // Touch session
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE session_id = ?2",
+            turso::params![created_at, session_id],
+        ).await?;
+        // Held across the insert and the touch: the guard is the transaction.
+        drop(conn);
+        Ok(())
+    }
+
+    /// Load all sessions from the database (regardless of channel).
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a column does
+    /// not decode as the expected type. Unparseable metadata loads as `None`.
+    pub async fn list_daemon_sessions(&self) -> Result<Vec<Session>, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(
+            // `datetime(...)`: `updated_at` is written as RFC 3339 by the
+            // daemon's own paths and as `datetime('now')` by the rename /
+            // workspace / touch paths, and as text a space sorts below `T` —
+            // a session renamed at 15:00 sorted below one touched at 09:00
+            // the same day, and the first row is the default session on boot.
+            "SELECT id, session_id, channel, user_id, created_at, updated_at, metadata, workspace_id, name
+             FROM sessions ORDER BY datetime(updated_at) DESC, id DESC",
+            (),
+        ).await?;
+        let mut sessions = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let metadata_str: Option<String> = row.get(6)?;
+            sessions.push(Session {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                channel: row.get(2)?,
+                user_id: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+                metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
+                workspace_id: row.get(7)?,
+                name: row.get(8)?,
+            });
+        }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        Ok(sessions)
+    }
+
+    /// Load all messages for a daemon session, ordered by creation time.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a column does
+    /// not decode as the expected type. Unparseable metadata loads as `None`.
+    pub async fn load_daemon_messages(&self, session_id: &str) -> Result<Vec<Message>, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(
+            "SELECT id, session_id, role, content, content_type, tool_use_id, created_at, tokens_in, tokens_out, metadata
+             FROM messages WHERE session_id = ?1 ORDER BY created_at ASC",
+            turso::params![session_id],
+        ).await?;
+        let mut messages = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let metadata_str: Option<String> = row.get(9)?;
+            messages.push(Message {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                content_type: row.get(4)?,
+                tool_use_id: row.get(5)?,
+                created_at: row.get(6)?,
+                tokens_in: row.get(7)?,
+                tokens_out: row.get(8)?,
+                metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
+            });
+        }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        Ok(messages)
+    }
+
+    /// Delete all messages for a daemon session.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the delete fails.
+    pub async fn clear_daemon_session_messages(&self, session_id: &str) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            turso::params![session_id],
+        ).await?;
+        drop(conn);
+        Ok(())
+    }
+
+    /// Delete one message of a daemon session, by its message id.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the delete fails.
+    pub async fn delete_daemon_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        // The message id is stored in `tool_use_id` (see `add_daemon_message`).
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ?1 AND tool_use_id = ?2",
+            turso::params![session_id, message_id],
+        )
+        .await?;
+        drop(conn);
+        Ok(())
+    }
+
+    /// Delete a daemon session and its messages.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if either delete fails; a failure on
+    /// the session row leaves its messages already deleted.
+    pub async fn delete_daemon_session(&self, session_id: &str) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute("DELETE FROM messages WHERE session_id = ?1", turso::params![session_id]).await?;
+        conn.execute("DELETE FROM sessions WHERE session_id = ?1", turso::params![session_id]).await?;
+        // Held across both deletes: the guard is the transaction.
+        drop(conn);
+        Ok(())
+    }
+
+    /// Update daemon session name.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the update fails.
+    pub async fn rename_daemon_session(&self, session_id: &str, name: &str) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE sessions SET name = ?1, updated_at = datetime('now') WHERE session_id = ?2",
+            turso::params![name, session_id],
+        ).await?;
+        drop(conn);
+        Ok(())
+    }
+
+    /// Update daemon session workspace.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the update fails.
+    pub async fn set_daemon_session_workspace(&self, session_id: &str, workspace_id: Option<&str>) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE sessions SET workspace_id = ?1, updated_at = datetime('now') WHERE session_id = ?2",
+            turso::params![workspace_id, session_id],
+        ).await?;
+        drop(conn);
+        Ok(())
+    }
+}
+
+/// One model request, as [`Storage::log_model_request`] records it.
+#[derive(Debug, Clone, Copy)]
+pub struct NewModelRequest<'a> {
+    pub model: &'a str,
+    pub success: bool,
+    pub latency_ms: u64,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_read_tokens: u32,
+    pub cache_creation_tokens: u32,
+    /// The 1-hour share of `cache_creation_tokens`.
+    pub cache_creation_1h_tokens: u32,
+    pub tier: Option<&'a str>,
+    pub escalated: bool,
+    pub session_id: Option<&'a str>,
+}
+
+/// One tool call, as [`Storage::log_tool_call`] records it.
+#[derive(Debug, Clone, Copy)]
+pub struct NewToolCall<'a> {
+    pub tool_name: &'a str,
+    pub success: bool,
+    /// The harness answered with a breaker replay instead of dispatching.
+    pub short_circuited: bool,
+    pub duration_ms: u64,
+    pub output_size: usize,
+    pub error_message: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+}
+
+/// How a usage rollup groups requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsagePeriod {
+    Day,
+    Month,
+    Session,
+}
+
+/// Longest window a usage rollup covers: a year and a day.
+pub const USAGE_BUCKET_DAYS_MAX: u32 = 366;
+
+/// The first UTC calendar day of a `days`-day window that ends today: "the
+/// last 7 days" is today and the six before it. Cutting at `now - days` and
+/// rounding to midnight took one day more — eight bars for "7 days", two for
+/// "today". `days` is clamped to `1..=USAGE_BUCKET_DAYS_MAX`.
+fn window_first_day(days: u32) -> chrono::NaiveDate {
+    let days = days.clamp(1, USAGE_BUCKET_DAYS_MAX);
+    let today = chrono::Utc::now().date_naive();
+    let first = today - chrono::Duration::days(i64::from(days - 1));
+    debug_assert!(first <= today);
+    debug_assert_eq!((today - first).num_days() + 1, i64::from(days));
+    first
+}
+
+/// Model usage summed over one period for one model.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelUsageBucket {
+    /// `YYYY-MM-DD` or `YYYY-MM` (UTC).
+    pub period: String,
+    pub model: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    /// The 1-hour share of `cache_write_tokens`.
+    pub cache_write_1h_tokens: u64,
+}
+
+/// Time-bucketed tool statistics (hourly or daily).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolStatsTimeBucket {
+    pub tool_name: String,
+    pub period: String,
+    pub call_count: u64,
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub total_duration_ms: u64,
+    pub avg_duration_ms: u64,
+    pub p95_duration_ms: u64,
+}
+
+/// A single tool call log entry.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolCallLogEntry {
+    pub tool_name: String,
+    pub success: bool,
+    pub duration_ms: u64,
+    pub output_size: u64,
+    pub error_message: Option<String>,
+    pub session_id: Option<String>,
+    pub created_at: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,6 +1679,59 @@ mod tests {
         let counts = |b: &ToolStatsTimeBucket| (b.call_count, b.success_count, b.failure_count);
         assert_eq!(counts(&hourly[0]), (2, 1, 0), "{hourly:?}");
         assert_eq!(counts(&daily[0]), counts(&hourly[0]), "{daily:?}");
+    }
+
+    /// A `days`-day window is `days` calendar days ending today, not one more.
+    #[test]
+    fn a_window_of_n_days_spans_n_calendar_days() {
+        let today = chrono::Utc::now().date_naive();
+        assert_eq!(window_first_day(1), today);
+        assert_eq!(window_first_day(0), today, "clamped to one day");
+        assert_eq!((today - window_first_day(7)).num_days(), 6);
+        assert_eq!(
+            (today - window_first_day(u32::MAX)).num_days(),
+            i64::from(USAGE_BUCKET_DAYS_MAX - 1)
+        );
+    }
+
+    /// A one-day usage window is today: yesterday's request is outside it.
+    #[tokio::test]
+    async fn a_one_day_usage_window_excludes_yesterday() {
+        let storage = Storage::in_memory().await.expect("storage");
+        for _ in 0..2 {
+            storage
+                .log_model_request(&NewModelRequest {
+                    model: "m",
+                    success: true,
+                    latency_ms: 1,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    cache_creation_1h_tokens: 0,
+                    tier: None,
+                    escalated: false,
+                    session_id: None,
+                })
+                .await
+                .expect("log");
+        }
+        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d 23:59:59")
+            .to_string();
+        let conn = storage.conn.lock().await;
+        conn.execute(
+            "UPDATE model_request_log SET created_at = ?1 WHERE id = 1",
+            turso::params![yesterday.as_str()],
+        )
+        .await
+        .expect("backdate");
+        drop(conn);
+        let one = storage.model_usage_buckets(1, false).await.expect("rollup");
+        assert_eq!(one.len(), 1, "{one:?}");
+        assert_eq!(one[0].requests, 1);
+        let two = storage.model_usage_buckets(2, false).await.expect("rollup");
+        assert_eq!(two.len(), 2, "{two:?}");
     }
 
     /// Session metadata is serialized, not formatted: a quote in the name used
@@ -973,1049 +2087,4 @@ mod tests {
         assert_eq!(bulk_ids, salv_ids);
         assert_eq!(report.memories[0].embedding, bulk[0].embedding);
     }
-}
-
-// =============================================================================
-// Model Stats Persistence
-// =============================================================================
-
-/// Stored model statistics row (mirrors `nanna-agent::ModelStats` without the dependency)
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct StoredModelStats {
-    pub model: String,
-    pub total_requests: u64,
-    pub successful_requests: u64,
-    pub failed_requests: u64,
-    pub total_input_tokens: u64,
-    pub total_output_tokens: u64,
-    pub total_cache_read_tokens: u64,
-    pub total_cache_creation_tokens: u64,
-    /// The 1-hour share of `total_cache_creation_tokens` (billed at 2x input, not 1.25x).
-    #[serde(default)]
-    pub total_cache_creation_1h_tokens: u64,
-    pub consecutive_failures: u32,
-    pub last_success_epoch_ms: u64,
-    pub last_failure_epoch_ms: u64,
-    pub tier_successes_simple: u64,
-    pub tier_successes_medium: u64,
-    pub tier_successes_complex: u64,
-    pub tier_failures_simple: u64,
-    pub tier_failures_medium: u64,
-    pub tier_failures_complex: u64,
-    pub escalations: u64,
-    pub latencies_ms: Vec<u64>,
-    pub throughput_tps: Vec<f64>,
-}
-
-impl Storage {
-    /// Save model stats to the database (upsert).
-    ///
-    /// Counters are stored in `INTEGER` columns by bit-reinterpretation
-    /// (`cast_signed`), and [`Self::load_model_stats`] reverses it with
-    /// `cast_unsigned`, so every `u64` round-trips exactly.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if an upsert fails; rows for models
-    /// earlier in `stats` are already saved by then.
-    pub async fn save_model_stats(&self, stats: &[StoredModelStats]) -> Result<(), StorageError> {
-        let conn = self.conn.lock().await;
-        for s in stats {
-            let latencies_json = serde_json::to_string(&s.latencies_ms)?;
-            let throughput_json = serde_json::to_string(&s.throughput_tps)?;
-            conn.execute(
-                "INSERT INTO model_stats (
-                    model, total_requests, successful_requests, failed_requests,
-                    total_input_tokens, total_output_tokens,
-                    total_cache_read_tokens, total_cache_creation_tokens,
-                    consecutive_failures, last_success_epoch_ms, last_failure_epoch_ms,
-                    tier_successes_simple, tier_successes_medium, tier_successes_complex,
-                    tier_failures_simple, tier_failures_medium, tier_failures_complex,
-                    escalations, latencies_ms_json, throughput_tps_json, total_cache_creation_1h_tokens, updated_at
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,datetime('now'))
-                ON CONFLICT(model) DO UPDATE SET
-                    total_requests=?2, successful_requests=?3, failed_requests=?4,
-                    total_input_tokens=?5, total_output_tokens=?6,
-                    total_cache_read_tokens=?7, total_cache_creation_tokens=?8,
-                    consecutive_failures=?9, last_success_epoch_ms=?10, last_failure_epoch_ms=?11,
-                    tier_successes_simple=?12, tier_successes_medium=?13, tier_successes_complex=?14,
-                    tier_failures_simple=?15, tier_failures_medium=?16, tier_failures_complex=?17,
-                    escalations=?18, latencies_ms_json=?19, throughput_tps_json=?20, total_cache_creation_1h_tokens=?21, updated_at=datetime('now')",
-                turso::params![
-                    s.model.clone(),
-                    s.total_requests.cast_signed(),
-                    s.successful_requests.cast_signed(),
-                    s.failed_requests.cast_signed(),
-                    s.total_input_tokens.cast_signed(),
-                    s.total_output_tokens.cast_signed(),
-                    s.total_cache_read_tokens.cast_signed(),
-                    s.total_cache_creation_tokens.cast_signed(),
-                    i64::from(s.consecutive_failures),
-                    s.last_success_epoch_ms.cast_signed(),
-                    s.last_failure_epoch_ms.cast_signed(),
-                    s.tier_successes_simple.cast_signed(),
-                    s.tier_successes_medium.cast_signed(),
-                    s.tier_successes_complex.cast_signed(),
-                    s.tier_failures_simple.cast_signed(),
-                    s.tier_failures_medium.cast_signed(),
-                    s.tier_failures_complex.cast_signed(),
-                    s.escalations.cast_signed(),
-                    latencies_json,
-                    throughput_json,
-                    s.total_cache_creation_1h_tokens.cast_signed()
-                ],
-            ).await?;
-        }
-        // Held for the whole batch: the guard is the transaction.
-        drop(conn);
-        Ok(())
-    }
-
-    /// Load all model stats from the database.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the query fails or a column does
-    /// not decode as the expected type. Unparseable latency/throughput JSON is
-    /// not an error: it loads as an empty series.
-    pub async fn load_model_stats(&self) -> Result<Vec<StoredModelStats>, StorageError> {
-        let conn = self.conn.lock().await;
-        let mut rows = conn.query(
-            "SELECT model, total_requests, successful_requests, failed_requests,
-                    total_input_tokens, total_output_tokens,
-                    total_cache_read_tokens, total_cache_creation_tokens,
-                    consecutive_failures, last_success_epoch_ms, last_failure_epoch_ms,
-                    tier_successes_simple, tier_successes_medium, tier_successes_complex,
-                    tier_failures_simple, tier_failures_medium, tier_failures_complex,
-                    escalations, latencies_ms_json, throughput_tps_json, total_cache_creation_1h_tokens
-             FROM model_stats",
-            (),
-        ).await?;
-
-        let mut result = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let latencies_json: String = row.get::<String>(18)?;
-            let throughput_json: String = row.get::<String>(19)?;
-            result.push(StoredModelStats {
-                model: row.get::<String>(0)?,
-                total_requests: row.get::<i64>(1)?.cast_unsigned(),
-                successful_requests: row.get::<i64>(2)?.cast_unsigned(),
-                failed_requests: row.get::<i64>(3)?.cast_unsigned(),
-                total_input_tokens: row.get::<i64>(4)?.cast_unsigned(),
-                total_output_tokens: row.get::<i64>(5)?.cast_unsigned(),
-                total_cache_read_tokens: row.get::<i64>(6)?.cast_unsigned(),
-                total_cache_creation_tokens: row.get::<i64>(7)?.cast_unsigned(),
-                // The only writer stores `i64::from(u32)`, so the fallback is
-                // unreachable for any row this crate wrote.
-                consecutive_failures: u32::try_from(row.get::<i64>(8)?).unwrap_or(u32::MAX),
-                last_success_epoch_ms: row.get::<i64>(9)?.cast_unsigned(),
-                last_failure_epoch_ms: row.get::<i64>(10)?.cast_unsigned(),
-                tier_successes_simple: row.get::<i64>(11)?.cast_unsigned(),
-                tier_successes_medium: row.get::<i64>(12)?.cast_unsigned(),
-                tier_successes_complex: row.get::<i64>(13)?.cast_unsigned(),
-                tier_failures_simple: row.get::<i64>(14)?.cast_unsigned(),
-                tier_failures_medium: row.get::<i64>(15)?.cast_unsigned(),
-                tier_failures_complex: row.get::<i64>(16)?.cast_unsigned(),
-                escalations: row.get::<i64>(17)?.cast_unsigned(),
-                latencies_ms: serde_json::from_str(&latencies_json).unwrap_or_default(),
-                throughput_tps: serde_json::from_str(&throughput_json).unwrap_or_default(),
-                total_cache_creation_1h_tokens: row.get::<i64>(20)?.cast_unsigned(),
-            });
-        }
-        // Held until the cursor is gone: an open `Rows` on the shared
-        // connection swallows later writes.
-        drop(rows);
-        drop(conn);
-        Ok(result)
-    }
-
-    /// Log a single model request observation (detailed per-request log).
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the insert fails.
-    pub async fn log_model_request(&self, request: &NewModelRequest<'_>) -> Result<(), StorageError> {
-        debug_assert!(
-            request.cache_creation_1h_tokens <= request.cache_creation_tokens,
-            "the 1-hour share is a subset of the write total"
-        );
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT INTO model_request_log (model, success, latency_ms, input_tokens, output_tokens,
-                cache_read_tokens, cache_creation_tokens, cache_creation_1h_tokens, tier,
-                escalated, session_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            turso::params![
-                request.model,
-                i64::from(request.success),
-                request.latency_ms.cast_signed(),
-                i64::from(request.input_tokens),
-                i64::from(request.output_tokens),
-                i64::from(request.cache_read_tokens),
-                i64::from(request.cache_creation_tokens),
-                i64::from(request.cache_creation_1h_tokens),
-                request.tier.unwrap_or(""),
-                i64::from(request.escalated),
-                request.session_id.unwrap_or("")
-            ],
-        ).await?;
-        drop(conn);
-        Ok(())
-    }
-
-    /// Model usage summed per day (`YYYY-MM-DD`) or month (`YYYY-MM`) and
-    /// model, oldest first, over the last `days` days.
-    ///
-    /// Rows are bounded by periods × models: `days` is clamped to 366, and the
-    /// model set is whatever was configured and used.
-    ///
-    /// # Errors
-    ///
-    /// The query failed or a row did not have the expected shape.
-    pub async fn model_usage_buckets(
-        &self,
-        days: u32,
-        by_month: bool,
-    ) -> Result<Vec<ModelUsageBucket>, StorageError> {
-        let period = if by_month {
-            UsagePeriod::Month
-        } else {
-            UsagePeriod::Day
-        };
-        self.model_usage_by(days, period).await
-    }
-
-    /// Model usage over the last `days` days grouped by `period` and model.
-    /// For [`UsagePeriod::Session`] the bucket's `period` is the session id
-    /// (empty for requests made outside any conversation).
-    ///
-    /// # Errors
-    ///
-    /// The query failed or a row did not have the expected shape.
-    pub async fn model_usage_by(
-        &self,
-        days: u32,
-        period: UsagePeriod,
-    ) -> Result<Vec<ModelUsageBucket>, StorageError> {
-        let days = days.clamp(1, USAGE_BUCKET_DAYS_MAX);
-        // `created_at` is `datetime('now')`: `YYYY-MM-DD HH:MM:SS`, so a day or
-        // month is a prefix of it and the cutoff compares as text. The column
-        // is chosen from a closed enum, never from caller text.
-        let group_expr = match period {
-            UsagePeriod::Day => "substr(created_at, 1, 10)",
-            UsagePeriod::Month => "substr(created_at, 1, 7)",
-            UsagePeriod::Session => "COALESCE(session_id, '')",
-        };
-        let since = (chrono::Utc::now() - chrono::Duration::days(i64::from(days)))
-            .format("%Y-%m-%d 00:00:00")
-            .to_string();
-        let sql = format!(
-            "SELECT {group_expr} AS period, model,
-                    CAST(COUNT(*) AS INTEGER),
-                    CAST(SUM(input_tokens) AS INTEGER),
-                    CAST(SUM(output_tokens) AS INTEGER),
-                    CAST(SUM(cache_read_tokens) AS INTEGER),
-                    CAST(SUM(cache_creation_tokens) AS INTEGER),
-                    CAST(SUM(cache_creation_1h_tokens) AS INTEGER)
-             FROM model_request_log
-             WHERE created_at >= ?1
-             GROUP BY period, model
-             ORDER BY period ASC, model ASC"
-        );
-        let conn = self.conn.lock().await;
-        let mut rows = conn.query(&sql, turso::params![since]).await?;
-        let mut buckets = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let count = |index: usize| row.get::<i64>(index).map(|n| u64::try_from(n).unwrap_or(0));
-            buckets.push(ModelUsageBucket {
-                period: row.get::<String>(0)?,
-                model: row.get::<String>(1)?,
-                requests: count(2)?,
-                input_tokens: count(3)?,
-                output_tokens: count(4)?,
-                cache_read_tokens: count(5)?,
-                cache_write_tokens: count(6)?,
-                cache_write_1h_tokens: count(7)?,
-            });
-        }
-        drop(rows);
-        drop(conn);
-        Ok(buckets)
-    }
-
-    // =========================================================================
-    // Tool Stats
-    // =========================================================================
-
-    /// Log a single tool call (time-series data for graphs).
-    ///
-    /// `short_circuited` (P22 Tier 4): the harness answered with a breaker
-    /// replay instead of dispatching. The row is still logged (with a
-    /// `[short_circuited]` error marker so it stays distinguishable in the
-    /// time series — the schema has no outcome column), but the hourly
-    /// aggregate counts it as neither success nor failure: the tool never
-    /// ran, and a wall of replays must not read as a broken tool.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the log insert or either
-    /// aggregate upsert fails. The statements are not rolled back, so a
-    /// failure in an aggregate leaves the earlier rows written.
-    pub async fn log_tool_call(&self, call: &NewToolCall<'_>) -> Result<(), StorageError> {
-        let NewToolCall {
-            tool_name,
-            success,
-            short_circuited,
-            duration_ms,
-            output_size,
-            error_message,
-            session_id,
-        } = *call;
-        let conn = self.conn.lock().await;
-        let logged_error = if short_circuited {
-            "[short_circuited]"
-        } else {
-            error_message.unwrap_or("")
-        };
-        conn.execute(
-            "INSERT INTO tool_call_log (tool_name, success, duration_ms, output_size, error_message, session_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            turso::params![
-                tool_name,
-                i64::from(success),
-                duration_ms.cast_signed(),
-                // A buffer length never exceeds `isize::MAX`, so the fallback
-                // is unreachable.
-                i64::try_from(output_size).unwrap_or(i64::MAX),
-                logged_error,
-                session_id.unwrap_or("")
-            ],
-        ).await?;
-
-        // One instant for both aggregates, so a call at 23:59:59.999 cannot
-        // land in one day's hourly row and the next day's daily row.
-        let now = chrono::Utc::now();
-        let hour = now.format("%Y-%m-%dT%H:00:00").to_string();
-        // A short-circuited call never ran: it is neither a success nor a
-        // failure in EITHER aggregate. The daily one used to count it as
-        // `success`, so the two views disagreed about the same calls.
-        let success_incr = i64::from(success && !short_circuited);
-        let failure_incr = i64::from(!success && !short_circuited);
-        conn.execute(
-            "INSERT INTO tool_stats_hourly (tool_name, hour, call_count, success_count, failure_count, total_duration_ms, avg_duration_ms, p95_duration_ms)
-             VALUES (?1, ?2, 1, ?3, ?4, ?5, ?5, ?5)
-             ON CONFLICT(tool_name, hour) DO UPDATE SET
-                call_count = call_count + 1,
-                success_count = success_count + ?3,
-                failure_count = failure_count + ?4,
-                total_duration_ms = total_duration_ms + ?5,
-                avg_duration_ms = (total_duration_ms + ?5) / (call_count + 1),
-                p95_duration_ms = MAX(p95_duration_ms, ?5)",
-            turso::params![
-                tool_name,
-                hour,
-                success_incr,
-                failure_incr,
-                duration_ms.cast_signed()
-            ],
-        ).await?;
-
-        let day = now.format("%Y-%m-%d").to_string();
-        conn.execute(
-            "INSERT INTO tool_stats_daily (tool_name, day, call_count, success_count, failure_count, total_duration_ms, avg_duration_ms, p95_duration_ms)
-             VALUES (?1, ?2, 1, ?3, ?4, ?5, ?5, ?5)
-             ON CONFLICT(tool_name, day) DO UPDATE SET
-                call_count = call_count + 1,
-                success_count = success_count + ?3,
-                failure_count = failure_count + ?4,
-                total_duration_ms = total_duration_ms + ?5,
-                avg_duration_ms = (total_duration_ms + ?5) / (call_count + 1),
-                p95_duration_ms = MAX(p95_duration_ms, ?5)",
-            turso::params![
-                tool_name,
-                day,
-                success_incr,
-                failure_incr,
-                duration_ms.cast_signed()
-            ],
-        ).await?;
-        // Held across the log row and both aggregates: the guard is the
-        // transaction.
-        drop(conn);
-
-        Ok(())
-    }
-
-    /// Get hourly tool stats for a given time range (for graphs).
-    /// Returns data for the last `hours` hours.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the query fails or a column does
-    /// not decode as the expected type.
-    pub async fn get_tool_stats_hourly(
-        &self,
-        tool_name: Option<&str>,
-        hours: u32,
-    ) -> Result<Vec<ToolStatsTimeBucket>, StorageError> {
-        let conn = self.conn.lock().await;
-        let since = chrono::Utc::now() - chrono::Duration::hours(i64::from(hours));
-        let since_str = since.format("%Y-%m-%dT%H:00:00").to_string();
-
-        let mut rows = if let Some(name) = tool_name {
-            conn.query(
-                "SELECT tool_name, hour, call_count, success_count, failure_count, 
-                        total_duration_ms, avg_duration_ms, p95_duration_ms
-                 FROM tool_stats_hourly
-                 WHERE tool_name = ?1 AND hour >= ?2
-                 ORDER BY hour ASC",
-                turso::params![name, since_str],
-            ).await?
-        } else {
-            conn.query(
-                "SELECT 'all' as tool_name, hour, 
-                        CAST(SUM(call_count) AS INTEGER),
-                        CAST(SUM(success_count) AS INTEGER),
-                        CAST(SUM(failure_count) AS INTEGER),
-                        CAST(SUM(total_duration_ms) AS INTEGER),
-                        CAST(AVG(avg_duration_ms) AS INTEGER),
-                        CAST(MAX(p95_duration_ms) AS INTEGER)
-                 FROM tool_stats_hourly
-                 WHERE hour >= ?1
-                 GROUP BY hour
-                 ORDER BY hour ASC",
-                turso::params![since_str],
-            ).await?
-        };
-        let mut result = Vec::new();
-        while let Some(row) = rows.next().await? {
-            result.push(ToolStatsTimeBucket {
-                tool_name: row.get::<String>(0)?,
-                period: row.get::<String>(1)?,
-                call_count: row.get::<i64>(2)?.cast_unsigned(),
-                success_count: row.get::<i64>(3)?.cast_unsigned(),
-                failure_count: row.get::<i64>(4)?.cast_unsigned(),
-                total_duration_ms: row.get::<i64>(5)?.cast_unsigned(),
-                avg_duration_ms: row.get::<i64>(6)?.cast_unsigned(),
-                p95_duration_ms: row.get::<i64>(7)?.cast_unsigned(),
-            });
-        }
-        // Held until the cursor is gone: an open `Rows` on the shared
-        // connection swallows later writes.
-        drop(rows);
-        drop(conn);
-        Ok(result)
-    }
-
-    /// Get daily tool stats for a given time range (for long-term graphs).
-    /// Returns data for the last `days` days.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the query fails or a column does
-    /// not decode as the expected type.
-    pub async fn get_tool_stats_daily(
-        &self,
-        tool_name: Option<&str>,
-        days: u32,
-    ) -> Result<Vec<ToolStatsTimeBucket>, StorageError> {
-        let conn = self.conn.lock().await;
-        let since = chrono::Utc::now() - chrono::Duration::days(i64::from(days));
-        let since_str = since.format("%Y-%m-%d").to_string();
-
-        let mut rows = if let Some(name) = tool_name {
-            conn.query(
-                "SELECT tool_name, day, call_count, success_count, failure_count,
-                        total_duration_ms, avg_duration_ms, p95_duration_ms
-                 FROM tool_stats_daily
-                 WHERE tool_name = ?1 AND day >= ?2
-                 ORDER BY day ASC",
-                turso::params![name, since_str],
-            ).await?
-        } else {
-            conn.query(
-                "SELECT 'all' as tool_name, day,
-                        CAST(SUM(call_count) AS INTEGER),
-                        CAST(SUM(success_count) AS INTEGER),
-                        CAST(SUM(failure_count) AS INTEGER),
-                        CAST(SUM(total_duration_ms) AS INTEGER),
-                        CAST(AVG(avg_duration_ms) AS INTEGER),
-                        CAST(MAX(p95_duration_ms) AS INTEGER)
-                 FROM tool_stats_daily
-                 WHERE day >= ?1
-                 GROUP BY day
-                 ORDER BY day ASC",
-                turso::params![since_str],
-            ).await?
-        };
-        let mut result = Vec::new();
-        while let Some(row) = rows.next().await? {
-            result.push(ToolStatsTimeBucket {
-                tool_name: row.get::<String>(0)?,
-                period: row.get::<String>(1)?,
-                call_count: row.get::<i64>(2)?.cast_unsigned(),
-                success_count: row.get::<i64>(3)?.cast_unsigned(),
-                failure_count: row.get::<i64>(4)?.cast_unsigned(),
-                total_duration_ms: row.get::<i64>(5)?.cast_unsigned(),
-                avg_duration_ms: row.get::<i64>(6)?.cast_unsigned(),
-                p95_duration_ms: row.get::<i64>(7)?.cast_unsigned(),
-            });
-        }
-        // Held until the cursor is gone: an open `Rows` on the shared
-        // connection swallows later writes.
-        drop(rows);
-        drop(conn);
-        Ok(result)
-    }
-
-    /// Get recent tool call log entries (for detail views).
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the query fails or a column does
-    /// not decode as the expected type.
-    pub async fn get_tool_call_log(
-        &self,
-        tool_name: Option<&str>,
-        limit: u32,
-    ) -> Result<Vec<ToolCallLogEntry>, StorageError> {
-        let conn = self.conn.lock().await;
-
-        let mut rows = if let Some(name) = tool_name {
-            conn.query(
-                "SELECT tool_name, success, duration_ms, output_size, error_message, session_id, created_at
-                 FROM tool_call_log
-                 WHERE tool_name = ?1
-                 ORDER BY created_at DESC
-                 LIMIT ?2",
-                turso::params![name, i64::from(limit)],
-            ).await?
-        } else {
-            conn.query(
-                "SELECT tool_name, success, duration_ms, output_size, error_message, session_id, created_at
-                 FROM tool_call_log
-                 ORDER BY created_at DESC
-                 LIMIT ?1",
-                turso::params![i64::from(limit)],
-            ).await?
-        };
-        let mut result = Vec::new();
-        while let Some(row) = rows.next().await? {
-            result.push(ToolCallLogEntry {
-                tool_name: row.get::<String>(0)?,
-                success: row.get::<i64>(1)? != 0,
-                duration_ms: row.get::<i64>(2)?.cast_unsigned(),
-                output_size: row.get::<i64>(3)?.cast_unsigned(),
-                error_message: {
-                    let s: String = row.get::<String>(4)?;
-                    if s.is_empty() { None } else { Some(s) }
-                },
-                session_id: {
-                    let s: String = row.get::<String>(5)?;
-                    if s.is_empty() { None } else { Some(s) }
-                },
-                created_at: row.get::<String>(6)?,
-            });
-        }
-        // Held until the cursor is gone: an open `Rows` on the shared
-        // connection swallows later writes.
-        drop(rows);
-        drop(conn);
-        Ok(result)
-    }
-
-    /// Delete raw tool-call rows older than `keep_days`; returns how many.
-    ///
-    /// The cutoff is computed by the database, in the format `created_at` is
-    /// written in (`datetime('now')`, `YYYY-MM-DD HH:MM:SS`). It used to be an
-    /// RFC 3339 string, and `' '` sorts below `'T'`, so every row of the cutoff
-    /// DAY compared as older and the whole day was deleted at any hour. Only
-    /// the raw log is pruned — the hourly and daily aggregates keep history.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the delete fails.
-    pub async fn prune_tool_call_log(&self, keep_days: u32) -> Result<u64, StorageError> {
-        let modifier = format!("-{keep_days} days");
-        let conn = self.conn.lock().await;
-        let deleted = conn
-            .execute(
-                "DELETE FROM tool_call_log WHERE created_at < datetime('now', ?1)",
-                turso::params![modifier],
-            )
-            .await?;
-        drop(conn);
-        Ok(deleted)
-    }
-}
-
-// =========================================================================
-// Checkpoints
-// =========================================================================
-
-impl Storage {
-    /// Save a checkpoint for crash recovery.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the upsert fails.
-    pub async fn save_checkpoint(&self, session_id: &str, data: &str) -> Result<(), StorageError> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT INTO checkpoints (session_id, data, updated_at)
-             VALUES (?1, ?2, datetime('now'))
-             ON CONFLICT(session_id) DO UPDATE SET data = ?2, updated_at = datetime('now')",
-            turso::params![session_id, data],
-        ).await?;
-        drop(conn);
-        Ok(())
-    }
-
-    /// Load a checkpoint for a session.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the query fails or the stored
-    /// data does not decode as text.
-    pub async fn load_checkpoint(&self, session_id: &str) -> Result<Option<String>, StorageError> {
-        let conn = self.conn.lock().await;
-        let mut rows = conn.query(
-            "SELECT data FROM checkpoints WHERE session_id = ?1",
-            turso::params![session_id],
-        ).await?;
-        let data = if let Some(row) = rows.next().await? {
-            Some(row.get::<String>(0)?)
-        } else {
-            None
-        };
-        // Held until the cursor is gone: an open `Rows` on the shared
-        // connection swallows later writes.
-        drop(rows);
-        drop(conn);
-        Ok(data)
-    }
-
-    /// Delete a checkpoint after successful completion.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the delete fails.
-    pub async fn delete_checkpoint(&self, session_id: &str) -> Result<(), StorageError> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "DELETE FROM checkpoints WHERE session_id = ?1",
-            turso::params![session_id],
-        ).await?;
-        drop(conn);
-        Ok(())
-    }
-
-    /// List all checkpoint session IDs (for recovery at startup).
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the query fails or a session id
-    /// does not decode as text.
-    pub async fn list_checkpoints(&self) -> Result<Vec<String>, StorageError> {
-        let conn = self.conn.lock().await;
-        let mut rows = conn.query(
-            "SELECT session_id FROM checkpoints",
-            (),
-        ).await?;
-        let mut ids = Vec::new();
-        while let Some(row) = rows.next().await? {
-            ids.push(row.get::<String>(0)?);
-        }
-        // Held until the cursor is gone: an open `Rows` on the shared
-        // connection swallows later writes.
-        drop(rows);
-        drop(conn);
-        Ok(ids)
-    }
-
-    // =========================================================================
-    // Tool Stats (aggregated — replaces tool-stats.json)
-    // =========================================================================
-
-    /// Save aggregated tool stats to the `tool_stats` table (upsert).
-    ///
-    /// Anything that is not the expected shape is skipped rather than
-    /// rejected: a missing `tools` object saves nothing, and a missing or
-    /// non-integer counter is stored as 0.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if an upsert fails; tools earlier in
-    /// the map are already saved by then.
-    pub async fn save_tool_stats_aggregated(&self, stats: &serde_json::Value) -> Result<(), StorageError> {
-        let conn = self.conn.lock().await;
-        // The JSON is expected to be { "tools": { "tool_name": { stats... }, ... }, "sessions": N }
-        if let Some(tools) = stats.get("tools").and_then(|v| v.as_object()) {
-            for (tool_name, tool_data) in tools {
-                let call_count = tool_data.get("call_count").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                let success_count = tool_data.get("success_count").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                let failure_count = tool_data.get("failure_count").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                let total_duration_ms = tool_data.get("total_duration_ms").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                let last_called_epoch_ms = tool_data.get("last_called_epoch_ms").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                let latencies = tool_data.get("latencies_ms").map_or_else(|| "[]".to_string(), std::string::ToString::to_string);
-                let output_sizes = tool_data.get("output_sizes").map_or_else(|| "[]".to_string(), std::string::ToString::to_string);
-                let errors = tool_data.get("errors").map_or_else(|| "[]".to_string(), std::string::ToString::to_string);
-
-                conn.execute(
-                    "INSERT INTO tool_stats (tool_name, call_count, success_count, failure_count, total_duration_ms, last_called_epoch_ms, latencies_ms_json, output_sizes_json, errors_json, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))
-                     ON CONFLICT(tool_name) DO UPDATE SET
-                        call_count = ?2, success_count = ?3, failure_count = ?4,
-                        total_duration_ms = ?5, last_called_epoch_ms = ?6,
-                        latencies_ms_json = ?7, output_sizes_json = ?8, errors_json = ?9,
-                        updated_at = datetime('now')",
-                    turso::params![
-                        tool_name.as_str(),
-                        call_count,
-                        success_count,
-                        failure_count,
-                        total_duration_ms,
-                        last_called_epoch_ms,
-                        latencies.as_str(),
-                        output_sizes.as_str(),
-                        errors.as_str()
-                    ],
-                ).await?;
-            }
-        }
-        // Held for the whole batch: the guard is the transaction.
-        drop(conn);
-        Ok(())
-    }
-
-    /// Load aggregated tool stats from the `tool_stats` table (returns the JSON format `ToolStatsTracker` expects).
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the query fails or a column does
-    /// not decode as the expected type. Unparseable stored JSON arrays load as
-    /// empty arrays.
-    pub async fn load_tool_stats_aggregated(&self) -> Result<serde_json::Value, StorageError> {
-        let conn = self.conn.lock().await;
-        let mut rows = conn.query(
-            "SELECT tool_name, call_count, success_count, failure_count, total_duration_ms, last_called_epoch_ms, latencies_ms_json, output_sizes_json, errors_json
-             FROM tool_stats",
-            (),
-        ).await?;
-
-        let mut tools = serde_json::Map::new();
-        let mut session_count: i64 = 0;
-        while let Some(row) = rows.next().await? {
-            let tool_name: String = row.get(0)?;
-            let call_count: i64 = row.get(1)?;
-            let success_count: i64 = row.get(2)?;
-            let failure_count: i64 = row.get(3)?;
-            let total_duration_ms: i64 = row.get(4)?;
-            let last_called_epoch_ms: i64 = row.get(5)?;
-            let latencies_str: String = row.get(6)?;
-            let output_sizes_str: String = row.get(7)?;
-            let errors_str: String = row.get(8)?;
-
-            let latencies: serde_json::Value = serde_json::from_str(&latencies_str).unwrap_or(serde_json::json!([]));
-            let output_sizes: serde_json::Value = serde_json::from_str(&output_sizes_str).unwrap_or(serde_json::json!([]));
-            let errors: serde_json::Value = serde_json::from_str(&errors_str).unwrap_or(serde_json::json!([]));
-
-            session_count += call_count;
-            tools.insert(tool_name, serde_json::json!({
-                "call_count": call_count,
-                "success_count": success_count,
-                "failure_count": failure_count,
-                "total_duration_ms": total_duration_ms,
-                "last_called_epoch_ms": last_called_epoch_ms,
-                "latencies_ms": latencies,
-                "output_sizes": output_sizes,
-                "errors": errors,
-            }));
-        }
-        // Held until the cursor is gone: an open `Rows` on the shared
-        // connection swallows later writes.
-        drop(rows);
-        drop(conn);
-
-        Ok(serde_json::json!({
-            "tools": tools,
-            "sessions": session_count
-        }))
-    }
-
-    // =========================================================================
-    // Daemon Session Persistence (replaces sessions.json)
-    // =========================================================================
-
-    /// Create or update a daemon session in the database.
-    /// This handles the daemon's Session struct format (different from GUI sessions).
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the upsert fails.
-    pub async fn upsert_daemon_session(
-        &self,
-        session_id: &str,
-        name: Option<&str>,
-        workspace_id: Option<&str>,
-        created_at: &str,
-        updated_at: &str,
-        metadata: Option<&str>,
-    ) -> Result<(), StorageError> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT INTO sessions (session_id, channel, name, workspace_id, created_at, updated_at, metadata)
-             VALUES (?1, 'gui', ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(session_id) DO UPDATE SET
-                name = COALESCE(?2, name),
-                workspace_id = COALESCE(?3, workspace_id),
-                updated_at = ?5,
-                metadata = COALESCE(?6, metadata)",
-            turso::params![session_id, name, workspace_id, created_at, updated_at, metadata],
-        ).await?;
-        drop(conn);
-        Ok(())
-    }
-
-    /// Add a daemon message to the messages table.
-    /// Stores `tool_calls`, attachments, and reasoning in the metadata JSON field.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the insert or the session touch
-    /// fails; a failed touch leaves the message already inserted.
-    pub async fn add_daemon_message(
-        &self,
-        session_id: &str,
-        message_id: &str,
-        role: &str,
-        content: &str,
-        created_at: &str,
-        metadata: Option<&str>,
-    ) -> Result<(), StorageError> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT INTO messages (session_id, role, content, content_type, tool_use_id, created_at, metadata)
-             VALUES (?1, ?2, ?3, 'text', ?4, ?5, ?6)",
-            turso::params![session_id, role, content, message_id, created_at, metadata],
-        ).await?;
-        // Touch session
-        conn.execute(
-            "UPDATE sessions SET updated_at = ?1 WHERE session_id = ?2",
-            turso::params![created_at, session_id],
-        ).await?;
-        // Held across the insert and the touch: the guard is the transaction.
-        drop(conn);
-        Ok(())
-    }
-
-    /// Load all sessions from the database (regardless of channel).
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the query fails or a column does
-    /// not decode as the expected type. Unparseable metadata loads as `None`.
-    pub async fn list_daemon_sessions(&self) -> Result<Vec<Session>, StorageError> {
-        let conn = self.conn.lock().await;
-        let mut rows = conn.query(
-            "SELECT id, session_id, channel, user_id, created_at, updated_at, metadata, workspace_id, name
-             FROM sessions ORDER BY updated_at DESC",
-            (),
-        ).await?;
-        let mut sessions = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let metadata_str: Option<String> = row.get(6)?;
-            sessions.push(Session {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                channel: row.get(2)?,
-                user_id: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-                metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
-                workspace_id: row.get(7)?,
-                name: row.get(8)?,
-            });
-        }
-        // Held until the cursor is gone: an open `Rows` on the shared
-        // connection swallows later writes.
-        drop(rows);
-        drop(conn);
-        Ok(sessions)
-    }
-
-    /// Load all messages for a daemon session, ordered by creation time.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the query fails or a column does
-    /// not decode as the expected type. Unparseable metadata loads as `None`.
-    pub async fn load_daemon_messages(&self, session_id: &str) -> Result<Vec<Message>, StorageError> {
-        let conn = self.conn.lock().await;
-        let mut rows = conn.query(
-            "SELECT id, session_id, role, content, content_type, tool_use_id, created_at, tokens_in, tokens_out, metadata
-             FROM messages WHERE session_id = ?1 ORDER BY created_at ASC",
-            turso::params![session_id],
-        ).await?;
-        let mut messages = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let metadata_str: Option<String> = row.get(9)?;
-            messages.push(Message {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                role: row.get(2)?,
-                content: row.get(3)?,
-                content_type: row.get(4)?,
-                tool_use_id: row.get(5)?,
-                created_at: row.get(6)?,
-                tokens_in: row.get(7)?,
-                tokens_out: row.get(8)?,
-                metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
-            });
-        }
-        // Held until the cursor is gone: an open `Rows` on the shared
-        // connection swallows later writes.
-        drop(rows);
-        drop(conn);
-        Ok(messages)
-    }
-
-    /// Delete all messages for a daemon session.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the delete fails.
-    pub async fn clear_daemon_session_messages(&self, session_id: &str) -> Result<(), StorageError> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "DELETE FROM messages WHERE session_id = ?1",
-            turso::params![session_id],
-        ).await?;
-        drop(conn);
-        Ok(())
-    }
-
-    /// Delete one message of a daemon session, by its message id.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the delete fails.
-    pub async fn delete_daemon_message(
-        &self,
-        session_id: &str,
-        message_id: &str,
-    ) -> Result<(), StorageError> {
-        let conn = self.conn.lock().await;
-        // The message id is stored in `tool_use_id` (see `add_daemon_message`).
-        conn.execute(
-            "DELETE FROM messages WHERE session_id = ?1 AND tool_use_id = ?2",
-            turso::params![session_id, message_id],
-        )
-        .await?;
-        drop(conn);
-        Ok(())
-    }
-
-    /// Delete a daemon session and its messages.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if either delete fails; a failure on
-    /// the session row leaves its messages already deleted.
-    pub async fn delete_daemon_session(&self, session_id: &str) -> Result<(), StorageError> {
-        let conn = self.conn.lock().await;
-        conn.execute("DELETE FROM messages WHERE session_id = ?1", turso::params![session_id]).await?;
-        conn.execute("DELETE FROM sessions WHERE session_id = ?1", turso::params![session_id]).await?;
-        // Held across both deletes: the guard is the transaction.
-        drop(conn);
-        Ok(())
-    }
-
-    /// Update daemon session name.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the update fails.
-    pub async fn rename_daemon_session(&self, session_id: &str, name: &str) -> Result<(), StorageError> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE sessions SET name = ?1, updated_at = datetime('now') WHERE session_id = ?2",
-            turso::params![name, session_id],
-        ).await?;
-        drop(conn);
-        Ok(())
-    }
-
-    /// Update daemon session workspace.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Database`] if the update fails.
-    pub async fn set_daemon_session_workspace(&self, session_id: &str, workspace_id: Option<&str>) -> Result<(), StorageError> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE sessions SET workspace_id = ?1, updated_at = datetime('now') WHERE session_id = ?2",
-            turso::params![workspace_id, session_id],
-        ).await?;
-        drop(conn);
-        Ok(())
-    }
-}
-
-/// One model request, as [`Storage::log_model_request`] records it.
-#[derive(Debug, Clone, Copy)]
-pub struct NewModelRequest<'a> {
-    pub model: &'a str,
-    pub success: bool,
-    pub latency_ms: u64,
-    pub input_tokens: u32,
-    pub output_tokens: u32,
-    pub cache_read_tokens: u32,
-    pub cache_creation_tokens: u32,
-    /// The 1-hour share of `cache_creation_tokens`.
-    pub cache_creation_1h_tokens: u32,
-    pub tier: Option<&'a str>,
-    pub escalated: bool,
-    pub session_id: Option<&'a str>,
-}
-
-/// One tool call, as [`Storage::log_tool_call`] records it.
-#[derive(Debug, Clone, Copy)]
-pub struct NewToolCall<'a> {
-    pub tool_name: &'a str,
-    pub success: bool,
-    /// The harness answered with a breaker replay instead of dispatching.
-    pub short_circuited: bool,
-    pub duration_ms: u64,
-    pub output_size: usize,
-    pub error_message: Option<&'a str>,
-    pub session_id: Option<&'a str>,
-}
-
-/// How a usage rollup groups requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UsagePeriod {
-    Day,
-    Month,
-    Session,
-}
-
-/// Longest window a usage rollup covers: a year and a day.
-pub const USAGE_BUCKET_DAYS_MAX: u32 = 366;
-
-/// Model usage summed over one period for one model.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ModelUsageBucket {
-    /// `YYYY-MM-DD` or `YYYY-MM` (UTC).
-    pub period: String,
-    pub model: String,
-    pub requests: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_write_tokens: u64,
-    /// The 1-hour share of `cache_write_tokens`.
-    pub cache_write_1h_tokens: u64,
-}
-
-/// Time-bucketed tool statistics (hourly or daily).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ToolStatsTimeBucket {
-    pub tool_name: String,
-    pub period: String,
-    pub call_count: u64,
-    pub success_count: u64,
-    pub failure_count: u64,
-    pub total_duration_ms: u64,
-    pub avg_duration_ms: u64,
-    pub p95_duration_ms: u64,
-}
-
-/// A single tool call log entry.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ToolCallLogEntry {
-    pub tool_name: String,
-    pub success: bool,
-    pub duration_ms: u64,
-    pub output_size: u64,
-    pub error_message: Option<String>,
-    pub session_id: Option<String>,
-    pub created_at: String,
 }

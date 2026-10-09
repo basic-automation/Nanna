@@ -10,8 +10,6 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
-anyhow.workspace = true
-flume.workspace = true
 uuid.workspace = true
 
 nanna-simd = { path = "../nanna-simd" }

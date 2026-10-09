@@ -45,8 +45,16 @@ impl ControlPlane {
         match action {
             SystemAction::Status => self.system_status().await,
             SystemAction::Restart => {
-                info!("Restart requested");
-                json!({ "status": "restarting" })
+                // Nothing here can restart the process; answering
+                // "restarting" and doing nothing told the caller to wait for
+                // a restart that never came. Say so, as Shutdown does when it
+                // cannot act.
+                info!("Restart requested; not supported by the daemon itself");
+                json!({
+                    "status": "unsupported",
+                    "error": "the daemon cannot restart itself; shut it down and let its \
+                              supervisor (the GUI or the service manager) start it again",
+                })
             }
             SystemAction::Shutdown => self.system_shutdown(),
             SystemAction::Version => {
@@ -205,6 +213,10 @@ impl ControlPlane {
                 None => json!([]),
             },
             "config_path": self.config_path,
+            // The folder this daemon opened its store in — read at boot, so a
+            // client can tell a saved `[general] data_dir` that waits for a
+            // restart from the one in use.
+            "data_dir": self.data_dir.as_ref().map(|dir| dir.display().to_string()),
         })
     }
 

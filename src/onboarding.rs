@@ -22,9 +22,12 @@ const BANNER: &str = r"
        NANNA
 ";
 
-/// Check if this is a first run (no config exists).
-pub fn is_first_run() -> bool {
-    Config::default_config_path().map_or(true, |p| !p.exists())
+/// Check if this is a first run: the config file this command uses (the
+/// `--config` file, or the default) does not exist. It checked the default
+/// path whatever `--config` named, so `--config alt.toml chat` ran the whole
+/// wizard whenever the default file was missing.
+pub fn is_first_run(config_path: &std::path::Path) -> bool {
+    !config_path.exists()
 }
 
 /// Environment variable that holds the API key for `provider`.
@@ -107,12 +110,10 @@ fn store_entered_key(llm: &mut LlmConfig, key: String) {
 ///
 /// Returns whether the chat key held going in came back from the secure store (see
 /// [`persist_config_to`]).
-fn persist_config(config: &mut Config) -> anyhow::Result<bool> {
-    persist_config_to(
-        config,
-        &Config::default_config_path()?,
-        Config::store_secrets,
-    )
+fn persist_config(config: &mut Config, config_path: &std::path::Path) -> anyhow::Result<bool> {
+    // The file this command loaded (`--config`, or the default): saving to
+    // the default path whatever `--config` named overwrote a different file.
+    persist_config_to(config, config_path, Config::store_secrets)
 }
 
 /// [`persist_config`] to `path`, filing secrets with `store_secrets`.
@@ -360,7 +361,7 @@ fn configure_workspace(config: &mut Config, theme: &ColorfulTheme) -> anyhow::Re
 }
 
 /// Run the onboarding wizard.
-pub fn run_onboarding() -> anyhow::Result<Config> {
+pub fn run_onboarding(config_path: &std::path::Path) -> anyhow::Result<Config> {
     println!("{}", style(BANNER).cyan());
     println!(
         "{MOON}Welcome to {} - the moon rises.",
@@ -378,7 +379,7 @@ pub fn run_onboarding() -> anyhow::Result<Config> {
 
     // Save config
     println!("\n{CHECK}{}", style("Saving configuration...").bold());
-    if !persist_config(&mut config)? {
+    if !persist_config(&mut config, config_path)? {
         warn_key_not_read_back(
             provider_api_key_env(&config.llm.provider).unwrap_or("ANTHROPIC_API_KEY"),
         );
@@ -406,7 +407,7 @@ pub fn run_onboarding() -> anyhow::Result<Config> {
 }
 
 /// Quick setup - just get API key.
-pub fn quick_setup(config: &mut Config) -> anyhow::Result<()> {
+pub fn quick_setup(config: &mut Config, config_path: &std::path::Path) -> anyhow::Result<()> {
     println!(
         "\n{}No API key found. Let's fix that.",
         style("⚠️  ").yellow()
@@ -428,7 +429,7 @@ pub fn quick_setup(config: &mut Config) -> anyhow::Result<()> {
     }
 
     store_entered_key(&mut config.llm, api_key);
-    if persist_config(config)? {
+    if persist_config(config, config_path)? {
         println!("{CHECK}API key saved to the OS keychain.");
     } else {
         warn_key_not_read_back(env_var);

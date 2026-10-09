@@ -184,6 +184,12 @@ static HOME_DIR: std::sync::LazyLock<Option<PathBuf>> = std::sync::LazyLock::new
 /// the trap instead of documenting it, and changes nothing for an
 /// already-expanded path.
 fn scope_covers(scope: &std::path::Path, path: &std::path::Path) -> bool {
+    // `Path::starts_with` compares components as written, so `~/../../etc`
+    // "starts with" home. The path the bridge hands over is joined, never
+    // normalised, and the OS resolves `..` when the file is opened — so the
+    // check has to see the same path the open will.
+    let normal = lexically_normal(path);
+    let path = normal.as_path();
     let text = scope.to_string_lossy();
     if text == "*" {
         return true;
@@ -197,6 +203,39 @@ fn scope_covers(scope: &std::path::Path, path: &std::path::Path) -> bool {
         return path.starts_with(expanded);
     }
     path.starts_with(scope)
+}
+
+/// `path` with `.` dropped and each `..` removing the component before it,
+/// never climbing past the root — what the OS does on open, short of
+/// symlinks: `a/link/..` is `a` here but the link's parent on disk, so a
+/// symlink out of a scope is still the scope's own business. Pure: no
+/// filesystem access, so a path that does not exist yet (a write) is checked
+/// the same way.
+fn lexically_normal(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // At the root (or a prefix) there is nothing to climb to.
+                if !matches!(
+                    normal.components().next_back(),
+                    None | Some(Component::RootDir | Component::Prefix(_))
+                ) {
+                    normal.pop();
+                }
+            }
+            other => normal.push(other),
+        }
+    }
+    debug_assert!(
+        normal
+            .components()
+            .all(|c| !matches!(c, Component::ParentDir | Component::CurDir)),
+        "nothing left to resolve"
+    );
+    normal
 }
 
 /// Where a tool's output should be routed after execution.
@@ -1047,6 +1086,28 @@ mod scope_tests {
         let perms = ToolPermissions::none().with_read(["/tmp"]);
         assert!(perms.allows_read(Path::new("/tmp/file.txt")));
         assert!(!perms.allows_read(Path::new("/etc/passwd")));
+    }
+
+    /// `..` used to pass the prefix check unresolved: with the default `~`
+    /// scope, `~/../../etc/passwd` was allowed while `/etc/passwd` was not.
+    #[test]
+    fn dot_dot_cannot_climb_out_of_a_scope() {
+        let perms = ToolPermissions::none()
+            .with_read(["~"])
+            .with_write(["~/projects"]);
+        let escape = home().join("..").join("..").join("etc").join("passwd");
+        assert!(!perms.allows_read(&escape), "{}", escape.display());
+        let sibling = home().join("projects").join("..").join("secrets.txt");
+        assert!(!perms.allows_write(&sibling));
+        // Climbing back inside is fine, and so is a `.`.
+        let inside = home().join("projects").join("a").join("..").join("b.txt");
+        assert!(perms.allows_write(&inside));
+        assert!(perms.allows_read(&home().join(".").join("notes.md")));
+        // `..` at the root stays at the root.
+        assert_eq!(
+            super::lexically_normal(Path::new("/../../etc")),
+            Path::new("/etc")
+        );
     }
 
     #[test]

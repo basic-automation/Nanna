@@ -170,7 +170,14 @@ pub enum LlmError {
     Stream(String),
     #[error("Missing API key for provider: {0}")]
     MissingApiKey(String),
-    #[error("Rate limit exceeded: {message}")]
+    /// The display carries `retry_after` as `(retry-after: N)`: the chat path
+    /// and the card cooldown read the wait back from the rendered text, and
+    /// without it a header-published wait reached neither (only the dream
+    /// summarizer read the field).
+    #[error(
+        "Rate limit exceeded{}: {message}",
+        .retry_after.map_or_else(String::new, |secs| format!(" (retry-after: {secs})"))
+    )]
     RateLimit {
         message: String,
         /// Seconds until rate limit resets (if available)
@@ -956,8 +963,10 @@ impl LlmError {
     /// into "wait exactly as long as they asked".
     ///
     /// Returns `None` when nothing usable is present, which keeps the caller's
-    /// own backoff as the fallback.
-    fn parse_retry_after(message: &str) -> Option<u64> {
+    /// own backoff as the fallback. Public so a caller holding only the
+    /// rendered error text (a step runner's error string) reads the same wait.
+    #[must_use]
+    pub fn parse_retry_after(message: &str) -> Option<u64> {
         /// A reset further out than this is a misread, not a real wait.
         const MAX_PLAUSIBLE_WAIT_SECS: u64 = 3_600;
 
@@ -1120,8 +1129,13 @@ impl PaceState {
         if let Some(remaining) = remaining {
             self.remaining = Some(remaining);
         }
-        if let Some(reset_in) = reset_in {
-            self.reset_at = Some(tokio::time::Instant::now() + reset_in);
+        // `checked_add`: the header is the provider's, and `Instant + Duration`
+        // panics past what an `Instant` can hold. A reset that far out is no
+        // usable window; keep the last one.
+        if let Some(reset_at) =
+            reset_in.and_then(|delay| tokio::time::Instant::now().checked_add(delay))
+        {
+            self.reset_at = Some(reset_at);
         }
     }
 }
@@ -5443,6 +5457,9 @@ impl LlmClient {
                 "messages": messages_json,
                 "max_tokens": request.max_tokens,
                 "stream": true,
+                // Without it a streamed turn carries no usage at all, and
+                // recorded 0/0 tokens (see `OpenAiStreamState::on_usage`).
+                "stream_options": { "include_usage": true },
             });
             if let Some(temp) = request.temperature {
                 body["temperature"] = serde_json::json!(temp);
@@ -5515,11 +5532,10 @@ impl LlmClient {
                 }
             }
 
-            // Emit close events if stream ended without finish_reason
-            for event in state.close_blocks() {
-                yield Ok(event);
+            // The body closed without `[DONE]` or a `finish_reason`.
+            for item in state.finish_unterminated::<OpenAiChunkDelta>(&buffer) {
+                yield item;
             }
-            yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
         }
     }
 
@@ -5780,11 +5796,10 @@ impl LlmClient {
                 }
             }
 
-            // If we got here without MessageStop, emit it
-            for event in state.close_blocks() {
-                yield Ok(event);
+            // The body closed without `[DONE]` or a `finish_reason`.
+            for item in state.finish_unterminated::<OpenAiRoleCheckedDelta>(&buffer) {
+                yield item;
             }
-            yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
         }
     }
 
@@ -6490,6 +6505,8 @@ struct OpenAiStreamRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     stream: bool,
+    /// `{"include_usage": true}`: the usage chunk after the last choice.
+    stream_options: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAiStreamTool>>,
 }
@@ -6534,6 +6551,7 @@ fn openai_stream_body(request: &CompletionRequest) -> OpenAiStreamRequest {
         max_tokens: request.max_tokens,
         temperature: request.temperature,
         stream: true,
+        stream_options: serde_json::json!({ "include_usage": true }),
         tools,
     }
 }
@@ -6541,7 +6559,28 @@ fn openai_stream_body(request: &CompletionRequest) -> OpenAiStreamRequest {
 /// One `data:` chunk of an OpenAI-compatible chat-completions stream.
 #[derive(Deserialize, Debug)]
 struct OpenAiStreamChunk<D> {
+    #[serde(default = "Vec::new")]
     choices: Vec<OpenAiChunkChoice<D>>,
+    /// Sent once, after the last choice, when `include_usage` was asked for.
+    #[serde(default)]
+    usage: Option<OpenAiStreamUsage>,
+}
+
+/// The token counts of a streamed completion.
+#[derive(Deserialize, Debug)]
+struct OpenAiStreamUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -6623,7 +6662,9 @@ fn ollama_separates_thinking(model: &str) -> bool {
 /// nothing about this refusal.
 fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    if let Some(wait) = header("retry-after").and_then(parse_reset_secs) {
+    if let Some(wait) = header("retry-after")
+        .and_then(|value| parse_reset_secs(value).or_else(|| http_date_wait_secs(value)))
+    {
         return Some(wait);
     }
     ["requests", "tokens"]
@@ -6637,13 +6678,32 @@ fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<u64>
         .max()
 }
 
-/// Whole seconds (rounded up) in a reset value: plain seconds (`"20"`), or a
-/// Go-style duration as `OpenAI` sends it (`"6m0s"`, `"1.5s"`, `"250ms"`).
-/// These used to be parsed as bare integers, so every duration form was `None`.
+/// Seconds from now until an HTTP-date `Retry-After`
+/// (`Wed, 09 Oct 2026 07:28:00 GMT`), rounded up; a date already past is 0.
+fn http_date_wait_secs(value: &str) -> Option<u64> {
+    let at = httpdate::parse_http_date(value.trim()).ok()?;
+    let wait = at
+        .duration_since(std::time::SystemTime::now())
+        .unwrap_or(std::time::Duration::ZERO);
+    Some(wait.as_secs() + u64::from(wait.subsec_nanos() > 0))
+}
+
+/// Whole seconds (rounded up) in a reset value: plain seconds (`"20"`, or a
+/// decimal `"1.5"`), or a Go-style duration as `OpenAI` sends it (`"6m0s"`,
+/// `"1.5s"`, `"250ms"`). These used to be parsed as bare integers, so every
+/// duration form was `None`. An empty value is no value: it used to read as
+/// `0` and win over the `x-ratelimit-reset-*` headers.
 fn parse_reset_secs(value: &str) -> Option<u64> {
     let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
     if let Ok(secs) = value.parse::<u64>() {
         return Some(secs);
+    }
+    if value.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        // A unit-less decimal is seconds, like the integer form.
+        return parse_reset_secs(&format!("{value}s"));
     }
     let mut millis: u64 = 0;
     let mut rest = value;
@@ -6724,6 +6784,10 @@ struct OpenAiStreamState {
     text_block_started: bool,
     /// Block index -> (id, name) of every tool call started so far.
     tool_calls_started: std::collections::HashMap<usize, (String, String)>,
+    /// The stop reason a `finish_reason` announced. The message ends at
+    /// `[DONE]`, not there: the usage chunk comes between the two, and the
+    /// stream used to be dropped before it was read.
+    finished_with: Option<String>,
 }
 
 impl OpenAiStreamState {
@@ -6740,6 +6804,69 @@ impl OpenAiStreamState {
             events.push(StreamEvent::ContentBlockStop { index: idx });
         }
         events
+    }
+
+    /// The items that end a stream whose body closed without `[DONE]` or a
+    /// `finish_reason`.
+    ///
+    /// A last `data:` line that arrived without its trailing newline is
+    /// translated first — it may be the terminator itself. Past that, a cut
+    /// that leaves a TOOL CALL open is an aborted generation, reported as a
+    /// retryable 502 like the Ollama path's (`finish`): closing it as a normal
+    /// `end_turn` handed the agent a half-written argument object, which the
+    /// JSON healer then "repaired" — a proxy hanging up inside
+    /// `"content":"def f(` ran a write tool with half its content. A text-only
+    /// reply still ends as before (logged): some OpenAI-compatible servers
+    /// omit both terminators, and a cut text reply harms nothing it touches.
+    fn finish_unterminated<D>(&mut self, buffer: &str) -> Vec<Result<StreamEvent, LlmError>>
+    where
+        D: serde::de::DeserializeOwned + Into<OpenAiChunkDelta>,
+    {
+        let mut items = Vec::new();
+        let residue = buffer.trim();
+        if !residue.is_empty() {
+            match self.on_line::<D>(residue) {
+                Ok((events, finished)) => {
+                    items.extend(events.into_iter().map(Ok));
+                    if finished {
+                        return items;
+                    }
+                }
+                Err(e) => {
+                    items.push(Err(e));
+                    return items;
+                }
+            }
+        }
+        if let Some(stop_reason) = self.finished_with.take() {
+            // A `finish_reason` arrived; only `[DONE]` (and perhaps the usage
+            // chunk) did not. The message is whole.
+            debug_assert!(self.tool_calls_started.is_empty(), "the finish closed every block");
+            items.push(Ok(StreamEvent::MessageStop { stop_reason }));
+            return items;
+        }
+        if self.tool_calls_started.is_empty() {
+            tracing::warn!(
+                "OpenAI-compatible stream closed without [DONE] or finish_reason; \
+                 ending the text reply as complete"
+            );
+            items.extend(self.close_blocks().into_iter().map(Ok));
+            items.push(Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() }));
+            return items;
+        }
+        let open_tools = self.tool_calls_started.len();
+        items.push(Err(LlmError::from_api_response(
+            502,
+            format!(
+                "OpenAI-compatible stream ended without [DONE] or a finish_reason while \
+                 {open_tools} tool call(s) were open — their arguments may be cut off"
+            ),
+        )));
+        debug_assert!(
+            items.last().is_some_and(Result::is_err),
+            "a cut tool call ends in an error"
+        );
+        items
     }
 
     /// Translate one SSE line into the events to yield, in order, and whether
@@ -6764,7 +6891,8 @@ impl OpenAiStreamState {
         if data == "[DONE]" {
             // Close any open blocks
             let mut events = self.close_blocks();
-            events.push(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
+            let stop_reason = self.finished_with.take().unwrap_or_else(|| "end_turn".to_string());
+            events.push(StreamEvent::MessageStop { stop_reason });
             return Ok((events, true));
         }
 
@@ -6779,18 +6907,48 @@ impl OpenAiStreamState {
 
             // Check for stop
             if let Some(reason) = choice.finish_reason {
-                // Close any open blocks
+                // Close any open blocks; the message itself stops at `[DONE]`.
                 events.extend(self.close_blocks());
+                self.text_block_started = false;
+                self.tool_calls_started.clear();
                 let stop_reason = match reason.as_str() {
                     "tool_calls" => "tool_use",
                     "stop" => "end_turn",
                     other => other,
                 };
-                events.push(StreamEvent::MessageStop { stop_reason: stop_reason.to_string() });
-                return Ok((events, true));
+                self.finished_with = Some(stop_reason.to_string());
             }
         }
+        if let Some(usage) = chunk.usage {
+            Self::on_usage(&usage, &mut events);
+        }
         Ok((events, false))
+    }
+
+    /// The usage chunk as the events every provider reports usage with: the
+    /// prompt side on a (late) `MessageStart`, the completion on a
+    /// `MessageDelta` — the order the Ollama path emits them, and the stream
+    /// consumer records both by assignment wherever they appear. Cached
+    /// prompt tokens are part of `prompt_tokens`, so they are split out.
+    fn on_usage(usage: &OpenAiStreamUsage, events: &mut Vec<StreamEvent>) {
+        let cached = usage
+            .prompt_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.cached_tokens)
+            .min(usage.prompt_tokens);
+        debug_assert!(cached <= usage.prompt_tokens);
+        events.push(StreamEvent::MessageStart {
+            id: String::new(),
+            model: String::new(),
+            input_tokens: token_count_u32(usage.prompt_tokens - cached),
+            cache_read_tokens: token_count_u32(cached),
+            cache_creation_tokens: 0,
+            cache_creation_1h_tokens: 0,
+        });
+        events.push(StreamEvent::MessageDelta {
+            stop_reason: None,
+            output_tokens: token_count_u32(usage.completion_tokens),
+        });
     }
 
     /// Append the events for one choice delta: text, then tool-call starts and
@@ -7396,6 +7554,24 @@ mod tests {
         assert_eq!(parse_reset_secs("0s"), Some(0));
         assert_eq!(parse_reset_secs("soon"), None);
         assert_eq!(parse_reset_secs("5x"), None);
+        assert_eq!(
+            parse_reset_secs("1.5"),
+            Some(2),
+            "unit-less decimal seconds"
+        );
+        assert_eq!(parse_reset_secs(""), None, "an empty header is no wait");
+        assert_eq!(parse_reset_secs("  "), None);
+        assert_eq!(
+            http_date_wait_secs("Wed, 21 Oct 2015 07:28:00 GMT"),
+            Some(0),
+            "past"
+        );
+        let soon = httpdate::fmt_http_date(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(120),
+        );
+        let wait = http_date_wait_secs(&soon).expect("an HTTP-date parses");
+        assert!((118..=121).contains(&wait), "{wait}");
+        assert_eq!(http_date_wait_secs("soon"), None);
     }
 
     /// `retry-after` wins; otherwise only an exhausted bucket's reset counts.
@@ -7467,6 +7643,120 @@ mod tests {
             r#"{"error":"input length 9000 exceeds maximum context length 8192"}"#
         ));
         assert!(!legacy_embed_may_answer(500, "internal error"));
+    }
+
+    /// A body that closes with a tool call open, and no `[DONE]` or
+    /// `finish_reason`, is an aborted generation — never a finished call whose
+    /// half-written arguments the healer would then "repair" and run.
+    #[test]
+    fn a_stream_cut_inside_a_tool_call_is_an_error_not_a_finish() {
+        let mut state = OpenAiStreamState::default();
+        let (events, finished) = state
+            .on_line::<OpenAiChunkDelta>(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":"{\"path\":\"a.py\",\"content\":\"def f("}}]}}]}"#,
+            )
+            .expect("a chunk");
+        assert!(!finished);
+        assert!(!events.is_empty());
+        let end = state.finish_unterminated::<OpenAiChunkDelta>("");
+        assert!(
+            matches!(end.last(), Some(Err(LlmError::Api { status: 502, .. }))),
+            "{end:?}"
+        );
+        assert!(
+            !end.iter().any(|item| matches!(item, Ok(StreamEvent::MessageStop { .. }))),
+            "a cut call is not stopped as complete"
+        );
+    }
+
+    /// The terminator itself may be the line that lost its trailing newline;
+    /// and a text-only reply with no terminator still ends as it did.
+    #[test]
+    fn an_unterminated_stream_honours_its_last_line_and_keeps_text_replies() {
+        let mut state = OpenAiStreamState::default();
+        state
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"ls","arguments":"{}"}}]}}]}"#)
+            .expect("a chunk");
+        let end = state.finish_unterminated::<OpenAiChunkDelta>(
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        );
+        assert!(
+            matches!(end.last(), Some(Ok(StreamEvent::MessageStop { stop_reason })) if stop_reason == "tool_use"),
+            "{end:?}"
+        );
+
+        let mut text_only = OpenAiStreamState::default();
+        text_only
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#)
+            .expect("a chunk");
+        let end = text_only.finish_unterminated::<OpenAiChunkDelta>("");
+        assert!(
+            matches!(end.last(), Some(Ok(StreamEvent::MessageStop { stop_reason })) if stop_reason == "end_turn"),
+            "{end:?}"
+        );
+    }
+
+    /// The usage chunk `OpenAI` sends between the last choice and `[DONE]` is
+    /// read and reported; the message stops at `[DONE]` with the reason the
+    /// `finish_reason` gave. Streamed turns used to record 0/0 tokens: usage
+    /// was never asked for, and the stream was dropped at `finish_reason`.
+    #[test]
+    fn a_streamed_turn_reports_its_usage_before_it_stops() {
+        let mut state = OpenAiStreamState::default();
+        state
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"ls","arguments":"{}"}}]}}]}"#)
+            .expect("a chunk");
+        let (events, finished) = state
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#)
+            .expect("the finish");
+        assert!(!finished, "the usage chunk is still to come");
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { index: 1 })));
+        let (usage, finished) = state
+            .on_line::<OpenAiChunkDelta>(
+                r#"data: {"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":34,"prompt_tokens_details":{"cached_tokens":1000}}}"#,
+            )
+            .expect("the usage");
+        assert!(!finished);
+        assert!(
+            matches!(
+                usage.as_slice(),
+                [
+                    StreamEvent::MessageStart { input_tokens: 200, cache_read_tokens: 1000, .. },
+                    StreamEvent::MessageDelta { output_tokens: 34, .. },
+                ]
+            ),
+            "{usage:?}"
+        );
+        let (done, finished) = state.on_line::<OpenAiChunkDelta>("data: [DONE]").expect("done");
+        assert!(finished);
+        assert!(
+            matches!(done.as_slice(), [StreamEvent::MessageStop { stop_reason }] if stop_reason == "tool_use"),
+            "{done:?}"
+        );
+
+        // A server that closes after the finish without `[DONE]` still ends
+        // the message whole — never as a cut tool call.
+        let mut closed = OpenAiStreamState::default();
+        closed
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"ls","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#)
+            .expect("call and finish in one chunk");
+        let end = closed.finish_unterminated::<OpenAiChunkDelta>("");
+        assert!(
+            matches!(end.as_slice(), [Ok(StreamEvent::MessageStop { stop_reason })] if stop_reason == "tool_use"),
+            "{end:?}"
+        );
+    }
+
+    /// Every streamed OpenAI-compatible body asks for the usage chunk.
+    #[test]
+    fn a_streamed_body_asks_for_usage() {
+        let request = CompletionRequest {
+            model: "gpt-x".to_string(),
+            ..CompletionRequest::default()
+        };
+        let body = serde_json::to_value(openai_stream_body(&request)).expect("serializes");
+        assert_eq!(body["stream_options"]["include_usage"], true, "{body}");
+        assert_eq!(body["stream"], true);
     }
 
     /// A mid-stream error envelope is the error it names — classified, so a

@@ -269,3 +269,33 @@ async fn raw_delete_leaves_embedding_on_disk() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Rewriting a memory's content (every dream consolidation does) must destroy
+/// the superseded embedding on disk too — it is a copy of the text that was
+/// just replaced.
+#[tokio::test]
+async fn a_content_rewrite_removes_the_old_embedding_from_disk() {
+    let (dir, db_path) = temp_db_path("rewrite");
+    let needle = embedding_bytes(&sentinel_embedding());
+
+    insert_and_confirm_present(&db_path, &needle).await;
+    {
+        let storage = Storage::new(&StorageConfig {
+            path: db_path.clone(),
+        })
+        .await
+        .expect("reopen storage");
+        let updated = storage
+            .memories()
+            .update_content("ghost-1", "rewritten by a dream")
+            .await
+            .expect("rewrite");
+        assert!(updated);
+    }
+    let after = read_all_db_bytes(&db_path);
+    assert!(
+        !contains_subsequence(&after, &needle),
+        "the superseded embedding must not survive a content rewrite on disk"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

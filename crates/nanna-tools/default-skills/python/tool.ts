@@ -158,7 +158,9 @@ export default {
         try {
           result = Nanna.service("python.exec", {
             code: codeToRun,
-            workdir: input.workdir,
+            // The documented default — the session workspace. Unset, the
+            // interpreter ran in the daemon's own working directory.
+            workdir: input.workdir || Nanna.workdir() || undefined,
             timeout: input.timeout || 30
           });
         } catch (e) {

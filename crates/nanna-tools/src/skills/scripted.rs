@@ -1,4 +1,4 @@
-//! Scripted tool wrapper (Boa/Deno)
+//! Scripted tool wrapper (Boa)
 //!
 //! Wraps nanna-scripting tools to implement the Tool trait.
 
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use tracing::{debug, info};
 
-/// A tool implemented in JavaScript/TypeScript, executed via Boa or Deno
+/// A tool implemented in JavaScript/TypeScript, executed via Boa
 pub struct ScriptedToolWrapper {
     /// The underlying scripted tool
     tool: ScriptedTool,
@@ -321,7 +321,6 @@ impl Tool for ScriptedToolWrapper {
             tool = %self.manifest.name,
             engine = %result.engine,
             duration_ms = result.duration_ms,
-            fallback = result.used_fallback,
             "Script executed"
         );
 

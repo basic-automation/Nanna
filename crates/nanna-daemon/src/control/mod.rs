@@ -12,7 +12,7 @@
 use crate::agent_service::AgentService;
 use crate::llm_router::LlmRouter;
 use crate::log_buffer::LogBuffer;
-use crate::protocol::{ChannelAction, ChatAction, Event, ConfigAction, MemoryAction, SchedulerAction, SessionAction, SystemAction, TaskAction, ToolAction, WorkspaceAction, Action, SubscribeAction, UnsubscribeAction};
+use crate::protocol::{ChannelAction, ChatAction, Event, ConfigAction, MemberAction, MemoryAction, Reply, SchedulerAction, SessionAction, SystemAction, TaskAction, ToolAction, WorkspaceAction, Action, SubscribeAction, UnsubscribeAction};
 use crate::session::{MessageRole, SessionManager, SubSessionInfo, SubSessionState};
 use crate::user_tools::UserToolManager;
 use nanna_channels::StatusManager;
@@ -32,7 +32,9 @@ mod chat;
 pub mod chat_harness;
 mod config;
 mod config_watch;
+mod member;
 mod memory;
+mod quick_add;
 mod scheduler;
 mod session;
 mod system;
@@ -225,6 +227,17 @@ impl ControlPlane {
     /// `ChannelAction::Status` and shared with channel listeners.
     pub fn set_status_manager(&mut self, status_manager: Arc<StatusManager>) {
         self.status_manager = Some(status_manager);
+    }
+
+    /// The live Telegram `allowed_users` list (`None`: not configured).
+    pub(crate) async fn telegram_allowed_users(&self) -> Option<Vec<i64>> {
+        self.config
+            .read()
+            .await
+            .channels
+            .telegram
+            .as_ref()
+            .and_then(|tg| tg.allowed_users.clone())
     }
 
     /// Shared channel status manager, if attached.
@@ -426,6 +439,12 @@ impl ControlPlane {
     pub fn with_task_runs(mut self, task_runs: Arc<crate::tasks::TaskRunManager>) -> Self {
         self.task_runs = Some(task_runs);
         self
+    }
+
+    /// The long-horizon task run manager, when one is attached.
+    #[must_use]
+    pub const fn task_runs(&self) -> Option<&Arc<crate::tasks::TaskRunManager>> {
+        self.task_runs.as_ref()
     }
 
     /// Record that the memory store was rebuilt after corruption at startup,
@@ -740,7 +759,7 @@ impl ControlPlane {
         // lock acquisition, then release it BEFORE awaiting the registry. The
         // policy is computed from the same lists that were just written, so the
         // file on disk and the live gate cannot disagree.
-        let policy = {
+        let (policy, unsaved) = {
             let mut config = self.config.write().await;
             if enabled {
                 config.tools.disabled.retain(|n| n != &canonical);
@@ -759,19 +778,15 @@ impl ControlPlane {
                 "the derived policy must agree with the toggle that produced it"
             );
 
-            if let Some(ref config_path) = self.config_path
-                && let Err(e) = config.save_to(config_path)
-            {
-                // The live gate below still applies, so the toggle is honoured
-                // for this run — it just will not survive a restart. Say which
-                // it is rather than reporting a clean success.
-                warn!("Tool toggle for {canonical} not persisted: {e}");
-            }
+            // The live gate below still applies, so a toggle whose save fails
+            // is honoured for this run — it just will not survive a restart,
+            // which the reply says rather than reporting a clean success.
+            let unsaved = self.save_config(&config);
             // Released only now: mutate, derive and persist are one critical
             // section, so a concurrent toggle cannot interleave with the save.
             drop(config);
 
-            policy
+            (policy, unsaved)
         };
 
         tools.set_policy(policy).await;
@@ -783,6 +798,11 @@ impl ControlPlane {
 
         let status = if enabled { "enabled" } else { "disabled" };
         info!("{status} tool: {canonical}");
+        if let Some(message) = unsaved {
+            let mut reply = config::not_persisted(status, &message);
+            reply["name"] = json!(canonical);
+            return reply;
+        }
         json!({ "status": status, "name": canonical })
     }
 
@@ -795,6 +815,21 @@ impl ControlPlane {
     // NOTE: save_memories_if_needed() removed — memory is now persisted
     // via Turso write-through on every mutation (add/remove/update).
     // No explicit save calls are required.
+
+    /// [`Self::handle`] for the IPC send path: the same answer, except that a
+    /// reply too large to hold as a tree comes back already serialized
+    /// (today `memory.list`, see `memory_list_raw`).
+    pub async fn handle_reply(self: &Arc<Self>, client_id: &str, action: Action) -> Reply {
+        if let Action::Memory(MemoryAction::List { scope }) = &action
+            && let Some(memory) = &self.memory
+        {
+            return match Self::memory_list_raw(memory, scope.clone()).await {
+                Ok(raw) => Reply::Raw(raw),
+                Err(e) => Reply::Tree(Self::memory_list_failed(&e)),
+            };
+        }
+        Reply::Tree(self.handle(client_id, action).await)
+    }
 
     /// Handle an action and return a response.
     ///
@@ -824,6 +859,7 @@ impl ControlPlane {
             Action::System(system) => self.handle_system(client_id, system).await,
             Action::Workspace(workspace) => self.handle_workspace(client_id, workspace).await,
             Action::Task(task) => self.handle_task(client_id, task).await,
+            Action::Member(member) => self.handle_member(member).await,
             Action::Subscribe(sub) => self.handle_subscribe(client_id, sub).await,
             Action::Unsubscribe(unsub) => self.handle_unsubscribe(client_id, unsub).await,
         }

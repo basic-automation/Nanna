@@ -8,7 +8,7 @@
 //! # User-Authored Skills
 //!
 //! The `skills` module supports two tiers of tool authoring:
-//! - **Scripted (Boa/Deno)**: JS/TS tools with sandboxing (requires `scripting` feature)
+//! - **Scripted (Boa)**: JS/TS tools with sandboxing (requires `scripting` feature)
 //! - **Executable (Manifest)**: Python/shell/binary via `tool.yaml`
 //!
 //! See [`skills`] module for details.

@@ -665,6 +665,34 @@ impl HealthState {
     pub async fn set_last_error(&self, error: Option<String>) {
         *self.last_error.write().await = error;
     }
+
+    /// Keep `last_error` at the newest [`Event::Error`] the daemon broadcasts,
+    /// as `code: message`, until `events` closes.
+    ///
+    /// `set_last_error` had no caller, so `/status` reported `last_error: null`
+    /// through any failure. The bus is the one place every error a client is
+    /// told about passes. The write is a lock held for one assignment, so the
+    /// loop never lags the bus; a lag (another consumer's backlog) skips to
+    /// the newest events, which is what "last" wants anyway.
+    #[must_use = "the handle ends with the bus; drop it to detach"]
+    pub fn record_errors_from(
+        self: Arc<Self>,
+        mut events: tokio::sync::broadcast::Receiver<crate::protocol::Event>,
+    ) -> tokio::task::JoinHandle<()> {
+        use tokio::sync::broadcast::error::RecvError;
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(crate::protocol::Event::Error { code, message, .. }) => {
+                        debug_assert!(!code.is_empty(), "an error event names its code");
+                        self.set_last_error(Some(format!("{code}: {message}"))).await;
+                    }
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return,
+                }
+            }
+        })
+    }
 }
 
 /// Simple health check response
@@ -1197,6 +1225,31 @@ mod tests {
         assert_eq!(status.sessions, 3);
         assert_eq!(status.clients, 2);
         assert_eq!(status.last_error.as_deref(), Some("boom"));
+    }
+
+    /// `/status` reports the newest error event the daemon broadcast, and
+    /// nothing else on the bus touches it.
+    #[tokio::test]
+    async fn status_reports_the_last_error_event() {
+        use crate::protocol::Event;
+        let shared = Arc::new(HealthState::new(true, true));
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let recorder = Arc::clone(&shared).record_errors_from(rx);
+        for (code, message) in [("first", "older"), ("llm_error", "429 from provider")] {
+            tx.send(Event::Error {
+                code: code.to_string(),
+                message: message.to_string(),
+                session_id: None,
+            })
+            .expect("a receiver is subscribed");
+        }
+        tx.send(Event::Connected { client_id: "c".to_string() }).expect("send");
+        drop(tx);
+        recorder.await.expect("the recorder ends when the bus closes");
+        assert_eq!(
+            shared.last_error.read().await.as_deref(),
+            Some("llm_error: 429 from provider")
+        );
     }
 
     #[tokio::test]

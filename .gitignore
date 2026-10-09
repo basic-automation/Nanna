@@ -39,3 +39,6 @@ gui/src-tauri/memory/
 *.pem
 .env
 .env.*
+
+# Nanna runtime state written into a workspace it works in (the .md files are the workspace templates)
+.nanna/*.json

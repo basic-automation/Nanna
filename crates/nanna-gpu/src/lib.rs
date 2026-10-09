@@ -34,6 +34,8 @@ pub enum GpuError {
     BufferMapping,
     #[error("GPU memory insufficient: {0}")]
     InsufficientMemory(String),
+    #[error("Invalid search input: {0}")]
+    InvalidInput(String),
 }
 
 /// GPU compute context
@@ -302,6 +304,13 @@ impl CosineSimilaritySearch {
     ///
     /// Returns a vector of similarity scores, one per input vector.
     ///
+    /// The vectors are scored in as many dispatches as the device's limits
+    /// require: one storage binding may not exceed
+    /// `max_storage_buffer_binding_size`, and one dispatch may not launch more
+    /// than `max_compute_workgroups_per_dimension` workgroups. A single dispatch
+    /// past either limit is a wgpu validation error, which wgpu's default
+    /// handler turns into a panic — under `panic = "abort"`, the process.
+    ///
     /// # Arguments
     ///
     /// * `ctx` - GPU context
@@ -310,9 +319,11 @@ impl CosineSimilaritySearch {
     ///
     /// # Errors
     ///
-    /// Returns `GpuError::BufferMapping` if the result buffer cannot be read, and
-    /// `GpuError::InsufficientMemory` if the query length or the vector count
-    /// does not fit the shader's `u32` parameters.
+    /// Returns `GpuError::BufferMapping` if a result buffer cannot be read,
+    /// `GpuError::InvalidInput` if `vectors` is not a whole number of
+    /// query-length vectors, and `GpuError::InsufficientMemory` if the counts do
+    /// not fit the shader's `u32` parameters or one vector alone exceeds a
+    /// storage binding.
     pub async fn search(
         &self,
         ctx: &GpuContext,
@@ -325,7 +336,54 @@ impl CosineSimilaritySearch {
             return Ok(vec![]);
         }
 
-        // Create uniform buffer for parameters
+        let per_dispatch = vectors_per_dispatch(query_len, &ctx.device.limits())?;
+        self.search_in_dispatches(ctx, query, vectors, per_dispatch).await
+    }
+
+    /// Score `vectors` against `query`, at most `per_dispatch` vectors a dispatch.
+    ///
+    /// The query buffer is uploaded once and bound by every dispatch.
+    async fn search_in_dispatches(
+        &self,
+        ctx: &GpuContext,
+        query: &[f32],
+        vectors: &[f32],
+        per_dispatch: u32,
+    ) -> Result<Vec<f32>, GpuError> {
+        assert!(per_dispatch > 0, "a dispatch must score at least one vector");
+        assert!(!query.is_empty() && vectors.len().is_multiple_of(query.len()));
+        let vector_count = vectors.len() / query.len();
+        let floats_per_dispatch = usize::try_from(per_dispatch)
+            .map_or(usize::MAX, |count| count.saturating_mul(query.len()));
+
+        let query_buffer = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("query_buffer"),
+            contents: bytemuck::cast_slice(query),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let mut similarities = Vec::with_capacity(vector_count);
+        for chunk in vectors.chunks(floats_per_dispatch) {
+            let scores = self.dispatch(ctx, &query_buffer, query.len(), chunk).await?;
+            similarities.extend_from_slice(&scores);
+        }
+
+        debug_assert_eq!(similarities.len(), vector_count);
+        Ok(similarities)
+    }
+
+    /// One dispatch: score every vector of `chunk`, which fits the device's limits.
+    async fn dispatch(
+        &self,
+        ctx: &GpuContext,
+        query_buffer: &wgpu::Buffer,
+        query_len: usize,
+        chunk: &[f32],
+    ) -> Result<Vec<f32>, GpuError> {
+        let (query_len, num_vectors) = shader_counts(query_len, chunk.len())?;
+        debug_assert!(num_vectors > 0, "a dispatch is never empty");
+        debug_assert!(num_vectors.div_ceil(WORKGROUP_SIZE) <= ctx.device.limits().max_compute_workgroups_per_dimension);
+
         let params = SimilarityParams {
             query_len,
             num_vectors,
@@ -335,64 +393,34 @@ impl CosineSimilaritySearch {
             contents: bytemuck::cast_slice(&[params]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-
-        // Create storage buffers
-        let query_buffer = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("query_buffer"),
-            contents: bytemuck::cast_slice(query),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
         let vectors_buffer = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vectors_buffer"),
-            contents: bytemuck::cast_slice(vectors),
+            contents: bytemuck::cast_slice(chunk),
             usage: wgpu::BufferUsages::STORAGE,
         });
 
-        let output_size = (num_vectors as usize) * std::mem::size_of::<f32>();
+        let output_size = u64::from(num_vectors) * F32_BYTES;
         let output_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("output_buffer"),
-            size: output_size as u64,
+            size: output_size,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
-        let staging_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging_buffer"),
-            size: output_size as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Create bind group
         let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("cosine_bind_group"),
             layout: &self.bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: query_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: vectors_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: output_buffer.as_entire_binding(),
-                },
+                wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: query_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: vectors_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: output_buffer.as_entire_binding() },
             ],
         });
 
-        // Dispatch compute
         let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("cosine_encoder"),
         });
-
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("cosine_pass"),
@@ -400,42 +428,61 @@ impl CosineSimilaritySearch {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            // Dispatch with ceiling division for workgroups
-            let workgroups = num_vectors.div_ceil(64);
-            pass.dispatch_workgroups(workgroups, 1, 1);
+            pass.dispatch_workgroups(num_vectors.div_ceil(WORKGROUP_SIZE), 1, 1);
         }
 
-        // Copy output to staging buffer
-        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_size as u64);
-
-        ctx.queue.submit(std::iter::once(encoder.finish()));
-
-        // Read results
-        let buffer_slice = staging_buffer.slice(..);
-        let (tx, rx) = futures::channel::oneshot::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-
-        // wgpu 30: Maintain → PollType; poll now returns a Result.
-        ctx.device
-            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
-            .map_err(|_| GpuError::BufferMapping)?;
-
-        rx.await
-            .map_err(|_| GpuError::BufferMapping)?
-            .map_err(|_| GpuError::BufferMapping)?;
-
-        // wgpu 30: get_mapped_range returns a Result.
-        let data = buffer_slice
-            .get_mapped_range()
-            .map_err(|_| GpuError::BufferMapping)?;
-        let results: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
-        drop(data);
-        staging_buffer.unmap();
-
-        Ok(results)
+        read_back(ctx, encoder, &output_buffer, output_size).await
     }
+}
+
+/// Invocations per workgroup — the shader's `@workgroup_size(64)`.
+const WORKGROUP_SIZE: u32 = 64;
+
+/// Bytes in one `f32` lane of every buffer the shader binds.
+const F32_BYTES: u64 = 4;
+
+/// Copy `output` into a staging buffer, submit `encoder`, and read the scores back.
+async fn read_back(
+    ctx: &GpuContext,
+    mut encoder: wgpu::CommandEncoder,
+    output: &wgpu::Buffer,
+    output_size: u64,
+) -> Result<Vec<f32>, GpuError> {
+    debug_assert!(output_size > 0 && output_size.is_multiple_of(F32_BYTES));
+    let staging_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("staging_buffer"),
+        size: output_size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    encoder.copy_buffer_to_buffer(output, 0, &staging_buffer, 0, output_size);
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+
+    let buffer_slice = staging_buffer.slice(..);
+    let (tx, rx) = futures::channel::oneshot::channel();
+    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+
+    // wgpu 30: Maintain → PollType; poll now returns a Result.
+    ctx.device
+        .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+        .map_err(|_| GpuError::BufferMapping)?;
+
+    rx.await
+        .map_err(|_| GpuError::BufferMapping)?
+        .map_err(|_| GpuError::BufferMapping)?;
+
+    // wgpu 30: get_mapped_range returns a Result.
+    let data = buffer_slice
+        .get_mapped_range()
+        .map_err(|_| GpuError::BufferMapping)?;
+    let results: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+    drop(data);
+    staging_buffer.unmap();
+
+    debug_assert_eq!(results.len() as u64 * F32_BYTES, output_size);
+    Ok(results)
 }
 
 /// The query length and vector count as the `u32`s the shader indexes with.
@@ -443,16 +490,50 @@ impl CosineSimilaritySearch {
 /// A count past `u32::MAX` would need a storage binding of more than 16 GiB,
 /// which no adapter's `max_storage_buffer_binding_size` allows, so refusing it
 /// replaces a silent truncation that could never reach a valid dispatch anyway.
+/// A trailing partial vector is refused too: it used to be dropped without a
+/// word, shifting nothing but scoring nothing.
 fn shader_counts(query_len: usize, vectors_len: usize) -> Result<(u32, u32), GpuError> {
     // An empty query has no dimensions to compare, so there are no vectors to
     // score; `vectors_len / 0` used to panic instead.
     let num_vectors = vectors_len.checked_div(query_len).unwrap_or(0);
+    if query_len > 0 && !vectors_len.is_multiple_of(query_len) {
+        return Err(GpuError::InvalidInput(format!(
+            "{vectors_len} floats is not a whole number of {query_len}-wide vectors"
+        )));
+    }
     match (u32::try_from(query_len), u32::try_from(num_vectors)) {
         (Ok(query_len), Ok(num_vectors)) => Ok((query_len, num_vectors)),
         _ => Err(GpuError::InsufficientMemory(format!(
             "search input exceeds the shader's u32 indexing: query length {query_len}, {num_vectors} vectors"
         ))),
     }
+}
+
+/// How many `query_len`-wide vectors one dispatch may score on a device with `limits`.
+///
+/// Three limits bind, and the smallest wins: the vectors' storage binding and
+/// the output's (both `max_storage_buffer_binding_size`, and no buffer past
+/// `max_buffer_size`), and the workgroup count (`max_compute_workgroups_per_dimension`
+/// × [`WORKGROUP_SIZE`] invocations, one per vector). On wgpu's default limits
+/// a 1536-wide store is bound by its binding (21 845 vectors a dispatch) and a
+/// 1-wide one by its workgroups (4 194 240).
+fn vectors_per_dispatch(query_len: u32, limits: &wgpu::Limits) -> Result<u32, GpuError> {
+    assert!(query_len > 0, "an empty query scores nothing and dispatches nothing");
+    let binding_bytes = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
+    let vector_bytes = u64::from(query_len) * F32_BYTES;
+    if vector_bytes > binding_bytes {
+        return Err(GpuError::InsufficientMemory(format!(
+            "one {query_len}-wide vector is {vector_bytes} bytes; this device binds at most {binding_bytes}"
+        )));
+    }
+
+    let by_vectors = binding_bytes / vector_bytes;
+    let by_output = binding_bytes / F32_BYTES;
+    let by_workgroups = u64::from(limits.max_compute_workgroups_per_dimension) * u64::from(WORKGROUP_SIZE);
+    let count = by_vectors.min(by_output).min(by_workgroups);
+
+    debug_assert!(count >= 1, "a vector that fits its binding fits a dispatch");
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
 // wgpu buffer init descriptor helper
@@ -511,6 +592,110 @@ mod tests {
     fn an_empty_query_scores_nothing_instead_of_dividing_by_zero() {
         assert_eq!(shader_counts(0, 12).unwrap(), (0, 0));
         assert_eq!(shader_counts(3, 12).unwrap(), (3, 4));
+    }
+
+    #[test]
+    fn a_trailing_partial_vector_is_refused_not_dropped() {
+        assert!(matches!(shader_counts(3, 13), Err(GpuError::InvalidInput(_))));
+        assert_eq!(shader_counts(3, 0).unwrap(), (3, 0));
+    }
+
+    #[test]
+    fn a_dispatch_holds_what_the_smallest_limit_admits() {
+        let limits = wgpu::Limits::default();
+        let binding = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
+        let workgroups = u64::from(limits.max_compute_workgroups_per_dimension) * u64::from(WORKGROUP_SIZE);
+
+        // Wide vectors: the vectors' binding binds.
+        let wide = vectors_per_dispatch(1536, &limits).unwrap();
+        assert_eq!(u64::from(wide), binding / (1536 * F32_BYTES));
+        // Narrow vectors: the workgroup count binds.
+        let narrow = vectors_per_dispatch(1, &limits).unwrap();
+        assert_eq!(u64::from(narrow), workgroups.min(binding / F32_BYTES));
+        assert!(u64::from(narrow).div_ceil(u64::from(WORKGROUP_SIZE)) <= u64::from(limits.max_compute_workgroups_per_dimension));
+    }
+
+    #[test]
+    fn a_vector_wider_than_a_binding_is_refused() {
+        let limits = wgpu::Limits { max_storage_buffer_binding_size: 64, ..wgpu::Limits::default() };
+        assert_eq!(vectors_per_dispatch(16, &limits).unwrap(), 1);
+        assert!(matches!(vectors_per_dispatch(17, &limits), Err(GpuError::InsufficientMemory(_))));
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (norm(a) * norm(b))
+    }
+
+    /// Deterministic, non-degenerate vectors: component `i` of vector `n`.
+    fn fixture(count: usize, width: usize) -> Vec<f32> {
+        (0..count * width)
+            .map(|i| {
+                let lane = u16::try_from(i % 997).unwrap_or(0);
+                f32::from(lane) / 997.0 + 0.01
+            })
+            .collect()
+    }
+
+    async fn gpu() -> Option<(GpuContext, CosineSimilaritySearch)> {
+        match GpuContext::new().await {
+            Ok(ctx) => {
+                let search = CosineSimilaritySearch::new(&ctx).ok()?;
+                Some((ctx, search))
+            }
+            Err(GpuError::NoAdapter) => {
+                println!("No GPU adapter found, skipping test");
+                None
+            }
+            Err(e) => panic!("Unexpected error: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn scores_split_across_dispatches_match_the_cpu() {
+        let Some((ctx, search)) = gpu().await else { return };
+        let width = 5;
+        let query = fixture(1, width);
+        let vectors = fixture(10, width);
+
+        // Three vectors a dispatch: two full dispatches and a partial one.
+        let scores = search.search_in_dispatches(&ctx, &query, &vectors, 3).await.unwrap();
+        assert_eq!(scores.len(), 10);
+        for (score, vector) in scores.iter().zip(vectors.chunks(width)) {
+            assert!((score - cosine(&query, vector)).abs() < 1e-5);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_past_the_binding_limit_is_scored_in_full() {
+        let Some((ctx, search)) = gpu().await else { return };
+        let width = 4;
+        let binding = ctx.device.limits().max_storage_buffer_binding_size;
+        // One vector more than a single storage binding holds: one dispatch
+        // was a validation error, i.e. a panic.
+        let count = usize::try_from(binding / (4 * F32_BYTES)).unwrap() + 1;
+        let query = fixture(1, width);
+        let vectors = fixture(count, width);
+
+        let scores = search.search(&ctx, &query, &vectors).await.unwrap();
+        assert_eq!(scores.len(), count);
+        let last = &vectors[(count - 1) * width..];
+        assert!((scores[count - 1] - cosine(&query, last)).abs() < 1e-5);
+    }
+
+    #[tokio::test]
+    async fn a_store_past_the_workgroup_limit_is_scored_in_full() {
+        let Some((ctx, search)) = gpu().await else { return };
+        let limit = ctx.device.limits().max_compute_workgroups_per_dimension;
+        // 1-wide vectors: one more than a dispatch can launch invocations for.
+        let count = usize::try_from(u64::from(limit) * u64::from(WORKGROUP_SIZE)).unwrap() + 1;
+        let query = vec![1.0_f32];
+        let vectors = fixture(count, 1);
+
+        let scores = search.search(&ctx, &query, &vectors).await.unwrap();
+        assert_eq!(scores.len(), count);
+        assert!(scores.iter().all(|score| (score - 1.0).abs() < 1e-5));
     }
 
     #[tokio::test]

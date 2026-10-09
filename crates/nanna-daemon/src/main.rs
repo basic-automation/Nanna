@@ -195,6 +195,12 @@ fn own_spans_only(metadata: &tracing::Metadata<'_>) -> bool {
 
 fn main() {
     let cli = Cli::parse();
+
+    // Before anything starts a thread: a daemon inside the AppImage mount
+    // re-execs from a copy outside it (see `nanna_daemon::appimage`).
+    #[cfg(target_os = "linux")]
+    let staging = matches!(cli.command, Commands::Run)
+        .then(nanna_daemon::appimage::run_outside_the_mount);
     
     // Special case: Windows Service mode doesn't parse args normally
     #[cfg(windows)]
@@ -255,6 +261,17 @@ fn main() {
 
     // Store log_buffer so run_daemon can pass it to the DaemonBuilder
     LOG_BUFFER.set(log_buffer).ok();
+
+    #[cfg(target_os = "linux")]
+    match staging {
+        Some(nanna_daemon::appimage::Outcome::Staged { exe }) => {
+            info!("Running from {}, a copy outside the AppImage mount", exe.display());
+        }
+        Some(nanna_daemon::appimage::Outcome::Failed(reason)) => tracing::warn!(
+            "Running from inside the AppImage mount ({reason}): if the app exits first, this daemon's shutdown can die of SIGBUS"
+        ),
+        Some(nanna_daemon::appimage::Outcome::NotInAppImage) | None => {}
+    }
     
     let result = match cli.command {
         Commands::Run => run_daemon(&cli),
@@ -489,6 +506,95 @@ fn uninstall_service(cli: &Cli) -> Result<(), String> {
     Ok(())
 }
 
-fn get_service_manager(_cli: &Cli) -> ServiceManager {
-    ServiceManager::new(ServiceConfig::default())
+fn get_service_manager(cli: &Cli) -> ServiceManager {
+    let config_path = std::env::var_os(nanna_config::Config::CONFIG_PATH_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    ServiceManager::new(service_config(cli, config_path.as_deref()))
+}
+
+/// The service this command line installs: the daemon on the same address
+/// and data directory, reading the same config file.
+///
+/// `install` used to write the defaults whatever it was given: a daemon
+/// installed with `--port`/`--data-dir` (or under a `NANNA_CONFIG_PATH`)
+/// started at login on the default port, data and config — a different
+/// daemon from the one the operator set up. The flags are global, so they go
+/// before the subcommand; relative paths are made absolute, since the
+/// supervisor starts the daemon from its own working directory.
+fn service_config(cli: &Cli, config_path: Option<&std::path::Path>) -> ServiceConfig {
+    let mut config = ServiceConfig::default();
+    let absolute = |path: &std::path::Path| {
+        std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut arguments = vec![
+        "--host".to_string(),
+        cli.host.clone(),
+        "--port".to_string(),
+        cli.port.to_string(),
+        "--health-port".to_string(),
+        cli.health_port.to_string(),
+    ];
+    if let Some(data_dir) = &cli.data_dir {
+        arguments.push("--data-dir".to_string());
+        arguments.push(absolute(data_dir).to_string_lossy().into_owned());
+    }
+    arguments.append(&mut config.arguments);
+    debug_assert_eq!(arguments.len() % 2, 1, "flag/value pairs, then the subcommand");
+    config.arguments = arguments;
+    if let Some(path) = config_path {
+        config.environment.push((
+            nanna_config::Config::CONFIG_PATH_ENV.to_string(),
+            absolute(path).to_string_lossy().into_owned(),
+        ));
+    }
+    config
+}
+
+#[cfg(test)]
+mod service_config_tests {
+    use super::{Cli, Commands, service_config};
+    use clap::Parser as _;
+
+    /// The installed service starts the daemon the install command describes:
+    /// its command line parses back to the same port, host and data dir, and
+    /// the config file rides along as `NANNA_CONFIG_PATH`.
+    #[test]
+    fn the_installed_service_runs_the_daemon_install_was_given() {
+        let cli = Cli::try_parse_from([
+            "nanna-daemon",
+            "--port",
+            "6001",
+            "--host",
+            "127.0.0.2",
+            "--data-dir",
+            "/srv/nanna",
+            "install",
+        ])
+        .expect("install parses");
+        let config = service_config(&cli, Some(std::path::Path::new("/etc/nanna/config.toml")));
+        let started = Cli::try_parse_from(
+            std::iter::once("nanna-daemon".to_string()).chain(config.arguments.iter().cloned()),
+        )
+        .expect("the service command line parses");
+        assert_eq!(started.port, 6001);
+        assert_eq!(started.host, "127.0.0.2");
+        assert_eq!(started.data_dir.as_deref(), Some(std::path::Path::new("/srv/nanna")));
+        #[cfg(not(windows))]
+        assert!(matches!(started.command, Commands::Run));
+        assert_eq!(
+            config.environment,
+            [(
+                "NANNA_CONFIG_PATH".to_string(),
+                "/etc/nanna/config.toml".to_string()
+            )]
+        );
+
+        let plain = service_config(
+            &Cli::try_parse_from(["nanna-daemon", "install"]).expect("parses"),
+            None,
+        );
+        assert_eq!(plain.environment, []);
+        assert!(!plain.arguments.iter().any(|a| a == "--data-dir"));
+    }
 }
