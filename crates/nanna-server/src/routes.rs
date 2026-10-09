@@ -203,40 +203,41 @@ async fn send_message(
     Path(session_id): Path<String>,
     Json(req): Json<SendMessageRequest>,
 ) -> Result<Json<MessageResponse>, (StatusCode, String)> {
-    let response = state
-        .process_message(&session_id, &req.content, req.system_prompt.as_deref())
+    let reply = state
+        .process_message_reply(&session_id, &req.content, req.system_prompt.as_deref())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    
-    // Get the last message from storage for accurate info
-    let messages = state
-        .storage
-        .messages()
-        .get_by_session(&session_id, 1)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    
-    let reply = messages.last().map_or_else(
-        || MessageResponse {
-            id: 0,
-            role: "assistant".to_string(),
-            content: response,
-            created_at: chrono::Utc::now().to_rfc3339(),
-            tokens_in: None,
-            tokens_out: None,
-        },
-        |msg| MessageResponse {
-            id: msg.id,
-            role: msg.role.clone(),
-            content: msg.content.clone(),
-            created_at: msg.created_at.clone(),
-            tokens_in: msg.tokens_in,
-            tokens_out: msg.tokens_out,
-        },
-    );
-    Ok(Json(reply))
+    Ok(Json(MessageResponse::from_reply(reply)))
 }
 
+impl MessageResponse {
+    /// The reply as the route answers it: the stored row when the turn's write
+    /// landed (its id, timestamp and token counts), else the bare text with
+    /// id 0 — never another message of the session.
+    fn from_reply(reply: crate::ProcessedReply) -> Self {
+        let Some(row) = reply.stored else {
+            return Self {
+                id: 0,
+                role: "assistant".to_string(),
+                content: reply.text,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                tokens_in: None,
+                tokens_out: None,
+            };
+        };
+        debug_assert_eq!(row.content, reply.text, "the stored row is this reply");
+        Self {
+            id: row.id,
+            role: row.role,
+            content: row.content,
+            created_at: row.created_at,
+            tokens_in: row.tokens_in,
+            tokens_out: row.tokens_out,
+        }
+    }
+}
+
+/// A session's newest 100 messages, oldest first.
 async fn get_messages(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -244,7 +245,7 @@ async fn get_messages(
     let messages = state
         .storage
         .messages()
-        .get_by_session(&session_id, 100)
+        .get_recent_by_session(&session_id, 100)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     
@@ -261,4 +262,51 @@ async fn get_messages(
         .collect();
     
     Ok(Json(responses))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MessageResponse;
+    use crate::ProcessedReply;
+
+    fn stored_reply(id: i64, content: &str) -> nanna_storage::Message {
+        nanna_storage::Message {
+            id,
+            session_id: "s".to_string(),
+            role: "assistant".to_string(),
+            content: content.to_string(),
+            content_type: "text".to_string(),
+            tool_use_id: None,
+            created_at: "2026-10-09 12:00:00".to_string(),
+            tokens_in: Some(11),
+            tokens_out: Some(7),
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn a_reply_answers_with_the_row_this_turn_stored() {
+        let reply = ProcessedReply {
+            text: "second answer".to_string(),
+            stored: Some(stored_reply(42, "second answer")),
+        };
+        let response = MessageResponse::from_reply(reply);
+        assert_eq!(response.id, 42);
+        assert_eq!(response.content, "second answer");
+        assert_eq!(response.created_at, "2026-10-09 12:00:00");
+        assert_eq!((response.tokens_in, response.tokens_out), (Some(11), Some(7)));
+    }
+
+    #[test]
+    fn a_reply_whose_write_failed_still_carries_the_text_and_no_id() {
+        let reply = ProcessedReply {
+            text: "unsaved".to_string(),
+            stored: None,
+        };
+        let response = MessageResponse::from_reply(reply);
+        assert_eq!(response.id, 0);
+        assert_eq!(response.role, "assistant");
+        assert_eq!(response.content, "unsaved");
+        assert_eq!((response.tokens_in, response.tokens_out), (None, None));
+    }
 }

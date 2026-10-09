@@ -47,16 +47,6 @@ toml = "1.1"
 # YAML for skill manifests
 serde_yaml = "0.9"
 
-# PKCE OAuth flow
-base64 = "0.23"
-sha2 = "0.11"
-urlencoding = "2.1"
-rand = "0.10"
-
-
-# Directories for fallback paths
-directories.workspace = true
-
 # Nanna crates the daemon *client* needs. The GUI is a pure daemon client, so it
 # links only: nanna-config (config cache read/write + credential manager),
 # nanna-core (cron parsing/description, workspace registry cache + folder

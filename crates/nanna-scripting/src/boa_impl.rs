@@ -471,6 +471,23 @@ where
     })
 }
 
+/// A script's `exec` timeout in whole seconds, or `None` for the bridge's
+/// auto-detected default.
+///
+/// The truncating conversion turned `0`, a negative, `NaN` or a fraction under
+/// one second into `Some(0)` — a deadline that killed the command on its first
+/// poll, which the `exec` skill then reported as "killed at the auto-detected
+/// deadline". Below one second is no usable request, so it means "default";
+/// a fraction above it rounds UP, never short of what was asked.
+fn exec_timeout_from_script(secs: f64) -> Option<u64> {
+    if secs.is_nan() || secs < 1.0 {
+        return None;
+    }
+    let whole = crate::f64_to_u64(secs.ceil());
+    debug_assert!(whole >= 1, "a requested deadline is at least a second");
+    Some(whole)
+}
+
 fn nanna_exec(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let command = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
     let workdir = args.get(1)
@@ -480,7 +497,7 @@ fn nanna_exec(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<
     let timeout_secs = args.get(2)
         .filter(|v| !v.is_undefined() && !v.is_null())
         .and_then(|v| v.to_number(context).ok())
-        .map(crate::f64_to_u64);
+        .and_then(exec_timeout_from_script);
     
     tracing::info!(target: "script", "Nanna.exec called with command: {}", command);
     
@@ -627,6 +644,7 @@ fn nanna_stat(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<
     match result {
         Ok(stat) => {
             let obj = boa_engine::object::JsObject::with_object_proto(context.intrinsics());
+            obj.set(js_string!("path"), JsValue::from(js_string!(stat.path.to_string_lossy().as_ref())), false, context)?;
             obj.set(js_string!("size"), JsValue::from(crate::u64_to_f64(stat.size)), false, context)?;
             obj.set(js_string!("is_file"), JsValue::from(stat.is_file), false, context)?;
             obj.set(js_string!("is_dir"), JsValue::from(stat.is_dir), false, context)?;
@@ -889,6 +907,16 @@ fn transpile_typescript(source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unusable_exec_timeout_means_the_default_not_an_instant_kill() {
+        for unusable in [0.0, -5.0, 0.5, f64::NAN] {
+            assert_eq!(exec_timeout_from_script(unusable), None, "{unusable}");
+        }
+        assert_eq!(exec_timeout_from_script(1.0), Some(1));
+        assert_eq!(exec_timeout_from_script(2.2), Some(3), "rounded up");
+        assert_eq!(exec_timeout_from_script(600.0), Some(600));
+    }
 
     /// A native call runs its async bridge work on its own runtime and hands
     /// back the value — also from a thread already inside a runtime, which is

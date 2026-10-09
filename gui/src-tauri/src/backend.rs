@@ -540,6 +540,19 @@ impl Backend {
                         active_model.write().await.clone_from(model);
                     }
                 }
+                if matches!(event, DaemonEvent::ConfigChanged)
+                    && let Some(state) = app.try_state::<Arc<RwLock<AppState>>>()
+                {
+                    // Before the views hear `config-changed`, so what they
+                    // re-read is the daemon's change and not the boot copy —
+                    // and so the next local setter saves on top of it rather
+                    // than reverting it. Read off the runtime: the keyring
+                    // can block.
+                    match tokio::task::spawn_blocking(crate::load_gui_config).await {
+                        Ok(fresh) => state.write().await.config = fresh,
+                        Err(e) => warn!("Could not refresh the config copy: {e}"),
+                    }
+                }
                 if let Some((name, payload)) = tauri_event_for(&event) {
                     let _ = app.emit(name, payload);
                 }

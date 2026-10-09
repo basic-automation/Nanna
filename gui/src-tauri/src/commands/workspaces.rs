@@ -206,26 +206,30 @@ pub async fn open_workspace(
 ///
 /// # Errors
 ///
-/// Returns `Workspace not found: …` when `id` is not in the cached registry. A
-/// failure to tell the daemon is only logged.
+/// Returns `Workspace not found: …` when `id` is not in the cached registry,
+/// or the daemon's own message when it refused the activation. A daemon that
+/// cannot be reached is only logged.
 #[tauri::command]
 pub async fn set_active_workspace(
     state: State<'_, Arc<RwLock<AppState>>>,
     id: String,
 ) -> Result<(), String> {
     let (backend, workspaces) = backend_and_registry(&state).await;
-    let activated = workspaces.write().await.set_active(&id);
-
-    if activated {
-        info!("Activated workspace: {}", id);
-        // Notify the daemon so it updates its registry and tool working directory.
-        if let Err(e) = backend.workspace_set_active(&id).await {
-            warn!("Failed to notify daemon of workspace activation: {}", e);
-        }
-        Ok(())
-    } else {
-        Err(format!("Workspace not found: {id}"))
+    if workspaces.read().await.get(&id).is_none() {
+        return Err(format!("Workspace not found: {id}"));
     }
+    // The daemon decides — it owns the tool working directory. A refusal (a
+    // workspace another client closed) used to be ignored, and the GUI showed
+    // it Active while the daemon's cwd never moved. An unreachable daemon is
+    // still only logged: the local view is all there is then.
+    match backend.workspace_set_active(&id).await {
+        Ok(reply) => super::daemon_refusal(&reply, "Could not activate the workspace")?,
+        Err(e) => warn!("Failed to notify daemon of workspace activation: {}", e),
+    }
+    let activated = workspaces.write().await.set_active(&id);
+    debug_assert!(activated, "the workspace was found above");
+    info!("Activated workspace: {}", id);
+    Ok(())
 }
 
 /// Clear active workspace (go back to global)

@@ -371,18 +371,6 @@ impl ChatRunRegistry {
             .collect()
     }
 
-    /// Park until NO harness run is live.
-    ///
-    /// The admission gate for background work on the shared local provider
-    /// (P22 Tier 4): the embedding backfill takes its next slot, a yielded
-    /// heartbeat resumes, and dream summarization proceeds only through
-    /// here. Event-driven — wakes on every claim/release edge, no polling
-    /// interval to tune — and PRIORITY, not a quota: the moment the last run
-    /// releases, waiters proceed.
-    ///
-    /// Wakeup-loss safety: interest in the next edge is registered (`enable`)
-    /// BEFORE the condition is read, so a release landing between the read
-    /// and the await still wakes the waiter.
     /// Wait until `session_id` has no live harness run. Interest is
     /// registered before the read so a release between the check and the
     /// await still wakes us — same wakeup-loss shape as [`Self::wait_idle`].
@@ -398,6 +386,18 @@ impl ChatRunRegistry {
         }
     }
 
+    /// Park until NO harness run is live.
+    ///
+    /// The admission gate for background work on the shared local provider
+    /// (P22 Tier 4): the embedding backfill takes its next slot, a yielded
+    /// heartbeat resumes, and dream summarization proceeds only through
+    /// here. Event-driven — wakes on every claim/release edge, no polling
+    /// interval to tune — and PRIORITY, not a quota: the moment the last run
+    /// releases, waiters proceed.
+    ///
+    /// Wakeup-loss safety: interest in the next edge is registered (`enable`)
+    /// BEFORE the condition is read, so a release landing between the read
+    /// and the await still wakes the waiter.
     pub async fn wait_idle(&self) {
         loop {
             let waiter = self.changed.notified();

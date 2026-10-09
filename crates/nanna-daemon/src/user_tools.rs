@@ -63,6 +63,10 @@ pub struct UserToolManager {
     tools_dir: PathBuf,
     engine: Arc<ScriptEngine>,
     tools: RwLock<HashMap<String, UserToolMeta>>,
+    /// The registry the tools are registered with, once they are: where a
+    /// running tool reads the active workspace (its working directory) and
+    /// session, as every bundled skill does.
+    registry: std::sync::OnceLock<std::sync::Weak<ToolRegistry>>,
 }
 
 /// Reject a tool whose source does not parse, before it reaches disk.
@@ -102,6 +106,7 @@ impl UserToolManager {
             tools_dir,
             engine: Arc::new(ScriptEngine::new()),
             tools: RwLock::new(HashMap::new()),
+            registry: std::sync::OnceLock::new(),
         }
     }
 
@@ -171,6 +176,9 @@ impl UserToolManager {
         // Security: the name becomes `{name}.json` on disk, so it must be a safe
         // single filename component — reject path traversal before anything else.
         validate_tool_name(&name)?;
+        // A user tool registers under `name`; a bundled name would replace the
+        // shipped tool (and its guards) in the live registry.
+        crate::tool_authoring::refuse_bundled(&name)?;
 
         // Validate the source PARSES. The line this replaces was
         // `let _test_tool = ScriptedTool::new(&name, &source);` under the comment
@@ -358,13 +366,16 @@ impl UserToolManager {
             meta: meta.clone(),
             tool,
             engine: self.engine.clone(),
+            registry: self.registry.get().cloned(),
         };
         
         Ok(Arc::new(wrapper))
     }
 
     /// Register all enabled user tools with the registry
-    pub async fn register_with_registry(&self, registry: &ToolRegistry) -> usize {
+    pub async fn register_with_registry(&self, registry: &Arc<ToolRegistry>) -> usize {
+        // The first registry wins: the daemon has one.
+        let _ = self.registry.set(Arc::downgrade(registry));
         let tools = self.tools.read().await;
         let mut count = 0;
         
@@ -396,6 +407,7 @@ struct UserToolWrapper {
     meta: UserToolMeta,
     tool: ScriptedTool,
     engine: Arc<ScriptEngine>,
+    registry: Option<std::sync::Weak<ToolRegistry>>,
 }
 
 #[async_trait]
@@ -417,10 +429,19 @@ impl Tool for UserToolWrapper {
 
     async fn execute(&self, params: HashMap<String, Value>) -> Result<ToolResult, ToolError> {
         let input = Value::Object(params.into_iter().collect());
-        
-        let result = self.engine.execute(&self.tool, input, None, None).await.map_err(|e| {
-            ToolError::ExecutionFailed(format!("Script execution failed: {e}"))
-        })?;
+        // The active workspace's directory and the session, as bundled skills
+        // get them: without these a user tool's relative paths resolved
+        // against the daemon's own working directory.
+        let registry = self.registry.as_ref().and_then(std::sync::Weak::upgrade);
+        let (workdir, session_id) = match registry {
+            Some(registry) => (registry.default_workdir().await, registry.session_id().await),
+            None => (None, None),
+        };
+        let result = self
+            .engine
+            .execute_with_workdir_and_session(&self.tool, input, None, None, workdir, session_id)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("Script execution failed: {e}")))?;
         
         // If the script returns an object with { content, success } fields,
         // respect the success flag. This lets tools like `exec` signal failure
@@ -564,6 +585,42 @@ fn parse_params_from_schema(schema: &Value) -> Vec<ToolParameter> {
     }
     
     params
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::UserToolManager;
+    use nanna_tools::ToolRegistry;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// A user tool runs in the active workspace, as bundled skills do: it
+    /// used to get no working directory, so its relative paths resolved
+    /// against the daemon's own.
+    #[tokio::test]
+    async fn a_user_tool_runs_in_the_active_workspace() {
+        let tools_dir = tempfile::tempdir().expect("tempdir");
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let manager = UserToolManager::new(tools_dir.path().to_path_buf());
+        let source = "export default { name: \"where\", description: \"d\", \
+                      execute() { return String(Nanna.workdir()); } }";
+        manager
+            .create_tool("where".into(), "d".into(), source.into(), None, None, None)
+            .await
+            .expect("create");
+        let registry = Arc::new(ToolRegistry::new());
+        registry
+            .set_default_workdir(Some(workspace.path().to_path_buf()))
+            .await;
+        assert_eq!(manager.register_with_registry(&registry).await, 1);
+        let tool = registry.get("where").await.expect("registered");
+        let result = tool.execute(HashMap::new()).await.expect("runs");
+        assert_eq!(
+            result.content,
+            workspace.path().display().to_string(),
+            "the tool saw the workspace as its working directory"
+        );
+    }
 }
 
 #[cfg(test)]

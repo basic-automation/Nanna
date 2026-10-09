@@ -74,19 +74,24 @@ impl ControlPlane {
                     Err(e) => json!({ "error": "create_failed", "message": e.to_string() })
                 }
             }
-            MemoryAction::Update { id, content, tags: _ } => {
-                // Update memory content
-                if let Some(new_content) = content {
-                    match memory.update_content(&id, &new_content).await {
-                        Ok(()) => {
-                            // Memory auto-persisted to Turso via write-through.
-                            json!({ "status": "updated", "id": id })
-                        }
-                        Err(e) => json!({ "error": "update_failed", "message": e.to_string() })
-                    }
-                } else {
-                    json!({ "error": "no_changes", "id": id })
+            MemoryAction::Update { id, content, tags } => {
+                // Tags used to be destructured as `_`: content + tags said
+                // `updated` with the tags dropped, tags alone said `no_changes`.
+                if content.is_none() && tags.is_none() {
+                    return json!({ "error": "no_changes", "id": id });
                 }
+                if let Some(new_content) = content
+                    && let Err(e) = memory.update_content(&id, &new_content).await
+                {
+                    return json!({ "error": "update_failed", "message": e.to_string() });
+                }
+                if let Some(tags) = tags
+                    && let Err(e) = memory.set_tags(&id, &tags).await
+                {
+                    return json!({ "error": "update_failed", "message": e.to_string() });
+                }
+                // Memory auto-persisted to Turso via write-through.
+                json!({ "status": "updated", "id": id })
             }
             MemoryAction::Delete { id } => {
                 match memory.forget(&id).await {

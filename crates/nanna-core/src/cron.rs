@@ -22,6 +22,12 @@ pub struct CronExpr {
     days: HashSet<u32>,
     months: HashSet<u32>,
     weekdays: HashSet<u32>, // 0 = Sunday, 6 = Saturday
+    /// Whether day-of-month and day-of-week were BOTH restricted (neither
+    /// field starts with `*`). Standard cron then fires when EITHER matches:
+    /// `0 9 1,15 * 1` is the 1st, the 15th and every Monday. Matching both
+    /// made it "a Monday that is the 1st or 15th", and `0 0 29 2 1` could fall
+    /// outside `next`'s four-year search and never run at all.
+    either_day: bool,
 }
 
 /// Cron parsing error
@@ -94,6 +100,7 @@ impl CronExpr {
         }
 
         Ok(Self {
+            either_day: !parts[2].starts_with('*') && !parts[4].starts_with('*'),
             minutes: parse_field(parts[0], "minute", 0, 59)?,
             hours: parse_field(parts[1], "hour", 0, 23)?,
             days: parse_field(parts[2], "day", 1, 31)?,
@@ -110,11 +117,16 @@ impl CronExpr {
         let month = dt.month();
         let weekday = dt.weekday().num_days_from_sunday();
 
+        let (day_ok, weekday_ok) = (self.days.contains(&day), self.weekdays.contains(&weekday));
+        let date_ok = if self.either_day {
+            day_ok || weekday_ok
+        } else {
+            day_ok && weekday_ok
+        };
         self.minutes.contains(&minute)
             && self.hours.contains(&hour)
-            && self.days.contains(&day)
             && self.months.contains(&month)
-            && self.weekdays.contains(&weekday)
+            && date_ok
     }
 
     /// Find the next datetime that matches this expression
@@ -397,6 +409,38 @@ fn is_step(values: &[u32]) -> bool {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    /// Standard cron: with BOTH day fields restricted, either one matching
+    /// fires; with one of them `*`, the other alone decides.
+    #[test]
+    fn restricted_day_and_weekday_fire_on_either() {
+        let expr = CronExpr::parse("0 9 1,15 * 1").unwrap();
+        // 2026-10-01 is a Thursday (the 1st), 2026-10-05 a Monday (the 5th).
+        let first = Utc.with_ymd_and_hms(2026, 10, 1, 9, 0, 0).unwrap();
+        let monday = Utc.with_ymd_and_hms(2026, 10, 5, 9, 0, 0).unwrap();
+        let neither = Utc.with_ymd_and_hms(2026, 10, 6, 9, 0, 0).unwrap();
+        assert!(expr.matches(&first), "the 1st");
+        assert!(expr.matches(&monday), "a Monday");
+        assert!(!expr.matches(&neither));
+
+        // One field starred: the other decides alone, as before.
+        let mondays = CronExpr::parse("0 9 * * 1").unwrap();
+        assert!(mondays.matches(&monday));
+        assert!(!mondays.matches(&first));
+        let firsts = CronExpr::parse("0 9 1 * *").unwrap();
+        assert!(firsts.matches(&first));
+        assert!(!firsts.matches(&monday));
+        // `*/2` counts as starred, like Vixie cron.
+        let odd_days_mondays = CronExpr::parse("0 9 */2 * 1").unwrap();
+        assert!(
+            !odd_days_mondays.matches(&first),
+            "Thursday the 1st is not a Monday"
+        );
+
+        // Feb 29 OR any Monday: always found, never "no match in four years".
+        let leap = CronExpr::parse("0 0 29 2 1").unwrap();
+        assert!(leap.next(&first).is_some());
+    }
 
     #[test]
     fn test_parse_simple() {

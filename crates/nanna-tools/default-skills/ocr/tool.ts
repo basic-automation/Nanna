@@ -13,8 +13,16 @@ export default {
   },
   execute: function(input) {
     try {
+      // Resolved and permission-checked by the bridge (a relative path is the
+      // workspace's); the service itself takes the path as given.
+      var file;
+      try {
+        file = Nanna.stat(input.path).path;
+      } catch (e) {
+        return "Error: cannot read " + input.path + ": " + e;
+      }
       var result = Nanna.service("vision.analyze", {
-        path: input.path,
+        path: file,
         prompt: "Extract ALL text visible in this image. Reproduce the text exactly as it appears, preserving layout and formatting where possible. If no text is found, say 'No text detected'."
       });
       return result.text || "(no text detected)";

@@ -22,7 +22,7 @@ export default {
       });
       return result.text || result.content || "(no content extracted)";
     } catch (e) {
-      return "Error: Browser service not available. " + e;
+      return { content: "Error: " + e, success: false };
     }
   }
 }

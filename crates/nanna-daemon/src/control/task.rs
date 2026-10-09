@@ -323,6 +323,11 @@ impl ControlPlane {
             due_at, deadline_at, recurrence, depends_on, acceptance, project, assignee,
             workspace_id,
         } = request;
+        let recurrence = match recurrence.as_deref().map(crate::tasks::admit_recurrence) {
+            None => None,
+            Some(Ok(admitted)) => admitted,
+            Some(Err(message)) => return json!({"error": "bad_recurrence", "message": message}),
+        };
         // A subtask always lives in its parent's scope and inherits
         // its ladder position; a new root task appends after
         // everything (sort_order 0 would jump the whole queue).
@@ -432,6 +437,16 @@ impl ControlPlane {
             }
             None => None,
         };
+        // An empty string clears it, like the dates; anything else must parse.
+        let recurrence = match patch
+            .get("recurrence")
+            .and_then(Value::as_str)
+            .map(crate::tasks::admit_recurrence)
+        {
+            None => None,
+            Some(Ok(admitted)) => Some(admitted),
+            Some(Err(message)) => return json!({"error": "bad_recurrence", "message": message}),
+        };
         let task_patch = TaskPatch {
             title: patch
                 .get("title")
@@ -462,10 +477,7 @@ impl ControlPlane {
                 .get("deadline_at")
                 .and_then(Value::as_str)
                 .map(clearable),
-            recurrence: patch
-                .get("recurrence")
-                .and_then(Value::as_str)
-                .map(|s| Some(s.to_string())),
+            recurrence,
             depends_on: patch.get("depends_on").filter(|v| v.is_array()).map(|v| {
                 v.as_array()
                     .map(|arr| arr.iter().filter_map(Value::as_i64).collect())
@@ -504,16 +516,16 @@ impl ControlPlane {
                     return json!({"error": "bad_acceptance", "message": message});
                 }
             };
-            // Default to the active workspace root — the daemon's own
-            // cwd is meaningless for workspace artifacts.
+            // Explicit > the card's own board > the active workspace — the
+            // same order a card run uses. Judging a board card against the
+            // ACTIVE workspace computed its verdict from another project's
+            // files whenever a different board was open.
             let dir = match workdir {
                 Some(dir) => PathBuf::from(dir),
                 None => self
-                    .workspaces
-                    .read()
+                    .card_workspace_root(&task)
                     .await
-                    .active()
-                    .map_or_else(|| PathBuf::from("."), |w| w.path.clone()),
+                    .unwrap_or_else(|| PathBuf::from(".")),
             };
             let verdict = check.run(&dir).await;
             let _ = repo
@@ -536,6 +548,21 @@ impl ControlPlane {
             }),
             Err(e) => json!({"error": "task_done_failed", "message": e.to_string()}),
         }
+    }
+
+    /// The root a card's work is judged in: its own board's workspace when it
+    /// is on one that is registered, else the active workspace.
+    async fn card_workspace_root(&self, card: &nanna_storage::Task) -> Option<PathBuf> {
+        let registry = self.workspaces.read().await;
+        let root = card
+            .scope_id
+            .as_deref()
+            .filter(|_| card.scope == "workspace")
+            .and_then(|id| registry.get(id))
+            .or_else(|| registry.active())
+            .map(|w| w.path.clone());
+        drop(registry);
+        root
     }
 
     /// `TaskAction::Query`.
@@ -761,15 +788,7 @@ impl ControlPlane {
             Err(reply) => return reply,
         };
         // Workdir: explicit > the card's own board > the active workspace.
-        let workspace_root = {
-            let registry = self.workspaces.read().await;
-            card.scope_id
-                .as_deref()
-                .filter(|_| card.scope == "workspace")
-                .and_then(|id| registry.get(id))
-                .or_else(|| registry.active())
-                .map(|w| w.path.clone())
-        };
+        let workspace_root = self.card_workspace_root(&card).await;
         let dir = workdir
             .map(PathBuf::from)
             .or_else(|| workspace_root.clone())

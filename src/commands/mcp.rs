@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use nanna_client::{Client, ClientConfig};
+use nanna_client::{Client, ClientConfig, DaemonLink};
 use nanna_config::Config;
 use nanna_mcp::{CallToolResult, McpServer, McpServerConfig, Tool, ToolContent, tools_bridge};
 use nanna_tools::{ToolDefinition, ToolPolicy, ToolRegistry};
@@ -61,7 +61,7 @@ pub async fn serve(
     if !standalone {
         let url = daemon_url.clone().unwrap_or_else(default_daemon_url);
         match connect_daemon(&url).await {
-            Ok(client) => return serve_via_daemon(client).await,
+            Ok(client) => return serve_via_daemon(client, &url).await,
             Err(e) if daemon_url.is_some() => return Err(e),
             Err(e) => warn!(
                 "no daemon at {url} ({e:#}); serving the standalone surface — memory, \
@@ -87,8 +87,9 @@ async fn connect_daemon(url: &str) -> anyhow::Result<Client> {
 ///
 /// Returns an error if the daemon's tool listing cannot be read, or the stdio
 /// loop fails.
-pub async fn serve_via_daemon(client: Client) -> anyhow::Result<()> {
-    let client = Arc::new(client);
+pub async fn serve_via_daemon(client: Client, url: &str) -> anyhow::Result<()> {
+    let link = Arc::new(DaemonLink::new(client, ClientConfig::new(url)));
+    let client = link.client().await.map_err(|e| anyhow::anyhow!(e))?;
     let listing = client
         .tools()
         .list()
@@ -110,14 +111,18 @@ pub async fn serve_via_daemon(client: Client) -> anyhow::Result<()> {
         let Some(tool) = daemon_tool(&client, name).await else {
             continue;
         };
-        let executor = Arc::clone(&client);
+        let executor = Arc::clone(&link);
         let tool_name = tool.name.clone();
         server
             .register_tool(tool, move |input: Value| {
                 let client = Arc::clone(&executor);
                 let name = tool_name.clone();
                 async move {
-                    Ok(match client.tools().execute(&name, input).await {
+                    // No client-side window: the daemon bounds the call by
+                    // the tool's own timeout, which may exceed any fixed one.
+                    // The link reopens the connection after a daemon restart;
+                    // a plain client stayed disconnected for good.
+                    Ok(match client.execute_tool(&name, input).await {
                         Ok(reply) => daemon_reply_to_result(&reply),
                         Err(e) => error_result(format!("the daemon did not run {name}: {e}")),
                     })

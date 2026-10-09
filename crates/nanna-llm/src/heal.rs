@@ -292,10 +292,17 @@ fn repair_common(s: &str) -> String {
 }
 
 /// Balance braces/brackets if truncated: close an open string, then every
-/// unclosed array, then every unclosed object.
+/// unclosed container innermost first.
+///
+/// Closers come from a stack of the openers seen, not from two counters: a
+/// fixed "all `]` then all `}`" order turned a truncated
+/// `{"edits":[{"old":"x"` into `{"edits":[{"old":"x"]}}`, which does not
+/// parse, so `heal_tool_args` fell back to `{}` and the call lost every
+/// argument. A closer that does not match the innermost opener is malformed
+/// input either way and is left alone. The stack is bounded by the input's
+/// length.
 fn close_unbalanced(out: &mut String) {
-    let mut depth_obj = 0i32;
-    let mut depth_arr = 0i32;
+    let mut open: Vec<char> = Vec::new();
     let mut in_string = false;
     let mut escape = false;
     for c in out.chars() {
@@ -311,21 +318,24 @@ fn close_unbalanced(out: &mut String) {
         }
         match c {
             '"' => in_string = true,
-            '{' => depth_obj += 1,
-            '}' => depth_obj -= 1,
-            '[' => depth_arr += 1,
-            ']' => depth_arr -= 1,
+            '{' => open.push('}'),
+            '[' => open.push(']'),
+            '}' | ']' if open.last() == Some(&c) => {
+                open.pop();
+            }
             _ => {}
         }
     }
+    debug_assert!(open.len() <= out.len(), "one closer per opener seen");
     if in_string {
+        // A dangling escape would turn the closing quote into an escaped one.
+        if escape {
+            out.pop();
+        }
         out.push('"');
     }
-    for _ in 0..depth_arr.max(0) {
-        out.push(']');
-    }
-    for _ in 0..depth_obj.max(0) {
-        out.push('}');
+    while let Some(closer) = open.pop() {
+        out.push(closer);
     }
 }
 
@@ -400,6 +410,25 @@ mod tests {
         let v = heal_json(r#"{"a": "hello", "b": 3"#).unwrap();
         assert_eq!(v["a"], "hello");
         assert_eq!(v["b"], 3);
+    }
+
+    #[test]
+    fn truncated_nesting_closes_innermost_first() {
+        // An object inside an array, cut off mid-string: the closers must be
+        // `"}]}`, not `"]}}`.
+        let v = heal_json(r#"{"edits":[{"old":"x"#).unwrap();
+        assert_eq!(v["edits"][0]["old"], "x");
+        let v = heal_json(r#"[{"a":[1,{"b":2"#).unwrap();
+        assert_eq!(v[0]["a"][1]["b"], 2);
+        let args = heal_tool_args(r#"{"path":"a.py","edits":[{"old":"f(","new":"g("#);
+        assert_eq!(args["path"], "a.py");
+        assert_eq!(args["edits"][0]["new"], "g(");
+    }
+
+    #[test]
+    fn a_truncated_escape_does_not_swallow_the_closing_quote() {
+        let v = heal_json(r#"{"content":"line"#).unwrap();
+        assert_eq!(v["content"], "line");
     }
 
     #[test]

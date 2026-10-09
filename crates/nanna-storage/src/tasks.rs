@@ -514,31 +514,30 @@ impl TaskRepository {
         patch: TaskPatch,
         actor: Option<&str>,
     ) -> Result<Task, StorageError> {
-        let mut task = self.get_raw(id).await?;
         let needs_graph_check = patch.depends_on.is_some() || patch.parent_id.is_some();
         let parent_changed = patch.parent_id.is_some();
-        let changed = apply_patch(&mut task, patch)?;
-        validate_dates(task.due_at.as_deref(), task.deadline_at.as_deref())?;
-        // Snapshot before the write when this update can change what blocks
-        // what: a status transition opens or closes a dependency, and a
-        // `depends_on` change moves the edges themselves. `task` is already
-        // patched in memory, but the rows still hold the pre-update state.
-        let blocking_before = if self.events.is_some()
-            && (changed.contains(&"status") || changed.contains(&"depends_on"))
-        {
-            Some(
-                self.load_scope(&task.scope, task.scope_id.as_deref())
-                    .await?,
-            )
-        } else {
-            None
-        };
-
-        {
-            // Validate and write under ONE connection guard: the mutex is the
-            // transaction, so a concurrent writer cannot slip a conflicting
-            // graph change between the checks and the write.
+        let (task, changed, blocking_before) = {
+            // Read, validate and write under ONE connection guard: the mutex is
+            // the transaction. The row is read under it too — `write_task_with`
+            // rewrites every column from this copy, so a copy read before the
+            // lock let a concurrent `complete` (or any other write) between the
+            // read and the write be silently undone: a reorder could put a
+            // finished card back to `in_progress`.
             let conn = self.conn.lock().await;
+            let mut task = get_raw_with(&conn, id).await?;
+            let changed = apply_patch(&mut task, patch)?;
+            validate_dates(task.due_at.as_deref(), task.deadline_at.as_deref())?;
+            // Snapshot before the write when this update can change what blocks
+            // what: a status transition opens or closes a dependency, and a
+            // `depends_on` change moves the edges themselves. `task` is already
+            // patched in memory, but the rows still hold the pre-update state.
+            let blocking_before = if self.events.is_some()
+                && (changed.contains(&"status") || changed.contains(&"depends_on"))
+            {
+                Some(load_scope_with(&conn, &task.scope, task.scope_id.as_deref()).await?)
+            } else {
+                None
+            };
             if changed.contains(&"assignee")
                 && let Err(err) =
                     ensure_member_exists(&conn, task.assignee.as_deref(), "assignee").await
@@ -557,9 +556,11 @@ impl TaskRepository {
                 check_graph_update(&borrow, &task, parent_changed)?;
             }
             write_task_with(&conn, &task).await?;
-            // Held from the graph check through the write (see above).
+            // Held from the read through the write (see above).
             drop(conn);
-        }
+            (task, changed, blocking_before)
+        };
+        debug_assert_eq!(task.id, id, "the row written is the row asked for");
         if !changed.is_empty() {
             self.log_activity(
                 task.id,
@@ -1509,10 +1510,13 @@ impl TaskRepository {
     /// back: rows deleted before a failure stay deleted, and a failure while
     /// stripping references leaves some `depends_on` lists naming deleted ids.
     pub async fn delete(&self, id: i64, actor: Option<&str>) -> Result<u64, StorageError> {
-        let task = self.get_raw(id).await?;
-        let scope_tasks = self
-            .load_scope(&task.scope, task.scope_id.as_deref())
-            .await?;
+        // Read, delete and strip under ONE guard. The dependents are rewritten
+        // whole from `scope_tasks`, so a copy read before the lock let a write
+        // in between (a status change, a new dependency) be undone, and a child
+        // created in between survived its deleted parent.
+        let conn = self.conn.lock().await;
+        let task = get_raw_with(&conn, id).await?;
+        let scope_tasks = load_scope_with(&conn, &task.scope, task.scope_id.as_deref()).await?;
 
         // Collect the subtree, bounded by scope size.
         let mut doomed: Vec<i64> = vec![id];
@@ -1526,7 +1530,6 @@ impl TaskRepository {
             }
         }
 
-        let conn = self.conn.lock().await;
         for task_id in &doomed {
             conn.execute(
                 "DELETE FROM task_notes WHERE task_id = ?1",
@@ -1541,7 +1544,6 @@ impl TaskRepository {
             conn.execute("DELETE FROM tasks WHERE id = ?1", turso::params![*task_id])
                 .await?;
         }
-        drop(conn);
 
         // Strip dangling dependency references. This is itself an unblocking
         // mechanism — a dependent whose only dependency was deleted is free —
@@ -1554,9 +1556,11 @@ impl TaskRepository {
             if t.depends_on.iter().any(|d| doomed_set.contains(d)) {
                 let mut kept = t.clone();
                 kept.depends_on.retain(|d| !doomed_set.contains(d));
-                self.write_task(&kept).await?;
+                write_task_with(&conn, &kept).await?;
             }
         }
+        // Held from the read through the last strip (see above).
+        drop(conn);
 
         if self.events.is_some() {
             let after = self
@@ -1941,19 +1945,7 @@ impl TaskRepository {
 
     async fn get_raw(&self, id: i64) -> Result<Task, StorageError> {
         let conn = self.conn.lock().await;
-        let mut rows = conn
-            .query(
-                &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
-                turso::params![id],
-            )
-            .await?;
-        let task = rows.next().await?.map_or_else(
-            || Err(StorageError::NotFound(format!("Task: #{id}"))),
-            |row| decode_task_row(&row),
-        );
-        // Held until the cursor is gone: an open `Rows` on the shared
-        // connection swallows later writes.
-        drop(rows);
+        let task = get_raw_with(&conn, id).await;
         drop(conn);
         task
     }
@@ -1980,6 +1972,29 @@ impl TaskRepository {
 
 /// Load a scope's tasks using an already-held connection guard (the mutex is
 /// the transaction: validate-then-write sequences hold one guard throughout).
+/// One task row as stored (no derived `blocked`), on a connection the caller
+/// already holds.
+async fn get_raw_with(conn: &Connection, id: i64) -> Result<Task, StorageError> {
+    let mut rows = conn
+        .query(
+            &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
+            turso::params![id],
+        )
+        .await?;
+    let task = rows.next().await?.map_or_else(
+        || Err(StorageError::NotFound(format!("Task: #{id}"))),
+        |row| decode_task_row(&row),
+    );
+    // Dropped before the caller's next statement: an open `Rows` on the
+    // shared connection swallows later writes.
+    drop(rows);
+    debug_assert!(
+        task.as_ref().ok().is_none_or(|t| t.id == id),
+        "the row read is the row asked for"
+    );
+    task
+}
+
 async fn load_scope_with(
     conn: &Connection,
     scope: &str,

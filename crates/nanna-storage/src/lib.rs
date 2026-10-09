@@ -774,9 +774,7 @@ impl Storage {
             UsagePeriod::Month => "substr(created_at, 1, 7)",
             UsagePeriod::Session => "COALESCE(session_id, '')",
         };
-        let since = (chrono::Utc::now() - chrono::Duration::days(i64::from(days)))
-            .format("%Y-%m-%d 00:00:00")
-            .to_string();
+        let since = window_first_day(days).format("%Y-%m-%d 00:00:00").to_string();
         let sql = format!(
             "SELECT {group_expr} AS period, model,
                     CAST(COUNT(*) AS INTEGER),
@@ -944,7 +942,7 @@ impl Storage {
                         CAST(SUM(success_count) AS INTEGER),
                         CAST(SUM(failure_count) AS INTEGER),
                         CAST(SUM(total_duration_ms) AS INTEGER),
-                        CAST(AVG(avg_duration_ms) AS INTEGER),
+                        CAST(SUM(total_duration_ms) / MAX(SUM(call_count), 1) AS INTEGER),
                         CAST(MAX(p95_duration_ms) AS INTEGER)
                  FROM tool_stats_hourly
                  WHERE hour >= ?1
@@ -985,8 +983,7 @@ impl Storage {
         days: u32,
     ) -> Result<Vec<ToolStatsTimeBucket>, StorageError> {
         let conn = self.conn.lock().await;
-        let since = chrono::Utc::now() - chrono::Duration::days(i64::from(days));
-        let since_str = since.format("%Y-%m-%d").to_string();
+        let since_str = window_first_day(days).format("%Y-%m-%d").to_string();
 
         let mut rows = if let Some(name) = tool_name {
             conn.query(
@@ -1004,7 +1001,7 @@ impl Storage {
                         CAST(SUM(success_count) AS INTEGER),
                         CAST(SUM(failure_count) AS INTEGER),
                         CAST(SUM(total_duration_ms) AS INTEGER),
-                        CAST(AVG(avg_duration_ms) AS INTEGER),
+                        CAST(SUM(total_duration_ms) / MAX(SUM(call_count), 1) AS INTEGER),
                         CAST(MAX(p95_duration_ms) AS INTEGER)
                  FROM tool_stats_daily
                  WHERE day >= ?1
@@ -1050,7 +1047,7 @@ impl Storage {
                 "SELECT tool_name, success, duration_ms, output_size, error_message, session_id, created_at
                  FROM tool_call_log
                  WHERE tool_name = ?1
-                 ORDER BY created_at DESC
+                 ORDER BY created_at DESC, id DESC
                  LIMIT ?2",
                 turso::params![name, i64::from(limit)],
             ).await?
@@ -1058,7 +1055,7 @@ impl Storage {
             conn.query(
                 "SELECT tool_name, success, duration_ms, output_size, error_message, session_id, created_at
                  FROM tool_call_log
-                 ORDER BY created_at DESC
+                 ORDER BY created_at DESC, id DESC
                  LIMIT ?1",
                 turso::params![i64::from(limit)],
             ).await?
@@ -1372,8 +1369,13 @@ impl Storage {
     pub async fn list_daemon_sessions(&self) -> Result<Vec<Session>, StorageError> {
         let conn = self.conn.lock().await;
         let mut rows = conn.query(
+            // `datetime(...)`: `updated_at` is written as RFC 3339 by the
+            // daemon's own paths and as `datetime('now')` by the rename /
+            // workspace / touch paths, and as text a space sorts below `T` —
+            // a session renamed at 15:00 sorted below one touched at 09:00
+            // the same day, and the first row is the default session on boot.
             "SELECT id, session_id, channel, user_id, created_at, updated_at, metadata, workspace_id, name
-             FROM sessions ORDER BY updated_at DESC",
+             FROM sessions ORDER BY datetime(updated_at) DESC, id DESC",
             (),
         ).await?;
         let mut sessions = Vec::new();
@@ -1551,6 +1553,19 @@ pub enum UsagePeriod {
 /// Longest window a usage rollup covers: a year and a day.
 pub const USAGE_BUCKET_DAYS_MAX: u32 = 366;
 
+/// The first UTC calendar day of a `days`-day window that ends today: "the
+/// last 7 days" is today and the six before it. Cutting at `now - days` and
+/// rounding to midnight took one day more — eight bars for "7 days", two for
+/// "today". `days` is clamped to `1..=USAGE_BUCKET_DAYS_MAX`.
+fn window_first_day(days: u32) -> chrono::NaiveDate {
+    let days = days.clamp(1, USAGE_BUCKET_DAYS_MAX);
+    let today = chrono::Utc::now().date_naive();
+    let first = today - chrono::Duration::days(i64::from(days - 1));
+    debug_assert!(first <= today);
+    debug_assert_eq!((today - first).num_days() + 1, i64::from(days));
+    first
+}
+
 /// Model usage summed over one period for one model.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelUsageBucket {
@@ -1664,6 +1679,59 @@ mod tests {
         let counts = |b: &ToolStatsTimeBucket| (b.call_count, b.success_count, b.failure_count);
         assert_eq!(counts(&hourly[0]), (2, 1, 0), "{hourly:?}");
         assert_eq!(counts(&daily[0]), counts(&hourly[0]), "{daily:?}");
+    }
+
+    /// A `days`-day window is `days` calendar days ending today, not one more.
+    #[test]
+    fn a_window_of_n_days_spans_n_calendar_days() {
+        let today = chrono::Utc::now().date_naive();
+        assert_eq!(window_first_day(1), today);
+        assert_eq!(window_first_day(0), today, "clamped to one day");
+        assert_eq!((today - window_first_day(7)).num_days(), 6);
+        assert_eq!(
+            (today - window_first_day(u32::MAX)).num_days(),
+            i64::from(USAGE_BUCKET_DAYS_MAX - 1)
+        );
+    }
+
+    /// A one-day usage window is today: yesterday's request is outside it.
+    #[tokio::test]
+    async fn a_one_day_usage_window_excludes_yesterday() {
+        let storage = Storage::in_memory().await.expect("storage");
+        for _ in 0..2 {
+            storage
+                .log_model_request(&NewModelRequest {
+                    model: "m",
+                    success: true,
+                    latency_ms: 1,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    cache_creation_1h_tokens: 0,
+                    tier: None,
+                    escalated: false,
+                    session_id: None,
+                })
+                .await
+                .expect("log");
+        }
+        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d 23:59:59")
+            .to_string();
+        let conn = storage.conn.lock().await;
+        conn.execute(
+            "UPDATE model_request_log SET created_at = ?1 WHERE id = 1",
+            turso::params![yesterday.as_str()],
+        )
+        .await
+        .expect("backdate");
+        drop(conn);
+        let one = storage.model_usage_buckets(1, false).await.expect("rollup");
+        assert_eq!(one.len(), 1, "{one:?}");
+        assert_eq!(one[0].requests, 1);
+        let two = storage.model_usage_buckets(2, false).await.expect("rollup");
+        assert_eq!(two.len(), 2, "{two:?}");
     }
 
     /// Session metadata is serialized, not formatted: a quote in the name used

@@ -1070,10 +1070,7 @@ impl NannaBridge {
             .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
             .collect();
         
-        let body = response
-            .text()
-            .await
-            .map_err(|e| ScriptError::Bridge(format!("Failed to read body: {e}")))?;
+        let body = read_body_capped(response, READ_FILE_BYTES_MAX).await?;
 
         Ok(FetchResponse {
             status,
@@ -1312,6 +1309,7 @@ impl NannaBridge {
             .map(|d| d.as_secs());
 
         Ok(FileStat {
+            path,
             size: metadata.len(),
             is_file: metadata.is_file(),
             is_dir: metadata.is_dir(),
@@ -1398,6 +1396,11 @@ pub struct DirEntry {
 /// File stat result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileStat {
+    /// The path as resolved — `~` expanded, a relative path joined onto the
+    /// workspace — and permitted. A skill hands THIS to a service: services
+    /// take a raw path, so a relative one resolved against the daemon's own
+    /// working directory and skipped the skill's read scope entirely.
+    pub path: std::path::PathBuf,
     pub size: u64,
     pub is_file: bool,
     pub is_dir: bool,
@@ -1703,6 +1706,40 @@ mod appimage_library_path_tests {
 /// daemon ran out of memory. The engine holds text as UTF-16, so a read costs
 /// about twice this before any copy.
 pub const READ_FILE_BYTES_MAX: u64 = 64 * 1024 * 1024;
+
+/// A response body as text, read chunk by chunk and refused past `cap` bytes.
+///
+/// `Response::text` buffered the whole body first, so a fast link could feed a
+/// skill gigabytes within the 30 s client timeout — `web_fetch`'s `max_chars`
+/// only applied after all of it was in memory. The cap is `readFile`'s: a
+/// fetch must not be a way to load what a file read refuses. Decoded as UTF-8,
+/// lossily (an invalid byte becomes U+FFFD rather than failing the call).
+async fn read_body_capped(mut response: reqwest::Response, cap: u64) -> Result<String> {
+    let cap_bytes = usize::try_from(cap).unwrap_or(usize::MAX);
+    if response
+        .content_length()
+        .is_some_and(|declared| declared > cap)
+    {
+        return Err(ScriptError::Bridge(format!(
+            "Response body is larger than {cap} bytes; not read"
+        )));
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| ScriptError::Bridge(format!("Failed to read body: {e}")))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > cap_bytes {
+            return Err(ScriptError::Bridge(format!(
+                "Response body exceeded {cap} bytes; stopped reading"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    debug_assert!(bytes.len() <= cap_bytes, "never more than the cap is held");
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
 
 /// Read `path` as UTF-8, refusing once more than `max_bytes` have arrived.
 ///
@@ -2178,6 +2215,83 @@ mod tests {
         ] {
             assert_eq!(strip_outer_quotes(input), want, "input: {input}");
         }
+    }
+
+    /// Serve one canned HTTP response on a loopback port; its URL.
+    async fn serve_once(head: &'static str, body: Vec<u8>) -> String {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0_u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// A body past the cap is refused — declared up front or only discovered
+    /// while streaming — instead of being buffered whole.
+    #[tokio::test]
+    async fn a_fetched_body_is_read_only_up_to_the_cap() {
+        let client = reqwest::Client::new();
+        let declared = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 32\r\nConnection: close\r\n\r\n",
+            vec![b'a'; 32],
+        )
+        .await;
+        let response = client.get(&declared).send().await.expect("send");
+        assert!(
+            read_body_capped(response, 16).await.is_err(),
+            "declared too large"
+        );
+
+        let undeclared = serve_once(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+            vec![b'b'; 32],
+        )
+        .await;
+        let response = client.get(&undeclared).send().await.expect("send");
+        assert!(
+            read_body_capped(response, 16).await.is_err(),
+            "streamed past the cap"
+        );
+
+        let small = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n",
+            b"hello".to_vec(),
+        )
+        .await;
+        let response = client.get(&small).send().await.expect("send");
+        assert_eq!(read_body_capped(response, 16).await.expect("read"), "hello");
+    }
+
+    /// `stat` hands back the path the bridge resolved — the one a skill passes
+    /// on to a service, which would otherwise resolve a relative path against
+    /// the daemon's own working directory and skip the skill's read scope.
+    #[tokio::test]
+    async fn stat_returns_the_resolved_permitted_path() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("spec.pdf"), b"%PDF").expect("file");
+        let root = workspace.path().to_string_lossy().to_string();
+        let bridge = NannaBridge::new(ToolPermissions::none().with_read([root.as_str()]))
+            .with_default_workdir(workspace.path());
+        let stat = bridge.stat("spec.pdf").await.expect("stat");
+        assert_eq!(stat.path, workspace.path().join("spec.pdf"));
+        assert!(stat.is_file);
+        // Outside the read scope, stat refuses — so a skill cannot reach a
+        // service with that path either.
+        let refused = bridge.stat("../outside.pdf").await;
+        assert!(
+            matches!(refused, Err(ScriptError::Permission(_))),
+            "{refused:?}"
+        );
     }
 
     #[test]

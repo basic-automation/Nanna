@@ -255,6 +255,24 @@ async fn a_saved_ollama_token_reaches_the_running_embedder_but_the_model_waits()
 /// address (the agent can send one) used to re-read the store for the new
 /// address, find no record, and hand the old server's token to the new one:
 /// chat, embeddings and the probe would all have sent it there.
+/// A typo'd path is refused, not answered `updated` while serde drops it.
+#[tokio::test]
+async fn config_set_of_an_unknown_path_is_refused() {
+    let cp = Arc::new(ControlPlane::new(Arc::new(SessionManager::new())));
+    let set = |path: &str, value: Value| {
+        let cp = Arc::clone(&cp);
+        let action = Action::Config(ConfigAction::Set {
+            path: path.into(),
+            value,
+        });
+        async move { cp.handle("test", action).await }
+    };
+    let typo = set("llm.modle", json!("x")).await;
+    assert_eq!(typo["error"], "unknown_path", "{typo}");
+    let nested_typo = set("memory.no_such.key", json!(1)).await;
+    assert_eq!(nested_typo["error"], "unknown_path", "{nested_typo}");
+}
+
 #[tokio::test]
 async fn config_set_does_not_hand_a_legacy_ollama_token_to_a_new_address() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1194,6 +1212,90 @@ async fn consolidate_with_dreaming_passes_the_gate_and_stops_at_the_llm() {
         resp["error"], "llm_unavailable",
         "with dreaming wired, the next precondition is the summarizer model"
     );
+}
+
+/// Closing the active workspace leaves global mode behind it: the tools'
+/// default working directory goes with the workspace, as `ClearActive` does.
+#[tokio::test]
+async fn closing_the_active_workspace_clears_the_tool_cwd() {
+    let registry = Arc::new(nanna_tools::ToolRegistry::new());
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.tools = Some(Arc::clone(&registry));
+    let cp = Arc::new(cp);
+    let dir = tempfile::tempdir().expect("dir");
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let opened = ask(serde_json::json!({
+        "type": "workspace", "action": "open", "path": dir.path().display().to_string(),
+    }))
+    .await;
+    let id = opened["id"].as_str().expect("an id").to_string();
+    ask(serde_json::json!({"type": "workspace", "action": "set_active", "id": id})).await;
+    assert!(
+        registry.default_workdir().await.is_some(),
+        "the active workspace is the cwd"
+    );
+
+    let closed = ask(serde_json::json!({"type": "workspace", "action": "close", "id": id})).await;
+    assert_eq!(closed["status"], "closed", "{closed}");
+    assert_eq!(
+        registry.default_workdir().await,
+        None,
+        "no cwd in a closed project"
+    );
+}
+
+/// `needs_shell` on `tool.update` sets the grant both ways and keeps the
+/// tool's other scopes: `false` used to change nothing (the reply still said
+/// `updated`), and `true` replaced the whole permission set.
+#[tokio::test]
+async fn needs_shell_grants_and_revokes_without_dropping_scopes() {
+    use crate::user_tools::{UserToolManager, UserToolPermissions};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let user_tools = Arc::new(UserToolManager::new(tmp.path().to_path_buf()));
+    let source =
+        "export default { name: \"t_sh\", description: \"sh\", execute(p) { return \"ok\"; } }";
+    let permissions = UserToolPermissions {
+        read: vec!["~/notes".to_string()],
+        run: true,
+        ..UserToolPermissions::default()
+    };
+    user_tools
+        .create_tool(
+            "t_sh".into(),
+            "sh".into(),
+            source.into(),
+            None,
+            None,
+            Some(permissions),
+        )
+        .await
+        .expect("create tool");
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.tools = Some(Arc::new(nanna_tools::ToolRegistry::new()));
+    cp.user_tools = Some(Arc::clone(&user_tools));
+    let cp = Arc::new(cp);
+    for run in [false, true] {
+        let action: Action = serde_json::from_value(serde_json::json!({
+            "type": "tool", "action": "update", "name": "t_sh", "needs_shell": run,
+        }))
+        .expect("parses");
+        let reply = cp.handle("test", action).await;
+        assert_eq!(reply["status"], "updated", "{reply}");
+        let meta = user_tools.get_tool("t_sh").await.expect("still there");
+        assert_eq!(meta.permissions.run, run);
+        assert_eq!(
+            meta.permissions.read,
+            ["~/notes"],
+            "the read scope survives"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2623,6 +2725,105 @@ async fn a_card_run_is_claimed_only_for_an_agent_on_an_open_board_card() {
 /// A client shows its own board: a `workspace_id` on `task.list` /
 /// `task.quick_add` names that board whichever workspace the daemon has
 /// active, and an unregistered one is refused rather than guessed.
+/// A recurrence is a cron expression or nothing: `"daily"` is refused instead
+/// of stored-and-never-run, and `""` clears one (it used to store `""`, which
+/// no write could ever remove).
+#[tokio::test]
+async fn a_recurrence_is_checked_on_write_and_can_be_cleared() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let refused = ask(serde_json::json!({
+        "type": "task", "action": "create", "title": "Water plants", "scope": "global",
+        "recurrence": "daily",
+    }))
+    .await;
+    assert_eq!(refused["error"], "bad_recurrence", "{refused}");
+
+    let created = ask(serde_json::json!({
+        "type": "task", "action": "create", "title": "Water plants", "scope": "global",
+        "recurrence": " 0 9 * * 1 ",
+    }))
+    .await;
+    let id = created["task"]["id"].as_i64().expect("created");
+    assert_eq!(
+        created["task"]["recurrence"], "0 9 * * 1",
+        "stored trimmed: {created}"
+    );
+
+    let bad_patch = ask(serde_json::json!({
+        "type": "task", "action": "update", "id": id, "patch": {"recurrence": "weekly"},
+    }))
+    .await;
+    assert_eq!(bad_patch["error"], "bad_recurrence", "{bad_patch}");
+    let cleared = ask(serde_json::json!({
+        "type": "task", "action": "update", "id": id, "patch": {"recurrence": ""},
+    }))
+    .await;
+    assert!(cleared.get("error").is_none(), "{cleared}");
+    let task = storage.tasks().get(id).await.expect("task");
+    assert_eq!(task.recurrence, None, "an empty string clears it");
+}
+
+/// `task.done` judges a board card in its OWN board's workspace, not whichever
+/// workspace happens to be active — as a card run already did.
+#[tokio::test]
+async fn a_cards_acceptance_is_judged_in_its_own_boards_workspace() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let (dir_a, dir_b) = (
+        tempfile::tempdir().expect("a"),
+        tempfile::tempdir().expect("b"),
+    );
+    std::fs::write(dir_b.path().join("report.md"), "done").expect("B's artifact");
+    let mut ids = Vec::new();
+    for dir in [&dir_a, &dir_b] {
+        let opened = ask(serde_json::json!({
+            "type": "workspace", "action": "open", "path": dir.path().display().to_string(),
+        }))
+        .await;
+        ids.push(opened["id"].as_str().expect("an id").to_string());
+    }
+    let on_b = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "Write the report", "workspace_id": ids[1],
+    }))
+    .await;
+    let card_id = on_b["task"]["id"].as_i64().expect("a card");
+    let patched = ask(serde_json::json!({
+        "type": "task", "action": "update", "id": card_id,
+        "patch": {"acceptance": {"kind": "file_exists", "path": "report.md"}},
+    }))
+    .await;
+    assert!(patched.get("error").is_none(), "{patched}");
+    // A, which lacks the file, is the active workspace.
+    let active =
+        ask(serde_json::json!({"type": "workspace", "action": "set_active", "id": ids[0]})).await;
+    assert!(active.get("error").is_none(), "{active}");
+
+    let done = ask(serde_json::json!({"type": "task", "action": "done", "id": card_id})).await;
+    assert_eq!(
+        done["done"], true,
+        "judged in B, where the report is: {done}"
+    );
+}
+
 #[tokio::test]
 async fn a_board_named_by_workspace_id_is_used_whatever_is_active() {
     let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
@@ -2919,4 +3120,40 @@ async fn a_quick_add_line_with_a_parent_becomes_its_sub_card() {
     }))
     .await;
     assert_eq!(missing["error"], "task_not_found", "{missing}");
+}
+
+/// A change whose save fails is live for this run and says it was not saved:
+/// every config write used to log the failure and reply a clean success, so a
+/// setting silently reverted at the next restart.
+#[tokio::test]
+async fn a_config_change_that_cannot_be_saved_says_so() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut cp, _store) = persisting_control_plane(dir.path());
+    // A directory where the file should be: every save fails.
+    let unwritable = dir.path().join("config-is-a-directory");
+    std::fs::create_dir(&unwritable).expect("mkdir");
+    cp.config_path = Some(unwritable);
+    let cp = Arc::new(cp);
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "llm.model".into(),
+                value: json!("nanna-test-unsaved-model"),
+            }),
+        )
+        .await;
+    assert_eq!(resp["error"], "not_persisted", "{resp}");
+    assert_eq!(resp["status"], "updated", "{resp}");
+    assert_eq!(resp["path"], "llm.model", "{resp}");
+    assert_eq!(
+        cp.config.read().await.llm.model,
+        "nanna-test-unsaved-model",
+        "the change still applies for this run"
+    );
+
+    let reset = cp.handle("test", Action::Config(ConfigAction::Reset { path: None })).await;
+    assert_eq!(reset["error"], "not_persisted", "{reset}");
+    assert_eq!(reset["status"], "reset", "{reset}");
 }

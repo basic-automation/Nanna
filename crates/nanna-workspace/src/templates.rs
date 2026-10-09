@@ -150,9 +150,27 @@ pub async fn create_from_template(path: &Path, template_id: &str) -> Result<(), 
         fs::create_dir_all(path.join(dir)).await?;
     }
 
+    // A file that already exists is the user's and is kept: the only guard
+    // upstream is "no AGENTS.md yet", so initialising a repo that already had
+    // a README.md or ROADMAP.md used to replace it with the starter text.
     for (filename, content) in &template.files {
         let file_path = path.join(filename);
-        fs::write(&file_path, content).await?;
+        let created = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file_path)
+            .await;
+        match created {
+            Ok(mut file) => {
+                use tokio::io::AsyncWriteExt;
+                file.write_all(content.as_bytes()).await?;
+                file.flush().await?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                info!("Kept the existing {}", file_path.display());
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
 
     info!(
@@ -168,6 +186,21 @@ pub async fn create_from_template(path: &Path, template_id: &str) -> Result<(), 
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn an_existing_file_is_kept_not_replaced() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("ROADMAP.md"), "my own plan").unwrap();
+        create_from_template(dir.path(), "project").await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("ROADMAP.md")).unwrap(),
+            "my own plan"
+        );
+        assert!(
+            dir.path().join("AGENTS.md").exists(),
+            "the missing files are still created"
+        );
+    }
 
     #[test]
     fn test_list_templates() {

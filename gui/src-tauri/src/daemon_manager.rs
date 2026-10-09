@@ -809,12 +809,19 @@ impl SpawnWatch {
 
 /// Relay `pipe`, one of the sidecar's output streams, line by line until it
 /// ends.
+///
+/// A line is read at most [`BOOT_LOG_LINE_BYTES`] at a time; a longer one
+/// is relayed in pieces. Unbounded, one line without a `\n` — an MCP server
+/// the daemon started drawing a `\r` progress bar on the shared stderr — grew
+/// in memory for a whole download before `fit_line` cut it down.
 async fn relay_output(watch: Arc<SpawnWatch>, stream: BootStream, pipe: impl AsyncRead + Unpin) {
+    use tokio::io::AsyncReadExt as _;
     let mut reader = BufReader::new(pipe);
     let mut line = Vec::new();
     loop {
         line.clear();
-        match reader.read_until(b'\n', &mut line).await {
+        let mut piece = (&mut reader).take(BOOT_LOG_LINE_BYTES as u64);
+        match piece.read_until(b'\n', &mut line).await {
             Ok(0) => break,
             Ok(_) => watch.relay(stream, &line).await,
             Err(e) => {
@@ -2709,6 +2716,19 @@ mod tests {
         assert_eq!(plain_text("\u{1b}(Bz\u{1b}"), "z");
         // Tabs stay; line endings, BEL and C1 controls go; text is untouched.
         assert_eq!(plain_text("k\tv\u{7}\u{85}é — ok\r\n"), "k\tvé — ok");
+    }
+
+    /// Output with no line ending is read and relayed a bounded piece at a
+    /// time, not held whole until the stream ends.
+    #[tokio::test]
+    async fn output_without_line_endings_is_relayed_in_bounded_pieces() {
+        let watch = Arc::new(SpawnWatch::default());
+        let progress = "x".repeat(BOOT_LOG_LINE_BYTES * 2 + 10);
+        relay_output(Arc::clone(&watch), BootStream::Stderr, progress.as_bytes()).await;
+        let log = watch.log.lock().await;
+        let pieces: Vec<usize> = log.lines.iter().map(|l| l.line.len()).collect();
+        drop(log);
+        assert_eq!(pieces, [BOOT_LOG_LINE_BYTES, BOOT_LOG_LINE_BYTES, 10]);
     }
 
     #[test]

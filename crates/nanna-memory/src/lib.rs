@@ -648,6 +648,12 @@ pub struct VectorStore {
     /// then a memory exists but no similarity search can find it. A bounded
     /// ring of the last [`SEARCHABLE_LATENCY_SAMPLES_MAX`] waits, in seconds.
     searchable_latency: std::sync::Mutex<std::collections::VecDeque<u64>>,
+    /// Held across "snapshot an entry, then upsert it" and across every
+    /// delete, so the two cannot interleave. A backfill that cloned an entry,
+    /// released the entries lock and only then saved it would re-insert a row
+    /// a delete removed in that gap — the memory came back on the next
+    /// restart. Taken before `entries`, never the other way round.
+    persist_serial: tokio::sync::Mutex<()>,
 }
 
 /// Samples kept for the queue-to-searchable percentiles.
@@ -718,6 +724,7 @@ impl VectorStore {
             seeded_models: std::sync::Mutex::new(std::collections::HashSet::new()),
             active_model: RwLock::new(None),
             searchable_latency: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            persist_serial: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -757,6 +764,7 @@ impl VectorStore {
                             searchable_latency: std::sync::Mutex::new(
                                 std::collections::VecDeque::new(),
                             ),
+                            persist_serial: tokio::sync::Mutex::new(()),
                         }
                     }
                     Err(e) => {
@@ -877,7 +885,10 @@ impl VectorStore {
     /// # Errors
     ///
     /// Returns `MemoryError::DimensionMismatch` if a non-empty embedding has
-    /// the wrong dimension.
+    /// the wrong dimension, or the backend's error if the write-through fails —
+    /// in which case nothing is added. An entry kept only in RAM is handed out
+    /// as an id that a restart silently takes back; `remove` is "durable or
+    /// refused", and `add` is now the same.
     pub async fn add(&self, mut entry: MemoryEntry) -> Result<(), MemoryError> {
         if !entry.embedding.is_empty() && entry.embedding.len() != self.config.get_dimension() {
             return Err(MemoryError::DimensionMismatch {
@@ -891,10 +902,11 @@ impl VectorStore {
 
         // Write-through to persistence backend before updating in-memory cache
         if let Some(ref db) = self.db
-            && let Err(e) = db.save_entry(&entry).await {
-                warn!("Failed to persist memory entry {}: {}", entry.id, e);
-                // Non-fatal: continue with in-memory add
-            }
+            && let Err(e) = db.save_entry(&entry).await
+        {
+            warn!("Failed to persist memory entry {}: {}", entry.id, e);
+            return Err(e);
+        }
 
         // Chunks follow the content, on EVERY path that writes content — not
         // just `remember`. The consolidation and dream paths mutate entries
@@ -1178,6 +1190,36 @@ impl VectorStore {
             .0
     }
 
+    /// The nearest memories OWNED by exactly `owner` (`None` = global ones):
+    /// the neighbours a write may fold into, reinforce, or call a duplicate.
+    ///
+    /// Not [`Self::search_scoped`], which is what a workspace may READ — its
+    /// own memories plus the global ones. The write paths used that (or the
+    /// unscoped [`Self::search`]) to pick their neighbour, so a workspace's
+    /// private text could be folded into a global row (visible to every other
+    /// workspace) and a global fact folded into, or discarded as a duplicate
+    /// of, one workspace's private row (hidden from all the others). Dreaming
+    /// already refuses such pairs (`consolidation::same_scope`); the write path
+    /// now keeps the same rule.
+    pub async fn search_owned_by(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        owner: Option<&str>,
+    ) -> Vec<(MemoryEntry, f32)> {
+        let (neighbours, _) = self
+            .search_admitting(query_embedding, top_k, |workspace| workspace == owner)
+            .await;
+        debug_assert!(neighbours.len() <= top_k, "never more than asked for");
+        debug_assert!(
+            neighbours
+                .iter()
+                .all(|(entry, _)| entry.workspace_id.as_deref() == owner),
+            "every neighbour shares the write's scope"
+        );
+        neighbours
+    }
+
     /// [`search_scoped`](Self::search_scoped), plus what the scan could compare.
     ///
     /// The coverage describes the SCAN, which is unscoped — a memory the
@@ -1205,20 +1247,49 @@ impl VectorStore {
         top_k: usize,
         scope: RecallScope<'_>,
     ) -> (Vec<(MemoryEntry, f32)>, SearchCoverage) {
-        // Get more to filter
-        let (all_results, coverage) = self.search_with_coverage(query_embedding, top_k * 3).await;
-
-        let filtered: Vec<(MemoryEntry, f32)> = all_results
-            .into_iter()
-            .filter(|(entry, _)| scope.admits(entry.workspace_id.as_deref()))
-            .take(top_k)
-            .collect();
-
+        let (filtered, coverage) = self
+            .search_admitting(query_embedding, top_k, |workspace| scope.admits(workspace))
+            .await;
         debug_assert!(
             filtered.len() <= top_k,
             "the scoped answer is bounded by top_k"
         );
         (filtered, coverage)
+    }
+
+    /// The `top_k` nearest memories whose workspace `admit` accepts.
+    ///
+    /// The scan ranks the whole store, so a filter applied to its global top
+    /// `3·top_k` (what this did) starved any scope that is a small part of the
+    /// store: a workspace's matches ranked below other workspaces' rows were
+    /// cut before the filter saw them, and the caller got fewer than `top_k`
+    /// (often none) while the coverage reported a complete scan. The window is
+    /// widened (×4) until `top_k` are admitted or it holds every comparable
+    /// row — so the bound is the store itself, and a narrow scope costs a few
+    /// more scans, never a missed match.
+    async fn search_admitting(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        admit: impl Fn(Option<&str>) -> bool,
+    ) -> (Vec<(MemoryEntry, f32)>, SearchCoverage) {
+        let mut window = top_k.saturating_mul(3);
+        loop {
+            let (ranked, coverage) = self.search_with_coverage(query_embedding, window).await;
+            let exhausted = ranked.len() < window || window >= coverage.comparable;
+            let admitted: Vec<(MemoryEntry, f32)> = ranked
+                .into_iter()
+                .filter(|(entry, _)| admit(entry.workspace_id.as_deref()))
+                .take(top_k)
+                .collect();
+            if admitted.len() >= top_k || exhausted {
+                debug_assert!(admitted.len() <= top_k);
+                return (admitted, coverage);
+            }
+            let wider = window.saturating_mul(4).min(coverage.comparable);
+            debug_assert!(wider > window, "each round widens until the store is covered");
+            window = wider;
+        }
     }
 
     /// Get entry by ID
@@ -1239,6 +1310,7 @@ impl VectorStore {
     /// Returns `MemoryError::NotFound` if no entry with the given ID exists,
     /// and the backend's error if it could not delete the row.
     pub async fn remove(&self, id: &str) -> Result<(), MemoryError> {
+        let _serial = self.persist_serial.lock().await;
         if !self.entries.read().await.iter().any(|e| e.id == id) {
             return Err(MemoryError::NotFound(id.to_string()));
         }
@@ -1267,6 +1339,7 @@ impl VectorStore {
         if ids.is_empty() {
             return DurableRemoval::default();
         }
+        let _serial = self.persist_serial.lock().await;
         let mut failed = 0usize;
         let mut first_error = None;
         let confirmed: Vec<&str> = match self.db {
@@ -1327,6 +1400,7 @@ impl VectorStore {
         }
         let requested = ids.len();
         let id_set: std::collections::HashSet<&str> = ids.iter().copied().collect();
+        let _serial = self.persist_serial.lock().await;
 
         let mut entries = self.entries.write().await;
         let before = entries.len();
@@ -1378,6 +1452,40 @@ impl VectorStore {
             }
 
         Ok(())
+    }
+
+    /// Replace an entry's tags (`metadata["tags"]`, comma-joined — the form
+    /// `memory.create` writes); an empty list removes them. Written through.
+    ///
+    /// # Errors
+    ///
+    /// `MemoryError::NotFound` for an unknown id, or the backend's error when
+    /// the write-through fails (the in-memory change then stands until restart,
+    /// which the caller is told).
+    pub async fn set_tags(&self, id: &str, tags: &[String]) -> Result<(), MemoryError> {
+        let joined = tags
+            .iter()
+            .map(|tag| tag.trim())
+            .filter(|tag| !tag.is_empty())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut entries = self.entries.write().await;
+        let entry = entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
+        if joined.is_empty() {
+            entry.metadata.remove("tags");
+        } else {
+            entry.metadata.insert("tags".to_string(), joined);
+        }
+        let snapshot = entry.clone();
+        drop(entries);
+        debug_assert_eq!(snapshot.id, id, "the entry changed is the one named");
+        match self.db {
+            Some(ref db) => db.save_entry(&snapshot).await,
+            None => Ok(()),
+        }
     }
 
     /// Update content for an entry (used during expansion).
@@ -1500,7 +1608,9 @@ impl VectorStore {
         // Normalize for cosine similarity, matching `add`.
         normalize_f32(&mut embedding);
 
-        // Update the in-memory entry, snapshot it, then release the lock.
+        // Update the in-memory entry, snapshot it, then release the lock. The
+        // serial guard is held until the snapshot is saved.
+        let serial = self.persist_serial.lock().await;
         let mut entries = self.entries.write().await;
         let entry = entries
             .iter_mut()
@@ -1541,6 +1651,7 @@ impl VectorStore {
                 // Non-fatal: in-memory cache already updated.
             }
         }
+        drop(serial);
 
         self.write_chunks(
             id,
@@ -1839,16 +1950,60 @@ impl VectorStore {
         embedding: Vec<f32>,
         activate: bool,
     ) -> Result<(), MemoryError> {
+        self.install_embedding(id, model, embedding, activate, None)
+            .await
+            .map(|installed| debug_assert!(installed, "an unguarded install always lands"))
+    }
+
+    /// [`Self::set_embedding_for_model`], only if the memory still holds
+    /// `embedded_from` — the text the vector was computed from. Returns
+    /// whether it was installed.
+    ///
+    /// The backfill embeds a content snapshot and installs the vector after
+    /// the (slow) embed call. An edit landing in between (`update_content`
+    /// clears the vectors and re-queues the row) used to get the OLD text's
+    /// vector installed on the NEW text — and since the model's bucket then
+    /// existed, the row was never queued again, so the memory stayed findable
+    /// by words it no longer contains. A changed row is left for the next pass.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_embedding_for_model`].
+    pub async fn set_embedding_if_content(
+        &self,
+        id: &str,
+        model: &str,
+        embedding: Vec<f32>,
+        embedded_from: &str,
+    ) -> Result<bool, MemoryError> {
+        self.install_embedding(id, model, embedding, true, Some(embedded_from))
+            .await
+    }
+
+    async fn install_embedding(
+        &self,
+        id: &str,
+        model: &str,
+        embedding: Vec<f32>,
+        activate: bool,
+        embedded_from: Option<&str>,
+    ) -> Result<bool, MemoryError> {
         if activate && embedding.len() != self.config.get_dimension() {
             return Err(MemoryError::DimensionMismatch {
                 expected: self.config.get_dimension(),
                 got: embedding.len(),
             });
         }
+        let serial = self.persist_serial.lock().await;
         let mut entries = self.entries.write().await;
         let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
             return Err(MemoryError::NotFound(id.to_string()));
         };
+        // Compared under the same write guard that installs: the check and the
+        // install are one step.
+        if embedded_from.is_some_and(|text| text != entry.content) {
+            return Ok(false);
+        }
         // A memory's FIRST vector ever is the moment it becomes findable by
         // similarity search. A re-embed after a provider switch keeps its old
         // buckets, so it is not a wait — counting it would read a days-old
@@ -1882,7 +2037,9 @@ impl VectorStore {
         {
             warn!("Failed to persist backfilled embedding for {}: {}", snapshot.id, e);
         }
-        Ok(())
+        drop(serial);
+        debug_assert!(snapshot.embeddings.contains_key(model), "the bucket was written");
+        Ok(true)
     }
 
     /// Get the current configured dimension
@@ -2376,6 +2533,69 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn tags_can_be_replaced_and_removed() {
+        let store = store_of_width(3);
+        store.add(unembedded("m", 0)).await.expect("stored");
+        store
+            .set_tags(
+                "m",
+                &[" work ".to_string(), String::new(), "urgent".to_string()],
+            )
+            .await
+            .expect("tagged");
+        let row = store.get("m").await.expect("row");
+        assert_eq!(
+            row.metadata.get("tags").map(String::as_str),
+            Some("work,urgent")
+        );
+        store.set_tags("m", &[]).await.expect("cleared");
+        assert!(
+            !store
+                .get("m")
+                .await
+                .expect("row")
+                .metadata
+                .contains_key("tags")
+        );
+        assert!(matches!(
+            store.set_tags("nope", &[]).await,
+            Err(MemoryError::NotFound(_))
+        ));
+    }
+
+    /// A vector computed from text the memory no longer holds is not
+    /// installed: the backfill embeds a snapshot, and an edit can land while
+    /// the embed is in flight.
+    #[tokio::test]
+    async fn a_vector_of_edited_text_is_not_installed() {
+        let store = store_of_width(3);
+        store.add(unembedded("m", 0)).await.expect("stored");
+        let stale = store
+            .set_embedding_if_content("m", "prov:a", vec![1.0, 0.0, 0.0], "an older text")
+            .await
+            .expect("no error");
+        assert!(!stale, "the edited row is left for the next pass");
+        let row = store.get("m").await.expect("row");
+        assert!(row.embedding.is_empty() && row.embeddings.is_empty());
+        assert_eq!(
+            store.entries_missing_model("prov:a", 8).await.len(),
+            1,
+            "still queued"
+        );
+
+        let fresh = store
+            .set_embedding_if_content("m", "prov:a", vec![1.0, 0.0, 0.0], "memory m")
+            .await
+            .expect("no error");
+        assert!(fresh);
+        assert_eq!(
+            store.entries_missing_model("prov:a", 8).await,
+            Vec::<(String, String)>::new(),
+            "filled"
+        );
+    }
+
     /// P13 staleness: a memory written without a vector records how long it
     /// waited once it receives its first one.
     #[tokio::test]
@@ -2531,6 +2751,109 @@ mod tests {
         async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
             Ok(vec![health_test_entry("ok")])
         }
+    }
+
+    /// A workspace whose matches all rank below other workspaces' rows still
+    /// gets them: the filter used to see only the store's global top 3·k.
+    #[tokio::test]
+    async fn a_small_scope_is_not_starved_by_the_rest_of_the_store() {
+        let store = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(4),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        });
+        for n in 0..40 {
+            let mut entry = chunked_entry(&format!("other-{n}"), "x", vec![1.0, 0.0, 0.0, 0.0], None);
+            entry.workspace_id = Some("other".to_string());
+            store.entries.write().await.push(entry);
+        }
+        let mut mine = chunked_entry("mine", "y", vec![0.6, 0.8, 0.0, 0.0], None);
+        mine.workspace_id = Some("mine".to_string());
+        store.entries.write().await.push(mine);
+        let query = [1.0, 0.0, 0.0, 0.0];
+
+        let owned = store.search_owned_by(&query, 2, Some("mine")).await;
+        assert_eq!(owned.len(), 1, "{owned:?}");
+        assert_eq!(owned[0].0.id, "mine");
+        let (scoped, coverage) = store
+            .search_in_scope_with_coverage(&query, 2, RecallScope::Workspace("mine"))
+            .await;
+        assert_eq!(scoped.iter().map(|(e, _)| e.id.as_str()).collect::<Vec<_>>(), ["mine"]);
+        assert_eq!(coverage.comparable, 41);
+        assert!(store.search_owned_by(&query, 2, None).await.is_empty(), "no global rows");
+    }
+
+    /// A backing store whose first `save_entry` waits at a gate, holding the
+    /// rows it has, so a test can line a delete up inside the save's gap.
+    struct GatedDb {
+        rows: std::sync::Mutex<std::collections::HashSet<String>>,
+        gate: tokio::sync::Notify,
+        waiting: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl MemoryPersistence for GatedDb {
+        async fn save_entry(&self, e: &MemoryEntry) -> Result<(), MemoryError> {
+            self.waiting.notify_one();
+            self.gate.notified().await;
+            self.rows.lock().unwrap().insert(e.id.clone());
+            Ok(())
+        }
+        async fn remove_entry(&self, id: &str) -> Result<(), MemoryError> {
+            self.rows.lock().unwrap().remove(id);
+            Ok(())
+        }
+        async fn update_entry_fsrs(&self, _id: &str, _f: &FsrsState) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_entry_content(&self, _id: &str, _c: &str) -> Result<(), MemoryError> { Ok(()) }
+        async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> { Ok(Vec::new()) }
+    }
+
+    /// A delete that lands while a backfill is saving its snapshot stays
+    /// deleted: it used to run in the gap between the snapshot and the
+    /// upsert, and the upsert put the row back — the memory returned on the
+    /// next restart.
+    #[tokio::test]
+    async fn a_delete_during_a_vector_install_is_not_undone() {
+        let db = Arc::new(GatedDb {
+            rows: std::sync::Mutex::new(std::collections::HashSet::from(["m".to_string()])),
+            gate: tokio::sync::Notify::new(),
+            waiting: tokio::sync::Notify::new(),
+        });
+        let store = Arc::new(
+            VectorStore::new(VectorStoreConfig {
+                dimension: std::sync::atomic::AtomicUsize::new(4),
+                chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+                use_f16: false,
+            })
+            .with_persistence(db.clone()),
+        );
+        store
+            .entries
+            .write()
+            .await
+            .push(chunked_entry("m", "text", Vec::new(), None));
+
+        let installing = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                store
+                    .set_embedding_for_model("m", "prov:a", vec![1.0, 0.0, 0.0, 0.0], true)
+                    .await
+            })
+        };
+        db.waiting.notified().await; // the install is inside its save
+        let removing = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move { store.remove("m").await })
+        };
+        // Give the delete every chance to run inside the gap.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        db.gate.notify_one();
+        installing.await.expect("join").expect("install");
+        removing.await.expect("join").expect("remove");
+        assert!(db.rows.lock().unwrap().is_empty(), "the deleted row was resurrected");
+        assert!(store.entries.read().await.is_empty());
     }
 
     /// Records every chunk-set replacement so a test can assert what the
@@ -2784,6 +3107,46 @@ mod tests {
             fsrs: FsrsState::default(),
             workspace_id: None,
         }
+    }
+
+    /// A backend whose every save fails.
+    struct UnwritableDb;
+    #[async_trait]
+    impl MemoryPersistence for UnwritableDb {
+        async fn save_entry(&self, _e: &MemoryEntry) -> Result<(), MemoryError> {
+            Err(MemoryError::Persistence("disk full".to_string()))
+        }
+        async fn remove_entry(&self, _id: &str) -> Result<(), MemoryError> {
+            Ok(())
+        }
+        async fn update_entry_fsrs(&self, _id: &str, _f: &FsrsState) -> Result<(), MemoryError> {
+            Ok(())
+        }
+        async fn update_entry_content(&self, _id: &str, _c: &str) -> Result<(), MemoryError> {
+            Ok(())
+        }
+        async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
+            Ok(vec![])
+        }
+    }
+
+    /// An add the backend refused is refused, not kept in RAM under an id a
+    /// restart takes back.
+    #[tokio::test]
+    async fn an_add_that_could_not_be_saved_is_refused_and_not_kept() {
+        let config = VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        };
+        let store = VectorStore::new(config).with_persistence(Arc::new(UnwritableDb));
+        let refused = store.add(entry_dim8("lost")).await;
+        assert!(
+            matches!(refused, Err(MemoryError::Persistence(_))),
+            "{refused:?}"
+        );
+        assert!(store.get("lost").await.is_none(), "nothing was kept in RAM");
+        assert!(store.all_entries().await.is_empty());
     }
 
     /// A backend that refuses to delete one named row, and whose batch delete

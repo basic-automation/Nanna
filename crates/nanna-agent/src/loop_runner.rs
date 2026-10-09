@@ -4109,6 +4109,10 @@ struct LlmCallMeta {
     escalated: bool,
     /// The complexity routing classified, when routed.
     complexity: Option<TaskComplexity>,
+    /// Whether Stop ended the call. Its empty result is neither outcome:
+    /// recorded as a success it reset the model's failure streak and added a
+    /// 0 t/s sample; it carries no tokens, so skipping it loses nothing.
+    cancelled: bool,
 }
 
 /// What the prose tool-call dialect pass salvaged from a zero-tool-call reply.
@@ -4644,20 +4648,21 @@ impl Agent {
                 complexity,
             )
             .await;
+        let meta = LlmCallMeta {
+            latency: llm_latency,
+            routed: routed_model.is_some(),
+            escalated,
+            complexity,
+            cancelled: options
+                .cancel
+                .as_ref()
+                .is_some_and(CancelToken::is_cancelled),
+        };
+        self.record_llm_failure(&request.model, &meta, &result)
+            .await;
         let mut result = Self::settle_llm_result(state, result)?;
-        self.record_llm_call(
-            state,
-            options,
-            &request.model,
-            &result,
-            LlmCallMeta {
-                latency: llm_latency,
-                routed: routed_model.is_some(),
-                escalated,
-                complexity,
-            },
-        )
-        .await;
+        self.record_llm_call(state, options, &request.model, &result, meta)
+            .await;
         self.post_hoc_spiral_nudge(state, &result).await?;
 
         let salvage = self.salvage_prose_calls(state, &mut result).await;
@@ -4675,17 +4680,22 @@ impl Agent {
         if !result.text.is_empty() {
             state.final_text = result.text;
         }
-        if let Some(exit) = self
-            .stop_after_stored_reply(
-                state,
-                options,
-                &result.tool_uses,
-                &result.error_tool_results,
+        // The stored turn carries the salvaged calls as `tool_use` blocks
+        // too, so an exit before they run pairs them as well.
+        let unrun: std::borrow::Cow<'_, [(String, String, Value)]> = if salvage.uses.is_empty() {
+            std::borrow::Cow::Borrowed(&result.tool_uses)
+        } else {
+            std::borrow::Cow::Owned(
+                result.tool_uses.iter().chain(&salvage.uses).cloned().collect(),
             )
+        };
+        if let Some(exit) = self
+            .stop_after_stored_reply(state, options, &unrun, &result.error_tool_results)
             .await
         {
             return ControlFlow::Break(exit);
         }
+        drop(unrun);
 
         // If no tool calls, check for narration loop before exiting.
         // A round whose structured calls ALL had malformed JSON
@@ -5743,6 +5753,38 @@ impl Agent {
         }
     }
 
+    /// Record a failed call in the tracker, so its health judgement sees the
+    /// failures and not only the successes.
+    ///
+    /// The tracker used to hear only successes, so a model failing on every
+    /// call kept a 100% success rate and was never deprioritized.
+    async fn record_llm_failure(
+        &self,
+        model: &str,
+        meta: &LlmCallMeta,
+        result: &Result<LlmResult, AgentError>,
+    ) {
+        let (Err(error), Some(tracker), false) = (result, self.stats.as_ref(), meta.cancelled)
+        else {
+            return;
+        };
+        debug!(model, %error, "recording a failed model call");
+        tracker
+            .record(crate::model_stats::RequestObservation {
+                model: model.to_string(),
+                success: false,
+                latency: meta.latency,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_creation_1h_tokens: 0,
+                tier: meta.complexity,
+                escalated: meta.escalated,
+            })
+            .await;
+    }
+
     /// Record the call in the run's and the tracker's model statistics and
     /// in the run's token totals.
     async fn record_llm_call(
@@ -5758,7 +5800,11 @@ impl Agent {
             routed,
             escalated,
             complexity,
+            cancelled,
         } = meta;
+        if cancelled {
+            return;
+        }
         // Record model statistics
         let actual_model = model.to_string();
         let was_routed = routed && !escalated;
@@ -6147,6 +6193,15 @@ impl Agent {
         // the report is quotation, not intent). Guarantee the report
         // is never silence.
         if state.wrap_up.engaged {
+            // Salvage never runs here, but the stored turn already carries
+            // its synthesized `tool_use` blocks: pair them, or the next
+            // request has calls with no results.
+            self.pair_unrun_calls(
+                &salvage.uses,
+                &[],
+                "tools are off on the step's wrap-up iteration",
+            )
+            .await;
             if state.final_text.trim().is_empty() {
                 state.final_text = step_activity_digest(&state.tool_records);
             }
@@ -8660,58 +8715,30 @@ impl Agent {
     /// keep only the latest result and replace the old one with a stub.
     async fn deduplicate_tool_results(&self) {
         let mut ctx = self.context.write().await;
-
-        // Build a map of tool_use_id → (tool_name, input_key) for tool results
-        // to detect duplicates (same tool + same primary argument)
-        let mut seen: HashMap<String, usize> = HashMap::new(); // key → latest message index
-        let mut to_stub: Vec<(usize, String)> = Vec::new(); // (message_idx, tool_use_id)
-
-        for (msg_idx, msg) in ctx.messages.iter().enumerate() {
-            if msg.role != "user" {
+        let superseded = Self::superseded_tool_results(&ctx.messages);
+        let stub_count = superseded.len();
+        for (msg_idx, tool_use_id) in superseded {
+            let Some(msg) = ctx.messages.get_mut(msg_idx) else {
                 continue;
-            }
-            for block in &msg.content {
+            };
+            // Only the superseded call's own result. This used to stub every
+            // result in that message — wiping a `cargo test` that merely
+            // shared a batch with a re-read file.
+            for block in &mut msg.content {
                 if let ContentBlock::ToolResult {
-                    tool_use_id,
+                    tool_use_id: id,
                     content,
                     ..
                 } = block
+                    && *id == tool_use_id
+                    && !content.starts_with("[superseded")
                 {
-                    // Skip already-stubbed results
-                    if content.starts_with("[superseded")
-                        || content.starts_with("[evicted")
-                        || content.starts_with("[Result from")
-                    {
-                        continue;
-                    }
-
-                    // Find the corresponding tool_use to get the dedup key
-                    let dedup_key = Self::find_tool_dedup_key(&ctx.messages, tool_use_id);
-                    if let Some(key) = dedup_key {
-                        if let Some(&prev_idx) = seen.get(&key) {
-                            // This tool+input was called before — the previous result is superseded
-                            to_stub.push((prev_idx, tool_use_id.clone()));
-                        }
-                        seen.insert(key, msg_idx);
-                    }
+                    let old_len = content.len();
+                    *content = format!("[superseded by later call — {old_len} chars removed]");
                 }
             }
         }
-
-        // Replace superseded results with stubs
-        let stub_count = to_stub.len();
-        for (msg_idx, _tool_use_id) in to_stub {
-            if let Some(msg) = ctx.messages.get_mut(msg_idx) {
-                for block in &mut msg.content {
-                    if let ContentBlock::ToolResult { content, .. } = block
-                        && !content.starts_with("[superseded") {
-                            let old_len = content.len();
-                            *content =
-                                format!("[superseded by later call — {old_len} chars removed]");
-                        }
-                }
-            }
-        }
+        drop(ctx);
 
         if stub_count > 0 {
             info!(
@@ -8857,11 +8884,55 @@ impl Agent {
                                 .map(String::from),
                             _ => None,
                         };
-                        return primary_arg.map(|arg| format!("{name}:{arg}"));
+                        // The whole input, not just the path: a paged read
+                        // (`offset`/`limit`) of the same file is different
+                        // content, and keying on the path alone marked each
+                        // page as superseding the last.
+                        return primary_arg.map(|_| format!("{name}:{input}"));
                     }
             }
         }
         None
+    }
+
+    /// The `(message index, tool_use_id)` of every tool result a later,
+    /// identical call superseded: same tool, same input, a newer result.
+    fn superseded_tool_results(messages: &[AnthropicMessage]) -> Vec<(usize, String)> {
+        // key → (message index, tool_use_id) of its newest result so far.
+        let mut latest: HashMap<String, (usize, String)> = HashMap::new();
+        let mut superseded = Vec::new();
+        for (msg_idx, msg) in messages.iter().enumerate() {
+            if msg.role != "user" {
+                continue;
+            }
+            for block in &msg.content {
+                let ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } = block
+                else {
+                    continue;
+                };
+                if content.starts_with("[superseded")
+                    || content.starts_with("[evicted")
+                    || content.starts_with("[Result from")
+                {
+                    continue;
+                }
+                let Some(key) = Self::find_tool_dedup_key(messages, tool_use_id) else {
+                    continue;
+                };
+                if let Some(previous) = latest.insert(key, (msg_idx, tool_use_id.clone())) {
+                    superseded.push(previous);
+                }
+            }
+        }
+        debug_assert!(
+            superseded.iter().all(|(idx, _)| *idx < messages.len()),
+            "every superseded result names a message that exists"
+        );
+        superseded
     }
 
     /// Summarize a large tool output with the summarization models, in the
@@ -10477,6 +10548,65 @@ fn parse_exit_code_prefix(text: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    /// Only the superseded call's own result is replaced: not the other
+    /// results that shared its batch, and not a paged read of the same file.
+    #[test]
+    fn dedup_supersedes_only_the_repeated_calls_own_result() {
+        use nanna_llm::{AnthropicMessage, ContentBlock};
+        let call = |id: &str, name: &str, input: serde_json::Value| ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input,
+        };
+        let result = |id: &str, text: &str| ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: text.to_string(),
+            is_error: None,
+        };
+        let turn = |role: &str, content: Vec<ContentBlock>| AnthropicMessage {
+            role: role.to_string(),
+            content,
+        };
+        let messages = vec![
+            turn(
+                "assistant",
+                vec![
+                    call("r1", "read_file", serde_json::json!({"path": "a.rs"})),
+                    call("t1", "exec", serde_json::json!({"command": "cargo test"})),
+                    call(
+                        "p1",
+                        "read_file",
+                        serde_json::json!({"path": "b.rs", "offset": 0}),
+                    ),
+                    call(
+                        "p2",
+                        "read_file",
+                        serde_json::json!({"path": "b.rs", "offset": 500}),
+                    ),
+                ],
+            ),
+            turn(
+                "user",
+                vec![
+                    result("r1", "old a"),
+                    result("t1", "test output"),
+                    result("p1", "page 1"),
+                    result("p2", "page 2"),
+                ],
+            ),
+            turn(
+                "assistant",
+                vec![call("r2", "read_file", serde_json::json!({"path": "a.rs"}))],
+            ),
+            turn("user", vec![result("r2", "new a")]),
+        ];
+        assert_eq!(
+            super::Agent::superseded_tool_results(&messages),
+            vec![(1, "r1".to_string())],
+            "only the earlier read of a.rs; the test output and both pages stay"
+        );
+    }
+
     /// A routing entry is judged by its explicit prefix only; a bare name is
     /// the client's to resolve, as it always was.
     #[test]

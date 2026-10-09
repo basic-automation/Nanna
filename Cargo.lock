@@ -1195,7 +1195,7 @@ checksum = "82f4b26e751e711a5302649417f2da046dce6391b2ea30a4820f37462314f0b9"
 dependencies = [
  "semver",
  "serde",
- "toml 1.1.7+spec-1.1.0",
+ "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]
@@ -1858,7 +1858,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote",
- "syn 3.0.6",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2338,7 +2338,7 @@ dependencies = [
  "cc",
  "memchr",
  "rustc_version",
- "toml 1.1.7+spec-1.1.0",
+ "toml 1.1.8+spec-1.1.0",
  "vswhom",
  "winreg",
 ]
@@ -4887,7 +4887,7 @@ dependencies = [
 
 [[package]]
 name = "nanna"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4908,7 +4908,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "toml 1.1.7+spec-1.1.0",
+ "toml 1.1.8+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -4916,9 +4916,8 @@ dependencies = [
 
 [[package]]
 name = "nanna-agent"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
- "anyhow",
  "async-trait",
  "base64 0.23.1",
  "chrono",
@@ -4945,7 +4944,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-bench"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "criterion",
  "nanna-simd",
@@ -4953,12 +4952,12 @@ dependencies = [
  "serde",
  "tempfile",
  "tokio",
- "toml 1.1.7+spec-1.1.0",
+ "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]
 name = "nanna-browser"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "async-trait",
  "chromiumoxide",
@@ -4974,7 +4973,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-channels"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "async-trait",
  "bitflags 2.13.2",
@@ -4995,12 +4994,10 @@ dependencies = [
 
 [[package]]
 name = "nanna-client"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
- "async-trait",
  "futures-util",
  "nanna-daemon",
- "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
@@ -5012,7 +5009,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-config"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "aes-gcm 0.11.1",
  "base64 0.23.1",
@@ -5025,18 +5022,16 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
- "toml 1.1.7+spec-1.1.0",
+ "toml 1.1.8+spec-1.1.0",
  "tracing",
  "zeroize",
 ]
 
 [[package]]
 name = "nanna-core"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
- "anyhow",
  "chrono",
- "flume",
  "nanna-channels",
  "nanna-gpu",
  "nanna-llm",
@@ -5056,9 +5051,8 @@ dependencies = [
 
 [[package]]
 name = "nanna-daemon"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "chrono",
@@ -5104,12 +5098,10 @@ dependencies = [
 
 [[package]]
 name = "nanna-gpu"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "bytemuck",
- "criterion",
  "futures",
- "half",
  "nanna-numeric",
  "nanna-simd",
  "thiserror 2.0.21",
@@ -5120,22 +5112,18 @@ dependencies = [
 
 [[package]]
 name = "nanna-gui"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
- "base64 0.23.1",
  "chrono",
- "directories",
  "futures-util",
  "nanna-config",
  "nanna-core",
  "nanna-numeric",
  "nanna-proc",
- "rand 0.10.3",
  "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
- "sha2 0.11.0",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -5147,20 +5135,20 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
- "toml 1.1.7+spec-1.1.0",
+ "toml 1.1.8+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
- "urlencoding",
  "uuid",
 ]
 
 [[package]]
 name = "nanna-llm"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "async-stream",
  "directories",
  "futures",
+ "httpdate",
  "nanna-config",
  "nanna-numeric",
  "reqwest",
@@ -5175,11 +5163,12 @@ dependencies = [
 
 [[package]]
 name = "nanna-mcp"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
  "futures",
+ "nanna-proc",
  "nanna-tools",
  "reqwest",
  "serde",
@@ -5192,10 +5181,9 @@ dependencies = [
 
 [[package]]
 name = "nanna-memory"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "async-trait",
- "half",
  "nanna-gpu",
  "nanna-numeric",
  "nanna-simd",
@@ -5209,11 +5197,11 @@ dependencies = [
 
 [[package]]
 name = "nanna-numeric"
-version = "0.3.39"
+version = "0.3.40"
 
 [[package]]
 name = "nanna-proc"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "libc",
  "tempfile",
@@ -5224,7 +5212,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-scripting"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "boa_engine",
  "chrono",
@@ -5246,7 +5234,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-server"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "anyhow",
  "axum",
@@ -5261,13 +5249,11 @@ dependencies = [
  "nanna-llm",
  "nanna-storage",
  "nanna-tools",
- "reqwest",
  "serde",
  "serde_json",
  "serde_urlencoded",
  "sha2 0.11.0",
  "subtle",
- "thiserror 2.0.21",
  "tokio",
  "tower",
  "tower-http 0.7.1",
@@ -5277,7 +5263,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-simd"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "half",
  "wide",
@@ -5285,7 +5271,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-storage"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "chrono",
  "nanna-numeric",
@@ -5300,7 +5286,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-timeline"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "nanna-storage",
  "serde",
@@ -5311,7 +5297,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-tools"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "async-trait",
  "base64-simd",
@@ -5344,14 +5330,14 @@ dependencies = [
 
 [[package]]
 name = "nanna-workspace"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "toml 1.1.7+spec-1.1.0",
+ "toml 1.1.8+spec-1.1.0",
  "tracing",
 ]
 
@@ -6593,7 +6579,7 @@ version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
 dependencies = [
- "toml_edit 0.25.16+spec-1.1.0",
+ "toml_edit 0.25.17+spec-1.1.0",
 ]
 
 [[package]]
@@ -8797,7 +8783,7 @@ dependencies = [
  "cfg-expr 0.20.10",
  "heck 0.5.0",
  "pkg-config",
- "toml 1.1.7+spec-1.1.0",
+ "toml 1.1.8+spec-1.1.0",
  "version-compare",
 ]
 
@@ -9054,7 +9040,7 @@ dependencies = [
  "tauri-plugin",
  "tauri-utils",
  "thiserror 2.0.21",
- "toml 1.1.7+spec-1.1.0",
+ "toml 1.1.8+spec-1.1.0",
  "url",
 ]
 
@@ -9257,7 +9243,7 @@ dependencies = [
  "serde_with",
  "swift-rs",
  "thiserror 2.0.21",
- "toml 1.1.7+spec-1.1.0",
+ "toml 1.1.8+spec-1.1.0",
  "url",
  "urlpattern",
  "uuid",
@@ -9272,7 +9258,7 @@ checksum = "cc65d45c68858bfe420dd29e834b5d15dbecf8a07a8a16cf4d532c7b1f69d4b6"
 dependencies = [
  "dunce",
  "embed-resource",
- "toml 1.1.7+spec-1.1.0",
+ "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]
@@ -9579,9 +9565,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.1.7+spec-1.1.0"
+version = "1.1.8+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7874cd34dd99040fc24e30923aa64a60a81ff3ddfe2b8129ccc84ba24949deed"
+checksum = "20489e00e4d8741d6be680764cc12e270655e375a20d1011e844a9c3379e678d"
 dependencies = [
  "indexmap 2.14.2",
  "serde_core",
@@ -9636,9 +9622,9 @@ dependencies = [
 
 [[package]]
 name = "toml_edit"
-version = "0.25.16+spec-1.1.0"
+version = "0.25.17+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88f38f3af8bf71841c67a990f4e2b52143b2d0a1a994c72513ff4c14977fc722"
+checksum = "e3641d5bbb5349a79e1020a242d251efbc546ad8048d133958323ce9c40a9c9c"
 dependencies = [
  "indexmap 2.14.2",
  "toml_datetime 1.1.2+spec-1.1.0",
@@ -9648,9 +9634,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.1.4+spec-1.1.0"
+version = "1.1.5+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bed810ee007d8e7f9cf20b4774e7198142fa27186e0f805871da7f3c39eaf333"
+checksum = "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
 dependencies = [
  "winnow 1.0.4",
 ]

@@ -15,6 +15,11 @@ use tracing::{debug, info};
 pub struct CdpBrowser {
     config: BrowserConfig,
     browser: RwLock<Option<CoBrowser>>,
+    /// Whether the launched browser's connection is still up: cleared by its
+    /// event handler when the connection ends (Chromium exited, crashed or
+    /// was killed). One flag per launch, so an old handler finishing late
+    /// cannot mark a newer browser dead.
+    alive: std::sync::Mutex<Arc<std::sync::atomic::AtomicBool>>,
     /// The launched browser's own profile directory, removed when it closes.
     ///
     /// Chromium refuses to start on a profile another Chromium holds ("Failed
@@ -34,13 +39,35 @@ impl CdpBrowser {
             config,
             browser: RwLock::new(None),
             profile: RwLock::new(None),
+            alive: std::sync::Mutex::new(Arc::new(std::sync::atomic::AtomicBool::new(false))),
         }
+    }
+
+    fn launched_alive(&self) -> bool {
+        self.alive
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     async fn ensure_launched(&self) -> Result<(), BrowserError> {
         let browser_guard = self.browser.read().await;
-        if browser_guard.is_none() {
+        let present = browser_guard.is_some();
+        drop(browser_guard);
+        if present && !self.launched_alive() {
+            // A dead browser stayed in the slot for good: `launch` saw it and
+            // did nothing, so after a crash every call failed or waited out
+            // its deadline until the daemon restarted. Drop it (and its
+            // profile) so the launch below starts a new one.
+            let mut browser_guard = self.browser.write().await;
+            if browser_guard.is_some() && !self.launched_alive() {
+                tracing::warn!("The browser's connection ended; relaunching it");
+                *browser_guard = None;
+                *self.profile.write().await = None;
+            }
             drop(browser_guard);
+        }
+        if !present || !self.launched_alive() {
             self.launch().await?;
         }
         Ok(())
@@ -108,11 +135,27 @@ impl Browser for CdpBrowser {
             .await
             .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
 
-        // Spawn handler task
+        // Spawn handler task; its end is the connection's end.
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        *self
+            .alive
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&alive);
         tokio::spawn(async move {
             while let Some(event) = handler.next().await {
-                debug!("CDP event: {:?}", event);
+                // A dead connection does not end the stream: chromiumoxide
+                // yields its error on every poll. Anything but a malformed
+                // message is the connection gone.
+                if let Err(e) = event {
+                    if matches!(e, chromiumoxide::error::CdpError::InvalidMessage(..)) {
+                        debug!("CDP invalid message: {e}");
+                        continue;
+                    }
+                    tracing::warn!("CDP connection ended: {e}");
+                    break;
+                }
             }
+            alive.store(false, std::sync::atomic::Ordering::SeqCst);
         });
 
         *self.profile.write().await = Some(profile);
@@ -580,6 +623,30 @@ mod tests {
             }
             other => panic!("a hung operation must time out, got {other:?}"),
         }
+    }
+
+    /// A browser that died is relaunched by the next call: the dead one used
+    /// to stay in the slot, and every call after a Chromium crash failed
+    /// until the daemon restarted. Needs a Chromium on the machine.
+    #[tokio::test]
+    #[ignore = "launches Chromium"]
+    async fn a_browser_that_died_is_relaunched() {
+        use crate::{Browser, BrowserConfig};
+        let browser = super::CdpBrowser::new(BrowserConfig::default());
+        browser.navigate("about:blank").await.expect("first launch");
+        assert!(browser.launched_alive());
+        let mut slot = browser.browser.write().await;
+        let _ = slot.as_mut().expect("launched").kill().await;
+        drop(slot);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while browser.launched_alive() {
+            assert!(tokio::time::Instant::now() < deadline, "the death was never seen");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let page = browser.navigate("about:blank").await.expect("relaunched");
+        assert!(browser.launched_alive());
+        page.close().await.expect("closes");
+        browser.close().await.expect("closes");
     }
 
     /// Positive space: the deadline must not interfere with work that finishes.

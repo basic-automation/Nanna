@@ -215,7 +215,7 @@ pub async fn run_cli(
 
     // Load session history if resuming
     if is_resume
-        && let Ok(messages) = storage.messages().get_by_session(&session_id, 50).await {
+        && let Ok(messages) = storage.messages().get_recent_by_session(&session_id, 50).await {
             let msg_count = messages.len();
             for msg in messages {
                 match msg.role.as_str() {
@@ -249,7 +249,13 @@ async fn run_cli_loop(
         stdout.flush()?;
 
         let mut input = String::new();
-        stdin.lock().read_line(&mut input)?;
+        // End of input (Ctrl-D, or a pipe that ran dry) reads 0 bytes; it
+        // used to be an empty line, so the loop re-prompted forever at full
+        // CPU.
+        if stdin.lock().read_line(&mut input)? == 0 {
+            println!();
+            break;
+        }
         let input = input.trim();
 
         if input.is_empty() {

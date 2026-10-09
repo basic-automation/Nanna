@@ -1002,7 +1002,8 @@ pub async fn set_provider(
 /// Returns `Unknown embedding provider: …` for anything but `openai`, `ollama`
 /// or `disabled`, and `Unknown OpenAI embedding model: …` for an `OpenAI` model
 /// other than `text-embedding-3-small` or `text-embedding-3-large`; nothing
-/// changes then. A failed `config.toml` save is only logged.
+/// changes then. Returns `Failed to save embedding config: …` when
+/// `config.toml` cannot be written (the cached value has changed by then).
 #[tauri::command]
 pub async fn set_embedding_config(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1030,10 +1031,11 @@ pub async fn set_embedding_config(
     state_guard.config.memory.embedding_provider.clone_from(&provider);
     state_guard.config.memory.embedding_model.clone_from(&model);
     state_guard.config.memory.enabled = provider != "disabled";
-    if let Err(e) = state_guard.config.save() {
-        error!("Failed to save embedding config: {}", e);
-    }
+    // A failed save is the caller's answer: it used to be logged while the
+    // page said "Embedding settings updated", and nothing had been written.
+    let saved = state_guard.config.save();
     drop(state_guard);
+    saved.map_err(|e| format!("Failed to save embedding config: {e}"))?;
 
     info!("Embedding config changed to: {} / {}", provider, model);
 

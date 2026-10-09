@@ -156,12 +156,29 @@ pub fn is_startable(card: &Task, now: chrono::DateTime<chrono::Utc>) -> bool {
 /// P25 decision 10: a *date* defers a card until it arrives. A date that does
 /// not parse defers nothing — the card is shown and worked, never hidden by a
 /// value nobody can read.
+///
+/// A bare `YYYY-MM-DD` — what quick-add and the board's date picker store —
+/// arrives at the start of that (store, UTC) day, the same day the store's
+/// `due` announcement uses. Reading only full timestamps here made every such
+/// date "unreadable", so an agent started at once on a card the board showed
+/// as "Deferred until …".
 #[must_use]
 pub fn is_deferred(card: &Task, now: chrono::DateTime<chrono::Utc>) -> bool {
     card.due_at
         .as_deref()
-        .and_then(crate::tasks::parse_db_time)
+        .and_then(defer_instant)
         .is_some_and(|date| date > now)
+}
+
+/// When a stored defer date arrives: a timestamp as written, a bare date at
+/// 00:00 UTC of that day.
+fn defer_instant(stored: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    crate::tasks::parse_db_time(stored).or_else(|| {
+        chrono::NaiveDate::parse_from_str(stored, "%Y-%m-%d")
+            .ok()
+            .and_then(|day| day.and_hms_opt(0, 0, 0))
+            .map(|midnight| midnight.and_utc())
+    })
 }
 
 /// Whether a card made by `creator` is board work a member may be started on.
@@ -992,6 +1009,21 @@ mod tests {
         let mut blocked = card("pending", Some("agent:builder"), None);
         blocked.blocked = true;
         assert!(!is_startable(&blocked, now), "waits on another card");
+        // Quick-add and the date picker store bare days.
+        assert!(
+            !is_startable(
+                &card("pending", Some("agent:builder"), Some("2026-10-02")),
+                now
+            ),
+            "a bare date tomorrow defers"
+        );
+        assert!(
+            is_startable(
+                &card("pending", Some("agent:builder"), Some("2026-10-01")),
+                now
+            ),
+            "a bare date today has arrived"
+        );
         let unreadable = card("pending", Some("agent:builder"), Some("next tuesday"));
         assert!(
             is_startable(&unreadable, now),

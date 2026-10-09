@@ -20,7 +20,7 @@ export default {
       });
       return "Result: " + (result.value !== undefined ? JSON.stringify(result.value) : "(undefined)");
     } catch (e) {
-      return "Error: Browser service not available. " + e;
+      return { content: "Error: " + e, success: false };
     }
   }
 }

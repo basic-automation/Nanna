@@ -22,9 +22,9 @@ export default {
         width: input.width || 1280,
         height: input.height || 720
       });
-      return "Screenshot captured (" + (result.size || "unknown") + " bytes, base64 PNG)";
+      return "Screenshot saved to " + result.path + " (" + (result.size || "unknown") + " bytes)";
     } catch (e) {
-      return "Error: Browser service not available. " + e;
+      return { content: "Error: " + e, success: false };
     }
   }
 }

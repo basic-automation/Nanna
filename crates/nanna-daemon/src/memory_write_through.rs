@@ -427,16 +427,18 @@ pub async fn fold_closed_cards(storage: &Storage, memory: &MemoryService) -> Res
             break;
         }
         let previous = already.get(&card.id.to_string());
-        let events = storage
+        let source = format!("task:{}", card.id);
+        let total = storage
             .memory_events()
-            .for_source(&format!("task:{}", card.id), nanna_storage::MAX_EVENT_PAGE)
+            .count_for_source(&source)
             .await
-            .map_err(|e| format!("reading card #{}'s episodes: {e}", card.id))?;
-        if events.len() < FOLD_MIN_EVENTS
-            || previous.is_some_and(|(_, covered)| events.len() <= *covered)
-        {
+            .map_err(|e| format!("counting card #{}'s episodes: {e}", card.id))?;
+        if total < FOLD_MIN_EVENTS || previous.is_some_and(|(_, covered)| total <= *covered) {
             continue;
         }
+        let events = card_story(storage, &source, total)
+            .await
+            .map_err(|e| format!("reading card #{}'s episodes: {e}", card.id))?;
         let Some(fold) =
             nanna_timeline::compress_episode(&events, nanna_timeline::DREAM_FOLD_BUDGET)
         else {
@@ -446,14 +448,14 @@ pub async fn fold_closed_cards(storage: &Storage, memory: &MemoryService) -> Res
             ("source".to_string(), "task_board".to_string()),
             ("source_task_id".to_string(), card.id.to_string()),
             ("board_event".to_string(), "episode".to_string()),
-            ("episode_events".to_string(), events.len().to_string()),
+            ("episode_events".to_string(), total.to_string()),
             ("episode_kept".to_string(), fold.kept.to_string()),
         ]);
         let content = format!(
             "The story of card #{} \"{}\" ({} events, {} shown):\n{}",
             card.id,
             card.title,
-            events.len(),
+            total,
             fold.kept,
             fold.episode.content
         );
@@ -476,6 +478,37 @@ pub async fn fold_closed_cards(storage: &Storage, memory: &MemoryService) -> Res
     }
     debug_assert!(folded <= FOLDS_PER_CYCLE_MAX, "the fold phase is bounded");
     Ok(folded)
+}
+
+/// The events a card's fold is computed from: all of them when they fit one
+/// page, else the oldest half-page and the newest half-page.
+///
+/// The fold used to read only the oldest page: a card with more than 1 000
+/// episodes was folded from its beginning alone, recorded as covering 1 000,
+/// and never re-folded however many came after — its story stopped where the
+/// page did. Covered is now the full count, and a long card keeps both how it
+/// started and how it ended.
+async fn card_story(
+    storage: &Storage,
+    source: &str,
+    total: usize,
+) -> Result<Vec<nanna_storage::MemoryEventRow>, nanna_storage::StorageError> {
+    let events = storage.memory_events();
+    if total <= nanna_storage::MAX_EVENT_PAGE {
+        return events.for_source(source, nanna_storage::MAX_EVENT_PAGE).await;
+    }
+    let half = nanna_storage::MAX_EVENT_PAGE / 2;
+    let mut story = events.for_source(source, half).await?;
+    let newest = events.newest_for_source(source, half).await?;
+    let last_oldest = story.last().map(|e| (e.ts_unix_ms, e.id));
+    // Events added between the count and the reads can make the halves meet.
+    story.extend(
+        newest
+            .into_iter()
+            .filter(|e| last_oldest.is_none_or(|last| (e.ts_unix_ms, e.id) > last)),
+    );
+    debug_assert!(story.len() <= nanna_storage::MAX_EVENT_PAGE);
+    Ok(story)
 }
 
 /// Importance of a folded card, above a single copy's: it is the account of a
@@ -565,6 +598,86 @@ mod tests {
         assert!(storage.set_task_events(Arc::new(bridge) as Arc<dyn TaskEventSink>));
         tokio::spawn(run(queue_rx, Arc::clone(&storage), memory));
         storage
+    }
+
+    /// A card with more than a page of episodes is folded from both ends of
+    /// its story, records its full count, and is folded again when it grows.
+    /// It used to be folded from its first 1 000 events and never again.
+    #[tokio::test]
+    async fn a_long_card_folds_from_both_ends_and_refolds_when_it_grows() {
+        let memory = MemoryService::new(nanna_memory::MemoryServiceConfig::default());
+        let storage = Storage::in_memory().await.expect("storage");
+        let card = storage
+            .tasks()
+            .create(NewTask {
+                scope: "workspace".to_string(),
+                scope_id: Some("ws1".to_string()),
+                title: "long".to_string(),
+                priority: 3,
+                ..NewTask::default()
+            })
+            .await
+            .expect("card");
+        storage.tasks().complete(card.id, Some("gui"), None).await.expect("close");
+        let source = format!("task:{}", card.id);
+        let append = |n: usize| {
+            let source = source.clone();
+            let storage = &storage;
+            async move {
+                let ts = i64::try_from(n).expect("small");
+                let content = format!("step {n}");
+                let content_len_chars = i64::try_from(content.chars().count()).expect("small");
+                storage
+                    .memory_events()
+                    .append(&nanna_storage::NewMemoryEvent {
+                        event_id: format!("e{n}"),
+                        ts_unix_ms: 1_000 + ts,
+                        kind: "task".to_string(),
+                        workspace_id: Some("ws1".to_string()),
+                        content,
+                        content_len_chars,
+                        embedding: None,
+                        embedding_model: None,
+                        salience: 0.5,
+                        source_ids: vec![source],
+                    })
+                    .await
+                    .expect("append");
+            }
+        };
+        let page = nanna_storage::MAX_EVENT_PAGE;
+        for n in 0..page + 200 {
+            append(n).await;
+        }
+
+        let story = card_story(&storage, &source, page + 200).await.expect("story");
+        assert_eq!(story.len(), page);
+        assert_eq!(story.first().map(|e| e.content.as_str()), Some("step 0"));
+        assert_eq!(
+            story.last().map(|e| e.content.clone()),
+            Some(format!("step {}", page + 199)),
+            "the newest event is part of the story"
+        );
+
+        assert_eq!(fold_closed_cards(&storage, &memory).await.expect("fold"), 1);
+        let folds = |all: Vec<nanna_memory::MemoryListEntry>| -> Vec<String> {
+            all.into_iter()
+                .filter_map(|m| m.metadata.get("episode_events").cloned())
+                .collect()
+        };
+        assert_eq!(folds(memory.list_all().await), [(page + 200).to_string()]);
+        assert_eq!(
+            fold_closed_cards(&storage, &memory).await.expect("fold"),
+            0,
+            "a fold covering every event is not redone"
+        );
+        append(page + 200).await;
+        assert_eq!(
+            fold_closed_cards(&storage, &memory).await.expect("fold"),
+            1,
+            "a card past the page that grew is folded again"
+        );
+        assert_eq!(folds(memory.list_all().await), [(page + 201).to_string()]);
     }
 
     async fn wait_for_episodes(

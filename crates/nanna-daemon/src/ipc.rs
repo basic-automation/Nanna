@@ -33,11 +33,6 @@ pub type ConnectionId = String;
 /// arrived on — what the accept loop hands the daemon's request loop.
 pub type TaggedRequest = (ConnectionId, Request);
 
-/// One connection's read half, after the WebSocket stream is split.
-type WsReader = futures_util::stream::SplitStream<
-    tokio_tungstenite::WebSocketStream<TcpStream>,
->;
-
 /// Configuration for the IPC server
 #[derive(Debug, Clone)]
 pub struct IpcServerConfig {
@@ -619,6 +614,28 @@ impl IpcServer {
 mod tests {
     use super::*;
     
+    /// A peer that sends nothing is dropped after the read deadline, even
+    /// though the server's own pings keep ending each `select!` pass.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_peer_is_dropped_at_the_read_deadline() {
+        let (msg_tx, mut msg_rx) = mpsc::channel::<Message>(64);
+        let (request_tx, _request_rx) = mpsc::channel::<TaggedRequest>(1);
+        // Drain the pings the pump sends, as the outgoing half would.
+        let drain = tokio::spawn(async move { while msg_rx.recv().await.is_some() {} });
+        let mut silent = futures_util::stream::pending::<
+            Result<Message, tokio_tungstenite::tungstenite::Error>,
+        >();
+        let id: ConnectionId = "silent".to_string();
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_secs(WS_READ_DEADLINE_SECS + 5),
+            pump_incoming(&id, &mut silent, &msg_tx, &request_tx),
+        )
+        .await;
+        assert!(ended.is_ok(), "the pump returned at the deadline");
+        drop(msg_tx);
+        drain.await.expect("drain");
+    }
+
     #[test]
     fn test_config_default() {
         let config = IpcServerConfig::default();
@@ -658,32 +675,39 @@ mod tests {
 /// silent past `WS_READ_DEADLINE_SECS` is dropped. Without this, a
 /// force-killed client (no Close frame, Windows TCP keepalive off) left
 /// `ws_rx.next()` pending forever.
-async fn pump_incoming(
+///
+/// The deadline is ONE timer, reset only when a frame arrives. It used to be a
+/// fresh `timeout(45 s, next())` built on every pass through the `select!` —
+/// and the 15 s ping tick ends a pass, so the timer restarted before it could
+/// ever expire and a silent peer was held until the kernel gave up on TCP.
+async fn pump_incoming<S>(
     client_id: &ConnectionId,
-    ws_rx: &mut WsReader,
+    ws_rx: &mut S,
     msg_tx: &mpsc::Sender<Message>,
     request_tx: &mpsc::Sender<TaggedRequest>,
-) {
+) where
+    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    let read_deadline = std::time::Duration::from_secs(WS_READ_DEADLINE_SECS);
     let mut ping_interval =
         tokio::time::interval(std::time::Duration::from_secs(WS_PING_INTERVAL_SECS));
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let silence = tokio::time::sleep(read_deadline);
+    tokio::pin!(silence);
     'incoming: loop {
         tokio::select! {
-            maybe_msg = tokio::time::timeout(
-                std::time::Duration::from_secs(WS_READ_DEADLINE_SECS),
-                ws_rx.next(),
-            ) => {
-                let msg = match maybe_msg {
-                    Err(_elapsed) => {
-                        warn!(
-                            "Read deadline ({WS_READ_DEADLINE_SECS}s) exceeded for {} — dropping dead connection",
-                            client_id
-                        );
-                        break 'incoming;
-                    }
-                    Ok(None) => break 'incoming,
-                    Ok(Some(m)) => m,
-                };
+            () = &mut silence => {
+                warn!(
+                    "Read deadline ({WS_READ_DEADLINE_SECS}s) exceeded for {} — dropping dead connection",
+                    client_id
+                );
+                break 'incoming;
+            }
+            maybe_msg = ws_rx.next() => {
+                let Some(msg) = maybe_msg else { break 'incoming };
+                // Any frame — a pong included — is proof of life.
+                silence.as_mut().reset(tokio::time::Instant::now() + read_deadline);
                 match msg {
                     Ok(Message::Text(text)) => {
                         match serde_json::from_str::<Request>(&text) {

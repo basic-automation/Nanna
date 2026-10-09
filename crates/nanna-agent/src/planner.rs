@@ -453,6 +453,24 @@ mod tests {
         assert!(tasks[0].acceptance.is_none());
     }
 
+    /// A check that parses but the store would refuse is dropped from the
+    /// task, not left to make `create` drop the whole task.
+    #[test]
+    fn a_check_the_store_would_refuse_is_dropped_and_the_task_kept() {
+        for check in [
+            r#"{"kind":"file_exists","path":""}"#,
+            r#"{"kind":"command","command":""}"#,
+            r#"{"kind":"regex","pattern":"ok"}"#,
+        ] {
+            let out = format!(r#"[{{"title":"Run tests","acceptance":{check}}}]"#);
+            let tasks = parse_plan(&out).expect("parses");
+            assert_eq!(tasks.len(), 1, "{check}");
+            assert!(tasks[0].acceptance.is_none(), "{check}");
+        }
+        let good = r#"[{"title":"Write it","acceptance":{"kind":"file_exists","path":"out.md"}}]"#;
+        assert!(parse_plan(good).expect("parses")[0].acceptance.is_some());
+    }
+
     #[test]
     fn tasks_are_capped_at_the_bound() {
         let items: Vec<String> = (0..40).map(|i| format!(r#"{{"title":"t{i}"}}"#)).collect();

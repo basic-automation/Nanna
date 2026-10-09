@@ -987,6 +987,15 @@ impl SessionManager {
             .create_in_workspace(name, original.workspace_id.clone())
             .await;
         forked.metadata = original.metadata.clone();
+        // The settings come along; the REPLY ROUTE does not. A fork is a new
+        // conversation the GUI owns, and the channel bridge sends every reply
+        // of a session carrying a route to that chat — so forking a Telegram
+        // conversation and chatting in the fork messaged the Telegram user.
+        forked.metadata.remove(REPLY_CHANNEL_KEY);
+        debug_assert!(
+            forked.reply_channel().is_none(),
+            "a fork answers no channel"
+        );
         forked.messages = original
             .messages
             .iter()
@@ -1775,6 +1784,27 @@ const fn floor_boundary(s: &str, max: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fork keeps its settings but answers no channel: the bridge sends
+    /// every reply of a routed session to that chat.
+    #[tokio::test]
+    async fn a_fork_of_a_channel_session_does_not_inherit_its_reply_route() {
+        let manager = SessionManager::new();
+        let route = ReplyChannel {
+            provider: "telegram".to_string(),
+            id: "4242".to_string(),
+        };
+        manager
+            .ensure_channel_session("tg-4242", "Telegram", &route)
+            .await;
+        assert_eq!(manager.reply_channel("tg-4242").await, Some(route));
+        let fork = manager.fork("tg-4242", None).await.expect("forked");
+        assert_eq!(manager.reply_channel(&fork.id).await, None);
+        assert!(
+            manager.reply_channel("tg-4242").await.is_some(),
+            "the original keeps its route"
+        );
+    }
 
     #[test]
     fn take_last_user_turn_drops_reply_and_returns_content() {

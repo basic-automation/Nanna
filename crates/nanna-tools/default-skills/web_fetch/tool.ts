@@ -14,7 +14,14 @@ export default {
   execute: function(input) {
     var maxChars = input.max_chars || 50000;
 
-    var response = Nanna.fetch(input.url);
+    // A refused host, a DNS failure or a timeout is an answer, not a crash:
+    // thrown, it surfaced as a script error instead of a result.
+    var response;
+    try {
+      response = Nanna.fetch(input.url);
+    } catch (e) {
+      return "Error: could not fetch " + input.url + ": " + e;
+    }
 
     if (response.status >= 400) {
       return "Error: HTTP " + response.status + " fetching " + input.url;
