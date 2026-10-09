@@ -9471,6 +9471,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       mapped, the Windows-only job-object size, and four `unwrap`s in `service.rs`'s
       macOS-only install/uninstall (`plist_path.parent()`, `to_str()`), left alone because
       that code does not compile on this host — **still open**, for a run with a macOS check.
+- [x] *(found 2026-10-09, audit of the tool runtime)* **`..` climbed out of a skill's file scope.**
+      `ToolPermissions::allows_read/allows_write` compared the bridge's joined-but-never-normalised
+      path with `Path::starts_with`, which matches components as written — so under the default
+      `~` scope `Nanna.readFile("~/../../etc/passwd")` was allowed while `/etc/passwd` was refused,
+      and a relative `../../..` from a workspace under home wrote outside it. `scope_covers` now
+      checks the lexically normalised path (`.` dropped, `..` resolved, never past the root), the
+      same path the OS opens short of symlinks. Test `dot_dot_cannot_climb_out_of_a_scope`.
 - [x] Tool authoring: `tools.update` refuses bundled names and runs `check_syntax`; GUI
       `update_skill` validates the name (`tool_authoring.rs:99,236`, `gui/.../tools.rs:458`). Both
       move with the `default-skills` → tools rename.
