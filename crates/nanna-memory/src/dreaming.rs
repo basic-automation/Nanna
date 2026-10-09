@@ -67,6 +67,30 @@ pub enum DreamTrigger {
     Skipped,
 }
 
+/// Cross-check a gate decision against its inputs — the guard against a
+/// future edit desyncing the policy from its two triggers. One copy, for both
+/// entry points: it used to be pasted verbatim into each, where one could be
+/// edited and the other not.
+fn debug_check_gate(
+    trigger: DreamTrigger,
+    idle: Duration,
+    memory_count: usize,
+    config: &DreamingConfig,
+) {
+    debug_assert!(
+        trigger != DreamTrigger::Skipped
+            || (idle < Duration::from_secs(config.idle_threshold_secs)
+                && (config.memory_pressure_count == 0
+                    || memory_count < config.memory_pressure_count)),
+        "Skipped must imply not-idle-yet AND below memory pressure"
+    );
+    debug_assert!(
+        trigger != DreamTrigger::MemoryPressure
+            || (config.memory_pressure_count > 0 && memory_count >= config.memory_pressure_count),
+        "MemoryPressure must imply the pressure ceiling was reached"
+    );
+}
+
 /// Pure gate decision: should a dream cycle run given how long the system has
 /// been idle and how many memories are live?
 ///
@@ -331,21 +355,7 @@ impl DreamingService {
         let memory_count = self.memory.stats().await.total;
         let trigger = dream_trigger(idle, memory_count, &self.config);
 
-        // Cross-check the gate's decision against its inputs (guards against a
-        // future edit desyncing the policy from these two triggers).
-        debug_assert!(
-            trigger != DreamTrigger::Skipped
-                || (idle < Duration::from_secs(self.config.idle_threshold_secs)
-                    && (self.config.memory_pressure_count == 0
-                        || memory_count < self.config.memory_pressure_count)),
-            "Skipped must imply not-idle-yet AND below memory pressure"
-        );
-        debug_assert!(
-            trigger != DreamTrigger::MemoryPressure
-                || (self.config.memory_pressure_count > 0
-                    && memory_count >= self.config.memory_pressure_count),
-            "MemoryPressure must imply the pressure ceiling was reached"
-        );
+        debug_check_gate(trigger, idle, memory_count, &self.config);
 
         if trigger == DreamTrigger::Skipped {
             debug!(
@@ -411,21 +421,7 @@ impl DreamingService {
         let memory_count = self.memory.stats().await.total;
         let trigger = dream_trigger(idle, memory_count, &self.config);
 
-        // Cross-check the gate's decision against its inputs (guards against a
-        // future edit desyncing the policy from these two triggers).
-        debug_assert!(
-            trigger != DreamTrigger::Skipped
-                || (idle < Duration::from_secs(self.config.idle_threshold_secs)
-                    && (self.config.memory_pressure_count == 0
-                        || memory_count < self.config.memory_pressure_count)),
-            "Skipped must imply not-idle-yet AND below memory pressure"
-        );
-        debug_assert!(
-            trigger != DreamTrigger::MemoryPressure
-                || (self.config.memory_pressure_count > 0
-                    && memory_count >= self.config.memory_pressure_count),
-            "MemoryPressure must imply the pressure ceiling was reached"
-        );
+        debug_check_gate(trigger, idle, memory_count, &self.config);
 
         if trigger == DreamTrigger::Skipped {
             debug!(
@@ -688,8 +684,9 @@ impl DreamingService {
     ///
     /// # Errors
     ///
-    /// Returns [`MemoryError::NotFound`] when no memory has `id`. Failing to
-    /// remove it from the persistence backend is logged, not returned.
+    /// Returns [`MemoryError::NotFound`] when no memory has `id`, and the
+    /// backend's error when it could not delete the row (the memory is then
+    /// kept, so RAM and disk still agree).
     pub async fn forget(&self, id: &str) -> Result<(), MemoryError> {
         self.memory.forget(id).await
     }

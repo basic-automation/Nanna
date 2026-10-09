@@ -32,21 +32,6 @@
         </div>
       </div>
 
-      <!-- Similarity Threshold -->
-      <div class="p-3 rounded-lg glass-panel">
-        <div class="flex items-center justify-between mb-2">
-          <span class="text-sm font-medium text-nanna-text">Recall Threshold</span>
-          <span class="text-sm text-nanna-accent font-mono">{{ (similarityThreshold * 100).toFixed(0) }}%</span>
-        </div>
-        <input
-          type="range" min="0" max="100" step="5"
-          :value="similarityThreshold * 100"
-          @change="setSimilarityThreshold(Number(($event.target as HTMLInputElement).value) / 100)"
-          class="w-full h-2 glass-well rounded-lg appearance-none cursor-pointer accent-nanna-primary"
-        >
-        <p class="text-xs text-nanna-text-dim mt-1">Lower = more results, higher = more precise</p>
-      </div>
-
       <!-- Toggles -->
       <div class="flex items-center justify-between">
         <div>
@@ -54,14 +39,6 @@
           <div class="text-xs text-nanna-text-dim">Save conversations to memory automatically</div>
         </div>
         <UiSwitch :model-value="settings?.auto_remember_messages" label="Auto-remember enabled" @update:model-value="setAutoRememberMessages" />
-      </div>
-
-      <div class="flex items-center justify-between">
-        <div>
-          <div class="text-sm font-medium text-nanna-text">Enable Dreaming</div>
-          <div class="text-xs text-nanna-text-dim">Memory consolidation</div>
-        </div>
-        <UiSwitch :model-value="settings?.dreaming_enabled" label="Dreaming enabled" @update:model-value="setDreamingEnabled" />
       </div>
 
       <!-- Advanced consolidation knobs -->
@@ -95,7 +72,7 @@
       </div>
 
       <!-- Dream Button -->
-      <UiButton @click="triggerConsolidation" :disabled="consolidating || !settings?.dreaming_enabled" class="w-full">
+      <UiButton @click="triggerConsolidation" :disabled="consolidating" class="w-full">
         <UiSpinner v-if="consolidating" size="sm" class="mr-2" />
         <Moon v-else class="w-4 h-4 mr-2" />
         {{ consolidating ? 'Dreaming...' : 'Dream Now' }}
@@ -105,7 +82,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { BrainCircuit, Moon } from '@lucide/vue'
 import { useSettingsPage } from '~/composables/useSettingsPage'
@@ -113,38 +90,10 @@ import { useSettingsPage } from '~/composables/useSettingsPage'
 const store = useSettingsPage()
 const { settings, showAdvanced, memoryStats, loadMemoryStats, loadSettings, showToast } = store
 
-const similarityThreshold = ref(0.4)
+// No dreaming switch and no recall-threshold slider: dreaming is a core
+// feature with no off switch, and recall keeps its calibrated threshold
+// (owner, 2026-09-23). Both controls were no-ops the daemon never saw.
 const consolidating = ref(false)
-
-onMounted(async () => {
-  await loadSimilarityThreshold()
-})
-
-async function loadSimilarityThreshold() {
-  try {
-    similarityThreshold.value = await invoke<number>('get_similarity_threshold')
-  } catch (e) {
-    console.error('Could not load similarity threshold:', e)
-  }
-}
-
-async function setSimilarityThreshold(value: number) {
-  try {
-    await invoke<string>('set_similarity_threshold', { threshold: value })
-    similarityThreshold.value = value
-  } catch (e: any) {
-    showToast(`Could not update recall threshold: ${e.message || e}`, 'error')
-  }
-}
-
-async function setDreamingEnabled(enabled: boolean) {
-  try {
-    await invoke('set_dreaming_enabled', { enabled })
-    await loadSettings()
-  } catch (e: any) {
-    showToast(`Could not update dreaming: ${e.message || e}`, 'error')
-  }
-}
 
 async function setAutoRememberMessages(enabled: boolean) {
   try {

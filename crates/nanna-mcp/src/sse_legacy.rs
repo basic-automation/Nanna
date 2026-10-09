@@ -8,9 +8,9 @@
 //! only this, and the Streamable HTTP binding tells a client to fall back to
 //! it when a `POST` gets `400`/`404`/`405` without a modern error body.
 //!
-//! This replaces nothing in [`crate::HttpTransport`] (the old implementation,
-//! which assumed `<url>/sse` and "waited" for the endpoint with a sleep); it is
-//! what the daemon uses. Source:
+//! This replaced the old `HttpTransport` (which assumed `<url>/sse`,
+//! "waited" for the endpoint with a sleep, and was deleted 2026-09-26 once
+//! nothing used it); it is what the daemon uses. Source:
 //! <https://modelcontextprotocol.io/specification/2024-11-05/basic/transports#http-with-sse>.
 
 use crate::streamable_http::{HTTP_REQUEST_TIMEOUT, SseParser};
@@ -35,7 +35,10 @@ const ENDPOINT_TIMEOUT: Duration = Duration::from_secs(10);
 /// per tool call; the bound only stops a leak from growing without limit.
 const PENDING_MAX: usize = 256;
 
-type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<JsonRpcResponse>>>>;
+/// Requests awaiting their answer on the stream, by id; `None` once the
+/// stream has ended, so a later request fails at once instead of waiting
+/// [`HTTP_REQUEST_TIMEOUT`] for an answer nothing can deliver.
+type Pending = Arc<Mutex<Option<HashMap<String, oneshot::Sender<JsonRpcResponse>>>>>;
 
 /// The 2024-11-05 HTTP+SSE transport.
 pub struct LegacySseTransport {
@@ -107,17 +110,14 @@ impl LegacySseTransport {
         })
         .await
         .map_err(|_| McpError::Protocol(format!("`{url}` named no message endpoint")))??;
-        let post_url = base
-            .join(endpoint.trim())
-            .map_err(|e| McpError::Protocol(format!("bad endpoint `{endpoint}`: {e}")))?
-            .to_string();
+        let post_url = same_origin_endpoint(&base, &endpoint)?;
         debug!(post_url, "Legacy MCP SSE endpoint");
 
         let client = reqwest::Client::builder()
             .timeout(HTTP_REQUEST_TIMEOUT)
             .build()
             .map_err(|e| McpError::Transport(e.to_string()))?;
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
         let list_changed = Arc::new(ListChangedFlags::default());
         let (stop, stop_rx) = tokio::sync::watch::channel(false);
         let reader = Reader {
@@ -136,6 +136,13 @@ impl LegacySseTransport {
             list_changed,
             stop,
         })
+    }
+
+    /// Stop waiting for `id`'s answer.
+    async fn forget(&self, id: &str) {
+        if let Some(waiting) = self.pending.lock().await.as_mut() {
+            waiting.remove(id);
+        }
     }
 
     async fn post(&self, body: String) -> Result<()> {
@@ -171,7 +178,7 @@ async fn post_message(
     if status.is_success() {
         return Ok(());
     }
-    let body = response.text().await.unwrap_or_default();
+    let body = crate::streamable_http::read_error_body(response, 2048).await;
     Err(McpError::HttpStatus {
         status: status.as_u16(),
         body: body.chars().take(512).collect(),
@@ -214,8 +221,10 @@ impl Reader {
                 self.route(&event.data).await;
             }
         }
-        // Nothing will answer the requests still waiting: fail them now.
-        self.pending.lock().await.clear();
+        // Nothing will answer the requests still waiting, or any later one:
+        // fail them now, and refuse the rest (dropping the senders ends
+        // every waiter with `ConnectionClosed`).
+        *self.pending.lock().await = None;
     }
 
     async fn route(&self, data: &str) {
@@ -251,7 +260,12 @@ impl Reader {
             }
             (None, _) => {
                 if let Ok(response) = serde_json::from_value::<JsonRpcResponse>(message)
-                    && let Some(waiter) = self.pending.lock().await.remove(&response.id.to_string())
+                    && let Some(waiter) = self
+                        .pending
+                        .lock()
+                        .await
+                        .as_mut()
+                        .and_then(|waiting| waiting.remove(&response.id.to_string()))
                 {
                     let _ = waiter.send(response);
                 }
@@ -265,24 +279,26 @@ impl Transport for LegacySseTransport {
     async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
         let id = request.id.to_string();
         let (tx, rx) = oneshot::channel();
-        {
-            let mut pending = self.pending.lock().await;
-            if pending.len() >= PENDING_MAX {
-                return Err(McpError::Protocol(format!(
-                    "{PENDING_MAX} MCP requests already await an answer"
-                )));
-            }
-            pending.insert(id.clone(), tx);
+        let mut guard = self.pending.lock().await;
+        let Some(waiting) = guard.as_mut() else {
+            return Err(McpError::ConnectionClosed);
+        };
+        if waiting.len() >= PENDING_MAX {
+            return Err(McpError::Protocol(format!(
+                "{PENDING_MAX} MCP requests already await an answer"
+            )));
         }
+        waiting.insert(id.clone(), tx);
+        drop(guard);
         if let Err(e) = self.post(serde_json::to_string(&request)?).await {
-            self.pending.lock().await.remove(&id);
+            self.forget(&id).await;
             return Err(e);
         }
         match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, rx).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => Err(McpError::ConnectionClosed),
             Err(_) => {
-                self.pending.lock().await.remove(&id);
+                self.forget(&id).await;
                 Err(McpError::Timeout)
             }
         }
@@ -299,5 +315,102 @@ impl Transport for LegacySseTransport {
 
     fn list_changed_flags(&self) -> Option<Arc<ListChangedFlags>> {
         Some(Arc::clone(&self.list_changed))
+    }
+}
+
+/// The message endpoint a legacy SSE server named, resolved against the URL it
+/// was reached at — refused unless it is on that same origin.
+///
+/// Every POST to it carries the server's bearer token, so taking the
+/// `endpoint` event's URL as given let a server (or anything on its path)
+/// redirect the configured credential to another host: `data:
+/// https://attacker.example/x`, or the scheme-relative `//attacker.example/x`.
+/// The TypeScript SDK refuses a cross-origin endpoint for the same reason.
+fn same_origin_endpoint(base: &reqwest::Url, endpoint: &str) -> Result<String> {
+    let joined = base
+        .join(endpoint.trim())
+        .map_err(|e| McpError::Protocol(format!("bad endpoint `{endpoint}`: {e}")))?;
+    if joined.origin() != base.origin() {
+        return Err(McpError::Protocol(format!(
+            "the server named a message endpoint on another origin (`{}`, connected to `{}`); \
+             refusing to send its credential there",
+            joined.origin().ascii_serialization(),
+            base.origin().ascii_serialization()
+        )));
+    }
+    debug_assert_eq!(joined.origin(), base.origin(), "same origin only");
+    Ok(joined.to_string())
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::same_origin_endpoint;
+
+    #[test]
+    fn a_message_endpoint_must_stay_on_the_connections_origin() {
+        let base = reqwest::Url::parse("https://mcp.example.com/sse").expect("url");
+        assert_eq!(
+            same_origin_endpoint(&base, "/messages?session=1").expect("relative"),
+            "https://mcp.example.com/messages?session=1"
+        );
+        assert!(same_origin_endpoint(&base, "https://mcp.example.com/m").is_ok());
+        for elsewhere in [
+            "https://attacker.example/x",
+            "//attacker.example/x",
+            "http://mcp.example.com/m",
+            "https://mcp.example.com:8443/m",
+        ] {
+            assert!(
+                same_origin_endpoint(&base, elsewhere).is_err(),
+                "{elsewhere}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod stream_end_tests {
+    use super::LegacySseTransport;
+    use crate::transport::Transport as _;
+    use crate::{JsonRpcRequest, McpError};
+
+    /// Once the server's event stream has ended, a request fails at once:
+    /// it used to be posted and then wait the full 60 s for an answer the
+    /// dead stream could never deliver.
+    #[tokio::test]
+    async fn a_request_after_the_stream_ended_fails_at_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0_u8; 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                          Connection: close\r\n\r\nevent: endpoint\ndata: /messages\n\n",
+                    )
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        let transport = LegacySseTransport::connect(&format!("http://{addr}/sse"), None)
+            .await
+            .expect("the endpoint event arrives before the stream ends");
+        // Let the reader see the end of the stream.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while transport.pending.lock().await.is_some() {
+            assert!(tokio::time::Instant::now() < deadline, "the reader never saw the end");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let started = tokio::time::Instant::now();
+        let refused = transport
+            .request(JsonRpcRequest::new(1_i64, "tools/list", None))
+            .await;
+        assert!(matches!(refused, Err(McpError::ConnectionClosed)), "{refused:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }

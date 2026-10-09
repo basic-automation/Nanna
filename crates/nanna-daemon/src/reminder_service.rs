@@ -215,7 +215,10 @@ async fn add_reminder(
             request.session_id
         ));
     }
-    let scheduler = scheduler.read().await;
+    // The WRITE guard, so the count below and the add after it are one step:
+    // under a read guard two concurrent adds both saw room and both added,
+    // and the bound held only while nobody raced it.
+    let scheduler = scheduler.write().await;
     if !scheduler.runtime().enabled() {
         return Err(
             "No reminder was set: the scheduler is switched off in Settings, so it would never \

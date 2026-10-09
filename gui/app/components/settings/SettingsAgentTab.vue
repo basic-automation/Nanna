@@ -381,12 +381,28 @@ async function setMaxTokens(tokens: number) {
   }
 }
 
+/**
+ * A whole count of at least 1, or null. A cleared `v-model.number` field holds
+ * `""`, which `Math.max(1, Math.round(""))` turned into 1 — clearing "Max
+ * iterations" capped every run at one iteration and said "saved".
+ */
+function wholeCount(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 1 ? Math.round(value) : null
+}
+
 async function saveIterationPolicy() {
+  const maxIterationsCount = wholeCount(maxIterations.value)
+  const nudgeAfter = wholeCount(nudgeAfterIterations.value)
+  const nudgeInterval = wholeCount(nudgeIntervalIterations.value)
+  if ((!unlimitedIterations.value && maxIterationsCount === null) || nudgeAfter === null || nudgeInterval === null) {
+    showToast('Enter a whole number of at least 1 in each field', 'error')
+    return
+  }
   try {
     await invoke('set_agent_iteration_policy', {
-      maxIterations: unlimitedIterations.value ? null : Math.max(1, Math.round(maxIterations.value)),
-      nudgeAfter: Math.max(1, Math.round(nudgeAfterIterations.value)),
-      nudgeInterval: Math.max(1, Math.round(nudgeIntervalIterations.value)),
+      maxIterations: unlimitedIterations.value ? null : maxIterationsCount,
+      nudgeAfter,
+      nudgeInterval,
     })
     showToast('Agent loop settings saved', 'success')
   } catch (e: any) {

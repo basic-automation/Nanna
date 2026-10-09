@@ -181,20 +181,23 @@ pub async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Res
         .default_model(config.llm.model.clone())
         .telegram_token(telegram_token)
         .discord_config(discord_bot_token, discord_app_id)
+        // ONE scheduler per process over the persisted job table. The server
+        // state's own would run beside the one below, load the same jobs, and
+        // "complete" every non-dreaming one by echoing its payload — so a
+        // one-shot could be marked done, and deleted, without ever running.
+        .scheduler(false)
         .build();
 
-    // Start the scheduler for heartbeats and scheduled tasks
-    let mut scheduler = create_scheduler(config, llm.clone(), tools.clone(), storage.clone());
-
-    // Load persisted cron jobs
-    match scheduler.load_jobs().await {
-        Ok(count) if count > 0 => info!("Loaded {} persisted cron jobs", count),
-        Ok(_) => debug!("No persisted cron jobs found"),
-        Err(e) => warn!("Failed to load cron jobs: {}", e),
-    }
-
-    scheduler.start();
-    info!("Scheduler started");
+    // The scheduler for heartbeats, jobs and — through the server's dreaming
+    // runtime — memory consolidation.
+    let mut scheduler = start_scheduler(
+        config,
+        llm.clone(),
+        tools.clone(),
+        storage.clone(),
+        state.dreaming.clone(),
+    )
+    .await;
 
     let server_config = ServerConfig {
         host: host.clone(),
@@ -209,6 +212,40 @@ pub async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Res
     scheduler.stop().await;
 
     Ok(())
+}
+
+/// Load, top up and start the one scheduler `nanna serve` runs.
+async fn start_scheduler(
+    config: &Config,
+    llm: std::sync::Arc<LlmClient>,
+    tools: std::sync::Arc<nanna_tools::ToolRegistry>,
+    storage: std::sync::Arc<nanna_storage::Storage>,
+    dreaming: Option<std::sync::Arc<nanna_core::DreamingRuntime>>,
+) -> nanna_core::Scheduler {
+    let has_dreaming = dreaming.is_some();
+    let mut scheduler = create_scheduler(config, llm, tools, storage, dreaming);
+
+    // Load persisted cron jobs
+    match scheduler.load_jobs().await {
+        Ok(count) if count > 0 => info!("Loaded {} persisted cron jobs", count),
+        Ok(_) => debug!("No persisted cron jobs found"),
+        Err(e) => warn!("Failed to load cron jobs: {}", e),
+    }
+    // The server state used to register consolidation on its own scheduler.
+    if has_dreaming
+        && !scheduler
+            .has_task_named(nanna_core::DREAMING_TASK_NAME)
+            .await
+    {
+        scheduler
+            .add_task(nanna_core::consolidation_task(None))
+            .await;
+        info!("Scheduled memory consolidation (every 1 hour)");
+    }
+
+    scheduler.start();
+    info!("Scheduler started");
+    scheduler
 }
 
 /// Run the daemon server (background mode)

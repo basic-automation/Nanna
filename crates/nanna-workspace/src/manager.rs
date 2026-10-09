@@ -1,15 +1,13 @@
-//! Workspace manager - main interface for workspace operations
+//! A loaded workspace: its root, marker, files and `.nanna` config.
 
 use crate::{
-    discover_workspace, find_workspace_root, WorkspaceError, WorkspaceFiles, WorkspaceMarker,
-    AGENTS_FILE, WORKSPACE_MARKER_DIR,
+    find_workspace_root, WorkspaceError, WorkspaceFiles, WorkspaceMarker, AGENTS_FILE,
+    WORKSPACE_MARKER_DIR,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use tokio::fs;
-use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 /// Configuration for a workspace (local non-md state in `.nanna/config.toml`)
@@ -148,173 +146,9 @@ impl Workspace {
     }
 }
 
-/// Manager for multiple workspaces with switching support
-pub struct WorkspaceManager {
-    /// Currently active workspace
-    active: RwLock<Option<Workspace>>,
-    /// Cache of loaded workspaces by path
-    cache: RwLock<HashMap<PathBuf, Workspace>>,
-    /// Default workspace path (if configured)
-    default_path: Option<PathBuf>,
-}
-
-impl WorkspaceManager {
-    /// Create a new workspace manager
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            active: RwLock::new(None),
-            cache: RwLock::new(HashMap::new()),
-            default_path: None,
-        }
-    }
-
-    /// Create with a default workspace path
-    #[must_use]
-    pub fn with_default(default_path: PathBuf) -> Self {
-        Self {
-            active: RwLock::new(None),
-            cache: RwLock::new(HashMap::new()),
-            default_path: Some(default_path),
-        }
-    }
-
-    /// Get the currently active workspace
-    pub async fn active(&self) -> Option<Workspace> {
-        self.active.read().await.clone()
-    }
-
-    /// Load and activate a workspace
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WorkspaceError::Io`] when `path` is relative and the current
-    /// directory cannot be read, and [`WorkspaceError::NotFound`] when the path
-    /// is not cached and does not exist.
-    pub async fn activate(&self, path: &Path) -> Result<Workspace, WorkspaceError> {
-        let canonical = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()?.join(path)
-        };
-
-        {
-            let cache = self.cache.read().await;
-            if let Some(ws) = cache.get(&canonical) {
-                *self.active.write().await = Some(ws.clone());
-                info!("Activated cached workspace: {}", ws.name());
-                return Ok(ws.clone());
-            }
-        }
-
-        let workspace = Workspace::load(canonical.clone()).await?;
-
-        {
-            let mut cache = self.cache.write().await;
-            cache.insert(canonical, workspace.clone());
-        }
-
-        {
-            let mut active = self.active.write().await;
-            *active = Some(workspace.clone());
-        }
-
-        info!("Activated workspace: {}", workspace.name());
-        Ok(workspace)
-    }
-
-    /// Auto-discover and activate a workspace
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of [`discover_workspace`] when no workspace can be
-    /// discovered, and those of [`Self::activate`] for the discovered path.
-    pub async fn auto_activate(&self, explicit_path: Option<&Path>) -> Result<Workspace, WorkspaceError> {
-        let path = discover_workspace(explicit_path)?;
-        self.activate(&path).await
-    }
-
-    /// Activate the default workspace (if configured)
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of [`Self::activate`] for the configured default path,
-    /// or of [`Self::auto_activate`] when no default is configured.
-    pub async fn activate_default(&self) -> Result<Workspace, WorkspaceError> {
-        if let Some(ref path) = self.default_path {
-            self.activate(path).await
-        } else {
-            self.auto_activate(None).await
-        }
-    }
-
-    /// Switch to a different workspace
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of [`Self::activate`].
-    pub async fn switch(&self, path: &Path) -> Result<Workspace, WorkspaceError> {
-        self.activate(path).await
-    }
-
-    /// Reload the currently active workspace
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of [`Workspace::reload`], which currently never fails.
-    pub async fn reload_active(&self) -> Result<(), WorkspaceError> {
-        let mut active = self.active.write().await;
-        if let Some(ref mut ws) = *active {
-            ws.reload().await?;
-        }
-        drop(active);
-        Ok(())
-    }
-
-    /// Get all cached workspaces
-    pub async fn list_cached(&self) -> Vec<Workspace> {
-        self.cache.read().await.values().cloned().collect()
-    }
-
-    /// Clear the workspace cache
-    pub async fn clear_cache(&self) {
-        self.cache.write().await.clear();
-    }
-
-    /// Create and initialize a new workspace
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WorkspaceError::Io`] when the directory cannot be created or
-    /// [`Workspace::initialize`] cannot write its files.
-    pub async fn create(&self, path: &Path) -> Result<Workspace, WorkspaceError> {
-        fs::create_dir_all(path).await?;
-
-        let workspace = Workspace::load(path.to_path_buf()).await?;
-        workspace.initialize().await?;
-
-        let mut workspace = workspace;
-        workspace.reload().await?;
-
-        {
-            let mut cache = self.cache.write().await;
-            cache.insert(path.to_path_buf(), workspace.clone());
-        }
-
-        Ok(workspace)
-    }
-}
-
-impl Default for WorkspaceManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::README_FILE;
     use std::fs::write;
     use tempfile::tempdir;
 
@@ -326,18 +160,6 @@ mod tests {
         let workspace = Workspace::load(dir.path().to_path_buf()).await.unwrap();
         assert!(workspace.files.agents.is_some());
         assert_eq!(workspace.marker, WorkspaceMarker::AgentsFile);
-    }
-
-    #[tokio::test]
-    async fn test_workspace_manager_activate() {
-        let dir = tempdir().unwrap();
-        write(dir.path().join(README_FILE), "# Test").unwrap();
-
-        let manager = WorkspaceManager::new();
-        let workspace = manager.activate(dir.path()).await.unwrap();
-
-        assert!(manager.active().await.is_some());
-        assert_eq!(workspace.root, dir.path());
     }
 
     #[tokio::test]

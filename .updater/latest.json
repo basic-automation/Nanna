@@ -1,7 +1,7 @@
 {
-  "version": "0.3.30",
-  "notes": "The task store announces itself: nine card events, and a memory edit no longer keeps its old search vector.",
-  "pub_date": "2026-09-24T19:48:32.408Z",
+  "version": "0.3.40",
+  "notes": "Ninety audit fixes: Telegram allowlist in webhook mode, no config overwrites, browser tabs closed, MCP reconnects, and more.",
+  "pub_date": "2026-10-09T16:17:55.458Z",
   "platforms": {
     "windows-x86_64": {
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXI3d0dDbGYxbE9zV2F2Qk85TGdENzV6c29BVnpIc3VMa1RQZnJETXNRaTJNUTFoV0lUbnFzM2lDcGlMckdvVzRpaVZmcjdoWk9BUkRiaklucTJWK1FrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMjc5MTY5CWZpbGU6TmFubmFfMC4zLjMwX3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMzAKQzlXUXl2andpclgxRzJTeVZEdnhOOEhaL1VWcFR6dU83MTY3ZzkzTXBoMFBEMUx4Q3pUVlhQcHl4VkY2NDloV2xQKytEdGY5OVorOGNGRXZieUtIQnc9PQo=",

@@ -5,8 +5,8 @@
 //! three were withheld at every boot (found by
 //! `tests/skill_services_are_registered.rs`). The Rust half has been complete
 //! the whole time: `vision_wiring::create_vision_fn` builds the request and
-//! `AnalyzeImageTool` wrapped it, but the tool was reachable from nowhere and
-//! the skills call a *service*, not a tool.
+//! `AnalyzeImageTool` wrapped it (deleted 2026-10-08), but the tool was
+//! reachable from nowhere and the skills call a *service*, not a tool.
 //!
 //! **Registered only when a vision model is actually reachable.** The model
 //! comes from `[memory] ocr_model_priority`, whose doc already says "only

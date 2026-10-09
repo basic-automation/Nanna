@@ -168,6 +168,12 @@ impl AcceptanceVerdict {
         }
     }
 
+    /// A check Stop interrupted: unknown, like a hang — it never answered —
+    /// and never a failure of the work.
+    fn interrupted(command: &str) -> Self {
+        Self::timeout(format!("`{command}` was interrupted by Stop before it answered"))
+    }
+
     /// Attach the head of the command's own output.
     fn with_output_head(mut self, combined: &str) -> Self {
         let head = text_head(combined.trim_start(), ACCEPTANCE_OUTPUT_EXCERPT_CHARS).trim();
@@ -283,7 +289,14 @@ impl AcceptanceCheck {
         // Round-tripping through the typed check is what makes the result
         // canonical rather than merely object-shaped: unknown keys are gone,
         // absent options are absent, and `timeout_secs` is an integer.
-        serde_json::to_value(&check)
+        let canonical = serde_json::to_value(&check)
+            .map_err(|e| format!("invalid acceptance check: {e}. {ACCEPTANCE_SHAPES}"))?;
+        // And the store's own admission, so the reader never accepts what the
+        // writer refuses: a check that parses but is empty (`file_exists` with
+        // no path, `command` with no command, `regex` with nothing to match)
+        // passed here and was then refused by `create` — which dropped the
+        // whole planned task, not just its check.
+        nanna_storage::admit_acceptance(&canonical)
             .map_err(|e| format!("invalid acceptance check: {e}. {ACCEPTANCE_SHAPES}"))
     }
 
@@ -431,6 +444,21 @@ impl AcceptanceCheck {
         workdir: &Path,
         cap: Option<Duration>,
     ) -> AcceptanceVerdict {
+        self.run_interruptible(workdir, cap, None).await
+    }
+
+    /// [`Self::run_with_timeout_cap`], ended early when `cancel` fires: the
+    /// command's whole process tree is killed and the verdict is unknown.
+    ///
+    /// Stop used to wait out a running check — up to its 600 s ceiling —
+    /// because nothing between the run's token and the check's child process
+    /// listened for it.
+    pub async fn run_interruptible(
+        &self,
+        workdir: &Path,
+        cap: Option<Duration>,
+        cancel: Option<&CancelToken>,
+    ) -> AcceptanceVerdict {
         let capped_timeout = |configured: Duration| -> (Duration, bool) {
             cap.map_or((configured, false), |cap| {
                 let floored = cap.max(Duration::from_secs(1));
@@ -443,7 +471,7 @@ impl AcceptanceCheck {
                 timeout_secs,
             } => {
                 let (timeout, capped) = capped_timeout(Self::effective_timeout(*timeout_secs));
-                run_command_check(command, workdir, timeout, capped).await
+                run_command_check(command, workdir, timeout, capped, cancel).await
             }
             Self::FileExists { path } => {
                 let resolved = resolve_in_workdir(workdir, path);
@@ -479,13 +507,16 @@ impl AcceptanceCheck {
                 } else if let Some(command) = command {
                     let (timeout, capped) =
                         capped_timeout(Self::effective_timeout(*timeout_secs));
-                    let output = run_shell(command, workdir, timeout).await;
+                    let output = run_shell(command, workdir, timeout, cancel).await;
                     match output {
                         Ok((_, combined)) => combined,
                         Err(ShellRunError::Timeout { secs }) => {
                             return AcceptanceVerdict::timeout(timeout_detail(
                                 command, secs, capped,
                             ));
+                        }
+                        Err(ShellRunError::Cancelled) => {
+                            return AcceptanceVerdict::interrupted(command);
                         }
                         Err(ShellRunError::Other(e)) => {
                             return AcceptanceVerdict::fail(format!("command failed: {e}"));
@@ -885,8 +916,9 @@ async fn run_command_check(
     workdir: &Path,
     timeout: Duration,
     capped: bool,
+    cancel: Option<&CancelToken>,
 ) -> AcceptanceVerdict {
-    match run_shell(command, workdir, timeout).await {
+    match run_shell(command, workdir, timeout, cancel).await {
         Ok((code, combined)) => {
             let passed = code == Some(0);
             let tail: String = combined
@@ -911,6 +943,7 @@ async fn run_command_check(
         Err(ShellRunError::Timeout { secs }) => {
             AcceptanceVerdict::timeout(timeout_detail(command, secs, capped))
         }
+        Err(ShellRunError::Cancelled) => AcceptanceVerdict::interrupted(command),
         Err(ShellRunError::Other(e)) => {
             AcceptanceVerdict::fail(format!("`{command}` failed to run: {e}"))
         }
@@ -924,6 +957,8 @@ async fn run_command_check(
 /// accounting downstream must never confuse the two.
 enum ShellRunError {
     Timeout { secs: u64 },
+    /// The run was stopped; the check's tree was killed.
+    Cancelled,
     Other(String),
 }
 
@@ -931,6 +966,7 @@ impl std::fmt::Display for ShellRunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Timeout { secs } => write!(f, "timed out after {secs}s"),
+            Self::Cancelled => write!(f, "interrupted by Stop"),
             Self::Other(message) => write!(f, "{message}"),
         }
     }
@@ -951,6 +987,7 @@ async fn run_shell(
     command: &str,
     workdir: &Path,
     timeout: Duration,
+    cancel: Option<&CancelToken>,
 ) -> Result<(Option<i32>, String), ShellRunError> {
     let mut cmd = shell_command(command);
     cmd.current_dir(workdir)
@@ -971,19 +1008,31 @@ async fn run_shell(
         // path a pgid to kill.
         cmd.process_group(0);
     }
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| ShellRunError::Other(e.to_string()))?;
-    // Capture the pid before the wait future consumes the child, so a timeout
+    // Capture the pid before the wait future borrows the child, so a timeout
     // can kill the whole tree rooted here (not just the shell).
     let pid = child.id();
     // Windows: contain the whole subtree in its own kill-on-close Job Object
     // (see exec_with_timeout in nanna-scripting bridge.rs for the full
     // rationale). Unix relies on the process group above.
     let mut job = nanna_proc::ChildJob::assign(&child);
-    let wait = child.wait_with_output();
+    // Read both pipes keeping at most the cap of each, draining the rest so
+    // the child never blocks on a full pipe. `wait_with_output` buffered
+    // everything first: a check spamming logs for its whole timeout (up to
+    // 600 s) could hold gigabytes before the cut below ran.
+    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    let wait = async {
+        let (stdout, stderr, status) = tokio::join!(
+            read_pipe_capped(stdout, ACCEPTANCE_READ_MAX_BYTES),
+            read_pipe_capped(stderr, ACCEPTANCE_READ_MAX_BYTES),
+            child.wait(),
+        );
+        status.map(|status| (status, stdout, stderr))
+    };
     tokio::pin!(wait);
-    let output = tokio::select! {
+    let (status, stdout, stderr) = tokio::select! {
         res = &mut wait => {
             let output = res.map_err(|e| ShellRunError::Other(e.to_string()))?;
             // Completed: spare deliberate background survivors (the
@@ -994,19 +1043,16 @@ async fn run_shell(
             output
         },
         () = tokio::time::sleep(timeout) => {
-            // Walk the live tree first, then terminate the job to sweep
-            // descendants the walk can't see (detached grandchildren).
-            if let Some(pid) = pid {
-                nanna_proc::kill_process_tree(pid).await;
-            }
-            if let Some(job) = job.take() {
-                job.terminate();
-            }
+            kill_check_tree(pid, job.take()).await;
             return Err(ShellRunError::Timeout { secs: timeout.as_secs() });
         }
+        () = until_cancelled(cancel) => {
+            kill_check_tree(pid, job.take()).await;
+            return Err(ShellRunError::Cancelled);
+        }
     };
-    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    let mut combined = String::from_utf8_lossy(&stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&stderr));
     if combined.len() > ACCEPTANCE_READ_MAX_BYTES {
         // Cut on a char boundary: String::truncate panics mid-char.
         let mut cut = ACCEPTANCE_READ_MAX_BYTES;
@@ -1015,7 +1061,50 @@ async fn run_shell(
         }
         combined.truncate(cut);
     }
-    Ok((output.status.code(), combined))
+    Ok((status.code(), combined))
+}
+
+/// Kill a check's whole tree: walk the live tree first, then terminate the
+/// job to sweep descendants the walk can't see (detached grandchildren).
+async fn kill_check_tree(pid: Option<u32>, job: Option<nanna_proc::ChildJob>) {
+    if let Some(pid) = pid {
+        nanna_proc::kill_process_tree(pid).await;
+    }
+    if let Some(job) = job {
+        job.terminate();
+    }
+}
+
+/// Resolves when `cancel` fires; never, without one.
+async fn until_cancelled(cancel: Option<&CancelToken>) {
+    match cancel {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Everything `pipe` yields, keeping at most `cap` bytes and discarding the
+/// rest (still read, so the writer is never blocked on a full pipe).
+async fn read_pipe_capped<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>, cap: usize) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let Some(mut pipe) = pipe else {
+        return Vec::new();
+    };
+    let mut kept = Vec::new();
+    // On the heap: two of these live in `run_shell`'s future, and a stack
+    // array made every future that awaits it 16 KiB larger.
+    let mut chunk = vec![0_u8; 8192];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let room = cap.saturating_sub(kept.len());
+                kept.extend_from_slice(&chunk[..read.min(room)]);
+            }
+        }
+    }
+    debug_assert!(kept.len() <= cap, "never more than the cap is kept");
+    kept
 }
 
 /// Locate Git-for-Windows `bash.exe`, cached. Mirrors the exec tool's routing
@@ -2263,7 +2352,7 @@ impl<'a> HarnessRun<'a> {
             // Re-hash BEFORE the run: the fingerprint has to
             // describe the inputs this run is about to read.
             let drift = self.evidence_guard.observe(&check, self.workdir);
-            let mut verdict = check.run_with_timeout_cap(self.workdir, hang_cap).await;
+            let mut verdict = check.run_interruptible(self.workdir, hang_cap, self.cancel.as_ref()).await;
             if let Some(sentence) = &drift {
                 verdict = verdict.with_evidence_drift(sentence);
             }
@@ -2336,7 +2425,7 @@ impl<'a> HarnessRun<'a> {
                 .contains(&check_identity(&check))
                 .then(|| self.longest_step.max(self.longest_decided_check));
             let drift = self.evidence_guard.observe(&check, self.workdir);
-            let mut verdict = check.run_with_timeout_cap(self.workdir, hang_cap).await;
+            let mut verdict = check.run_interruptible(self.workdir, hang_cap, self.cancel.as_ref()).await;
             if let Some(sentence) = &drift {
                 verdict = verdict.with_evidence_drift(sentence);
             }
@@ -2371,6 +2460,7 @@ impl<'a> HarnessRun<'a> {
                     .is_ok()
             {
                 self.reopened_once.insert(id);
+                self.forget_verified(id);
                 self.progress.remove(&id);
                 self.items_completed = self.items_completed.saturating_sub(1);
                 self.items_regressed_reopened += 1;
@@ -2502,7 +2592,7 @@ impl<'a> HarnessRun<'a> {
                 .contains(&check_identity(check))
                 .then(|| self.longest_step.max(self.longest_decided_check));
             let drift = self.evidence_guard.observe(check, self.workdir);
-            let mut verdict = check.run_with_timeout_cap(self.workdir, hang_cap).await;
+            let mut verdict = check.run_interruptible(self.workdir, hang_cap, self.cancel.as_ref()).await;
             if let Some(sentence) = &drift {
                 verdict = verdict.with_evidence_drift(sentence);
             }
@@ -2999,7 +3089,7 @@ impl<'a> HarnessRun<'a> {
         // the verdict, so a step that edited what the check reads
         // cannot close the item in the same breath.
         let drift = self.evidence_guard.observe(check, self.workdir);
-        let mut verdict = check.run_with_timeout_cap(self.workdir, hang_cap).await;
+        let mut verdict = check.run_interruptible(self.workdir, hang_cap, self.cancel.as_ref()).await;
         if let Some(sentence) = &drift {
             verdict = verdict.with_evidence_drift(sentence);
         }
@@ -3502,7 +3592,7 @@ impl<'a> HarnessRun<'a> {
                 .contains(&check_identity(&check))
                 .then(|| self.longest_step.max(self.longest_decided_check));
             let drift = self.evidence_guard.observe(&check, self.workdir);
-            let mut verdict = check.run_with_timeout_cap(self.workdir, hang_cap).await;
+            let mut verdict = check.run_interruptible(self.workdir, hang_cap, self.cancel.as_ref()).await;
             if let Some(sentence) = &drift {
                 verdict = verdict.with_evidence_drift(sentence);
             }
@@ -3569,6 +3659,25 @@ impl<'a> HarnessRun<'a> {
         }
     }
 
+    /// Drop item `id` from what the run calls verified, because its check
+    /// just failed again.
+    ///
+    /// `verified_outcomes` feeds the do-not-regress digest, which tells the
+    /// model that EDITS "#id … VERIFIED WORKING right now" — so a regressed
+    /// item left in it was asserted as working in the very prompt that sent the
+    /// model back to fix it, and a re-earned verdict was listed twice in the
+    /// report. `verified_this_run` feeds later sweeps; the item re-enters both
+    /// when its check passes again.
+    fn forget_verified(&mut self, id: i64) {
+        self.verified_outcomes.retain(|outcome| outcome.id != id);
+        self.verified_this_run
+            .retain(|(verified, _, _)| *verified != id);
+        debug_assert!(
+            self.verified_outcomes.iter().all(|o| o.id != id),
+            "a regressed item is no longer claimed verified"
+        );
+    }
+
     /// Mid-run: reopen verified items whose check fails again. Returns the
     /// regressions as `(id, title, detail)`.
     async fn recheck_verified_mid_run(
@@ -3587,7 +3696,7 @@ impl<'a> HarnessRun<'a> {
                 .contains(&check_identity(&check))
                 .then(|| self.longest_step.max(self.longest_decided_check));
             let drift = self.evidence_guard.observe(&check, self.workdir);
-            let mut verdict = check.run_with_timeout_cap(self.workdir, hang_cap).await;
+            let mut verdict = check.run_interruptible(self.workdir, hang_cap, self.cancel.as_ref()).await;
             if let Some(sentence) = &drift {
                 verdict = verdict.with_evidence_drift(sentence);
             }
@@ -3623,6 +3732,7 @@ impl<'a> HarnessRun<'a> {
                 .is_ok()
             {
                 self.reopened_once.insert(id);
+                self.forget_verified(id);
                 self.progress.remove(&id);
                 self.items_completed = self.items_completed.saturating_sub(1);
                 self.items_regressed_reopened += 1;
@@ -4500,6 +4610,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_pipe_is_drained_but_only_the_cap_is_kept() {
+        let source = vec![b'x'; 100_000];
+        let kept = read_pipe_capped(Some(source.as_slice()), 1024).await;
+        assert_eq!(kept.len(), 1024);
+        assert_eq!(read_pipe_capped::<&[u8]>(None, 1024).await.len(), 0);
+    }
+
+    #[tokio::test]
     async fn run_shell_timeout_errors_and_returns_promptly() {
         let dir = tempfile::tempdir().unwrap();
         // A sleeper that works under every shell run_shell can route to.
@@ -4509,7 +4627,7 @@ mod tests {
         let command = "sleep 30";
 
         let started = std::time::Instant::now();
-        let result = run_shell(command, dir.path(), Duration::from_secs(1)).await;
+        let result = run_shell(command, dir.path(), Duration::from_secs(1), None).await;
         let err = result.expect_err("a 30s sleeper must time out at 1s");
         assert!(err.to_string().contains("timed out"), "unexpected error: {err}");
         // Bound: 1s timeout + tree-kill (taskkill subprocess on Windows).
@@ -4543,7 +4661,7 @@ mod tests {
         let command =
             format!("ping -n 60 127.0.0.1 & cat /proc/$!/winpid > '{pid_path}'; exit 0");
 
-        let result = run_shell(&command, dir.path(), Duration::from_secs(2)).await;
+        let result = run_shell(&command, dir.path(), Duration::from_secs(2), None).await;
         let err = result.expect_err("held pipes must force the timeout");
         assert!(err.to_string().contains("timed out"), "unexpected error: {err}");
 
@@ -5859,6 +5977,11 @@ mod tests {
         );
         assert!(requests[2].prompt.contains("Disk is truth"));
         assert!(
+            !requests[2].prompt.contains("- #1 build artifact:"),
+            "the prompt that sends the model back to #1 must not call #1 verified: {}",
+            requests[2].prompt
+        );
+        assert!(
             !requests[3].prompt.contains("un-did verified work"),
             "the notice is one-shot"
         );
@@ -5893,6 +6016,16 @@ mod tests {
         assert_eq!(report.items_regressed_reopened, 1, "{report:?}");
         assert_eq!(report.items_completed, 2);
         assert_eq!(report.steps_taken, 4);
+        assert_eq!(
+            report
+                .verified_outcomes
+                .iter()
+                .filter(|o| o.id == 1)
+                .count(),
+            1,
+            "a re-earned verdict is listed once: {:?}",
+            report.verified_outcomes
+        );
         assert_mid_run_regression_caught(&source, &runner).await;
     }
 
@@ -7231,6 +7364,34 @@ TASK COMPLETE"))]);
             "must die of script exhaustion, never of fruitlessness: {reasons:?}"
         );
         drop(reasons);
+    }
+
+    /// Stop interrupts a check already running: the check's tree is killed
+    /// and the verdict is unknown, not a failure. It used to run on to its
+    /// timeout (up to 600 s) after the run was stopped.
+    #[tokio::test]
+    async fn stop_interrupts_a_running_check() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let hang = "ping -n 60 127.0.0.1";
+        #[cfg(not(windows))]
+        let hang = "sleep 60";
+        let check = AcceptanceCheck::Command {
+            command: hang.to_string(),
+            timeout_secs: Some(60),
+        };
+        let cancel = CancelToken::new();
+        let stopper = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stopper.cancel();
+        });
+        let started = std::time::Instant::now();
+        let verdict = check.run_interruptible(dir.path(), None, Some(&cancel)).await;
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+        assert!(verdict.is_unknown(), "{verdict:?}");
+        assert!(!verdict.passed);
+        assert!(verdict.detail.contains("interrupted by Stop"), "{}", verdict.detail);
     }
 
     /// Once a check has consumed its ENTIRE ceiling without answering,

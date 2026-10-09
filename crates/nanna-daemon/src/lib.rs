@@ -25,6 +25,11 @@
 // reads it, so the control plane and `DreamingService` share **one** clock
 // instead of each keeping a private notion of "last activity". Re-exported
 // below because the daemon is where it is stamped.
+#[cfg(target_os = "linux")]
+pub mod appimage;
+pub mod board_router;
+pub mod board_router_trigger;
+pub mod card_run_trigger;
 pub mod agent_service;
 pub mod channels;
 pub mod control;
@@ -34,6 +39,7 @@ pub mod embedding_router;
 pub mod exit_reason;
 pub mod export;
 pub mod health;
+pub mod heap;
 pub mod liveness;
 pub mod ipc;
 #[cfg(windows)]
@@ -47,6 +53,7 @@ pub use nanna_core::log_buffer;
 pub mod log_file;
 pub mod memory_adapter;
 pub mod memory_persistence;
+pub mod memory_write_through;
 mod numeric;
 pub mod persistence;
 pub mod protocol;

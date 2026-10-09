@@ -10,11 +10,39 @@ name: Dependency audit
 #   of the 16 is fixable from this tree (they sit under rustpython, turso's
 #   exact pin, and the Tauri/GTK stack). Failing on them would make the job
 #   permanently red and therefore ignored. They stay visible in the log.
-# - npm: an advisory of `high` or `critical` severity in the GUI's production
-#   dependencies. On 2026-09-21 the only findings were 4 low/moderate
-#   DOMPurify advisories, all inside `monaco-editor`'s *vendored* copy
-#   (esm/vs/base/browser/dompurify/) — a pnpm override would silence the
-#   audit without changing any code that runs, so there is none.
+# - npm: an advisory of `moderate` severity or worse in the GUI's production
+#   dependencies. Until 2026-09-26 the bar was `high`, because the only
+#   findings were 4 low/moderate DOMPurify advisories inside `monaco-editor`'s
+#   *vendored* copy (esm/vs/base/browser/dompurify/), which no pnpm override
+#   could reach. `monaco-editor 0.57.0` vendors DOMPurify 3.4.15 and the audit
+#   is clean at every level, so the exemption that justified `high` is gone.
+# - One advisory is exempted by id, in gui/package.json `pnpm.auditConfig.
+#   ignoreGhsas`, and only because no fix exists: GHSA-86w9-cpqp-85rv (high,
+#   node-forge <=1.4.0 RSA PKCS#1 v1.5 signature verification). node-forge
+#   1.4.0 is its latest release and the advisory lists no patched version. It
+#   arrives through nuxt -> listhen, the *dev server's* self-signed-cert helper;
+#   the shipped app is Nuxt's static output inside Tauri, which runs no listhen
+#   and verifies no RSA signatures with node-forge. Drop the entry the day
+#   node-forge publishes a fix (ROADMAP P0.3).
+# - A second, for the same reason (no fix exists), added 2026-10-03:
+#   GHSA-vfj7-8cjw-p6xm (high, braces <=3.0.3, stack-exhaustion DoS on deeply
+#   nested brace patterns). braces 3.0.3 is its latest release and the
+#   advisory's patched range is empty. It arrives only through nuxt ->
+#   @nuxt/nitro-server -> nitropack -> globby -> micromatch, i.e. Nitro's
+#   build-time file globbing over our own source tree; the static output the
+#   app ships contains no braces code (checked: the word appears in the
+#   bundle only inside Monaco/TypeScript message strings). Drop the entry when
+#   braces or micromatch ships a fix.
+# - Four more, added 2026-10-08, for a different reason (a fix exists but
+#   cannot be taken): GHSA-v5rq-49vh-5v5c, GHSA-x6jw-m9v5-85vh (critical) and
+#   GHSA-g4wm-2vf7-vfgr, GHSA-858h-whjf-mvg5 (high), all simple-git <4.0.1
+#   letting attacker-controlled git options or env reach `git`. simple-git
+#   arrives only through nuxt -> @nuxt/devtools 3.4.2 (`simple-git ^3.36.0`),
+#   which calls `branch()`, `revparse(['--short','HEAD'])` and `status()` with
+#   fixed arguments on our own rootDir to name a build analysis; devtools is
+#   off in production builds. The fix (4.x) drops the default export devtools
+#   imports, so a pnpm override breaks `nuxt dev` at module link time
+#   (verified). Drop the entries when @nuxt/devtools ships on simple-git 4.
 #
 # Triggered by the files that can change the answer, plus weekly: an advisory
 # can be published against a lockfile nobody touched.
@@ -63,4 +91,4 @@ jobs:
         with:
           version: 9
       # Reads pnpm-lock.yaml only — verified to need no install.
-      - run: pnpm audit --prod --audit-level=high
+      - run: pnpm audit --prod --audit-level=moderate

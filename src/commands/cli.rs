@@ -215,7 +215,7 @@ pub async fn run_cli(
 
     // Load session history if resuming
     if is_resume
-        && let Ok(messages) = storage.messages().get_by_session(&session_id, 50).await {
+        && let Ok(messages) = storage.messages().get_recent_by_session(&session_id, 50).await {
             let msg_count = messages.len();
             for msg in messages {
                 match msg.role.as_str() {
@@ -249,7 +249,13 @@ async fn run_cli_loop(
         stdout.flush()?;
 
         let mut input = String::new();
-        stdin.lock().read_line(&mut input)?;
+        // End of input (Ctrl-D, or a pipe that ran dry) reads 0 bytes; it
+        // used to be an empty line, so the loop re-prompted forever at full
+        // CPU.
+        if stdin.lock().read_line(&mut input)? == 0 {
+            println!();
+            break;
+        }
         let input = input.trim();
 
         if input.is_empty() {
@@ -382,15 +388,7 @@ Be concise and direct.",
 /// List recent sessions
 pub async fn list_sessions(config: &Config, limit: i64) -> anyhow::Result<()> {
     // Initialize storage only (no LLM needed)
-    let storage_path = config
-        .memory
-        .storage_path
-        .clone()
-        .unwrap_or_else(|| {
-            Config::default_data_dir()
-                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
-                .join("nanna.db")
-        });
+    let storage_path = crate::setup::cli_storage_path(config);
 
     let storage_config = StorageConfig {
         path: storage_path.to_string_lossy().to_string(),

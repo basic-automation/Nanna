@@ -2,7 +2,7 @@
 
 use crate::backend::Backend;
 use crate::state::AppState;
-use nanna_core::{discover_workspaces, find_workspace_root, Workspace, WorkspaceRegistry};
+use nanna_core::{Workspace, WorkspaceRegistry};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::State;
@@ -64,18 +64,11 @@ impl From<&Workspace> for WorkspaceInfo {
     }
 }
 
-/// The workspace-registry cache, cloned out of the shared state.
-///
+/// The daemon handle and the workspace-registry cache, cloned out of the
+/// shared state together (see [`backend_handle`](crate::state::backend_handle)).
 /// [`AppState::workspaces`] is set once and never replaced, so the state lock
 /// is released before the registry is touched; the registry's own lock does
 /// the serializing.
-async fn registry_handle(state: &RwLock<AppState>) -> Arc<RwLock<WorkspaceRegistry>> {
-    Arc::clone(&state.read().await.workspaces)
-}
-
-/// The daemon handle and the workspace-registry cache, cloned out of the
-/// shared state together (see [`backend_handle`](crate::state::backend_handle)
-/// and [`registry_handle`]).
 async fn backend_and_registry(
     state: &RwLock<AppState>,
 ) -> (Arc<Backend>, Arc<RwLock<WorkspaceRegistry>>) {
@@ -213,26 +206,30 @@ pub async fn open_workspace(
 ///
 /// # Errors
 ///
-/// Returns `Workspace not found: …` when `id` is not in the cached registry. A
-/// failure to tell the daemon is only logged.
+/// Returns `Workspace not found: …` when `id` is not in the cached registry,
+/// or the daemon's own message when it refused the activation. A daemon that
+/// cannot be reached is only logged.
 #[tauri::command]
 pub async fn set_active_workspace(
     state: State<'_, Arc<RwLock<AppState>>>,
     id: String,
 ) -> Result<(), String> {
     let (backend, workspaces) = backend_and_registry(&state).await;
-    let activated = workspaces.write().await.set_active(&id);
-
-    if activated {
-        info!("Activated workspace: {}", id);
-        // Notify the daemon so it updates its registry and tool working directory.
-        if let Err(e) = backend.workspace_set_active(&id).await {
-            warn!("Failed to notify daemon of workspace activation: {}", e);
-        }
-        Ok(())
-    } else {
-        Err(format!("Workspace not found: {id}"))
+    if workspaces.read().await.get(&id).is_none() {
+        return Err(format!("Workspace not found: {id}"));
     }
+    // The daemon decides — it owns the tool working directory. A refusal (a
+    // workspace another client closed) used to be ignored, and the GUI showed
+    // it Active while the daemon's cwd never moved. An unreachable daemon is
+    // still only logged: the local view is all there is then.
+    match backend.workspace_set_active(&id).await {
+        Ok(reply) => super::daemon_refusal(&reply, "Could not activate the workspace")?,
+        Err(e) => warn!("Failed to notify daemon of workspace activation: {}", e),
+    }
+    let activated = workspaces.write().await.set_active(&id);
+    debug_assert!(activated, "the workspace was found above");
+    info!("Activated workspace: {}", id);
+    Ok(())
 }
 
 /// Clear active workspace (go back to global)
@@ -252,42 +249,6 @@ pub async fn clear_active_workspace(
         warn!("Failed to notify daemon of workspace deactivation: {}", e);
     }
     Ok(())
-}
-
-/// Get active workspace info
-///
-/// # Errors
-///
-/// Never returns `Err`; the `Result` is what Tauri requires of an async command
-/// that borrows `State`.
-#[tauri::command]
-pub async fn get_active_workspace(
-    state: State<'_, Arc<RwLock<AppState>>>,
-) -> Result<Option<WorkspaceInfo>, String> {
-    let workspaces = registry_handle(&state).await;
-    let registry = workspaces.read().await;
-    Ok(registry.active().map(WorkspaceInfo::from))
-}
-
-/// Get workspace context (for system prompt injection)
-///
-/// # Errors
-///
-/// Returns `Workspace not found: …` when `id` is not in the cached registry.
-#[tauri::command]
-pub async fn get_workspace_context(
-    state: State<'_, Arc<RwLock<AppState>>>,
-    id: String,
-) -> Result<String, String> {
-    // Served from the local registry cache (hydrated from the daemon at startup
-    // and kept current on reload).
-    let workspaces = registry_handle(&state).await;
-    let registry = workspaces.read().await;
-
-    registry
-        .get(&id)
-        .map(|ws| ws.context.build_system_prompt_injection())
-        .ok_or_else(|| format!("Workspace not found: {id}"))
 }
 
 /// Reload workspace context from disk
@@ -347,77 +308,6 @@ pub async fn close_workspace(
     workspaces.write().await.remove(&id);
     info!("Closed workspace: {}", id);
     Ok(())
-}
-
-/// Discover workspaces in a directory
-///
-/// # Errors
-///
-/// Never returns `Err`: an unreadable path discovers nothing.
-#[tauri::command]
-pub async fn discover_workspaces_in_path(
-    path: String,
-) -> Result<Vec<String>, String> {
-    let paths = discover_workspaces(&path).await;
-    Ok(paths.iter().map(|p| p.to_string_lossy().to_string()).collect())
-}
-
-/// Find workspace root from a path (walks up)
-///
-/// # Errors
-///
-/// Never returns `Err`: a path with no workspace root above it is `Ok(None)`.
-#[tauri::command]
-pub async fn find_workspace_root_from_path(
-    path: String,
-) -> Result<Option<String>, String> {
-    let root = find_workspace_root(&path).await;
-    Ok(root.map(|p| p.to_string_lossy().to_string()))
-}
-
-/// Save content to a workspace file
-///
-/// # Errors
-///
-/// Returns `Workspace not found: …` when `workspace_id` is not in the cached
-/// registry, and `Failed to save file: …` when the file cannot be written
-/// (including a name that is not a standard context file). A failure to tell
-/// the daemon is only logged.
-#[tauri::command]
-pub async fn save_workspace_file(
-    state: State<'_, Arc<RwLock<AppState>>>,
-    workspace_id: String,
-    filename: String,
-    content: String,
-) -> Result<(), String> {
-    let (backend, workspaces) = backend_and_registry(&state).await;
-
-    // Write to disk (standard project files at workspace root), then notify the daemon
-    // so its context copy refreshes. The registry stays read-locked while the
-    // file is written, so the workspace cannot leave the cache mid-write.
-    save_cached_context_file(&*workspaces.read().await, &workspace_id, &filename, &content).await?;
-    if let Err(e) = backend
-        .workspace_update_context(&workspace_id, &filename, &content)
-        .await
-    {
-        warn!("Failed to notify daemon of workspace file update: {}", e);
-    }
-
-    Ok(())
-}
-
-
-/// Write one context file into a cached workspace's root.
-async fn save_cached_context_file(
-    registry: &WorkspaceRegistry,
-    workspace_id: &str,
-    filename: &str,
-    content: &str,
-) -> Result<(), String> {
-    let ws = registry.get(workspace_id)
-        .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?;
-    ws.save_context_file(filename, content).await
-        .map_err(|e| format!("Failed to save file: {e}"))
 }
 
 /// Initialize a minimal workspace at path (root AGENTS.md + optional ROADMAP.md).
@@ -487,39 +377,6 @@ pub async fn init_workspace(
     let info = WorkspaceInfo::from(&workspace);
     workspaces.write().await.register(workspace);
     Ok(info)
-}
-
-/// Read a standard context file from the workspace root
-///
-/// # Errors
-///
-/// Fails with the validator's message when `filename` is not a standard context
-/// file, with `Workspace not found: …` when `workspace_id` is not in the cached
-/// registry, and with `Failed to read …` when the file exists but cannot be
-/// read. A missing file is `Ok(None)`.
-#[tauri::command]
-pub async fn read_workspace_file(
-    state: State<'_, Arc<RwLock<AppState>>>,
-    workspace_id: String,
-    filename: String,
-) -> Result<Option<String>, String> {
-    nanna_core::validate_context_filename(&filename)
-        .map_err(|e| e.to_string())?;
-
-    // Only the path is needed from the cache; the file is read unlocked.
-    let file_path = registry_handle(&state)
-        .await
-        .read()
-        .await
-        .get(&workspace_id)
-        .map(|ws| ws.path.join(&filename))
-        .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?;
-
-    match tokio::fs::read_to_string(&file_path).await {
-        Ok(content) => Ok(Some(content)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("Failed to read {filename}: {e}")),
-    }
 }
 
 /// Check if a path looks like a valid workspace (standard project signals)

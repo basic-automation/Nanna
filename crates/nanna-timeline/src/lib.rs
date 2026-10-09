@@ -25,6 +25,9 @@
 
 use nanna_storage::{MemoryEventRow, NewMemoryEvent, Storage, StorageError};
 
+pub mod compress;
+pub use compress::{CompressedEpisode, DREAM_FOLD_BUDGET, compress_episode};
+
 /// Largest content an episode stores, in characters.
 ///
 /// An episode is a record that something happened, not the artifact it
@@ -107,7 +110,7 @@ pub enum TimelineError {
 }
 
 /// One episode to append.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Episode {
     pub kind: EventKind,
     /// Unix milliseconds. Supplied by the caller rather than taken from the

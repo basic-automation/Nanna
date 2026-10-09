@@ -29,8 +29,12 @@ offline, fixed-seed — these are exact, reproducible values, not timing samples
 | w20 aged-recall (FSRS-6 `0.0658`) | **6/6 topics** | `retention::tests::w20_experiment_aged_recall` | 800-day-aged corpus, FSRS-gated recall |
 | w20 aged-recall (FSRS-5 `0.5`, the old default) | **0/6 topics** | same test | evidence the shipped constant was wrong; default flipped 2026-07-17 |
 
+| Timeline fold compression (P25 DSP step 2) | **0.76** (24 of 100 events kept) | `nanna_timeline::compress::tests::budget_gate_timeline_fold` | *(2026-09-26)* fixed-seed `SplitMix64` card series at `DREAM_FOLD_BUDGET` (24); model-free, so exact |
+| Timeline fold transition retention | **1.0** (10/10 outcomes kept) | same test | a transition is never decimated while the budget can hold it |
+
 Budget: consolidation must not regress **recall retention below 1.0** on this fixed corpus,
-and must hold **compression ≥ 0.90**. The w20 rows are a correctness fixture (they assert the
+and must hold **compression ≥ 0.90**. The timeline fold must hold **compression ≥ 0.75** and
+**keep every transition** on its corpus. The w20 rows are a correctness fixture (they assert the
 FSRS-6 exponent strictly out-recalls the old FSRS-5 one on aged memories), not a tunable budget.
 
 ### Summarization drift (content fidelity, not recall)
@@ -794,6 +798,25 @@ residency the comparison is about; quiet host, 20 samples, criterion mean with i
 | `ram_scan` *(shipped)* | **39.85 µs** [39.69, 40.00] | **1.441 ms** [1.411, 1.483] | **10.89 ms** [10.84, 10.94] |
 | `ram_scan_prior_code` *(control B)* | 46.12 µs [45.90, 46.30] | 1.767 ms [1.670, 1.857] | 11.53 ms [11.48, 11.58] |
 | `ram_scan_sort_same_cmp` *(control A)* | 50.06 µs [49.68, 50.40] | 1.908 ms [1.891, 1.925] | 14.09 ms [13.83, 14.27] |
+
+**2026-10-04 — the allocator moves these rows, and the old ones were measured under mimalloc.**
+Every row above ran with turso's C `mimalloc` as the process's `#[global_allocator]` (a default
+nobody chose). With it switched off (`nanna-storage/Cargo.toml` states the decision), same tree
+and toolchain (nightly-2026-10-02), quiet host, both orders run — mimalloc → system and system →
+mimalloc — with matching numbers:
+
+| Arm (N=50,000) | mimalloc | system allocator |
+| --- | --- | --- |
+| `ram_scan` *(shipped)* | 11.58 ms / 11.20 ms | **4.93 ms / 4.67 ms** |
+| `ram_scan_prior_code` | 11.99 ms | 5.52 ms |
+| `sql_knn` | 80.34 ms | 79.28 ms |
+| `bulk_load` | **119.4 ms / 121.3 ms** | 181.1 ms / 180.7 ms |
+
+At 10k: `ram_scan` 1.566 → 0.724 ms, `bulk_load` 23.0 → 36.6 ms. The per-query scan (every
+recall, every ingest) is ~2.4× faster; the once-per-boot load is ~1.5× slower. Cause not
+isolated (no `perf` on this host; no mimalloc runtime option — purge delay, THP, eager commit,
+large OS pages — moved the scan). **Baseline for `ram_scan` at 50k is now ~4.8 ms**; its budget
+(through Suite 2's `simd_batch` ceilings) is unchanged.
 | `bulk_load` *(one-time)* | 1.203 ms [1.197, 1.207] | 26.32 ms [26.06, 26.72] | 141.6 ms [140.8, 142.5] |
 
 #### Finding 1 — keep the in-RAM scan as the live recall path. Do not wire SQL k-NN into it.
@@ -892,6 +915,55 @@ says what the number *is*, and a budget wants at least a second machine and a se
 before it starts failing anyone's CI.
 
 Machine-readable rows land under `suite = "guardrails"`.
+
+### 2026-10-05: RSS of a long-lived daemon under a light IPC load
+
+The idle figure above is a fresh store. A real store, used, is a different number. The release
+daemon ran isolated (`--data-dir` on a copy of the operator's store: 3 730 memories and a 105 MB
+`nanna.db`; heartbeat off; no model) and was sampled once a minute. Idle for 19 min, it held flat
+at **142.5 MB**. Then every 2 min a stdlib-Python WebSocket client sent `memory.list` (a 14.4 MB
+reply), a keyword `memory.search` and `memory.stats`. Four daemons ran side by side on that load
+(RSS in kB):
+
+| build | after 1 cycle | after 9 cycles | later |
+| --- | --- | --- | --- |
+| before (master) | 217 172 | ~425 700 | 608 388 after ~40, still climbing |
+| before + `MALLOC_ARENA_MAX=2` | 235 752 | ~351 700 | 366 204 after ~25 |
+| `list_all`/`stats` project instead of cloning vectors | 194 336 | ~300 000 | 377 056 after ~25, climbing |
+| + `malloc_trim(0)` after a reply of ≥ 1 MiB (≤ 1 per 10 s) | 145 300 | **~177 700** | ~213 000 after ~15 (one 267 000 peak), still drifting slowly |
+
+Each trim took 4.4–4.7 ms. RSS moves in steps, not a steady leak: it holds between the large
+replies and rises only at them. The trim returns most of each reply's transient heap, but not all
+of it: the trimmed daemon still drifts up slowly, at about a third of the untrimmed rate. At ~15
+cycles the four builds stood at ~439 / ~352 / ~306 / ~213 MB. Not covered: a day of real use on
+the operator's machine.
+
+### 2026-10-08: `memory.list` serialized from typed rows
+
+`memory.list` used to build its reply as a `serde_json::Value` tree, deep-copy that tree into the
+`Response` (`Response::success` ran `to_value` on a `Value`), then write the string. It now writes
+typed rows into one buffer reserved at an estimate of the final size and splices that into a frame
+allocated once at its exact size. The reply text is unchanged: same keys in the same order, floats
+widened to f64 as before.
+
+Release daemons A (before) and B (after), same tree otherwise, run one after the other with the
+harness above (isolated HOME/config/data dir, heartbeat off, no model). The operator's store has
+shrunk to 561 memories (a 0.64 MB reply, below the 1 MiB trim line), so the large case is a copy of
+it inflated to **3 927 memories** by duplicating rows with padded content (**15.8 MB reply**). One
+`memory.list` every 11.5 s, 8 calls; latency is send-to-full-reply at the client, RSS is read 1.5 s
+after the reply.
+
+| store | build | latency, calls 1–7 (mean) | RSS after call 7 | VmHWM after call 7 |
+| --- | --- | --- | --- | --- |
+| 561 memories | A | 5.1–8.2 ms | 76.1 MB | 76.1 MB |
+| 561 memories | B | 4.1–6.9 ms | 70.3 MB | 70.8 MB |
+| 3 927 memories | A | 63–92 ms (**78.8**) | 166.8 MB | 185.2 MB |
+| 3 927 memories | B | 59–78 ms (**66.7**) | 159.3 MB | 191.9 MB |
+
+About 15% less time per large reply. RSS and peak are **not** improved beyond noise: a second run
+of A on the same load ended at 127 MB, the first at 167 MB. A first version of B that grew two
+16 MB strings by doubling was clearly worse (RSS 107 → 204 MB over 8 calls, VmHWM 236 MB) and was
+not shipped; reserving the buffers up front is what removed that.
 
 ---
 

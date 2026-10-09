@@ -170,7 +170,14 @@ pub enum LlmError {
     Stream(String),
     #[error("Missing API key for provider: {0}")]
     MissingApiKey(String),
-    #[error("Rate limit exceeded: {message}")]
+    /// The display carries `retry_after` as `(retry-after: N)`: the chat path
+    /// and the card cooldown read the wait back from the rendered text, and
+    /// without it a header-published wait reached neither (only the dream
+    /// summarizer read the field).
+    #[error(
+        "Rate limit exceeded{}: {message}",
+        .retry_after.map_or_else(String::new, |secs| format!(" (retry-after: {secs})"))
+    )]
     RateLimit {
         message: String,
         /// Seconds until rate limit resets (if available)
@@ -906,6 +913,29 @@ impl LlmError {
         }
     }
 
+    /// [`Self::from_api_response`] for a failed HTTP response, with the wait
+    /// the response's headers name when the body names none.
+    ///
+    /// A 429's headers are where most providers say when to come back —
+    /// Anthropic's `retry-after`, `OpenAI`'s `x-ratelimit-reset-*` — and the
+    /// error used to be built from the body alone, so every one of them was
+    /// dropped and the caller backed off on a guess.
+    pub async fn from_response(response: reqwest::Response) -> Self {
+        let status = response.status().as_u16();
+        let header_wait = retry_after_from_headers(response.headers());
+        let message = response.text().await.unwrap_or_default();
+        match Self::from_api_response(status, message) {
+            Self::RateLimit {
+                message,
+                retry_after,
+            } => Self::RateLimit {
+                message,
+                retry_after: retry_after.or(header_wait),
+            },
+            other => other,
+        }
+    }
+
     /// Parse an API error response to extract rate limit info
     #[must_use]
     pub fn from_api_response(status: u16, message: String) -> Self {
@@ -933,8 +963,10 @@ impl LlmError {
     /// into "wait exactly as long as they asked".
     ///
     /// Returns `None` when nothing usable is present, which keeps the caller's
-    /// own backoff as the fallback.
-    fn parse_retry_after(message: &str) -> Option<u64> {
+    /// own backoff as the fallback. Public so a caller holding only the
+    /// rendered error text (a step runner's error string) reads the same wait.
+    #[must_use]
+    pub fn parse_retry_after(message: &str) -> Option<u64> {
         /// A reset further out than this is a misread, not a real wait.
         const MAX_PLAUSIBLE_WAIT_SECS: u64 = 3_600;
 
@@ -1097,8 +1129,13 @@ impl PaceState {
         if let Some(remaining) = remaining {
             self.remaining = Some(remaining);
         }
-        if let Some(reset_in) = reset_in {
-            self.reset_at = Some(tokio::time::Instant::now() + reset_in);
+        // `checked_add`: the header is the provider's, and `Instant + Duration`
+        // panics past what an `Instant` can hold. A reset that far out is no
+        // usable window; keep the last one.
+        if let Some(reset_at) =
+            reset_in.and_then(|delay| tokio::time::Instant::now().checked_add(delay))
+        {
+            self.reset_at = Some(reset_at);
         }
     }
 }
@@ -3546,9 +3583,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         };
 
         if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(LlmError::from_api_response(status, message));
+            return Err(LlmError::from_response(response).await);
         }
 
         let mut result: AnthropicResponse = response.json().await?;
@@ -3605,9 +3640,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
 
         learn_rate_limit_headers(self.provider, response.headers());
         if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(LlmError::from_api_response(status, message));
+            return Err(LlmError::from_response(response).await);
         }
 
         let result: serde_json::Value = response.json().await?;
@@ -3627,7 +3660,10 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     }
 
     /// Convert `AnthropicRequest` → Ollama /api/chat and execute
-    async fn complete_anthropic_via_ollama(&self, request: &AnthropicRequest) -> Result<AnthropicResponse, LlmError> {
+    async fn complete_anthropic_via_ollama(
+        &self,
+        request: &AnthropicRequest,
+    ) -> Result<AnthropicResponse, LlmError> {
         pace_provider_requests(self.provider).await;
         let (messages_json, tools_json) = anthropic_to_ollama_request(request);
 
@@ -3719,11 +3755,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         // Enable thinking separation for models that support it (qwen3, deepseek-r1, etc.)
         // This makes Ollama return thinking in a separate `thinking` field instead of
         // embedding <think>...</think> tags inside `content`.
-        let model_lower = request.model.to_lowercase();
-        if model_lower.contains("qwen3")
-            || model_lower.contains("deepseek-r1")
-            || model_lower.contains("qwq")
-        {
+        if ollama_separates_thinking(&request.model) {
             body["think"] = serde_json::json!(true);
         }
 
@@ -3743,9 +3775,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             .await?;
 
         if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(LlmError::from_api_response(status, message));
+            return Err(LlmError::from_response(response).await);
         }
 
         let result: serde_json::Value = response.json().await?;
@@ -3972,16 +4002,6 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             num_ctx: Option<u32>,
         }
 
-        #[derive(Deserialize)]
-        struct OllamaResponse {
-            message: OllamaResponseMessage,
-        }
-
-        #[derive(Deserialize)]
-        struct OllamaResponseMessage {
-            content: String,
-        }
-
         pace_provider_requests(self.provider).await;
 
         let messages: Vec<OllamaMessage> = request
@@ -4032,14 +4052,37 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             .await?;
 
         if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(LlmError::from_api_response(status, message));
+            return Err(LlmError::from_response(response).await);
         }
 
-        let result: OllamaResponse = response.json().await?;
-        Ok(result.message.content)
+        let result: serde_json::Value = response.json().await?;
+        ollama_completion_text(&result)
     }
+}
+
+/// The text of a non-streaming Ollama `/api/chat` completion, held to what
+/// [`ollama_response_to_anthropic`] holds the agent's own path to.
+///
+/// `done: false` is an aborted generation, not a short answer, and inline
+/// `<think>…</think>` is reasoning, not reply. This path — dream summaries,
+/// context compression, multi-agent decomposition — used to take `content`
+/// as-is, so an abort became an empty or truncated "summary" and a reasoning
+/// model's think block was stored as memory text.
+fn ollama_completion_text(response: &serde_json::Value) -> Result<String, LlmError> {
+    if response.get("done").and_then(serde_json::Value::as_bool) == Some(false) {
+        return Err(LlmError::from_api_response(
+            502,
+            "Ollama aborted generation mid-response (done=false)".to_string(),
+        ));
+    }
+    let content = response["message"]["content"].as_str().ok_or_else(|| {
+        LlmError::Json("ollama completion: no message.content in the response".to_string())
+    })?;
+    Ok(if content.contains("<think>") {
+        strip_think_tags(content)
+    } else {
+        content.to_string()
+    })
 }
 
 // ============================================================================
@@ -4721,9 +4764,7 @@ impl EmbeddingClient {
             .await?;
 
         if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(LlmError::from_api_response(status, message));
+            return Err(LlmError::from_response(response).await);
         }
 
         // Heal malformed embedding JSON bodies (some proxies/wrappers garble arrays).
@@ -4792,6 +4833,12 @@ impl EmbeddingClient {
                     && !emb.is_empty() {
                         return Ok(emb);
                     }
+        } else {
+            let status = response.status().as_u16();
+            let message = response.text().await.unwrap_or_default();
+            if !legacy_embed_may_answer(status, &message) {
+                return Err(LlmError::from_api_response(status, message));
+            }
         }
 
         // Fall back to legacy API: POST /api/embeddings { model, prompt }
@@ -4806,9 +4853,7 @@ impl EmbeddingClient {
             .await?;
 
         if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(LlmError::from_api_response(status, message));
+            return Err(LlmError::from_response(response).await);
         }
 
         let raw = response.text().await?;
@@ -4821,6 +4866,14 @@ impl EmbeddingClient {
                     .map_err(|e2| LlmError::Json(format!("ollama embedding after heal: {e2}")))?
             }
         };
+        // `embedding` defaults to empty when absent: an empty vector is no
+        // embedding, and storing it would poison every similarity it meets.
+        if result.embedding.is_empty() {
+            return Err(LlmError::Api {
+                status: 502,
+                message: format!("ollama returned no embedding for model {}", self.model),
+            });
+        }
         Ok(result.embedding)
     }
 
@@ -5205,7 +5258,29 @@ struct UsageDelta {
 
 #[derive(Debug, Deserialize)]
 struct ErrorData {
+    /// Anthropic's error type (`overloaded_error`, `rate_limit_error`, …). An
+    /// SSE `error` event carries no HTTP status, so this is the only thing
+    /// that says whether another model is worth trying.
+    #[serde(rename = "type", default)]
+    error_type: String,
     message: String,
+}
+
+/// The HTTP status Anthropic uses for each documented error type, so an error
+/// that arrives inside a 200 stream is judged by the same
+/// [`LlmError::should_fallback`] rule as one that arrives as a status.
+/// Unknown types map to 500, the status of `api_error`.
+fn anthropic_error_status(error_type: &str) -> u16 {
+    match error_type {
+        "invalid_request_error" => 400,
+        "authentication_error" => 401,
+        "permission_error" => 403,
+        "not_found_error" => 404,
+        "request_too_large" => 413,
+        "rate_limit_error" => 429,
+        "overloaded_error" => 529,
+        _ => 500,
+    }
 }
 
 impl LlmClient {
@@ -5313,9 +5388,7 @@ impl LlmClient {
             }
 
             if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let message = response.text().await.unwrap_or_default();
-                yield Err(LlmError::from_api_response(status, message));
+                yield Err(LlmError::from_response(response).await);
                 return;
             }
 
@@ -5384,6 +5457,9 @@ impl LlmClient {
                 "messages": messages_json,
                 "max_tokens": request.max_tokens,
                 "stream": true,
+                // Without it a streamed turn carries no usage at all, and
+                // recorded 0/0 tokens (see `OpenAiStreamState::on_usage`).
+                "stream_options": { "include_usage": true },
             });
             if let Some(temp) = request.temperature {
                 body["temperature"] = serde_json::json!(temp);
@@ -5409,9 +5485,7 @@ impl LlmClient {
             learn_rate_limit_headers(provider, response.headers());
 
             if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let message = response.text().await.unwrap_or_default();
-                yield Err(LlmError::from_api_response(status, message));
+                yield Err(LlmError::from_response(response).await);
                 return;
             }
 
@@ -5442,7 +5516,13 @@ impl LlmClient {
                     let line = buffer[..line_end].trim().to_string();
                     buffer = buffer[line_end + 1..].to_string();
 
-                    let (events, finished) = state.on_line::<OpenAiChunkDelta>(&line);
+                    let (events, finished) = match state.on_line::<OpenAiChunkDelta>(&line) {
+                        Ok(translated) => translated,
+                        Err(e) => {
+                            yield Err(e);
+                            return;
+                        }
+                    };
                     for event in events {
                         yield Ok(event);
                     }
@@ -5452,11 +5532,10 @@ impl LlmClient {
                 }
             }
 
-            // Emit close events if stream ended without finish_reason
-            for event in state.close_blocks() {
-                yield Ok(event);
+            // The body closed without `[DONE]` or a `finish_reason`.
+            for item in state.finish_unterminated::<OpenAiChunkDelta>(&buffer) {
+                yield item;
             }
-            yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
         }
     }
 
@@ -5499,9 +5578,7 @@ impl LlmClient {
             };
 
             if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let message = response.text().await.unwrap_or_default();
-                yield Err(LlmError::from_api_response(status, message));
+                yield Err(LlmError::from_response(response).await);
                 return;
             }
 
@@ -5625,6 +5702,12 @@ impl LlmClient {
         if let Some(tools) = tools_json {
             body["tools"] = tools;
         }
+        // The same request the non-streaming path makes. Without it the agent's
+        // own (streaming) path got reasoning inline in `content`, leaving the
+        // tag splitter as the only thing keeping it out of the reply.
+        if ollama_separates_thinking(&request.model) {
+            body["think"] = serde_json::json!(true);
+        }
         body
     }
 
@@ -5664,9 +5747,7 @@ impl LlmClient {
             learn_rate_limit_headers(provider, response.headers());
 
             if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let message = response.text().await.unwrap_or_default();
-                yield Err(LlmError::from_api_response(status, message));
+                yield Err(LlmError::from_response(response).await);
                 return;
             }
 
@@ -5699,7 +5780,13 @@ impl LlmClient {
                     let line = buffer[..line_end].trim().to_string();
                     buffer = buffer[line_end + 1..].to_string();
 
-                    let (events, finished) = state.on_line::<OpenAiRoleCheckedDelta>(&line);
+                    let (events, finished) = match state.on_line::<OpenAiRoleCheckedDelta>(&line) {
+                        Ok(translated) => translated,
+                        Err(e) => {
+                            yield Err(e);
+                            return;
+                        }
+                    };
                     for event in events {
                         yield Ok(event);
                     }
@@ -5709,11 +5796,10 @@ impl LlmClient {
                 }
             }
 
-            // If we got here without MessageStop, emit it
-            for event in state.close_blocks() {
-                yield Ok(event);
+            // The body closed without `[DONE]` or a `finish_reason`.
+            for item in state.finish_unterminated::<OpenAiRoleCheckedDelta>(&buffer) {
+                yield item;
             }
-            yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
         }
     }
 
@@ -6300,16 +6386,17 @@ impl OllamaStreamState {
         // A final NDJSON object that arrived without its trailing newline
         // would otherwise sit in `buffer` unparsed and be reported as an
         // aborted generation. Cheap to honour, and it can only ever turn
-        // a false 502 into the success it actually was.
+        // a false 502 into the success it actually was. It is translated like
+        // any other line: this used to only close the blocks, so whatever the
+        // object itself carried — its last text, a tool call, its
+        // `done_reason` — was dropped from a reply reported as complete.
         if let Ok(obj) = serde_json::from_str::<serde_json::Value>(buffer.trim())
-            && obj["done"].as_bool().unwrap_or(false) {
-                self.flush_content(&mut items);
-                if self.thinking_block_started || self.text_block_started {
-                    items.push(Ok(StreamEvent::ContentBlockStop { index: self.next_block_index }));
-                }
-                items.push(Ok(StreamEvent::MessageStop { stop_reason: self.stop_reason().to_string() }));
-                return items;
-            }
+            && obj["done"].as_bool().unwrap_or(false)
+        {
+            let (items, finished) = self.on_object(&obj, bytes_received);
+            debug_assert!(finished, "a done object ends the stream");
+            return items;
+        }
 
         // A sentinel-terminated stream is a COMPLETE turn.
         //
@@ -6418,6 +6505,8 @@ struct OpenAiStreamRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     stream: bool,
+    /// `{"include_usage": true}`: the usage chunk after the last choice.
+    stream_options: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAiStreamTool>>,
 }
@@ -6462,6 +6551,7 @@ fn openai_stream_body(request: &CompletionRequest) -> OpenAiStreamRequest {
         max_tokens: request.max_tokens,
         temperature: request.temperature,
         stream: true,
+        stream_options: serde_json::json!({ "include_usage": true }),
         tools,
     }
 }
@@ -6469,7 +6559,28 @@ fn openai_stream_body(request: &CompletionRequest) -> OpenAiStreamRequest {
 /// One `data:` chunk of an OpenAI-compatible chat-completions stream.
 #[derive(Deserialize, Debug)]
 struct OpenAiStreamChunk<D> {
+    #[serde(default = "Vec::new")]
     choices: Vec<OpenAiChunkChoice<D>>,
+    /// Sent once, after the last choice, when `include_usage` was asked for.
+    #[serde(default)]
+    usage: Option<OpenAiStreamUsage>,
+}
+
+/// The token counts of a streamed completion.
+#[derive(Deserialize, Debug)]
+struct OpenAiStreamUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -6517,6 +6628,155 @@ struct OpenAiFunctionDelta {
     arguments: Option<String>,
 }
 
+/// Whether a failed `/api/embed` may be retried on the legacy `/api/embeddings`.
+///
+/// Only when the endpoint itself is missing — an Ollama older than `/api/embed`
+/// answers `404` with a plain-text body. Any error Ollama itself reports is a
+/// JSON `{"error": …}` (a missing model is a `404` too) and is the answer: the
+/// fallback used to discard it and report the legacy call's error instead, so
+/// the caller saw the wrong reason — and `embed_one`'s input-overflow heal,
+/// which reads that message, never saw the overflow it exists to heal.
+fn legacy_embed_may_answer(status: u16, body: &str) -> bool {
+    status == 404
+        && serde_json::from_str::<serde_json::Value>(body)
+            .map_or(true, |value| value.get("error").is_none())
+}
+
+/// Whether to ask Ollama for `think: true` — reasoning in a separate
+/// `message.thinking` field rather than inline `<think>` tags in `content` —
+/// for `model`: the families known to support it (qwen3, deepseek-r1, qwq).
+/// Asking a model without thinking support is a 400, so this stays a known list.
+fn ollama_separates_thinking(model: &str) -> bool {
+    let model = model.to_lowercase();
+    ["qwen3", "deepseek-r1", "qwq"]
+        .iter()
+        .any(|family| model.contains(family))
+}
+
+/// Seconds to wait before retrying, as a rate-limited response's headers say.
+///
+/// `retry-after` wins when present (Anthropic sends it on every 429; plain
+/// seconds). Otherwise the reset of each exhausted bucket — `OpenAI`'s
+/// `x-ratelimit-remaining-{requests,tokens}` at `0` — and the longest of those,
+/// since the request needs both. A bucket not known to be exhausted says
+/// nothing about this refusal.
+fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if let Some(wait) = header("retry-after")
+        .and_then(|value| parse_reset_secs(value).or_else(|| http_date_wait_secs(value)))
+    {
+        return Some(wait);
+    }
+    ["requests", "tokens"]
+        .iter()
+        .filter(|bucket| {
+            header(&format!("x-ratelimit-remaining-{bucket}")).is_some_and(|v| v.trim() == "0")
+        })
+        .filter_map(|bucket| {
+            header(&format!("x-ratelimit-reset-{bucket}")).and_then(parse_reset_secs)
+        })
+        .max()
+}
+
+/// Seconds from now until an HTTP-date `Retry-After`
+/// (`Wed, 09 Oct 2026 07:28:00 GMT`), rounded up; a date already past is 0.
+fn http_date_wait_secs(value: &str) -> Option<u64> {
+    let at = httpdate::parse_http_date(value.trim()).ok()?;
+    let wait = at
+        .duration_since(std::time::SystemTime::now())
+        .unwrap_or(std::time::Duration::ZERO);
+    Some(wait.as_secs() + u64::from(wait.subsec_nanos() > 0))
+}
+
+/// Whole seconds (rounded up) in a reset value: plain seconds (`"20"`, or a
+/// decimal `"1.5"`), or a Go-style duration as `OpenAI` sends it (`"6m0s"`,
+/// `"1.5s"`, `"250ms"`). These used to be parsed as bare integers, so every
+/// duration form was `None`. An empty value is no value: it used to read as
+/// `0` and win over the `x-ratelimit-reset-*` headers.
+fn parse_reset_secs(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(secs);
+    }
+    if value.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        // A unit-less decimal is seconds, like the integer form.
+        return parse_reset_secs(&format!("{value}s"));
+    }
+    let mut millis: u64 = 0;
+    let mut rest = value;
+    while !rest.is_empty() {
+        let number_len = rest.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
+        let unit_len = rest[number_len..]
+            .find(|c: char| c.is_ascii_digit())
+            .unwrap_or(rest.len() - number_len);
+        let (number, unit) = (
+            &rest[..number_len],
+            &rest[number_len..number_len + unit_len],
+        );
+        let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+        let whole: u64 = if whole.is_empty() {
+            0
+        } else {
+            whole.parse().ok()?
+        };
+        // Milliseconds of the fraction: its first three digits, zero-padded.
+        let fraction_millis: u64 = format!("{fraction:0<3}").get(..3)?.parse().ok()?;
+        let unit_millis: u64 = match unit {
+            "h" => 3_600_000,
+            "m" => 60_000,
+            "s" => 1_000,
+            "ms" => 1,
+            "us" | "µs" | "ns" => 0,
+            _ => return None,
+        };
+        millis = millis
+            .saturating_add(whole.saturating_mul(unit_millis))
+            .saturating_add(fraction_millis.saturating_mul(unit_millis) / 1_000);
+        rest = &rest[number_len + unit_len..];
+    }
+    Some(millis.div_ceil(1_000))
+}
+
+/// The error an OpenAI-compatible stream sends in place of a chunk, if `data`
+/// is one: `{"error": {"message": …, "code": 429 | "…", "type": …}}`.
+///
+/// `OpenRouter` sends exactly this mid-stream when an upstream rate-limits or
+/// fails after the `200` is already out; `OpenAI` does for server errors. It
+/// decodes as no chunk, so it used to be skipped as noise, the stream ran to its
+/// end, and the caller got an empty reply ending `end_turn` — a "successful"
+/// silence, never retried, never classified as the 429 it was. The status is the
+/// numeric `code` when it is an HTTP status, else 429 for a rate-limit `type`,
+/// else 500; the message then classifies exactly as a response status would.
+fn stream_error_envelope(data: &str) -> Option<LlmError> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let error = value.get("error")?;
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| error.to_string(), str::to_string);
+    let kind = error
+        .get("type")
+        .or_else(|| error.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let status = error
+        .get("code")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|code| u16::try_from(code).ok())
+        .filter(|code| (400..=599).contains(code))
+        .unwrap_or_else(|| {
+            if kind.contains("rate_limit") {
+                429
+            } else {
+                500
+            }
+        });
+    Some(LlmError::from_api_response(status, message))
+}
+
 /// Block bookkeeping while translating an OpenAI-compatible SSE stream into
 /// Anthropic stream events: text is block 0, tool call `i` is block `i + 1`.
 #[derive(Default)]
@@ -6524,6 +6784,10 @@ struct OpenAiStreamState {
     text_block_started: bool,
     /// Block index -> (id, name) of every tool call started so far.
     tool_calls_started: std::collections::HashMap<usize, (String, String)>,
+    /// The stop reason a `finish_reason` announced. The message ends at
+    /// `[DONE]`, not there: the usage chunk comes between the two, and the
+    /// stream used to be dropped before it was read.
+    finished_with: Option<String>,
 }
 
 impl OpenAiStreamState {
@@ -6542,26 +6806,98 @@ impl OpenAiStreamState {
         events
     }
 
+    /// The items that end a stream whose body closed without `[DONE]` or a
+    /// `finish_reason`.
+    ///
+    /// A last `data:` line that arrived without its trailing newline is
+    /// translated first — it may be the terminator itself. Past that, a cut
+    /// that leaves a TOOL CALL open is an aborted generation, reported as a
+    /// retryable 502 like the Ollama path's (`finish`): closing it as a normal
+    /// `end_turn` handed the agent a half-written argument object, which the
+    /// JSON healer then "repaired" — a proxy hanging up inside
+    /// `"content":"def f(` ran a write tool with half its content. A text-only
+    /// reply still ends as before (logged): some OpenAI-compatible servers
+    /// omit both terminators, and a cut text reply harms nothing it touches.
+    fn finish_unterminated<D>(&mut self, buffer: &str) -> Vec<Result<StreamEvent, LlmError>>
+    where
+        D: serde::de::DeserializeOwned + Into<OpenAiChunkDelta>,
+    {
+        let mut items = Vec::new();
+        let residue = buffer.trim();
+        if !residue.is_empty() {
+            match self.on_line::<D>(residue) {
+                Ok((events, finished)) => {
+                    items.extend(events.into_iter().map(Ok));
+                    if finished {
+                        return items;
+                    }
+                }
+                Err(e) => {
+                    items.push(Err(e));
+                    return items;
+                }
+            }
+        }
+        if let Some(stop_reason) = self.finished_with.take() {
+            // A `finish_reason` arrived; only `[DONE]` (and perhaps the usage
+            // chunk) did not. The message is whole.
+            debug_assert!(self.tool_calls_started.is_empty(), "the finish closed every block");
+            items.push(Ok(StreamEvent::MessageStop { stop_reason }));
+            return items;
+        }
+        if self.tool_calls_started.is_empty() {
+            tracing::warn!(
+                "OpenAI-compatible stream closed without [DONE] or finish_reason; \
+                 ending the text reply as complete"
+            );
+            items.extend(self.close_blocks().into_iter().map(Ok));
+            items.push(Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() }));
+            return items;
+        }
+        let open_tools = self.tool_calls_started.len();
+        items.push(Err(LlmError::from_api_response(
+            502,
+            format!(
+                "OpenAI-compatible stream ended without [DONE] or a finish_reason while \
+                 {open_tools} tool call(s) were open — their arguments may be cut off"
+            ),
+        )));
+        debug_assert!(
+            items.last().is_some_and(Result::is_err),
+            "a cut tool call ends in an error"
+        );
+        items
+    }
+
     /// Translate one SSE line into the events to yield, in order, and whether
     /// the message ended (`[DONE]` or a `finish_reason`). Lines that are not
     /// `data:` lines, and chunks that do not decode as `D`, yield nothing.
-    fn on_line<D>(&mut self, line: &str) -> (Vec<StreamEvent>, bool)
+    ///
+    /// # Errors
+    ///
+    /// An error envelope in place of a chunk (see [`stream_error_envelope`]),
+    /// classified as the same error in a response status would be.
+    fn on_line<D>(&mut self, line: &str) -> Result<(Vec<StreamEvent>, bool), LlmError>
     where
         D: serde::de::DeserializeOwned + Into<OpenAiChunkDelta>,
     {
         let Some(data) = line.strip_prefix("data: ") else {
-            return (Vec::new(), false);
+            return Ok((Vec::new(), false));
         };
+        if let Some(error) = stream_error_envelope(data) {
+            return Err(error);
+        }
 
         if data == "[DONE]" {
             // Close any open blocks
             let mut events = self.close_blocks();
-            events.push(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
-            return (events, true);
+            let stop_reason = self.finished_with.take().unwrap_or_else(|| "end_turn".to_string());
+            events.push(StreamEvent::MessageStop { stop_reason });
+            return Ok((events, true));
         }
 
         let Ok(chunk) = serde_json::from_str::<OpenAiStreamChunk<D>>(data) else {
-            return (Vec::new(), false);
+            return Ok((Vec::new(), false));
         };
         let mut events = Vec::new();
         for choice in chunk.choices {
@@ -6571,18 +6907,48 @@ impl OpenAiStreamState {
 
             // Check for stop
             if let Some(reason) = choice.finish_reason {
-                // Close any open blocks
+                // Close any open blocks; the message itself stops at `[DONE]`.
                 events.extend(self.close_blocks());
+                self.text_block_started = false;
+                self.tool_calls_started.clear();
                 let stop_reason = match reason.as_str() {
                     "tool_calls" => "tool_use",
                     "stop" => "end_turn",
                     other => other,
                 };
-                events.push(StreamEvent::MessageStop { stop_reason: stop_reason.to_string() });
-                return (events, true);
+                self.finished_with = Some(stop_reason.to_string());
             }
         }
-        (events, false)
+        if let Some(usage) = chunk.usage {
+            Self::on_usage(&usage, &mut events);
+        }
+        Ok((events, false))
+    }
+
+    /// The usage chunk as the events every provider reports usage with: the
+    /// prompt side on a (late) `MessageStart`, the completion on a
+    /// `MessageDelta` — the order the Ollama path emits them, and the stream
+    /// consumer records both by assignment wherever they appear. Cached
+    /// prompt tokens are part of `prompt_tokens`, so they are split out.
+    fn on_usage(usage: &OpenAiStreamUsage, events: &mut Vec<StreamEvent>) {
+        let cached = usage
+            .prompt_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.cached_tokens)
+            .min(usage.prompt_tokens);
+        debug_assert!(cached <= usage.prompt_tokens);
+        events.push(StreamEvent::MessageStart {
+            id: String::new(),
+            model: String::new(),
+            input_tokens: token_count_u32(usage.prompt_tokens - cached),
+            cache_read_tokens: token_count_u32(cached),
+            cache_creation_tokens: 0,
+            cache_creation_1h_tokens: 0,
+        });
+        events.push(StreamEvent::MessageDelta {
+            stop_reason: None,
+            output_tokens: token_count_u32(usage.completion_tokens),
+        });
     }
 
     /// Append the events for one choice delta: text, then tool-call starts and
@@ -7132,14 +7498,307 @@ fn parse_sse_event(event: &str) -> Option<StreamEvent> {
             stop_reason: "end_turn".to_string(),
         }),
         AnthropicSSE::Ping => Some(StreamEvent::Ping),
-        AnthropicSSE::Error { error } => Some(StreamEvent::Error {
-            message: error.message,
-        }),
+        // Typed, not flattened to a message: an `overloaded_error` mid-stream
+        // is exactly the failure a fallback model exists for, and as a plain
+        // `Error { message }` nothing downstream could tell it from a bad request.
+        AnthropicSSE::Error { error } => {
+            let status = anthropic_error_status(&error.error_type);
+            Some(stream_error_event(LlmError::Api {
+                status,
+                message: if error.error_type.is_empty() {
+                    error.message
+                } else {
+                    format!("{}: {}", error.error_type, error.message)
+                },
+            }))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// Both Ollama paths ask a thinking model for separated reasoning; the
+    /// streaming one — the agent's own — used to leave it inline.
+    #[test]
+    fn the_stream_body_asks_a_thinking_model_to_separate_its_reasoning() {
+        let request = |model: &str| AnthropicRequest {
+            context_limit: None,
+            model: model.to_string(),
+            messages: vec![],
+            max_tokens: 512,
+            temperature: None,
+            system: None,
+            tools: None,
+            stream: None,
+            thinking: None,
+            cache_control: None,
+        };
+        let body = LlmClient::ollama_stream_body("http://127.0.0.1:9", &request("qwen3.5:9b"));
+        assert_eq!(body["think"], serde_json::json!(true));
+        let plain = LlmClient::ollama_stream_body("http://127.0.0.1:9", &request("gemma3:12b"));
+        assert!(
+            plain.get("think").is_none(),
+            "a model without thinking is not asked"
+        );
+    }
+
+    /// Reset values in every form providers send, rounded up to whole seconds.
+    #[test]
+    fn reset_values_parse_in_every_form() {
+        assert_eq!(parse_reset_secs("20"), Some(20));
+        assert_eq!(parse_reset_secs("6m0s"), Some(360));
+        assert_eq!(parse_reset_secs("1.5s"), Some(2));
+        assert_eq!(parse_reset_secs("250ms"), Some(1));
+        assert_eq!(parse_reset_secs("1h2m3s"), Some(3723));
+        assert_eq!(parse_reset_secs("0s"), Some(0));
+        assert_eq!(parse_reset_secs("soon"), None);
+        assert_eq!(parse_reset_secs("5x"), None);
+        assert_eq!(
+            parse_reset_secs("1.5"),
+            Some(2),
+            "unit-less decimal seconds"
+        );
+        assert_eq!(parse_reset_secs(""), None, "an empty header is no wait");
+        assert_eq!(parse_reset_secs("  "), None);
+        assert_eq!(
+            http_date_wait_secs("Wed, 21 Oct 2015 07:28:00 GMT"),
+            Some(0),
+            "past"
+        );
+        let soon = httpdate::fmt_http_date(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(120),
+        );
+        let wait = http_date_wait_secs(&soon).expect("an HTTP-date parses");
+        assert!((118..=121).contains(&wait), "{wait}");
+        assert_eq!(http_date_wait_secs("soon"), None);
+    }
+
+    /// `retry-after` wins; otherwise only an exhausted bucket's reset counts.
+    #[test]
+    fn a_rate_limit_waits_as_the_headers_say() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut openai = HeaderMap::new();
+        openai.insert(
+            "x-ratelimit-remaining-requests",
+            HeaderValue::from_static("12"),
+        );
+        openai.insert("x-ratelimit-reset-requests", HeaderValue::from_static("1s"));
+        openai.insert(
+            "x-ratelimit-remaining-tokens",
+            HeaderValue::from_static("0"),
+        );
+        openai.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("6m0s"));
+        assert_eq!(retry_after_from_headers(&openai), Some(360));
+
+        openai.insert("retry-after", HeaderValue::from_static("7"));
+        assert_eq!(
+            retry_after_from_headers(&openai),
+            Some(7),
+            "retry-after wins"
+        );
+
+        let mut unknown = HeaderMap::new();
+        unknown.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("6m0s"));
+        assert_eq!(
+            retry_after_from_headers(&unknown),
+            None,
+            "not known to be exhausted"
+        );
+    }
+
+    /// A non-streaming completion is held to the agent path's rules: an
+    /// abort is an error, and a think block is not part of the reply.
+    #[test]
+    fn a_plain_ollama_completion_drops_think_and_refuses_an_abort() {
+        let thinking = serde_json::json!({
+            "message": { "role": "assistant", "content": "<think>plan it</think>\nThe summary." },
+            "done": true
+        });
+        assert_eq!(
+            ollama_completion_text(&thinking).expect("text"),
+            "The summary."
+        );
+        let plain = serde_json::json!({ "message": { "content": "  as is  " }, "done": true });
+        assert_eq!(ollama_completion_text(&plain).expect("text"), "  as is  ");
+        let aborted = serde_json::json!({ "message": { "content": "half a sen" }, "done": false });
+        assert!(matches!(
+            ollama_completion_text(&aborted),
+            Err(LlmError::Api { status: 502, .. })
+        ));
+        assert!(ollama_completion_text(&serde_json::json!({ "done": true })).is_err());
+    }
+
+/// Only a missing endpoint falls back to the legacy embeddings API; an
+    /// error Ollama reports is the answer.
+    #[test]
+    fn only_a_missing_embed_endpoint_falls_back() {
+        assert!(legacy_embed_may_answer(404, "404 page not found"));
+        assert!(!legacy_embed_may_answer(
+            404,
+            r#"{"error":"model \"nomic\" not found"}"#
+        ));
+        assert!(!legacy_embed_may_answer(
+            400,
+            r#"{"error":"input length 9000 exceeds maximum context length 8192"}"#
+        ));
+        assert!(!legacy_embed_may_answer(500, "internal error"));
+    }
+
+    /// A body that closes with a tool call open, and no `[DONE]` or
+    /// `finish_reason`, is an aborted generation — never a finished call whose
+    /// half-written arguments the healer would then "repair" and run.
+    #[test]
+    fn a_stream_cut_inside_a_tool_call_is_an_error_not_a_finish() {
+        let mut state = OpenAiStreamState::default();
+        let (events, finished) = state
+            .on_line::<OpenAiChunkDelta>(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":"{\"path\":\"a.py\",\"content\":\"def f("}}]}}]}"#,
+            )
+            .expect("a chunk");
+        assert!(!finished);
+        assert!(!events.is_empty());
+        let end = state.finish_unterminated::<OpenAiChunkDelta>("");
+        assert!(
+            matches!(end.last(), Some(Err(LlmError::Api { status: 502, .. }))),
+            "{end:?}"
+        );
+        assert!(
+            !end.iter().any(|item| matches!(item, Ok(StreamEvent::MessageStop { .. }))),
+            "a cut call is not stopped as complete"
+        );
+    }
+
+    /// The terminator itself may be the line that lost its trailing newline;
+    /// and a text-only reply with no terminator still ends as it did.
+    #[test]
+    fn an_unterminated_stream_honours_its_last_line_and_keeps_text_replies() {
+        let mut state = OpenAiStreamState::default();
+        state
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"ls","arguments":"{}"}}]}}]}"#)
+            .expect("a chunk");
+        let end = state.finish_unterminated::<OpenAiChunkDelta>(
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        );
+        assert!(
+            matches!(end.last(), Some(Ok(StreamEvent::MessageStop { stop_reason })) if stop_reason == "tool_use"),
+            "{end:?}"
+        );
+
+        let mut text_only = OpenAiStreamState::default();
+        text_only
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#)
+            .expect("a chunk");
+        let end = text_only.finish_unterminated::<OpenAiChunkDelta>("");
+        assert!(
+            matches!(end.last(), Some(Ok(StreamEvent::MessageStop { stop_reason })) if stop_reason == "end_turn"),
+            "{end:?}"
+        );
+    }
+
+    /// The usage chunk `OpenAI` sends between the last choice and `[DONE]` is
+    /// read and reported; the message stops at `[DONE]` with the reason the
+    /// `finish_reason` gave. Streamed turns used to record 0/0 tokens: usage
+    /// was never asked for, and the stream was dropped at `finish_reason`.
+    #[test]
+    fn a_streamed_turn_reports_its_usage_before_it_stops() {
+        let mut state = OpenAiStreamState::default();
+        state
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"ls","arguments":"{}"}}]}}]}"#)
+            .expect("a chunk");
+        let (events, finished) = state
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#)
+            .expect("the finish");
+        assert!(!finished, "the usage chunk is still to come");
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { index: 1 })));
+        let (usage, finished) = state
+            .on_line::<OpenAiChunkDelta>(
+                r#"data: {"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":34,"prompt_tokens_details":{"cached_tokens":1000}}}"#,
+            )
+            .expect("the usage");
+        assert!(!finished);
+        assert!(
+            matches!(
+                usage.as_slice(),
+                [
+                    StreamEvent::MessageStart { input_tokens: 200, cache_read_tokens: 1000, .. },
+                    StreamEvent::MessageDelta { output_tokens: 34, .. },
+                ]
+            ),
+            "{usage:?}"
+        );
+        let (done, finished) = state.on_line::<OpenAiChunkDelta>("data: [DONE]").expect("done");
+        assert!(finished);
+        assert!(
+            matches!(done.as_slice(), [StreamEvent::MessageStop { stop_reason }] if stop_reason == "tool_use"),
+            "{done:?}"
+        );
+
+        // A server that closes after the finish without `[DONE]` still ends
+        // the message whole — never as a cut tool call.
+        let mut closed = OpenAiStreamState::default();
+        closed
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"ls","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#)
+            .expect("call and finish in one chunk");
+        let end = closed.finish_unterminated::<OpenAiChunkDelta>("");
+        assert!(
+            matches!(end.as_slice(), [Ok(StreamEvent::MessageStop { stop_reason })] if stop_reason == "tool_use"),
+            "{end:?}"
+        );
+    }
+
+    /// Every streamed OpenAI-compatible body asks for the usage chunk.
+    #[test]
+    fn a_streamed_body_asks_for_usage() {
+        let request = CompletionRequest {
+            model: "gpt-x".to_string(),
+            ..CompletionRequest::default()
+        };
+        let body = serde_json::to_value(openai_stream_body(&request)).expect("serializes");
+        assert_eq!(body["stream_options"]["include_usage"], true, "{body}");
+        assert_eq!(body["stream"], true);
+    }
+
+    /// A mid-stream error envelope is the error it names — classified, so a
+    /// 429 is a rate limit — not a chunk to skip on the way to an empty reply.
+    #[test]
+    fn a_stream_error_envelope_is_an_error_not_an_empty_reply() {
+        let mut state = OpenAiStreamState::default();
+        let rate = state.on_line::<OpenAiChunkDelta>(
+            r#"data: {"error":{"code":429,"message":"Provider returned error: rate-limited upstream"}}"#,
+        );
+        assert!(matches!(rate, Err(LlmError::RateLimit { .. })), "{rate:?}");
+
+        let typed = stream_error_envelope(
+            r#"{"error":{"message":"slow down","type":"rate_limit_exceeded","code":null}}"#,
+        );
+        assert!(
+            matches!(typed, Some(LlmError::RateLimit { .. })),
+            "{typed:?}"
+        );
+        let server = stream_error_envelope(r#"{"error":{"message":"boom","type":"server_error"}}"#);
+        assert!(
+            matches!(server, Some(LlmError::Api { status: 500, ref message }) if message == "boom"),
+            "{server:?}"
+        );
+
+        // Ordinary chunks and the terminator are untouched.
+        let text = state
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#)
+            .expect("a chunk");
+        assert!(!text.1);
+        assert!(
+            text.0
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == "hi"))
+        );
+        assert!(
+            state
+                .on_line::<OpenAiChunkDelta>("data: [DONE]")
+                .expect("done")
+                .1
+        );
+    }
 
     // -----------------------------------------------------------------
     // GGUF metadata, which is namespaced by architecture
@@ -8544,6 +9203,36 @@ mod tests {
         assert!(matches!(result.unwrap(), StreamEvent::SignatureDelta { index: 0, .. }));
     }
 
+    /// An overload inside a 200 stream is what a fallback model is for. It
+    /// used to parse to a flat `Error { message }` that no consumer could tell
+    /// from a malformed request — and that the agent loop ignored outright.
+    #[test]
+    fn an_sse_error_is_typed_so_an_overload_falls_back() {
+        let overloaded = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}";
+        match parse_sse_event(overloaded).expect("an error event parses") {
+            StreamEvent::RecoverableError { error, .. } => {
+                assert!(error.should_fallback(), "{error}");
+                assert!(error.to_string().contains("overloaded_error"), "{error}");
+            }
+            other => panic!("an overload must be recoverable, got {other:?}"),
+        }
+        let limited = "data: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}";
+        assert!(matches!(
+            parse_sse_event(limited),
+            Some(StreamEvent::RecoverableError { .. })
+        ));
+        let invalid = "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad\"}}";
+        assert!(
+            matches!(parse_sse_event(invalid), Some(StreamEvent::Error { .. })),
+            "a bad request is final: another model would get the same request"
+        );
+        let untyped = "data: {\"type\":\"error\",\"error\":{\"message\":\"???\"}}";
+        assert!(
+            parse_sse_event(untyped).is_some(),
+            "an untyped error still parses"
+        );
+    }
+
     #[test]
     fn test_parse_sse_event_message_start_carries_usage() {
         // message_start reports prompt-side usage incl. cache read/write — the
@@ -9268,7 +9957,35 @@ mod inline_think_tests {
         assert_eq!(unique.len(), ids.len(), "ids repeat: {ids:?}");
     }
 
-    /// Through the NDJSON translator: the reply's text deltas carry no tag
+    /// A last line without its newline is translated in full: its text and
+    /// tool call reach the reply, and the turn stops as a tool turn.
+    #[test]
+    fn an_unterminated_final_line_keeps_what_it_carries() {
+        let mut state = OllamaStreamState::default();
+        let first = serde_json::json!({ "message": { "content": "Hello" }, "done": false });
+        let (mut items, _) = state.on_object(&first, 0);
+        let last = r#"{"message":{"content":" world","tool_calls":[{"function":{"name":"read","arguments":{}}}]},"done":true,"done_reason":"stop"}"#;
+        items.extend(state.finish(last, None, 0, 1));
+        let events: Vec<StreamEvent> = items.into_iter().map(|i| i.expect("no error")).collect();
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Hello world", "{events:?}");
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::ContentBlockStart { tool_name: Some(n), .. } if n == "read")),
+            "{events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(StreamEvent::MessageStop { stop_reason }) if stop_reason == "tool_use"),
+            "{events:?}"
+        );
+    }
+
+/// Through the NDJSON translator: the reply's text deltas carry no tag
     /// and no reasoning, and the reasoning arrives as thinking.
     #[test]
     fn the_stream_translator_separates_inline_reasoning() {

@@ -1,14 +1,10 @@
-//! PDF tools - read text and extract images from PDFs
+//! PDF reading: text extraction with `lopdf`, page selection, and an OCR pass
+//! over embedded images for pages that carry no text.
 //!
-//! # OCR Fallback
-//!
-//! `ReadPdfTool` now accepts an optional `OcrFn` callback that mirrors the
-//! full tiered OCR pipeline from `OcrTool`.  When `lopdf` extracts an empty
-//! (or whitespace-only) page, the tool can call `ocr_fn` on any embedded
-//! images to recover text.
-//!
-//! Wiring the `OcrFn` is done in the daemon/GUI layer by passing in an async
-//! closure that calls the full `OcrTool` pipeline.
+//! These are functions, not a `Tool`: the daemon's `pdf.read` service
+//! (`nanna-daemon` `server.rs`, `pdf_read_services`) calls [`read_pdf_text`]
+//! and then [`ocr_empty_pages`] with an [`OcrFn`] bound to the first configured
+//! vision model (`vision_service::bind_pdf_ocr_fn`).
 //!
 //! ## Future: pdfium page rendering
 //! Rendering a whole PDF page to pixels (as opposed to extracting embedded
@@ -16,37 +12,18 @@
 //! This is not implemented here to avoid a large C dependency; instead, we
 //! fall back to extracting embedded image objects from the PDF stream.
 
-use crate::{Tool, ToolDefinition, ToolError, ToolResult};
-use async_trait::async_trait;
-use serde_json::Value;
-use std::collections::HashMap;
+use crate::ToolError;
 use std::fmt::Write as _;
-use std::path::Path;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Public type aliases
 // ---------------------------------------------------------------------------
 
-/// Async callback for analyzing images embedded in a PDF (vision model or OCR).
+/// OCR callback for the embedded images of pages that have no extractable text.
 ///
-/// Arguments: `(base64_image_data, prompt, media_type)` → `Result<text, err_msg>`
-pub type PdfVisionFn = Arc<
-    dyn Fn(
-            String,
-            String,
-            String,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
-        + Send
-        + Sync,
->;
-
-/// Full OCR pipeline callback — same signature as `PdfVisionFn`.
-///
-/// When set on `ReadPdfTool`, this is called for pages that have no
-/// extractable text but do contain embedded image objects.  The daemon
-/// wires this to the tiered `OcrTool` pipeline.
+/// Arguments: `(base64_image_data, prompt, media_type)` → `Result<text, err_msg>`.
+/// The daemon binds it to the first configured vision model.
 pub type OcrFn = Arc<
     dyn Fn(
             String,
@@ -183,309 +160,6 @@ pub struct PdfExtract {
 pub const PDF_MAX_BYTES: usize = 10 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
-// ReadPdfTool
-// ---------------------------------------------------------------------------
-
-/// Tool for reading text from PDF files.
-pub struct ReadPdfTool {
-    /// Vision model for analyzing embedded images (decorative / non-OCR).
-    vision_fn: Option<PdfVisionFn>,
-    /// Full OCR pipeline callback used when `lopdf` returns empty pages.
-    ocr_fn: Option<OcrFn>,
-}
-
-impl ReadPdfTool {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            vision_fn: None,
-            ocr_fn: None,
-        }
-    }
-
-    /// Set vision function for analyzing embedded images.
-    #[must_use]
-    pub fn with_vision_fn(mut self, f: PdfVisionFn) -> Self {
-        self.vision_fn = Some(f);
-        self
-    }
-
-    /// Set the OCR pipeline callback used as a fallback for image-only pages.
-    ///
-    /// When a PDF page contains no extractable text, the tool will attempt to
-    /// extract embedded image objects from the page and run them through this
-    /// OCR function to recover text.
-    #[must_use]
-    pub fn with_ocr_fn(mut self, f: OcrFn) -> Self {
-        self.ocr_fn = Some(f);
-        self
-    }
-
-    /// Recover text from image-only pages, or say plainly why none was.
-    ///
-    /// Silence here would be indistinguishable from a scanned document that
-    /// genuinely holds no text, so every branch writes something.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ToolError` when image extraction fails.
-    async fn append_ocr_fallback(
-        &self,
-        bytes: &[u8],
-        selection: PageSelection,
-        enabled: bool,
-        empty_pages: &[u32],
-        out: &mut String,
-    ) -> Result<(), ToolError> {
-        if !enabled || empty_pages.is_empty() {
-            return Ok(());
-        }
-        let Some(ref ocr_fn) = self.ocr_fn else {
-            let _ = write!(
-                out,
-                "
-
-*Note: {} page(s) had no extractable text. Configure an OCR \
-                 pipeline to recover text from image-only pages.*",
-                empty_pages.len()
-            );
-            return Ok(());
-        };
-
-        let images = extract_pdf_images(bytes, selection)?;
-        if images.is_empty() {
-            out.push_str(
-                "
-
-*Note: Some pages had no extractable text and no embedded \
-                 images were found for OCR fallback.*",
-            );
-            return Ok(());
-        }
-
-        out.push_str(
-            "
-
-## OCR Text (from image-only pages)
-
-",
-        );
-        for (index, (image_data, media_type)) in images.into_iter().enumerate() {
-            let encoded = base64_simd::STANDARD.encode_to_string(&image_data);
-            let prompt = "Extract ALL text from this image using OCR. Output the \
-                          extracted text only."
-                .to_string();
-            match ocr_fn(encoded, prompt, media_type).await {
-                Ok(text) if !text.trim().is_empty() => {
-                    let _ = write!(
-                        out,
-                        "### Image {} (OCR)
-{text}
-
-",
-                        index + 1
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    let _ = write!(
-                        out,
-                        "### Image {} (OCR failed)
-Error: {e}
-
-",
-                        index + 1
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Describe embedded images with the vision model, if one is configured.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ToolError` when image extraction fails.
-    async fn append_image_descriptions(
-        &self,
-        bytes: &[u8],
-        selection: PageSelection,
-        prompt: &str,
-        out: &mut String,
-    ) -> Result<(), ToolError> {
-        let Some(ref vision_fn) = self.vision_fn else {
-            out.push_str(
-                "
-
-*Note: Image extraction requested but vision model not configured.*",
-            );
-            return Ok(());
-        };
-
-        let images = extract_pdf_images(bytes, selection)?;
-        if images.is_empty() {
-            return Ok(());
-        }
-
-        out.push_str(
-            "
-
-## Extracted Images
-
-",
-        );
-        for (index, (image_data, media_type)) in images.into_iter().enumerate() {
-            let encoded = base64_simd::STANDARD.encode_to_string(&image_data);
-            match vision_fn(encoded, prompt.to_string(), media_type).await {
-                Ok(description) => {
-                    let _ = write!(
-                        out,
-                        "### Image {}
-{description}
-
-",
-                        index + 1
-                    );
-                }
-                Err(e) => {
-                    let _ = write!(
-                        out,
-                        "### Image {} (analysis failed)
-Error: {e}
-
-",
-                        index + 1
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Default for ReadPdfTool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl Tool for ReadPdfTool {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition::new(
-            "read_pdf",
-            "Read text content from a PDF file. Can also extract and analyze images.",
-        )
-        .string_param("path", "Path to the PDF file", true)
-        .bool_param(
-            "extract_images",
-            "Whether to extract and analyze embedded images (default: false)",
-            false,
-        )
-        .string_param(
-            "pages",
-            "Pages to read: \"3\", \"2-5\", \"4-\", or \"-4\" (default: all)",
-            false,
-        )
-        .int_param(
-            "max_pages",
-            "Maximum pages to read from the start (superseded by `pages`)",
-            false,
-        )
-        .string_param(
-            "image_prompt",
-            "Prompt for analyzing extracted images (default: 'Describe this image')",
-            false,
-        )
-        .bool_param(
-            "ocr_fallback",
-            "Use OCR on embedded images when a page has no extractable text (default: true)",
-            false,
-        )
-    }
-
-    async fn execute(&self, params: HashMap<String, Value>) -> Result<ToolResult, ToolError> {
-        let path_str = params
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParams("Missing 'path' parameter".to_string()))?;
-
-        let extract_images = params
-            .get("extract_images")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-
-        // `pages` is what the read_pdf skill has always sent; `max_pages` is
-        // the older integer form. When both arrive the range wins: it is the
-        // more specific request, and silently preferring the count is exactly
-        // the bug this replaces.
-        let selection = match params.get("pages").and_then(|v| v.as_str()) {
-            Some(spec) => parse_page_selection(spec).map_err(ToolError::InvalidParams)?,
-            None => params
-                .get("max_pages")
-                .and_then(serde_json::Value::as_u64)
-                .map_or(PageSelection::All, |n| PageSelection::First(crate::u64_to_usize(n))),
-        };
-
-        let image_prompt = params
-            .get("image_prompt")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Describe this image in detail.");
-
-        // OCR fallback is on by default when an OCR function is configured
-        let ocr_fallback = params
-            .get("ocr_fallback")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true);
-
-        let path = Path::new(path_str);
-        if !path.exists() {
-            return Err(ToolError::ExecutionFailed(format!(
-                "File not found: {path_str}"
-            )));
-        }
-
-        // Refuse oversized input before parsing, with the same ceiling
-        // `ReadFileTool` applies — `read_pdf` must not be a way in for a file
-        // `read_file` would turn away.
-        let size_bytes = tokio::fs::metadata(path)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to stat file: {e}")))?
-            .len();
-        if size_bytes > PDF_MAX_BYTES as u64 {
-            return Err(ToolError::ExecutionFailed(format!(
-                "PDF too large: {size_bytes} bytes (max: {PDF_MAX_BYTES} bytes)"
-            )));
-        }
-
-        // Read PDF bytes
-        let bytes = tokio::fs::read(path)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read file: {e}")))?;
-
-        // ------------------------------------------------------------------
-        // Tier 1: lopdf text extraction
-        // ------------------------------------------------------------------
-        let extracted = read_pdf_text(&bytes, selection)?;
-        let (text, empty_pages) = (extracted.text, extracted.empty_pages);
-        let mut result = format!("# PDF Content: {path_str}\n\n{text}");
-
-        // Both optional stages live in their own methods: `execute` is the
-        // one place a reader looks to see what a call does, and it should not
-        // have to scroll past two independent enrichment passes to find out.
-        self.append_ocr_fallback(&bytes, selection, ocr_fallback, &empty_pages, &mut result)
-            .await?;
-        if extract_images {
-            self.append_image_descriptions(&bytes, selection, image_prompt, &mut result)
-                .await?;
-        }
-
-        Ok(ToolResult::success(result))
-    }
-}
-
-// ---------------------------------------------------------------------------
 // lopdf helpers
 // ---------------------------------------------------------------------------
 
@@ -609,9 +283,8 @@ pub enum PdfOcrOutcome {
 
 /// Run OCR over a document's embedded images, if it needs it and can.
 ///
-/// Structured rather than the markdown [`ReadPdfTool`] appends, so a caller
-/// that returns JSON can report the outcome instead of embedding prose in a
-/// text field.
+/// Structured rather than markdown, so a caller that returns JSON can report
+/// the outcome instead of embedding prose in a text field.
 ///
 /// # Errors
 /// Returns `ToolError` when the document cannot be parsed for images.
@@ -720,14 +393,6 @@ fn extract_pdf_images(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn test_read_pdf_tool_definition() {
-        let tool = ReadPdfTool::new();
-        let def = tool.definition();
-        assert_eq!(def.name, "read_pdf");
-        assert!(!def.parameters.is_empty());
-    }
 
     #[test]
     fn a_bare_number_selects_exactly_that_page() {

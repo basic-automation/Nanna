@@ -1,6 +1,10 @@
 //! Repository implementations using Turso
 
-use crate::{CronJob, JobRun, Memory, MemoryChunk, MemoryEventRow, MemoryFsrsUpdate, Message, NewCronJob, NewJobRun, NewMemory, NewMemoryChunk, NewMemoryEvent, NewMessage, Session, StorageError, WorkspaceRecord};
+use crate::{
+    CronJob, JobRun, Memory, MemoryChunk, MemoryEventRow, MemoryFsrsUpdate, Message, NewCronJob,
+    NewJobRun, NewMemory, NewMemoryChunk, NewMemoryEvent, NewMessage, QueuedChunk, Session,
+    StorageError, WorkspaceRecord,
+};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use turso::Connection;
@@ -107,7 +111,7 @@ impl SessionRepository {
         let mut rows = conn
             .query(
                 "SELECT id, session_id, channel, user_id, created_at, updated_at, metadata, workspace_id, name 
-                 FROM sessions ORDER BY updated_at DESC LIMIT ?1",
+                 FROM sessions ORDER BY datetime(updated_at) DESC, id DESC LIMIT ?1",
                 turso::params![limit],
             )
             .await?;
@@ -147,14 +151,14 @@ impl SessionRepository {
             Some(ws_id) => {
                 conn.query(
                     "SELECT id, session_id, channel, user_id, created_at, updated_at, metadata, workspace_id, name 
-                     FROM sessions WHERE workspace_id = ?1 ORDER BY updated_at DESC LIMIT ?2",
+                     FROM sessions WHERE workspace_id = ?1 ORDER BY datetime(updated_at) DESC, id DESC LIMIT ?2",
                     turso::params![ws_id, limit],
                 ).await?
             }
             None => {
                 conn.query(
                     "SELECT id, session_id, channel, user_id, created_at, updated_at, metadata, workspace_id, name 
-                     FROM sessions WHERE workspace_id IS NULL ORDER BY updated_at DESC LIMIT ?1",
+                     FROM sessions WHERE workspace_id IS NULL ORDER BY datetime(updated_at) DESC, id DESC LIMIT ?1",
                     turso::params![limit],
                 ).await?
             }
@@ -290,7 +294,11 @@ impl MessageRepository {
         message
     }
 
-    /// Up to `limit` messages of a session, oldest first.
+    /// The FIRST `limit` messages of a session, oldest first.
+    ///
+    /// This is the session's opening, not its latest exchange: a caller that
+    /// wants recent context (resuming a conversation, answering "what was
+    /// said last") wants [`Self::get_recent_by_session`].
     ///
     /// # Errors
     /// Returns [`StorageError::Database`] if the query fails or a column does
@@ -300,15 +308,48 @@ impl MessageRepository {
         session_id: &str,
         limit: i64,
     ) -> Result<Vec<Message>, StorageError> {
-        let conn = self.conn.lock().await;
+        self.read_session(session_id, limit, SessionEnd::Oldest)
+            .await
+    }
 
-        let mut rows = conn
-            .query(
+    /// The NEWEST `limit` messages of a session, returned oldest first so they
+    /// replay in conversation order.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a column does
+    /// not decode. Unparseable metadata loads as `None`.
+    pub async fn get_recent_by_session(
+        &self,
+        session_id: &str,
+        limit: i64,
+    ) -> Result<Vec<Message>, StorageError> {
+        self.read_session(session_id, limit, SessionEnd::Newest)
+            .await
+    }
+
+    /// Read up to `limit` messages from one end of a session, oldest first.
+    ///
+    /// `created_at` has one-second resolution, so a turn's user message and
+    /// its reply usually share it; `id` (monotonic per insert) breaks the tie,
+    /// or "oldest first" would be the engine's choice within a second.
+    async fn read_session(
+        &self,
+        session_id: &str,
+        limit: i64,
+        end: SessionEnd,
+    ) -> Result<Vec<Message>, StorageError> {
+        let sql = match end {
+            SessionEnd::Oldest => {
                 "SELECT id, session_id, role, content, content_type, tool_use_id, created_at, tokens_in, tokens_out, metadata
-                 FROM messages WHERE session_id = ?1 ORDER BY created_at ASC LIMIT ?2",
-                turso::params![session_id, limit],
-            )
-            .await?;
+                 FROM messages WHERE session_id = ?1 ORDER BY created_at ASC, id ASC LIMIT ?2"
+            }
+            SessionEnd::Newest => {
+                "SELECT id, session_id, role, content, content_type, tool_use_id, created_at, tokens_in, tokens_out, metadata
+                 FROM messages WHERE session_id = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2"
+            }
+        };
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(sql, turso::params![session_id, limit]).await?;
 
         let mut messages = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -331,8 +372,31 @@ impl MessageRepository {
         drop(rows);
         drop(conn);
 
+        if end == SessionEnd::Newest {
+            messages.reverse();
+        }
+        debug_assert!(
+            usize::try_from(limit)
+                .ok()
+                .is_none_or(|max| messages.len() <= max),
+            "the read never returns more than `limit` rows"
+        );
+        debug_assert!(
+            messages
+                .windows(2)
+                .all(|pair| (pair[0].created_at.as_str(), pair[0].id)
+                    < (pair[1].created_at.as_str(), pair[1].id)),
+            "messages come back oldest first"
+        );
         Ok(messages)
     }
+}
+
+/// Which end of a session [`MessageRepository::read_session`] reads from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionEnd {
+    Oldest,
+    Newest,
 }
 
 /// Memory repository (for vector search)
@@ -1149,11 +1213,6 @@ impl MemoryRepository {
     /// rebuild: the text is already stored and chunked, so only the vectors
     /// need recomputing — incrementally, and restartably after a crash.
     ///
-    /// # Errors
-    /// Returns [`StorageError`] if the query fails.
-    ///
-    /// # Panics
-    /// Panics if `limit` is 0.
     /// Chunk work for `model`, taken from the durable queue.
     ///
     /// Seeds the queue first so an existing database — whose chunks predate the
@@ -1171,7 +1230,7 @@ impl MemoryRepository {
         model: &str,
         limit: usize,
         seed: bool,
-    ) -> Result<Vec<MemoryChunk>, StorageError> {
+    ) -> Result<Vec<QueuedChunk>, StorageError> {
         assert!(!model.is_empty(), "chunk work must name the model it is for");
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let conn = self.conn.lock().await;
@@ -1204,20 +1263,11 @@ impl MemoryRepository {
             .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
-            out.push(MemoryChunk {
+            out.push(QueuedChunk {
                 id: row.get(0)?,
                 memory_id: row.get(1)?,
                 ordinal: row.get(2)?,
                 content: row.get(3)?,
-                char_start: 0,
-                char_end: 0,
-                embedding: None,
-                embedding_model: None,
-                chunk_max_chars: 0,
-                chunker_version: 0,
-                workspace_id: None,
-                created_at: String::new(),
-                updated_at: String::new(),
             });
         }
         // Held from the seeding through the drained cursor: seeding and
@@ -1818,6 +1868,17 @@ impl MemoryRepository {
     /// Returns [`StorageError::Database`] if the update fails.
     pub async fn update_content(&self, memory_id: &str, content: &str) -> Result<bool, StorageError> {
         let conn = self.conn.lock().await;
+        // The superseded vector is zeroed in place before it is dropped, and
+        // the WAL truncated after — what the bucket and chunk paths already do
+        // (`clear_memory_buckets`): an embedding is invertible back to the
+        // text it was computed from, and a NULL alone leaves the old bytes in
+        // the WAL and, after a checkpoint, in free page space.
+        conn.execute(
+            "UPDATE memories SET embedding = zeroblob(octet_length(embedding)) \
+             WHERE memory_id = ?1 AND embedding IS NOT NULL",
+            turso::params![memory_id],
+        )
+        .await?;
         let result = conn
             .execute(
                 "UPDATE memories SET content = ?1, embedding = NULL, embedding_model = NULL, \
@@ -1825,6 +1886,9 @@ impl MemoryRepository {
                 turso::params![content, memory_id],
             )
             .await?;
+        Self::checkpoint_truncate(&conn).await;
+        // Held from the zeroing through the checkpoint: the guard is the
+        // transaction.
         drop(conn);
         Ok(result > 0)
     }
@@ -2695,13 +2759,34 @@ impl WorkspaceRepository {
         Ok(workspace)
     }
 
-    /// Insert or update a workspace (upsert by path)
+    /// Insert or update a workspace (upsert by path), and make sure its board
+    /// has a Task Management Agent.
+    ///
+    /// The members migration seeded a router for every workspace that existed
+    /// when it ran; this is the path for every workspace registered since, so
+    /// "every stored workspace has a router member" holds from both ends.
     ///
     /// # Errors
     /// Returns [`StorageError::Database`] if the upsert fails — including when
     /// a workspace with a different `id` already holds `record.path`, since
-    /// `path` is unique and the conflict target is `id`.
+    /// `path` is unique and the conflict target is `id` — and
+    /// [`StorageError::Invalid`] when the roster is full, so the router could
+    /// not be added.
     pub async fn upsert(&self, record: &WorkspaceRecord) -> Result<(), StorageError> {
+        debug_assert!(!record.id.is_empty(), "a workspace has an id");
+        self.write_record(record).await?;
+        let router = crate::MemberRepository::new(Arc::clone(&self.conn))
+            .ensure_router(Some(&record.id))
+            .await?;
+        debug_assert_eq!(
+            router.owner_id.as_deref(),
+            Some(record.id.as_str()),
+            "the router belongs to the board it was ensured for"
+        );
+        Ok(())
+    }
+
+    async fn write_record(&self, record: &WorkspaceRecord) -> Result<(), StorageError> {
         let conn = self.conn.lock().await;
         let id = record.id.clone();
         let name = record.name.clone();
@@ -2966,6 +3051,107 @@ impl MemoryEventRepository {
         debug_assert!(out.len() <= limit, "the page cap must hold");
         Ok(out)
     }
+
+    /// Up to `limit` events whose lineage names `source_id`, oldest first —
+    /// one card's series (`task:<id>`) for the dream fold.
+    ///
+    /// Matched against the stored JSON array with the id's own quotes, so
+    /// `task:12` never matches `task:120`.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if `limit` exceeds [`MAX_EVENT_PAGE`] or the
+    /// query fails.
+    pub async fn for_source(
+        &self,
+        source_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryEventRow>, StorageError> {
+        self.page_for_source(source_id, limit, MEMORY_EVENTS_FOR_SOURCE).await
+    }
+
+    /// The NEWEST `limit` events naming `source_id`, oldest first.
+    ///
+    /// [`Self::for_source`] pages from the start, so a source with more than a
+    /// page of events (a long-running card) is otherwise known only by its
+    /// beginning.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::for_source`].
+    pub async fn newest_for_source(
+        &self,
+        source_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryEventRow>, StorageError> {
+        let mut newest = self
+            .page_for_source(source_id, limit, MEMORY_EVENTS_FOR_SOURCE_NEWEST)
+            .await?;
+        newest.reverse();
+        debug_assert!(
+            newest.windows(2).all(|w| (w[0].ts_unix_ms, w[0].id) <= (w[1].ts_unix_ms, w[1].id)),
+            "oldest first"
+        );
+        Ok(newest)
+    }
+
+    /// How many events name `source_id` — all of them, not a page.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::for_source`].
+    pub async fn count_for_source(&self, source_id: &str) -> Result<usize, StorageError> {
+        let pattern = source_pattern(source_id)?;
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM memory_events WHERE source_ids LIKE ?1",
+                turso::params![pattern],
+            )
+            .await?;
+        let count = match rows.next().await? {
+            Some(row) => row.get::<i64>(0)?,
+            None => 0,
+        };
+        drop(rows);
+        drop(conn);
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    async fn page_for_source(
+        &self,
+        source_id: &str,
+        limit: usize,
+        sql: &str,
+    ) -> Result<Vec<MemoryEventRow>, StorageError> {
+        check_page(limit)?;
+        let pattern = source_pattern(source_id)?;
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                sql,
+                turso::params![pattern, i64::try_from(limit).unwrap_or(i64::MAX)],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row_to_memory_event(&row)?);
+        }
+        drop(rows);
+        drop(conn);
+        debug_assert!(out.len() <= limit, "the page cap must hold");
+        Ok(out)
+    }
+}
+
+/// The `LIKE` pattern matching events whose `source_ids` JSON array names
+/// `source_id`.
+fn source_pattern(source_id: &str) -> Result<String, StorageError> {
+    if source_id.is_empty() || source_id.contains('"') {
+        return Err(StorageError::Invalid(format!(
+            "a source id to match must be non-empty and unquoted, got {source_id:?}"
+        )));
+    }
+    Ok(format!("%\"{source_id}\"%"))
 }
 
 /// Reject a backwards window rather than returning an empty page for it: an
@@ -3033,6 +3219,22 @@ FROM memory_events
 WHERE ts_unix_ms >= ?1 AND ts_unix_ms < ?2 AND workspace_id = ?3
 ORDER BY ts_unix_ms ASC, id ASC
 LIMIT ?4";
+
+const MEMORY_EVENTS_FOR_SOURCE: &str = "
+SELECT id, event_id, ts_unix_ms, kind, workspace_id, content,
+       content_len_chars, embedding, embedding_model, salience, created_at, source_ids
+FROM memory_events
+WHERE source_ids LIKE ?1
+ORDER BY ts_unix_ms ASC, id ASC
+LIMIT ?2";
+
+const MEMORY_EVENTS_FOR_SOURCE_NEWEST: &str = "
+SELECT id, event_id, ts_unix_ms, kind, workspace_id, content,
+       content_len_chars, embedding, embedding_model, salience, created_at, source_ids
+FROM memory_events
+WHERE source_ids LIKE ?1
+ORDER BY ts_unix_ms DESC, id DESC
+LIMIT ?2";
 
 const RECENT_MEMORY_EVENTS: &str = "
 SELECT id, event_id, ts_unix_ms, kind, workspace_id, content,

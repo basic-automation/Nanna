@@ -22,7 +22,7 @@ pub use git::{
     GIT_TIMEOUT, GitContext, is_git_repo, load_git_context,
 };
 
-pub use manager::{Workspace, WorkspaceConfig, WorkspaceManager};
+pub use manager::{Workspace, WorkspaceConfig};
 pub use templates::{create_from_template, list_templates, WorkspaceTemplate};
 
 use std::path::PathBuf;

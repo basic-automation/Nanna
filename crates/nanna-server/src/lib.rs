@@ -17,7 +17,7 @@ mod state;
 mod webhooks;
 
 pub use routes::create_router;
-pub use state::{AppState, AppStateBuilder};
+pub use state::{AppState, AppStateBuilder, ProcessedReply};
 
 use std::net::SocketAddr;
 use tokio::net::TcpListener;

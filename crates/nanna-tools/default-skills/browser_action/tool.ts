@@ -29,9 +29,9 @@ export default {
         value: input.value,
         delay_ms: input.delay_ms || 1000
       });
-      return result.message || "Action completed: " + input.action;
+      return result.result || "Action completed: " + input.action;
     } catch (e) {
-      return "Error: Browser service not available. " + e;
+      return { content: "Error: " + e, success: false };
     }
   }
 }

@@ -457,8 +457,38 @@ impl Default for MessageRouter {
     }
 }
 
+/// The provider's own message id in a `reply_to`.
+///
+/// Incoming ids are composite — `chat:message` (Telegram), `channel:message`
+/// (Discord), `channel:ts` (Slack) — because a bare message id is only unique
+/// within its chat, and the daemon replies with `reply_to` set to the id it
+/// received. Every sender passed that composite straight to its API: Telegram
+/// failed to parse it as a number and silently sent unthreaded, Discord sent it
+/// as a message reference (not a snowflake), Slack as a `thread_ts`. The native
+/// id is the last segment; an id without a separator is returned as is.
+#[must_use]
+pub fn native_reply_id(reply_to: &str) -> &str {
+    reply_to.rsplit(':').next().unwrap_or(reply_to)
+}
+
 #[cfg(test)]
 mod tests {
+    /// The native id is the composite's last segment, whatever the provider.
+    #[test]
+    fn a_reply_names_the_providers_own_message_id() {
+        use super::native_reply_id;
+        assert_eq!(native_reply_id("-1001234:5678"), "5678");
+        assert_eq!(
+            native_reply_id("99887766:1100000000000000000"),
+            "1100000000000000000"
+        );
+        assert_eq!(
+            native_reply_id("C024BE91L:1726012345.000200"),
+            "1726012345.000200"
+        );
+        assert_eq!(native_reply_id("5678"), "5678", "already native");
+    }
+
     use super::*;
     use std::sync::Arc;
 

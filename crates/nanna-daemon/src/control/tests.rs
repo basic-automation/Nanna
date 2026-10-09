@@ -255,6 +255,24 @@ async fn a_saved_ollama_token_reaches_the_running_embedder_but_the_model_waits()
 /// address (the agent can send one) used to re-read the store for the new
 /// address, find no record, and hand the old server's token to the new one:
 /// chat, embeddings and the probe would all have sent it there.
+/// A typo'd path is refused, not answered `updated` while serde drops it.
+#[tokio::test]
+async fn config_set_of_an_unknown_path_is_refused() {
+    let cp = Arc::new(ControlPlane::new(Arc::new(SessionManager::new())));
+    let set = |path: &str, value: Value| {
+        let cp = Arc::clone(&cp);
+        let action = Action::Config(ConfigAction::Set {
+            path: path.into(),
+            value,
+        });
+        async move { cp.handle("test", action).await }
+    };
+    let typo = set("llm.modle", json!("x")).await;
+    assert_eq!(typo["error"], "unknown_path", "{typo}");
+    let nested_typo = set("memory.no_such.key", json!(1)).await;
+    assert_eq!(nested_typo["error"], "unknown_path", "{nested_typo}");
+}
+
 #[tokio::test]
 async fn config_set_does_not_hand_a_legacy_ollama_token_to_a_new_address() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1196,6 +1214,90 @@ async fn consolidate_with_dreaming_passes_the_gate_and_stops_at_the_llm() {
     );
 }
 
+/// Closing the active workspace leaves global mode behind it: the tools'
+/// default working directory goes with the workspace, as `ClearActive` does.
+#[tokio::test]
+async fn closing_the_active_workspace_clears_the_tool_cwd() {
+    let registry = Arc::new(nanna_tools::ToolRegistry::new());
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.tools = Some(Arc::clone(&registry));
+    let cp = Arc::new(cp);
+    let dir = tempfile::tempdir().expect("dir");
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let opened = ask(serde_json::json!({
+        "type": "workspace", "action": "open", "path": dir.path().display().to_string(),
+    }))
+    .await;
+    let id = opened["id"].as_str().expect("an id").to_string();
+    ask(serde_json::json!({"type": "workspace", "action": "set_active", "id": id})).await;
+    assert!(
+        registry.default_workdir().await.is_some(),
+        "the active workspace is the cwd"
+    );
+
+    let closed = ask(serde_json::json!({"type": "workspace", "action": "close", "id": id})).await;
+    assert_eq!(closed["status"], "closed", "{closed}");
+    assert_eq!(
+        registry.default_workdir().await,
+        None,
+        "no cwd in a closed project"
+    );
+}
+
+/// `needs_shell` on `tool.update` sets the grant both ways and keeps the
+/// tool's other scopes: `false` used to change nothing (the reply still said
+/// `updated`), and `true` replaced the whole permission set.
+#[tokio::test]
+async fn needs_shell_grants_and_revokes_without_dropping_scopes() {
+    use crate::user_tools::{UserToolManager, UserToolPermissions};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let user_tools = Arc::new(UserToolManager::new(tmp.path().to_path_buf()));
+    let source =
+        "export default { name: \"t_sh\", description: \"sh\", execute(p) { return \"ok\"; } }";
+    let permissions = UserToolPermissions {
+        read: vec!["~/notes".to_string()],
+        run: true,
+        ..UserToolPermissions::default()
+    };
+    user_tools
+        .create_tool(
+            "t_sh".into(),
+            "sh".into(),
+            source.into(),
+            None,
+            None,
+            Some(permissions),
+        )
+        .await
+        .expect("create tool");
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.tools = Some(Arc::new(nanna_tools::ToolRegistry::new()));
+    cp.user_tools = Some(Arc::clone(&user_tools));
+    let cp = Arc::new(cp);
+    for run in [false, true] {
+        let action: Action = serde_json::from_value(serde_json::json!({
+            "type": "tool", "action": "update", "name": "t_sh", "needs_shell": run,
+        }))
+        .expect("parses");
+        let reply = cp.handle("test", action).await;
+        assert_eq!(reply["status"], "updated", "{reply}");
+        let meta = user_tools.get_tool("t_sh").await.expect("still there");
+        assert_eq!(meta.permissions.run, run);
+        assert_eq!(
+            meta.permissions.read,
+            ["~/notes"],
+            "the read scope survives"
+        );
+    }
+}
+
 #[tokio::test]
 async fn enable_disable_reconciles_live_registry() {
     use crate::user_tools::UserToolManager;
@@ -2034,4 +2136,1024 @@ async fn a_null_set_of_no_secret_leaves_the_store_alone() {
 
     assert_eq!(resp["status"], "updated", "{resp}");
     assert_eq!(cp.config.read().await.llm.sub_agent_model, None);
+}
+
+/// `memory.search` and `memory.list` must mean the same thing by a scope. They
+/// did not: `search` read `scope:"global"` as *every* memory while `list` and
+/// `export` read it as the global ones, so the board's memory page showed one
+/// set under "Global" and searched another.
+#[tokio::test]
+async fn memory_search_and_list_agree_on_the_global_scope() {
+    let embed: nanna_memory::EmbedFn =
+        Arc::new(|_text: &str| Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0, 0.0]) }));
+    let memory = Arc::new(
+        nanna_memory::MemoryService::new(nanna_memory::MemoryServiceConfig {
+            dimension: 4,
+            min_score: 0.4,
+            ..Default::default()
+        })
+        .with_embed_fn(embed),
+    );
+    for (id, workspace) in [("global", None), ("scoped", Some("ws-a"))] {
+        memory
+            .add_entry(nanna_memory::MemoryEntry {
+                id: id.to_string(),
+                content: format!("memory {id}"),
+                embeddings: std::collections::HashMap::new(),
+                embedding_model: None,
+                embedding: vec![1.0, 0.0, 0.0, 0.0],
+                metadata: std::collections::HashMap::new(),
+                timestamp: 0,
+                fsrs: nanna_memory::FsrsState::default(),
+                workspace_id: workspace.map(str::to_string),
+            })
+            .await
+            .expect("add");
+    }
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.memory = Some(memory);
+    let cp = Arc::new(cp);
+
+    let ids = |resp: &Value| -> Vec<String> {
+        let mut ids: Vec<String> = resp["memories"]
+            .as_array()
+            .expect("a memories array")
+            .iter()
+            .filter_map(|m| m["id"].as_str().map(str::to_string))
+            .collect();
+        ids.sort();
+        ids
+    };
+    let global = Some("global".to_string());
+    let listed = cp
+        .handle(
+            "test",
+            Action::Memory(MemoryAction::List {
+                scope: global.clone(),
+            }),
+        )
+        .await;
+    let search = MemoryAction::Search {
+        query: "memory".to_string(),
+        limit: None,
+        scope: global,
+    };
+    let searched = cp.handle("test", Action::Memory(search)).await;
+    assert_eq!(ids(&listed), ["global"], "{listed}");
+    assert_eq!(
+        ids(&searched),
+        ids(&listed),
+        "search must scope like list: {searched}"
+    );
+
+    // And a workspace scope is that workspace plus the globals, in both.
+    let ws = Some("ws-a".to_string());
+    let search = MemoryAction::Search {
+        query: "memory".to_string(),
+        limit: None,
+        scope: ws,
+    };
+    let searched = cp.handle("test", Action::Memory(search)).await;
+    assert_eq!(ids(&searched), ["global", "scoped"], "{searched}");
+}
+
+/// `memory.list` is serialized from typed rows (`memory_list_raw`) instead of a
+/// `json!` tree. The GUI parses its fields by name, so the typed form must be
+/// the same document: the tree the old code built is kept here as the oracle,
+/// covering provenance present and absent, a session id, a workspace, and a
+/// content string that needs escaping.
+#[tokio::test]
+async fn a_typed_memory_list_is_the_tree_it_replaced() {
+    // (id, workspace, metadata, timestamp)
+    type Row<'a> = (&'a str, Option<&'a str>, &'a [(&'a str, &'a str)], i64);
+    let memory = Arc::new(nanna_memory::MemoryService::new(
+        nanna_memory::MemoryServiceConfig {
+            dimension: 4,
+            ..Default::default()
+        },
+    ));
+    let rows: [Row<'_>; 3] = [
+        ("plain", None, &[], 0),
+        (
+            "provenanced",
+            Some("ws-a"),
+            &[("fact_type", "observed"), ("session_id", "s-1")],
+            1_760_000_000,
+        ),
+        ("escaped", Some("ws-b"), &[("fact_type", "stated")], -1),
+    ];
+    for (id, workspace, metadata, timestamp) in rows {
+        memory
+            .add_entry(nanna_memory::MemoryEntry {
+                id: id.to_string(),
+                content: format!("{id}: a \"quoted\" line\n\ttab \u{1F600}"),
+                embeddings: std::collections::HashMap::new(),
+                embedding_model: None,
+                embedding: vec![1.0, 0.0, 0.0, 0.0],
+                metadata: metadata
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+                timestamp,
+                // 0.7 has no exact f32: the typed row must print the same
+                // digits the tree did, not the f32's shortest form.
+                fsrs: nanna_memory::FsrsState {
+                    importance: 0.7,
+                    stability: 2.3,
+                    ..nanna_memory::FsrsState::default()
+                },
+                workspace_id: workspace.map(str::to_string),
+            })
+            .await
+            .expect("add");
+    }
+    // The pre-change `memory_list` body, verbatim in what it emitted.
+    let oracle = |scope: Option<&str>, listed: &[nanna_memory::MemoryListEntry]| -> Value {
+        let memories: Vec<Value> = listed
+            .iter()
+            .filter(|m| ControlPlane::memory_scope(scope).admits(m.workspace_id.as_deref()))
+            .map(|m| {
+                let fact_type = m.metadata.get("fact_type").cloned().unwrap_or_else(|| "unknown".to_string());
+                let created_at = chrono::DateTime::from_timestamp(m.timestamp, 0)
+                    .map_or_else(|| m.timestamp.to_string(), |dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
+                json!({
+                    "id": m.id,
+                    "content": m.content,
+                    "fact_type": fact_type,
+                    "importance": m.importance,
+                    "state": format!("{:?}", m.state).to_lowercase(),
+                    "weight": m.weight,
+                    "retrievability": m.retrievability,
+                    "access_count": m.access_count,
+                    "created_at": created_at,
+                    "session_id": m.metadata.get("session_id"),
+                    "workspace_id": m.workspace_id,
+                })
+            })
+            .collect();
+        json!({ "memories": memories })
+    };
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.memory = Some(Arc::clone(&memory));
+    let cp = Arc::new(cp);
+
+    let listed = memory.list_all().await;
+    // Compared as text as well as trees: a tree comparison parses both sides
+    // to f64 and would call `0.7` and `0.699999988079071` different values
+    // only by luck of the parse.
+    let raw = ControlPlane::memory_list_raw(&memory, None).await.expect("raw");
+    assert_eq!(raw.get(), serde_json::to_string(&oracle(None, &listed)).expect("text"));
+    for scope in [None, Some("global"), Some("ws-a")] {
+        let action = || {
+            Action::Memory(MemoryAction::List {
+                scope: scope.map(str::to_string),
+            })
+        };
+        let expected = oracle(scope, &listed);
+        let tree = cp.handle("test", action()).await;
+        assert_eq!(tree, expected, "scope {scope:?}");
+        let reply = cp.handle_reply("test", action()).await;
+        assert!(matches!(reply, Reply::Raw(_)), "the IPC path never builds the tree");
+        assert_eq!(reply.into_value().expect("valid JSON"), expected, "scope {scope:?}");
+    }
+    assert_eq!(oracle(None, &listed)["memories"].as_array().map(Vec::len), Some(3));
+}
+
+/// Records every row the daemon asks storage to delete, and refuses one.
+struct RecordingDeletes {
+    refuse: Option<&'static str>,
+    deleted: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl nanna_memory::MemoryPersistence for RecordingDeletes {
+    async fn save_entry(
+        &self,
+        _entry: &nanna_memory::MemoryEntry,
+    ) -> Result<(), nanna_memory::MemoryError> {
+        Ok(())
+    }
+    async fn remove_entry(&self, id: &str) -> Result<(), nanna_memory::MemoryError> {
+        if self.refuse == Some(id) {
+            return Err(nanna_memory::MemoryError::Persistence(
+                "disk I/O error".into(),
+            ));
+        }
+        self.deleted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(id.to_string());
+        Ok(())
+    }
+    async fn update_entry_fsrs(
+        &self,
+        _id: &str,
+        _fsrs: &nanna_memory::FsrsState,
+    ) -> Result<(), nanna_memory::MemoryError> {
+        Ok(())
+    }
+    async fn update_entry_content(
+        &self,
+        _id: &str,
+        _content: &str,
+    ) -> Result<(), nanna_memory::MemoryError> {
+        Ok(())
+    }
+    async fn load_all(&self) -> Result<Vec<nanna_memory::MemoryEntry>, nanna_memory::MemoryError> {
+        Ok(Vec::new())
+    }
+}
+
+async fn clear_all_against(db: Arc<RecordingDeletes>) -> (Value, usize) {
+    let memory = Arc::new(
+        nanna_memory::MemoryService::new(nanna_memory::MemoryServiceConfig {
+            dimension: 4,
+            ..Default::default()
+        })
+        .with_persistence(db),
+    );
+    for (id, workspace) in [("a", None), ("b", Some("ws")), ("c", None)] {
+        memory
+            .add_entry(nanna_memory::MemoryEntry {
+                id: id.to_string(),
+                content: format!("memory {id}"),
+                embeddings: std::collections::HashMap::new(),
+                embedding_model: None,
+                embedding: vec![1.0, 0.0, 0.0, 0.0],
+                metadata: std::collections::HashMap::new(),
+                timestamp: 0,
+                fsrs: nanna_memory::FsrsState::default(),
+                workspace_id: workspace.map(str::to_string),
+            })
+            .await
+            .expect("add");
+    }
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.memory = Some(Arc::clone(&memory));
+    let resp = Arc::new(cp)
+        .handle("test", Action::Memory(MemoryAction::Clear { scope: None }))
+        .await;
+    (resp, memory.count().await)
+}
+
+/// "Delete All Memories" used to empty RAM only and answer `cleared`: the rows
+/// stayed in Turso and the next restart loaded every one of them back.
+#[tokio::test]
+async fn clearing_every_memory_deletes_the_rows() {
+    let db = Arc::new(RecordingDeletes {
+        refuse: None,
+        deleted: std::sync::Mutex::new(Vec::new()),
+    });
+    let (resp, left) = clear_all_against(Arc::clone(&db)).await;
+    assert_eq!(resp["status"], "cleared", "{resp}");
+    assert_eq!(resp["removed"], 3, "{resp}");
+    assert_eq!(left, 0);
+    let mut deleted = db.deleted.lock().expect("lock").clone();
+    deleted.sort();
+    assert_eq!(deleted, ["a", "b", "c"], "every row reached storage");
+}
+
+/// A row storage refused is kept, and the reply says so instead of `cleared`.
+#[tokio::test]
+async fn a_clear_storage_refused_is_reported_not_claimed() {
+    let db = Arc::new(RecordingDeletes {
+        refuse: Some("b"),
+        deleted: std::sync::Mutex::new(Vec::new()),
+    });
+    let (resp, left) = clear_all_against(db).await;
+    assert_eq!(resp["error"], "clear_incomplete", "{resp}");
+    assert_eq!(resp["removed"], 2, "{resp}");
+    assert_eq!(resp["failed"], 1, "{resp}");
+    assert!(
+        resp["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("disk I/O")),
+        "{resp}"
+    );
+    assert_eq!(
+        left, 1,
+        "the refused memory is still visible, as it is still on disk"
+    );
+}
+
+/// `task.verdicts` reaches the rollup from the wire, and a window outside the
+/// store's bound is refused as a reply rather than tripping its assert.
+#[tokio::test]
+async fn task_verdicts_answers_the_rollup_over_ipc() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    storage
+        .members()
+        .create(nanna_storage::NewMember {
+            id: "agent-a".to_string(),
+            name: "Agent A".to_string(),
+            avatar: None,
+            kind: nanna_storage::MemberKind::Agent,
+            owner_kind: nanna_storage::MemberOwner::Workspace,
+            owner_id: None,
+            status: nanna_storage::MemberStatus::Idle,
+            profile: serde_json::json!({}),
+        })
+        .await
+        .expect("member");
+    let id = storage
+        .tasks()
+        .create(nanna_storage::NewTask {
+            scope: "workspace".to_string(),
+            scope_id: Some("ws1".to_string()),
+            title: "card".to_string(),
+            priority: 3,
+            labels: vec!["rust".to_string()],
+            assignee: Some("agent-a".to_string()),
+            ..nanna_storage::NewTask::default()
+        })
+        .await
+        .expect("card")
+        .id;
+    storage
+        .tasks()
+        .log_activity(
+            id,
+            Some("harness"),
+            "acceptance_checked",
+            Some(serde_json::json!({ "passed": true })),
+        )
+        .await
+        .expect("verdict");
+
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(storage);
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+
+    let resp = ask(serde_json::json!({ "type": "task", "action": "verdicts" })).await;
+    assert_eq!(
+        resp["window"],
+        crate::protocol::TASK_VERDICT_WINDOW_DEFAULT,
+        "{resp}"
+    );
+    let verdicts = resp["verdicts"].as_array().expect("verdicts array");
+    assert_eq!(verdicts.len(), 2, "overall + the one label: {resp}");
+    assert!(
+        verdicts
+            .iter()
+            .any(|v| v["member_id"] == "agent-a" && v["label"] == "rust" && v["passed"] == 1),
+        "{resp}"
+    );
+
+    let refused =
+        ask(serde_json::json!({ "type": "task", "action": "verdicts", "window": 0 })).await;
+    assert_eq!(refused["error"], "bad_window", "{refused}");
+}
+
+#[tokio::test]
+async fn the_board_roster_is_managed_over_ipc() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let (events, mut received) = tokio::sync::broadcast::channel(64);
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new())).with_event_tx(events);
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+
+    let created = ask(serde_json::json!({
+        "type": "member", "action": "create", "name": "Code Reviewer",
+        "profile": { "model_priority": ["qwen3.5:9b"], "tags": ["rust"] },
+    }))
+    .await;
+    assert_eq!(created["member"]["id"], "agent:code-reviewer", "{created}");
+    assert_eq!(created["member"]["kind"], "agent", "{created}");
+    assert_eq!(created["member"]["owner_kind"], "workspace", "{created}");
+    assert!(created["member"]["owner_id"].is_null(), "global board: {created}");
+
+    let duplicate = ask(serde_json::json!({
+        "type": "member", "action": "create", "name": "code reviewer",
+    }))
+    .await;
+    assert_eq!(duplicate["error"], "invalid_member", "{duplicate}");
+
+    // The router reads this roster: the new agent is assignable on the global board.
+    let listed = ask(serde_json::json!({ "type": "member", "action": "list" })).await;
+    let ids: Vec<&str> = listed["members"]
+        .as_array()
+        .expect("members array")
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"human") && ids.contains(&"agent:code-reviewer"), "{listed}");
+    let card = storage
+        .tasks()
+        .create(nanna_storage::NewTask {
+            title: "review the diff".to_string(),
+            scope: "global".to_string(),
+            priority: 3,
+            assignee: Some("agent:code-reviewer".to_string()),
+            ..nanna_storage::NewTask::default()
+        })
+        .await;
+    assert!(card.is_ok(), "an IPC-created member is a real assignee: {card:?}");
+
+    let busy = ask(serde_json::json!({
+        "type": "member", "action": "update", "id": "agent:code-reviewer", "status": "busy",
+    }))
+    .await;
+    assert_eq!(busy["member"]["status"], "busy", "{busy}");
+    assert_eq!(busy["member"]["profile"]["tags"][0], "rust", "untouched fields stay: {busy}");
+
+    // The router's own model list is settable — nothing else could set it.
+    let router = ask(serde_json::json!({
+        "type": "member", "action": "update", "id": "router:global",
+        "profile": { "role": "router", "model_priority": ["ornith:9b"] },
+    }))
+    .await;
+    assert_eq!(router["member"]["profile"]["model_priority"][0], "ornith:9b", "{router}");
+
+    for (refused, why) in [
+        (serde_json::json!({ "type": "member", "action": "update", "id": "human", "status": "asleep" }), "unknown status"),
+        (serde_json::json!({ "type": "member", "action": "create", "name": "x", "profile": ["a"] }), "profile shape"),
+        (serde_json::json!({ "type": "member", "action": "create", "name": "x", "personal": true, "workspace_id": "w" }), "personal + workspace"),
+        (serde_json::json!({ "type": "member", "action": "create", "name": "x", "workspace_id": "nope" }), "unregistered workspace"),
+        (serde_json::json!({ "type": "member", "action": "delete", "id": "human" }), "protected member"),
+    ] {
+        let resp = ask(refused).await;
+        assert_eq!(resp["error"], "invalid_member", "{why}: {resp}");
+    }
+    let missing = ask(serde_json::json!({ "type": "member", "action": "get", "id": "agent:nobody" })).await;
+    assert_eq!(missing["error"], "member_not_found", "{missing}");
+
+    let personal = ask(serde_json::json!({
+        "type": "member", "action": "create", "name": "Scribe", "personal": true,
+    }))
+    .await;
+    assert_eq!(personal["member"]["owner_kind"], "human", "{personal}");
+    assert_eq!(personal["member"]["owner_id"], "human", "{personal}");
+
+    let removed = ask(serde_json::json!({ "type": "member", "action": "delete", "id": "agent:scribe" })).await;
+    assert_eq!(removed["removed"], true, "{removed}");
+    let gone = ask(serde_json::json!({ "type": "member", "action": "delete", "id": "agent:scribe" })).await;
+    assert_eq!(gone["removed"], false, "{gone}");
+
+    // One MembersChanged per write that changed the roster: create, update
+    // status, update router, create personal, delete. Reads, refusals and the
+    // second (no-op) delete announce nothing.
+    let mut announced = 0;
+    while let Ok(event) = received.try_recv() {
+        assert!(matches!(event, Event::MembersChanged), "{event:?}");
+        announced += 1;
+    }
+    assert_eq!(announced, 5);
+}
+
+/// P25 Stage 3: a card is worked only by the agent it is assigned to, only on
+/// a board, only while open — a sub-card included, under its own claim.
+#[tokio::test]
+async fn a_card_run_is_claimed_only_for_an_agent_on_an_open_board_card() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let created = Arc::new(cp)
+        .handle(
+            "test",
+            serde_json::from_value(serde_json::json!({
+                "type": "member", "action": "create", "name": "Builder",
+            }))
+            .expect("parses"),
+        )
+        .await;
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+    let tasks = storage.tasks();
+    let card =
+        |title: &str, scope: &str, scope_id: Option<&str>, parent_id, assignee: Option<&str>| {
+            nanna_storage::NewTask {
+                title: title.to_string(),
+                scope: scope.to_string(),
+                scope_id: scope_id.map(str::to_string),
+                parent_id,
+                priority: 3,
+                assignee: assignee.map(str::to_string),
+                ..nanna_storage::NewTask::default()
+            }
+        };
+    let refusal = |claimed: Result<_, Value>| match claimed {
+        Ok(_) => "claimed".to_string(),
+        Err(reply) => reply["error"].as_str().unwrap_or("?").to_string(),
+    };
+
+    let nobody = tasks
+        .create(card("a", "global", None, None, None))
+        .await
+        .expect("card");
+    let human = tasks
+        .create(card("b", "global", None, None, Some("human")))
+        .await
+        .expect("card");
+    let chat = tasks
+        .create(card(
+            "c",
+            "session",
+            Some("s1"),
+            None,
+            Some("agent:builder"),
+        ))
+        .await
+        .expect("card");
+    let parent = tasks
+        .create(card("d", "global", None, None, Some("agent:builder")))
+        .await
+        .expect("card");
+    let child = tasks
+        .create(card(
+            "e",
+            "global",
+            None,
+            Some(parent.id),
+            Some("agent:builder"),
+        ))
+        .await
+        .expect("card");
+
+    assert_eq!(
+        refusal(ControlPlane::card_claim(&storage, nobody.id).await),
+        "card_unassigned"
+    );
+    assert_eq!(
+        refusal(ControlPlane::card_claim(&storage, human.id).await),
+        "not_an_agent"
+    );
+    assert_eq!(
+        refusal(ControlPlane::card_claim(&storage, chat.id).await),
+        "not_a_board_card"
+    );
+    assert_eq!(
+        refusal(ControlPlane::card_claim(&storage, 9_999).await),
+        "task_not_found"
+    );
+
+    let (_, member, claim) = ControlPlane::card_claim(&storage, child.id)
+        .await
+        .expect("an agent's open board card is claimable");
+    assert_eq!(member.id, "agent:builder");
+    assert_eq!(
+        (claim.card_id, claim.member_id.as_str()),
+        (child.id, "agent:builder")
+    );
+    assert!(
+        child.parent_id == Some(parent.id),
+        "a sub-card is claimable too"
+    );
+
+    tasks
+        .complete(child.id, Some("human"), None)
+        .await
+        .expect("done");
+    assert_eq!(
+        refusal(ControlPlane::card_claim(&storage, child.id).await),
+        "card_closed"
+    );
+}
+
+/// A client shows its own board: a `workspace_id` on `task.list` /
+/// `task.quick_add` names that board whichever workspace the daemon has
+/// active, and an unregistered one is refused rather than guessed.
+/// A recurrence is a cron expression or nothing: `"daily"` is refused instead
+/// of stored-and-never-run, and `""` clears one (it used to store `""`, which
+/// no write could ever remove).
+#[tokio::test]
+async fn a_recurrence_is_checked_on_write_and_can_be_cleared() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let refused = ask(serde_json::json!({
+        "type": "task", "action": "create", "title": "Water plants", "scope": "global",
+        "recurrence": "daily",
+    }))
+    .await;
+    assert_eq!(refused["error"], "bad_recurrence", "{refused}");
+
+    let created = ask(serde_json::json!({
+        "type": "task", "action": "create", "title": "Water plants", "scope": "global",
+        "recurrence": " 0 9 * * 1 ",
+    }))
+    .await;
+    let id = created["task"]["id"].as_i64().expect("created");
+    assert_eq!(
+        created["task"]["recurrence"], "0 9 * * 1",
+        "stored trimmed: {created}"
+    );
+
+    let bad_patch = ask(serde_json::json!({
+        "type": "task", "action": "update", "id": id, "patch": {"recurrence": "weekly"},
+    }))
+    .await;
+    assert_eq!(bad_patch["error"], "bad_recurrence", "{bad_patch}");
+    let cleared = ask(serde_json::json!({
+        "type": "task", "action": "update", "id": id, "patch": {"recurrence": ""},
+    }))
+    .await;
+    assert!(cleared.get("error").is_none(), "{cleared}");
+    let task = storage.tasks().get(id).await.expect("task");
+    assert_eq!(task.recurrence, None, "an empty string clears it");
+}
+
+/// `task.done` judges a board card in its OWN board's workspace, not whichever
+/// workspace happens to be active — as a card run already did.
+#[tokio::test]
+async fn a_cards_acceptance_is_judged_in_its_own_boards_workspace() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let (dir_a, dir_b) = (
+        tempfile::tempdir().expect("a"),
+        tempfile::tempdir().expect("b"),
+    );
+    std::fs::write(dir_b.path().join("report.md"), "done").expect("B's artifact");
+    let mut ids = Vec::new();
+    for dir in [&dir_a, &dir_b] {
+        let opened = ask(serde_json::json!({
+            "type": "workspace", "action": "open", "path": dir.path().display().to_string(),
+        }))
+        .await;
+        ids.push(opened["id"].as_str().expect("an id").to_string());
+    }
+    let on_b = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "Write the report", "workspace_id": ids[1],
+    }))
+    .await;
+    let card_id = on_b["task"]["id"].as_i64().expect("a card");
+    let patched = ask(serde_json::json!({
+        "type": "task", "action": "update", "id": card_id,
+        "patch": {"acceptance": {"kind": "file_exists", "path": "report.md"}},
+    }))
+    .await;
+    assert!(patched.get("error").is_none(), "{patched}");
+    // A, which lacks the file, is the active workspace.
+    let active =
+        ask(serde_json::json!({"type": "workspace", "action": "set_active", "id": ids[0]})).await;
+    assert!(active.get("error").is_none(), "{active}");
+
+    let done = ask(serde_json::json!({"type": "task", "action": "done", "id": card_id})).await;
+    assert_eq!(
+        done["done"], true,
+        "judged in B, where the report is: {done}"
+    );
+}
+
+#[tokio::test]
+async fn a_board_named_by_workspace_id_is_used_whatever_is_active() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let (dir_a, dir_b) = (
+        tempfile::tempdir().expect("a"),
+        tempfile::tempdir().expect("b"),
+    );
+    let mut ids = Vec::new();
+    for dir in [&dir_a, &dir_b] {
+        let opened = ask(serde_json::json!({
+            "type": "workspace", "action": "open", "path": dir.path().display().to_string(),
+        }))
+        .await;
+        ids.push(opened["id"].as_str().expect("an id").to_string());
+    }
+    let (id_a, id_b) = (ids[0].clone(), ids[1].clone());
+    let active =
+        ask(serde_json::json!({"type": "workspace", "action": "set_active", "id": id_a})).await;
+    assert!(active.get("error").is_none(), "{active}");
+
+    let on_b = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "On B", "workspace_id": id_b,
+    }))
+    .await;
+    assert_eq!(
+        on_b["task"]["scope_id"],
+        id_b.as_str(),
+        "the named board: {on_b}"
+    );
+    let on_a =
+        ask(serde_json::json!({"type": "task", "action": "quick_add", "text": "On A"})).await;
+    assert_eq!(
+        on_a["task"]["scope_id"],
+        id_a.as_str(),
+        "the active board by default: {on_a}"
+    );
+
+    let titles = |reply: &Value| -> Vec<String> {
+        reply["tasks"]
+            .as_array()
+            .map(|tasks| {
+                tasks
+                    .iter()
+                    .filter_map(|t| t["title"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let listed_b = ask(serde_json::json!({
+        "type": "task", "action": "list", "scope": "workspace", "workspace_id": id_b,
+    }))
+    .await;
+    assert_eq!(titles(&listed_b), vec!["On B".to_string()], "{listed_b}");
+    let listed_active = ask(serde_json::json!({
+        "type": "task", "action": "list", "scope": "workspace",
+    }))
+    .await;
+    assert_eq!(
+        titles(&listed_active),
+        vec!["On A".to_string()],
+        "{listed_active}"
+    );
+
+    let unknown = ask(serde_json::json!({
+        "type": "task", "action": "list", "scope": "workspace", "workspace_id": "nope",
+    }))
+    .await;
+    assert_eq!(unknown["error"], "bad_scope", "{unknown}");
+    assert!(
+        unknown["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("not registered")),
+        "{unknown}"
+    );
+    // A workspace id says nothing about the global board.
+    let global = ask(serde_json::json!({
+        "type": "task", "action": "list", "scope": "global", "workspace_id": id_b,
+    }))
+    .await;
+    assert_eq!(titles(&global), Vec::<String>::new(), "{global}");
+}
+
+#[tokio::test]
+async fn a_quick_add_line_becomes_a_board_card() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let created = ask(serde_json::json!({
+        "type": "member", "action": "create", "name": "Builder",
+    }))
+    .await;
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+
+    // No workspace is open, so the line lands on the global board.
+    let added = ask(serde_json::json!({
+        "type": "task", "action": "quick_add",
+        "text": "Ship the fix #release p2 @builder tomorrow {in 9 days}",
+    }))
+    .await;
+    let card = &added["task"];
+    assert_eq!(card["title"], "Ship the fix", "{added}");
+    assert_eq!(card["scope"], "global", "{added}");
+    assert_eq!(card["labels"], serde_json::json!(["release"]), "{added}");
+    assert_eq!(card["priority"], 2, "{added}");
+    assert_eq!(card["assignee"], "agent:builder", "{added}");
+    let tomorrow = (chrono::Utc::now().date_naive() + chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_eq!(card["due_at"], tomorrow.as_str(), "{added}");
+    assert!(card["deadline_at"].is_string(), "{added}");
+    assert_eq!(added["parsed"]["assignee"], "builder", "the raw handle is echoed: {added}");
+    let id = card["id"].as_i64().expect("id");
+    assert_eq!(
+        storage.tasks().created_by(id).await.expect("created_by").as_deref(),
+        Some("gui"),
+        "a quick-add card is the board client's, so its router takes it up"
+    );
+
+    // Refusals name what to fix, and write nothing.
+    let unknown = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "Paint @nobody",
+    }))
+    .await;
+    assert_eq!(unknown["error"], "unknown_member", "{unknown}");
+    assert!(unknown["message"].as_str().is_some_and(|m| m.contains("@builder")), "{unknown}");
+    let router = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "Paint @router:global",
+    }))
+    .await;
+    assert_eq!(router["error"], "unknown_member", "{router}");
+    let braces = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "Paint {soon}",
+    }))
+    .await;
+    assert_eq!(braces["error"], "bad_quick_add", "{braces}");
+    let session = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "Paint", "scope": "session",
+    }))
+    .await;
+    assert_eq!(session["error"], "bad_scope", "{session}");
+    let all = storage.tasks().list("global", None, true).await.expect("list");
+    assert_eq!(all.len(), 1, "only the good line made a card: {all:?}");
+}
+
+#[tokio::test]
+async fn a_members_cards_are_read_across_boards_over_ipc() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    for (title, scope, scope_id) in [("one", "global", None), ("two", "workspace", Some("ws-a"))] {
+        storage
+            .tasks()
+            .create(nanna_storage::NewTask {
+                title: title.to_string(),
+                scope: scope.to_string(),
+                scope_id: scope_id.map(str::to_string),
+                priority: 3,
+                assignee: Some("human".to_string()),
+                ..nanna_storage::NewTask::default()
+            })
+            .await
+            .expect("card");
+    }
+    let mine = ask(serde_json::json!({ "type": "task", "action": "assigned" })).await;
+    assert_eq!(mine["member_id"], "human", "the human by default: {mine}");
+    assert_eq!(mine["cards"].as_array().map(Vec::len), Some(2), "both boards: {mine}");
+    assert_eq!(
+        mine["today"].as_str().map(str::len),
+        Some(10),
+        "the store's day comes with it: {mine}"
+    );
+    let refused = ask(serde_json::json!({ "type": "task", "action": "assigned", "limit": 0 })).await;
+    assert_eq!(refused["error"], "bad_limit", "{refused}");
+}
+
+#[tokio::test]
+async fn an_empty_date_in_a_patch_clears_it_and_null_skips_it() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let card = storage
+        .tasks()
+        .create(nanna_storage::NewTask {
+            title: "dated".to_string(),
+            scope: "global".to_string(),
+            priority: 3,
+            due_at: Some("2026-11-01".to_string()),
+            deadline_at: Some("2026-11-30".to_string()),
+            ..nanna_storage::NewTask::default()
+        })
+        .await
+        .expect("card");
+    let skipped = ask(serde_json::json!({
+        "type": "task", "action": "update", "id": card.id,
+        "patch": { "due_at": null, "priority": 2 },
+    }))
+    .await;
+    assert_eq!(skipped["task"]["due_at"], "2026-11-01", "null leaves the date: {skipped}");
+    let cleared = ask(serde_json::json!({
+        "type": "task", "action": "update", "id": card.id,
+        "patch": { "due_at": "", "deadline_at": " " },
+    }))
+    .await;
+    assert!(cleared["task"]["due_at"].is_null(), "{cleared}");
+    assert!(cleared["task"]["deadline_at"].is_null(), "{cleared}");
+    assert_eq!(cleared["task"]["priority"], 2, "{cleared}");
+}
+
+#[tokio::test]
+async fn a_quick_add_line_with_a_parent_becomes_its_sub_card() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let parent = storage
+        .tasks()
+        .create(nanna_storage::NewTask {
+            title: "release".to_string(),
+            scope: "workspace".to_string(),
+            scope_id: Some("ws-x".to_string()),
+            priority: 3,
+            ..nanna_storage::NewTask::default()
+        })
+        .await
+        .expect("parent");
+    // `scope: global` is ignored: a sub-card lives on its parent's board.
+    let child = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "tag it #ops",
+        "scope": "global", "parent_id": parent.id,
+    }))
+    .await;
+    assert_eq!(child["task"]["parent_id"], parent.id, "{child}");
+    assert_eq!(child["task"]["scope"], "workspace", "{child}");
+    assert_eq!(child["task"]["scope_id"], "ws-x", "{child}");
+    let session_parent = storage
+        .tasks()
+        .create(nanna_storage::NewTask {
+            title: "chat plan".to_string(),
+            scope: "session".to_string(),
+            scope_id: Some("s1".to_string()),
+            priority: 3,
+            ..nanna_storage::NewTask::default()
+        })
+        .await
+        .expect("session card");
+    let refused = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "nope", "parent_id": session_parent.id,
+    }))
+    .await;
+    assert_eq!(refused["error"], "bad_scope", "{refused}");
+    let missing = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "nope", "parent_id": 9_999,
+    }))
+    .await;
+    assert_eq!(missing["error"], "task_not_found", "{missing}");
+}
+
+/// A change whose save fails is live for this run and says it was not saved:
+/// every config write used to log the failure and reply a clean success, so a
+/// setting silently reverted at the next restart.
+#[tokio::test]
+async fn a_config_change_that_cannot_be_saved_says_so() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut cp, _store) = persisting_control_plane(dir.path());
+    // A directory where the file should be: every save fails.
+    let unwritable = dir.path().join("config-is-a-directory");
+    std::fs::create_dir(&unwritable).expect("mkdir");
+    cp.config_path = Some(unwritable);
+    let cp = Arc::new(cp);
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "llm.model".into(),
+                value: json!("nanna-test-unsaved-model"),
+            }),
+        )
+        .await;
+    assert_eq!(resp["error"], "not_persisted", "{resp}");
+    assert_eq!(resp["status"], "updated", "{resp}");
+    assert_eq!(resp["path"], "llm.model", "{resp}");
+    assert_eq!(
+        cp.config.read().await.llm.model,
+        "nanna-test-unsaved-model",
+        "the change still applies for this run"
+    );
+
+    let reset = cp.handle("test", Action::Config(ConfigAction::Reset { path: None })).await;
+    assert_eq!(reset["error"], "not_persisted", "{reset}");
+    assert_eq!(reset["status"], "reset", "{reset}");
 }

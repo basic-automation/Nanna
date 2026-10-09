@@ -276,18 +276,7 @@ mod tools_impl {
             let content = result
                 .content
                 .iter()
-                .filter_map(|c| match c {
-                    ToolContent::Text { text } => Some(text.clone()),
-                    ToolContent::Image { data, mime_type } => {
-                        Some(format!("[Image: {mime_type}, {} bytes]", data.len()))
-                    }
-                    ToolContent::Resource { resource } => resource.text.clone().or_else(|| {
-                        resource
-                            .blob
-                            .as_ref()
-                            .map(|b| format!("[Blob: {} bytes]", b.len()))
-                    }),
-                })
+                .filter_map(ToolContent::to_text)
                 .collect::<Vec<_>>()
                 .join("\n");
 
@@ -307,8 +296,12 @@ mod tools_impl {
             Ok(tool_result)
         }
 
+        /// The registry's deadline sits just past the transport's own, so the
+        /// transport's timeout — which names the server — is the one a slow
+        /// call reports, not the registry's generic one. The two used to
+        /// disagree outright: 60 s advertised here, 30 s enforced below.
         fn timeout_secs(&self) -> Option<u64> {
-            Some(60) // MCP tools may be slower
+            Some(crate::MCP_REQUEST_TIMEOUT.as_secs() + crate::MCP_DEADLINE_MARGIN_SECS)
         }
     }
 
@@ -783,18 +776,7 @@ impl<T: Transport + 'static> McpToolAdapter<T> {
         let content = result
             .content
             .iter()
-            .filter_map(|c| match c {
-                ToolContent::Text { text } => Some(text.clone()),
-                ToolContent::Image { data, mime_type } => {
-                    Some(format!("[Image: {mime_type}, {} bytes]", data.len()))
-                }
-                ToolContent::Resource { resource } => resource.text.clone().or_else(|| {
-                    resource
-                        .blob
-                        .as_ref()
-                        .map(|b| format!("[Blob: {} bytes]", b.len()))
-                }),
-            })
+            .filter_map(ToolContent::to_text)
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -804,126 +786,6 @@ impl<T: Transport + 'static> McpToolAdapter<T> {
             raw: result.content,
             structured: result.structured_content,
         })
-    }
-}
-
-/// Manager for multiple MCP server connections (standalone, no nanna-tools)
-pub struct McpManager<T: Transport + 'static> {
-    /// Connected MCP clients by server name
-    clients: HashMap<String, Arc<McpClient<T>>>,
-    /// All available tools across all servers
-    tools: HashMap<String, McpToolAdapter<T>>,
-}
-
-impl<T: Transport + 'static> McpManager<T> {
-    /// Create a new MCP manager
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            clients: HashMap::new(),
-            tools: HashMap::new(),
-        }
-    }
-
-    /// Register an MCP client
-    ///
-    /// # Errors
-    ///
-    /// Returns error if client is not initialized
-    pub async fn register(
-        &mut self,
-        name: impl Into<String>,
-        client: McpClient<T>,
-    ) -> Result<(), McpError> {
-        let name = name.into();
-        let client = Arc::new(client);
-
-        // Get tools from the server
-        let tools = client.list_tools().await?;
-        debug!(server = %name, count = tools.len(), "Registered MCP server tools");
-
-        for tool in tools {
-            let tool_name = format!("{}:{}", name, tool.name);
-            let adapter = McpToolAdapter::new(client.clone(), tool);
-            self.tools.insert(tool_name, adapter);
-        }
-
-        self.clients.insert(name, client);
-        Ok(())
-    }
-
-    /// Get all available tools
-    pub fn tools(&self) -> impl Iterator<Item = (&str, &McpToolAdapter<T>)> {
-        self.tools.iter().map(|(k, v)| (k.as_str(), v))
-    }
-
-    /// Get a specific tool by name
-    #[must_use]
-    pub fn get_tool(&self, name: &str) -> Option<&McpToolAdapter<T>> {
-        self.tools.get(name)
-    }
-
-    /// Execute a tool by name
-    ///
-    /// # Errors
-    ///
-    /// Returns error if tool not found or execution fails
-    pub async fn execute(
-        &self,
-        name: &str,
-        arguments: Option<serde_json::Value>,
-    ) -> Result<McpToolResult, McpError> {
-        let tool = self
-            .tools
-            .get(name)
-            .ok_or_else(|| McpError::ToolNotFound(name.to_string()))?;
-
-        tool.execute(arguments).await
-    }
-
-    /// Refresh tools from all servers
-    ///
-    /// # Errors
-    ///
-    /// Returns error if refresh fails for any server
-    pub async fn refresh(&mut self) -> Result<(), McpError> {
-        self.tools.clear();
-
-        for (name, client) in &self.clients {
-            match client.refresh_tools().await {
-                Ok(tools) => {
-                    for tool in tools {
-                        let tool_name = format!("{name}:{}", tool.name);
-                        let adapter = McpToolAdapter::new(client.clone(), tool);
-                        self.tools.insert(tool_name, adapter);
-                    }
-                }
-                Err(e) => {
-                    warn!(server = %name, error = %e, "Failed to refresh tools");
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Close all connections concurrently (see the tools manager's
-    /// `close_all` for why).
-    ///
-    /// # Errors
-    ///
-    /// Returns the first close error, after every close has been attempted.
-    pub async fn close_all(&self) -> Result<(), McpError> {
-        let outcomes =
-            futures::future::join_all(self.clients.values().map(|client| client.close())).await;
-        debug_assert_eq!(outcomes.len(), self.clients.len());
-        outcomes.into_iter().collect()
-    }
-}
-
-impl<T: Transport + 'static> Default for McpManager<T> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

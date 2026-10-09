@@ -128,6 +128,14 @@ function installInPage(options = {}) {
       { name: 'discord', configured: false, connected: false, status: 'not_configured' },
     ],
     cronJobs: [],
+    // Board (P25 Stage 4): cards and the global board's roster.
+    cards: [],
+    nextCardId: 1,
+    runningCards: [],
+    members: [
+      { id: 'human', name: 'You', avatar: null, kind: 'human', owner_kind: 'human', status: 'idle', profile: {} },
+      { id: 'router:global', name: 'Task Router', avatar: null, kind: 'agent', owner_kind: 'workspace', status: 'idle', profile: { role: 'router' } },
+    ],
     modelStats: { models: [], total_requests: 0, total_tokens: 0, total_cost_usd: 0, costs: [] },
     toolStats: { tools: [], total_calls: 0 },
     agentStats: { agents: [], clusters: [] },
@@ -501,10 +509,6 @@ function installInPage(options = {}) {
         return true;
       case 'get_cognitive_memory_stats':
         return { total: state.memories.length, by_category: {}, avg_importance: 0.5 };
-      case 'get_similarity_threshold':
-        return 0.85;
-      case 'set_similarity_threshold':
-      case 'set_dreaming_enabled':
       case 'set_max_compression_ratio':
       case 'set_min_remaining_memories':
       case 'trigger_consolidation':
@@ -568,7 +572,110 @@ function installInPage(options = {}) {
         return { valid: true, next: nowIso() };
 
       case 'list_tasks':
-        return { tasks: [] };
+        // Only the board's scopes hold cards here; a chat's session list stays empty.
+        return { tasks: args.scope === 'session' ? [] : state.cards.filter((c) => c.scope === args.scope).map((c) => ({ ...c })) };
+      case 'quick_add_card': {
+        // A small stand-in for the daemon's parser: #label, p1-p4 and @member.
+        const words = String(args.text || '').trim().split(/\s+/).filter(Boolean);
+        const card = { id: state.nextCardId, parent_id: null, scope: args.scope || 'global', scope_id: null,
+          title: '', description: null, status: 'pending', priority: 3, labels: [], due_at: null, deadline_at: null,
+          assignee: null, blocked: false, depends_on: [], sort_order: state.nextCardId, created_at: nowIso(), updated_at: nowIso() };
+        const title = [];
+        for (const word of words) {
+          if (/^#./.test(word)) card.labels.push(word.slice(1));
+          else if (/^p[1-4]$/i.test(word)) card.priority = Number(word.slice(1));
+          else if (/^@./.test(word)) {
+            const handle = word.slice(1).toLowerCase();
+            const member = handle === 'me' ? state.members[0] : state.members.find((m) => !m.id.startsWith('router:') && (m.id === handle || m.id === 'agent:' + handle));
+            if (!member) return { error: 'unknown_member', message: 'no member @' + handle + ' on this board — members: @human' };
+            card.assignee = member.id;
+          } else title.push(word);
+        }
+        card.title = title.join(' ');
+        if (args.parentId) {
+          const parent = state.cards.find((c) => c.id === args.parentId);
+          if (!parent) return { error: 'task_not_found', message: 'no card #' + args.parentId };
+          card.parent_id = parent.id;
+          card.scope = parent.scope;
+        }
+        if (!card.title) return { error: 'bad_quick_add', message: 'a card needs a title — every word was a token' };
+        state.nextCardId += 1;
+        state.cards.push(card);
+        emitEvent('board-event', { kind: 'created', task_id: card.id, scope: card.scope, scope_id: null, actor: 'gui' });
+        return { task: { ...card } };
+      }
+      case 'get_card': {
+        const card = state.cards.find((c) => c.id === args.id);
+        if (!card) return { error: 'task_not_found', message: 'no card #' + args.id };
+        return { task: { ...card }, notes: (card.notes || []).map((n) => ({ ...n })), activity: [] };
+      }
+      case 'post_on_card': {
+        const card = state.cards.find((c) => c.id === args.id);
+        if (!card) return { error: 'task_note_failed', message: 'no card #' + args.id };
+        card.notes = card.notes || [];
+        const note = { id: card.notes.length + 1, task_id: card.id, author: 'gui', author_member_id: 'human', kind: 'comment', content: args.content, created_at: nowIso() };
+        card.notes.push(note);
+        return { note };
+      }
+      case 'update_task': {
+        const card = state.cards.find((c) => c.id === args.id);
+        if (!card) return { error: 'task_update_failed', message: 'no card #' + args.id };
+        for (const [key, value] of Object.entries(args.patch || {})) {
+          if (value !== null && value !== undefined) card[key] = value === '' ? null : value;
+        }
+        card.updated_at = nowIso();
+        return { task: { ...card } };
+      }
+      case 'complete_task': {
+        const card = state.cards.find((c) => c.id === args.id);
+        if (!card) return { error: 'task_done_failed', message: 'no card #' + args.id };
+        card.status = 'done';
+        card.updated_at = nowIso();
+        return { done: true, already_done: false, auto_completed: [] };
+      }
+      case 'card_run_status':
+        return { running: state.runningCards.includes(args.cardId), resumes: 0 };
+      case 'start_card_run': {
+        const card = state.cards.find((c) => c.id === args.cardId);
+        if (!card || !String(card.assignee || '').startsWith('agent:')) return { error: 'not_an_agent', message: 'card #' + args.cardId + ' is not assigned to an agent' };
+        card.status = 'in_progress';
+        if (!state.runningCards.includes(card.id)) state.runningCards.push(card.id);
+        return { started: true, card_id: card.id, member_id: card.assignee };
+      }
+      case 'stop_card_run': {
+        const was = state.runningCards.includes(args.cardId);
+        state.runningCards = state.runningCards.filter((id) => id !== args.cardId);
+        return { cancelled: was };
+      }
+      case 'list_members':
+        return { members: state.members.map((m) => ({ ...m })) };
+      case 'list_assigned_cards': {
+        const id = args.memberId || 'human';
+        return { member_id: id, today: nowIso().slice(0, 10), cards: state.cards.filter((c) => c.assignee === id && (c.status === 'pending' || c.status === 'in_progress')).map((c) => ({ ...c })) };
+      }
+      case 'create_member': {
+        const slug = String(args.name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+        const id = 'agent:' + slug;
+        if (state.members.some((m) => m.id === id)) return { error: 'invalid_member', message: 'a member ' + id + ' already exists' };
+        const member = { id, name: args.name, avatar: null, kind: 'agent', owner_kind: args.personal ? 'human' : 'workspace', status: 'idle', profile: args.profile || {} };
+        state.members.push(member);
+        emitEvent('members-changed', null);
+        return { member: { ...member } };
+      }
+      case 'update_member': {
+        const member = state.members.find((m) => m.id === args.id);
+        if (!member) return { error: 'member_not_found', message: args.id };
+        if (args.name) member.name = args.name;
+        if (args.profile) member.profile = args.profile;
+        emitEvent('members-changed', null);
+        return { member: { ...member } };
+      }
+      case 'delete_member': {
+        const before = state.members.length;
+        state.members = state.members.filter((m) => m.id !== args.id || !m.id.startsWith('agent:'));
+        if (state.members.length !== before) emitEvent('members-changed', null);
+        return { deleted: state.members.length !== before };
+      }
 
       case 'get_model_stats':
         return { ...state.modelStats };
@@ -658,8 +765,11 @@ function installInPage(options = {}) {
         };
       case 'check_claude_proxy_health':
         return false;
+      case 'get_data_dir':
+        return { effective: '/home/e2e/.local/share/nanna', default: '/home/e2e/.local/share/nanna', is_custom: false, in_use: '/home/e2e/.local/share/nanna' };
+      case 'set_data_dir':
+        return { effective: args?.path || '/home/e2e/.local/share/nanna', default: '/home/e2e/.local/share/nanna', is_custom: !!args?.path, in_use: '/home/e2e/.local/share/nanna' };
       case 'get_cognitive_memory_stats':
-      case 'get_memory_stats':
         return {
           total_memories: state.memories?.length || 0,
           by_category: {},

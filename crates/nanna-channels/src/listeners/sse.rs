@@ -28,6 +28,31 @@ pub fn take_event(buffer: &mut Vec<u8>) -> Option<String> {
     )
 }
 
+/// How long connecting to an SSE endpoint may take.
+const SSE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// TCP keepalive for a long-lived stream: how a peer that vanished without a
+/// FIN (a sleeping laptop, a dropped NAT mapping) is eventually noticed on a
+/// stream that is legitimately silent for hours.
+const SSE_TCP_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// An HTTP client for a listener whose main request is a long-lived SSE stream.
+///
+/// **No whole-request timeout.** reqwest's `timeout` covers reading the body
+/// too, so the 120 s the `Signal` and `WhatsApp` listeners used cut every healthy
+/// stream at two minutes; each cut was recorded as a connection failure,
+/// feeding the circuit breaker, and anything sent during the reconnect was
+/// missed. Connecting is bounded (`SSE_CONNECT_TIMEOUT`) and a dead peer is
+/// found by TCP keepalive; the listener's other requests set their own
+/// per-request deadlines.
+pub(super) fn long_lived_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(SSE_CONNECT_TIMEOUT)
+        .tcp_keepalive(SSE_TCP_KEEPALIVE)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::take_event;

@@ -72,6 +72,11 @@ pub enum Action {
     Task(TaskAction),
 
     // =========================================================================
+    // Board members (P25 decision 3: the human and every agent, one entity)
+    // =========================================================================
+    Member(MemberAction),
+
+    // =========================================================================
     // Subscriptions
     // =========================================================================
     Subscribe(SubscribeAction),
@@ -79,13 +84,74 @@ pub enum Action {
 }
 
 // =============================================================================
+// Member Actions (P25 board members)
+// =============================================================================
+
+/// The board's roster over IPC: who can be assigned a card.
+///
+/// Only **agents** are created here — the install has one human, seeded by the
+/// members migration, and the Task Management Agent of each board is created
+/// with its workspace. Identity (`id`, `kind`, owner) never changes after
+/// creation; re-creating the member is the honest way to change what it is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum MemberAction {
+    /// The roster one board sees: its workspace's members plus every
+    /// human-owned one (the human and their personal agents). No
+    /// `workspace_id` means the global board.
+    List {
+        #[serde(default)]
+        workspace_id: Option<String>,
+    },
+    /// One member.
+    Get { id: String },
+    /// Add an agent. Its id is `agent:<slug of name>`. `personal` makes it the
+    /// human's own agent, which travels with them between boards (P25
+    /// decision 12); otherwise it belongs to `workspace_id`'s board (none =
+    /// global).
+    Create {
+        name: String,
+        #[serde(default)]
+        workspace_id: Option<String>,
+        #[serde(default)]
+        personal: bool,
+        #[serde(default)]
+        avatar: Option<String>,
+        /// Model tier, capability tags, tools, skills, cost — what the router
+        /// reads. For a router, `model_priority` is its own model list.
+        #[serde(default)]
+        profile: Option<Value>,
+    },
+    /// Change what may change: name, avatar, status, profile. Absent fields
+    /// are left as they are.
+    Update {
+        id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        avatar: Option<String>,
+        /// `idle` | `busy` | `offline`
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        profile: Option<Value>,
+    },
+    /// Remove an agent. The human and the routers are refused.
+    Delete { id: String },
+}
+
+// =============================================================================
 // Task Actions (P15 store + P14 long-horizon runs)
 // =============================================================================
 
+/// Verdicts `task.verdicts` scans when the caller names no window: enough
+/// recent history to tell members apart on the labels they share, small enough
+/// to answer from one indexed scan in well under a frame.
+pub const TASK_VERDICT_WINDOW_DEFAULT: usize = 500;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
-pub enum TaskAction {
-    /// List tasks in a scope
+pub enum TaskAction {    /// List tasks in a scope
     List {
         #[serde(default)]
         scope: Option<String>,
@@ -93,6 +159,11 @@ pub enum TaskAction {
         session_id: Option<String>,
         #[serde(default)]
         include_closed: Option<bool>,
+        /// With `scope: "workspace"`, the board of this registered workspace
+        /// rather than the daemon's active one — a client shows its own
+        /// board, which another client's choice must not change.
+        #[serde(default)]
+        workspace_id: Option<String>,
     },
     /// Get one task with notes + activity
     Get { id: i64 },
@@ -146,6 +217,36 @@ pub enum TaskAction {
         #[serde(default)]
         assignee: Option<String>,
     },
+    /// One line of text → one board card (P25 decision 1): `#label`,
+    /// `p1`..`p4`, `@member`, a date phrase (the defer date) and `{date
+    /// phrase}` (the deadline) fill fields, the rest is the title. `scope`
+    /// is `workspace` (the active board, the default when one is open) or
+    /// `global`; with `parent_id` the card is a sub-card on the parent's board.
+    /// The reply is `{task, parsed}`.
+    QuickAdd {
+        text: String,
+        #[serde(default)]
+        scope: Option<String>,
+        /// Make the card a sub-card of this one; it then lives on the
+        /// parent's board and `scope` is ignored.
+        #[serde(default)]
+        parent_id: Option<i64>,
+        /// With `scope: "workspace"`, put the card on this registered
+        /// workspace's board rather than the daemon's active one.
+        #[serde(default)]
+        workspace_id: Option<String>,
+    },
+    /// Every open board card assigned to `member_id` (default: the human),
+    /// across every board — the read behind Inbox and Upcoming (P25 decision
+    /// 11). The reply is `{cards, today}`, `today` being the store's UTC day,
+    /// so a client splits "date today or past, or none" from "later" on the
+    /// same clock the store uses.
+    Assigned {
+        #[serde(default)]
+        member_id: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     /// Partial update (status accepts `pending|in_progress|cancelled`)
     Update {
         id: i64,
@@ -170,9 +271,14 @@ pub enum TaskAction {
         #[serde(default)]
         session_id: Option<String>,
     },
-    /// Start a long-horizon run over a scope's plan (P14)
+    /// Start a long-horizon run over a scope's plan (P14) — or, with
+    /// `card_id`, the card's assignee working that card's subtree (P25
+    /// Stage 3; `goal` and `scope` are then the card's own and ignored).
     StartRun {
+        #[serde(default)]
         goal: String,
+        #[serde(default)]
+        card_id: Option<i64>,
         #[serde(default)]
         scope: Option<String>,
         #[serde(default)]
@@ -184,19 +290,30 @@ pub enum TaskAction {
         #[serde(default)]
         max_total_tokens: Option<u64>,
     },
-    /// Status of the scope's run (live or last report)
+    /// Status of the scope's run (live or last report), or card `card_id`'s
     RunStatus {
+        #[serde(default)]
+        card_id: Option<i64>,
         #[serde(default)]
         scope: Option<String>,
         #[serde(default)]
         session_id: Option<String>,
     },
-    /// Cancel the scope's active run
+    /// Cancel the scope's active run, or card `card_id`'s
     CancelRun {
+        #[serde(default)]
+        card_id: Option<i64>,
         #[serde(default)]
         scope: Option<String>,
         #[serde(default)]
         session_id: Option<String>,
+    },
+    /// Each member's acceptance verdicts per label and overall, over the most
+    /// recent `window` of them (default [`TASK_VERDICT_WINDOW_DEFAULT`]) — the
+    /// history the P25 router reads to choose a member.
+    Verdicts {
+        #[serde(default)]
+        window: Option<usize>,
     },
 }
 
@@ -457,7 +574,67 @@ pub enum MemoryAction {
 // Config Actions
 // =============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A secret the user typed, carried in a request.
+///
+/// The wire form is the plain string (`serde(transparent)`), so no client
+/// changes; `Debug` never shows it. It exists because the IPC layer logs every
+/// request with `{:?}` at debug level — and a `String` field printed the key
+/// under validation in full, while the handler's comment said it was "never
+/// logged".
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretInput(String);
+
+impl SecretInput {
+    #[must_use]
+    pub fn new(secret: impl Into<String>) -> Self {
+        Self(secret.into())
+    }
+
+    /// The secret itself — for the one call that needs it, never a log.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[redacted {} bytes]", self.0.len())
+    }
+}
+
+/// `value` with every string at a secret config path (as `nanna-config`
+/// defines them: the fields a save strips) replaced by `"[redacted]"`.
+/// `prefix` is the dotted path `value` sits at; `""` for a whole config.
+fn redact_config_secrets(prefix: &str, value: &Value) -> Value {
+    match value {
+        Value::String(text) if nanna_config::Config::names_a_secret(prefix) && !text.is_empty() => {
+            Value::String("[redacted]".to_string())
+        }
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, child)| {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    (key.clone(), redact_config_secrets(&path, child))
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| redact_config_secrets(prefix, item))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ConfigAction {
     /// Get full config or specific path
@@ -472,6 +649,30 @@ pub enum ConfigAction {
     Export,
     /// Import config
     Import { config: Value },
+}
+
+/// Written by hand so a secret never reaches a log: `config.set` of
+/// `llm.api_key`, or a whole imported config, printed every key in full through
+/// the IPC layer's debug line. Values at secret paths are redacted; everything
+/// else prints as before.
+impl std::fmt::Debug for ConfigAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Get { path } => f.debug_struct("Get").field("path", path).finish(),
+            Self::Set { path, value } => f
+                .debug_struct("Set")
+                .field("path", path)
+                .field("value", &redact_config_secrets(path, value))
+                .finish(),
+            Self::Reset { path } => f.debug_struct("Reset").field("path", path).finish(),
+            Self::Reload => f.write_str("Reload"),
+            Self::Export => f.write_str("Export"),
+            Self::Import { config } => f
+                .debug_struct("Import")
+                .field("config", &redact_config_secrets("", config))
+                .finish(),
+        }
+    }
 }
 
 // =============================================================================
@@ -633,8 +834,7 @@ pub enum WorkspaceAction {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
-pub enum SystemAction {
-    /// Get system status
+pub enum SystemAction {    /// Get system status
     Status,
     /// Restart the daemon
     Restart,
@@ -715,8 +915,9 @@ pub enum SystemAction {
     ValidateApiKey {
         /// `anthropic` | `openai` | `openrouter` | `github` (GitHub Models).
         provider: String,
-        /// The key as typed. Blank is refused before any network.
-        key: String,
+        /// The key as typed. Blank is refused before any network. Redacted in
+        /// `Debug`, which the IPC layer logs every request through.
+        key: SecretInput,
     },
 }
 
@@ -765,12 +966,14 @@ pub enum ResponseResult {
 }
 
 impl Response {
-    pub fn success(id: RequestId, data: impl Serialize) -> Self {
+    /// A success response carrying `data` as is. It takes the tree by value:
+    /// the old `impl Serialize` form ran `to_value` on a `Value`, which deep-
+    /// copied every reply (a 14 MB `memory.list` twice over).
+    #[must_use]
+    pub const fn success(id: RequestId, data: Value) -> Self {
         Self {
             id,
-            result: ResponseResult::Success {
-                data: serde_json::to_value(data).unwrap_or(Value::Null),
-            },
+            result: ResponseResult::Success { data },
         }
     }
 
@@ -805,6 +1008,123 @@ impl Response {
         match &self.result {
             ResponseResult::Error { message, .. } => Some(message),
             ResponseResult::Success { .. } => None,
+        }
+    }
+}
+
+/// What a request handler gives the IPC layer to send back as `data`.
+///
+/// Almost every handler builds a [`Value`]. A handler whose reply is large
+/// (`memory.list`) serializes it straight from typed rows instead, so the
+/// daemon never holds the reply as a tree of heap nodes.
+#[derive(Debug)]
+pub enum Reply {
+    Tree(Value),
+    Raw(RawJson),
+}
+
+impl Reply {
+    /// The reply as a tree, for in-process callers. Parses a raw reply, so
+    /// it is for tests and small replies, never the IPC send path.
+    ///
+    /// # Errors
+    ///
+    /// A raw reply that is not valid JSON (it was serialized by `serde_json`,
+    /// so this means a bug, not bad input).
+    pub fn into_value(self) -> serde_json::Result<Value> {
+        match self {
+            Self::Tree(value) => Ok(value),
+            Self::Raw(raw) => serde_json::from_str(raw.get()),
+        }
+    }
+
+    /// The wire text of a success [`Response`] carrying this reply, written
+    /// without first building a [`Response`]: a tree is borrowed, a raw reply
+    /// is spliced into a frame allocated once at its exact size. Byte for
+    /// byte what serializing `Response::success(id, data)` gives
+    /// (`a_raw_reply_is_the_same_wire_response_as_its_tree`).
+    ///
+    /// # Errors
+    ///
+    /// Only what `serde_json::to_string` can return for a tree or a request
+    /// id, which in practice is nothing.
+    pub fn success_text(&self, id: &RequestId) -> serde_json::Result<String> {
+        const OPEN: &str = r#"{"id":"#;
+        const DATA: &str = r#","result":{"status":"success","data":"#;
+        const CLOSE: &str = "}}";
+        match self {
+            Self::Tree(data) => serde_json::to_string(&SuccessFrame::new(id, data)),
+            Self::Raw(data) => {
+                // `Response`'s layout spelled out: `id`, then `result` tagged
+                // by `status`. One allocation at the final size: a 16 MB reply
+                // grown by doubling left glibc arenas fragmented (measured).
+                let id_json = serde_json::to_string(id)?;
+                let bytes = OPEN.len() + id_json.len() + DATA.len() + data.get().len() + CLOSE.len();
+                let mut text = String::with_capacity(bytes);
+                for part in [OPEN, id_json.as_str(), DATA, data.get(), CLOSE] {
+                    text.push_str(part);
+                }
+                debug_assert_eq!(text.len(), bytes, "sized exactly");
+                Ok(text)
+            }
+        }
+    }
+}
+
+/// JSON text that `serde_json` wrote, so valid by construction: it can be
+/// spliced into a frame without being parsed again.
+#[derive(Debug)]
+pub struct RawJson(String);
+
+impl RawJson {
+    /// Serialize `value` into a buffer reserved at `capacity_bytes` up front.
+    /// A large reply's caller passes its size estimate: a buffer grown by
+    /// doubling to 16 MB leaves the freed 8, 4, 2 … MB blocks behind.
+    ///
+    /// # Errors
+    ///
+    /// What `serde_json` returns for `value` (a map with non-string keys, a
+    /// failing `Serialize` impl).
+    pub fn to_json<T: Serialize + ?Sized>(value: &T, capacity_bytes: usize) -> serde_json::Result<Self> {
+        let mut buf = Vec::with_capacity(capacity_bytes);
+        serde_json::to_writer(&mut buf, value)?;
+        debug_assert!(!buf.is_empty(), "every JSON value has text");
+        // serde_json writes UTF-8 only; the check is a scan, not a parse.
+        String::from_utf8(buf)
+            .map(Self)
+            .map_err(<serde_json::Error as serde::ser::Error>::custom)
+    }
+
+    /// The JSON text.
+    #[must_use]
+    pub fn get(&self) -> &str {
+        &self.0
+    }
+}
+
+/// `Response { id, result: Success { data } }` by reference. The field order
+/// and the `status` tag are [`ResponseResult`]'s `#[serde(tag = "status")]`
+/// layout, spelled out.
+#[derive(Serialize)]
+struct SuccessFrame<'a, D: ?Sized> {
+    id: &'a RequestId,
+    result: SuccessResult<'a, D>,
+}
+
+#[derive(Serialize)]
+struct SuccessResult<'a, D: ?Sized> {
+    status: &'static str,
+    data: &'a D,
+}
+
+impl<'a, D: ?Sized> SuccessFrame<'a, D> {
+    const fn new(id: &'a RequestId, data: &'a D) -> Self {
+        Self {
+            id,
+            result: SuccessResult {
+                status: "success",
+                data,
+            },
         }
     }
 }
@@ -943,6 +1263,14 @@ pub enum Event {
     /// Without this a workspace registered after a client connected stayed
     /// invisible to it until restart.
     WorkspacesChanged,
+
+    /// The board roster changed — a member was created, updated or deleted
+    /// (P25 decision 3).
+    ///
+    /// Payload-free like [`Event::WorkspacesChanged`]: a client re-lists the
+    /// roster of the board it shows. Without it an agent added in one client
+    /// was not assignable from another until that one re-listed.
+    MembersChanged,
 
     /// The daemon's configuration was mutated and committed (set / reset /
     /// reload / import).
@@ -1135,6 +1463,7 @@ impl Event {
             | Self::SessionRenamed { id, .. } => Some(id),
             Self::Error { session_id, .. } => session_id.as_deref(),
             Self::WorkspacesChanged
+            | Self::MembersChanged
             | Self::ConfigChanged
             | Self::MemoryCreated { .. }
             | Self::MemoryStoreRebuilt { .. }
@@ -1221,6 +1550,80 @@ impl From<ControlAction> for Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The IPC server writes success frames through [`Reply::success_text`]
+    /// instead of serializing a [`Response`]. Clients parse `Response`, so the
+    /// frame must be the same text — for a tree and for a raw reply alike.
+    #[test]
+    fn a_raw_reply_is_the_same_wire_response_as_its_tree() {
+        let data = serde_json::json!({
+            "memories": [{ "id": "m1", "content": "a \"quoted\" line\n", "session_id": null, "weight": 0.5 }],
+            "count": 1,
+        });
+        // An id that needs escaping: the raw frame writes it through serde.
+        let id: RequestId = "req-\"7\"".to_string();
+        let expected = serde_json::to_string(&Response::success(id.clone(), data.clone())).expect("serialize");
+        let raw = RawJson::to_json(&data, 16).expect("raw");
+
+        let tree_text = Reply::Tree(data).success_text(&id).expect("tree frame");
+        let raw_text = Reply::Raw(raw).success_text(&id).expect("raw frame");
+
+        assert_eq!(tree_text, expected);
+        assert_eq!(raw_text, expected);
+        let parsed: Response = serde_json::from_str(&raw_text).expect("a client parses it");
+        assert_eq!(parsed.id, id);
+        assert_eq!(parsed.data().and_then(|d| d["count"].as_u64()), Some(1));
+    }
+
+    /// The IPC layer logs every request as `{:?}`. A key under validation, a
+    /// `config.set` of a key, and an imported config all printed their secrets
+    /// in full there; the wire form must stay exactly what clients send.
+    #[test]
+    fn secrets_never_reach_a_requests_debug_line() {
+        let validate = serde_json::json!({
+            "type": "system", "action": "validate_api_key",
+            "provider": "anthropic", "key": "sk-ant-SECRET-1",
+        });
+        let set_key = serde_json::json!({
+            "type": "config", "action": "set", "path": "llm.api_key", "value": "sk-SECRET-2",
+        });
+        let set_section = serde_json::json!({
+            "type": "config", "action": "set", "path": "llm",
+            "value": { "api_key": "sk-SECRET-3", "model": "claude-fable-5" },
+        });
+        let import = serde_json::json!({
+            "type": "config", "action": "import",
+            "config": { "llm": { "api_key": "sk-SECRET-4", "model": "qwen" } },
+        });
+        for raw in [validate, set_key, set_section, import] {
+            let action: Action = serde_json::from_value(raw.clone()).expect("parses");
+            let line = format!("{action:?}");
+            assert!(
+                !line.contains("SECRET"),
+                "a secret reached the log line: {line}"
+            );
+            assert_eq!(
+                serde_json::to_value(&action).expect("serializes"),
+                raw,
+                "the wire form is unchanged"
+            );
+        }
+        // What is not a secret still prints, or the log line is useless.
+        let set_model: Action = serde_json::from_value(serde_json::json!({
+            "type": "config", "action": "set", "path": "llm.model", "value": "qwen3.5:9b",
+        }))
+        .expect("parses");
+        assert!(format!("{set_model:?}").contains("qwen3.5:9b"));
+        let Action::System(SystemAction::ValidateApiKey { key, .. }) =
+            serde_json::from_value(serde_json::json!({
+                "type": "system", "action": "validate_api_key", "provider": "openai", "key": "k",
+            }))
+            .expect("parses")
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(key.expose(), "k", "the handler still gets the key itself");
+    }
 
     /// Every client hand-writes this envelope as JSON (the GUI's
     /// `daemon_client.rs`, the CLI, anything on the socket), so the tag

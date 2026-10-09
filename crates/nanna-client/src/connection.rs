@@ -15,6 +15,11 @@ use tokio_tungstenite::{
 };
 use tracing::{debug, error, info, warn};
 
+/// How often a request with no deadline re-checks that the connection is
+/// still up. Only a disconnect racing the request's registration needs it,
+/// so a second is plenty.
+const DISCONNECT_POLL: Duration = Duration::from_secs(1);
+
 /// Client configuration
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -24,10 +29,6 @@ pub struct ClientConfig {
     pub connect_timeout: Duration,
     /// Request timeout
     pub request_timeout: Duration,
-    /// Auto-reconnect on disconnect
-    pub auto_reconnect: bool,
-    /// Maximum reconnection attempts
-    pub max_reconnect_attempts: u32,
     /// Client identifier (for logging)
     pub client_id: Option<String>,
 }
@@ -38,8 +39,6 @@ impl Default for ClientConfig {
             url: nanna_daemon::ipc::default_daemon_ws_url(),
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(30),
-            auto_reconnect: true,
-            max_reconnect_attempts: 10,
             client_id: None,
         }
     }
@@ -60,7 +59,6 @@ pub enum ConnectionState {
     Disconnected,
     Connecting,
     Connected,
-    Reconnecting,
 }
 
 /// Pending request waiting for response
@@ -308,6 +306,21 @@ impl Client {
     /// - [`ClientError::Timeout`] when no response arrives within
     ///   `config.request_timeout`.
     pub async fn request(&self, action: Action) -> Result<Value> {
+        self.request_within(action, Some(self.config.request_timeout)).await
+    }
+
+    /// [`Self::request`] bounded by `timeout`, or — with `None` — waiting
+    /// until the daemon answers or the connection drops.
+    ///
+    /// `None` is for work the DAEMON bounds: a tool call runs under the
+    /// tool's own timeout, which a script may set past any fixed client
+    /// window (a long build), so a client-side cut only abandons a call the
+    /// daemon is still running.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::request`]; `Timeout` only when `timeout` is set.
+    pub async fn request_within(&self, action: Action, timeout: Option<Duration>) -> Result<Value> {
         if !self.is_connected().await {
             return Err(ClientError::NotConnected);
         }
@@ -327,12 +340,19 @@ impl Client {
             pending.insert(id.clone(), PendingRequest { tx });
         }
         
-        // Send request
-        self.msg_tx.send(Message::Text(json.into())).await
-            .map_err(|e| ClientError::Request(e.to_string()))?;
+        // Send request. A send that fails leaves nothing that will ever answer
+        // the entry just registered, so it goes too — it used to stay in
+        // `pending` for the life of the client.
+        if let Err(e) = self.msg_tx.send(Message::Text(json.into())).await {
+            self.pending.write().await.remove(&id);
+            return Err(ClientError::Request(e.to_string()));
+        }
         
+        let Some(timeout) = timeout else {
+            return self.await_answer(&id, rx).await;
+        };
         // Wait for response with timeout
-        match tokio::time::timeout(self.config.request_timeout, rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(ClientError::Request("Response channel closed".to_string())),
             Err(_) => {
@@ -343,6 +363,33 @@ impl Client {
         }
     }
     
+    /// Wait for request `id`'s answer with no deadline, but not past the
+    /// connection: a drop fails every pending request, and a request
+    /// registered just after that sweep is caught by re-checking the state
+    /// every [`DISCONNECT_POLL`].
+    async fn await_answer(
+        &self,
+        id: &str,
+        rx: oneshot::Receiver<std::result::Result<Value, ClientError>>,
+    ) -> Result<Value> {
+        tokio::pin!(rx);
+        loop {
+            tokio::select! {
+                answer = &mut rx => {
+                    return answer.unwrap_or_else(|_| {
+                        Err(ClientError::Request("Response channel closed".to_string()))
+                    });
+                }
+                () = tokio::time::sleep(DISCONNECT_POLL) => {
+                    if !self.is_connected().await {
+                        self.pending.write().await.remove(id);
+                        return Err(ClientError::Connection("Disconnected".to_string()));
+                    }
+                }
+            }
+        }
+    }
+
     /// Disconnect from daemon.
     ///
     /// On return the client reports `Disconnected` and `request()` fails fast with
@@ -591,6 +638,26 @@ impl ToolsApi<'_> {
             input,
             session_id: None,
         })).await
+    }
+
+    /// [`Self::execute`] with no client-side timeout: the call waits for the
+    /// daemon's answer, which the tool's own timeout bounds, or for the
+    /// connection to drop.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::request_within`] with no timeout.
+    pub async fn execute_until_answered(&self, name: &str, input: Value) -> Result<Value> {
+        self.client
+            .request_within(
+                Action::Tool(ToolAction::Execute {
+                    name: name.to_string(),
+                    input,
+                    session_id: None,
+                }),
+                None,
+            )
+            .await
     }
 }
 
@@ -913,5 +980,69 @@ mod session_events_tests {
             ),
             "a bounded stream that overflowed must say how much was lost"
         );
+    }
+}
+
+#[cfg(test)]
+mod unbounded_request_tests {
+    use super::{Client, ClientConfig, ClientError};
+    use futures_util::{SinkExt, StreamExt};
+    use std::time::Duration;
+
+    /// A daemon that answers each request after `delay`, with `{"ok":true}`.
+    async fn slow_daemon(delay: Duration) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(socket).await else {
+                return;
+            };
+            while let Some(Ok(message)) = ws.next().await {
+                let Ok(text) = message.to_text() else {
+                    continue;
+                };
+                let Ok(request) = serde_json::from_str::<serde_json::Value>(text) else {
+                    continue;
+                };
+                let id = request["id"].as_str().unwrap_or_default().to_string();
+                tokio::time::sleep(delay).await;
+                let reply = nanna_daemon::protocol::Response::success(
+                    id,
+                    serde_json::json!({ "ok": true }),
+                );
+                let json = serde_json::to_string(&reply).expect("serializes");
+                if ws.send(json.into()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    /// A tool call the daemon takes longer than the client's request window
+    /// to answer still gets its answer through `execute_until_answered`;
+    /// `execute` gives up at the window. `nanna mcp serve` used `execute`, so
+    /// every tool call past 30 s failed while the daemon was still running it.
+    #[tokio::test]
+    async fn a_tool_call_waits_for_the_daemons_answer() {
+        let url = slow_daemon(Duration::from_millis(600)).await;
+        let config = ClientConfig {
+            request_timeout: Duration::from_millis(200),
+            ..ClientConfig::new(url)
+        };
+        let client = Client::connect(config).await.expect("connect");
+        let cut = client.tools().execute("exec", serde_json::json!({})).await;
+        assert!(matches!(cut, Err(ClientError::Timeout)), "{cut:?}");
+        let answered = client
+            .tools()
+            .execute_until_answered("exec", serde_json::json!({}))
+            .await
+            .expect("the daemon's answer");
+        assert_eq!(answered["ok"], true);
     }
 }

@@ -4,8 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-wide.workspace = true
 half.workspace = true
+
+# `wide` backs the AVX2 path only; on other targets it would be unused.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+wide.workspace = true
 
 [features]
 default = []

@@ -159,7 +159,7 @@ fn main() {
         if let (Some(ctx), Some(pipeline)) = (&ctx, &pipeline) {
             let gpu_stats = bench_async_fn(&rt, || gpu_batch_search(pipeline, ctx, query, &flat), warmup, iters);
 
-            let ratio = gpu_stats.mean.as_secs_f64() * 1e9 / simd.mean.as_secs_f64() * 1e9;
+            let ratio = gpu_stats.mean.as_secs_f64() / simd.mean.as_secs_f64();
             let winner = if ratio < 1.0 { "GPU" } else { "SIMD" };
 
             if ratio < 1.0 && crossover.is_none() {
@@ -206,7 +206,7 @@ fn main() {
 
             if let (Some(ctx), Some(pipeline)) = (&ctx, &pipeline) {
                 let gpu_stats = bench_async_fn(&rt, || gpu_batch_search(pipeline, ctx, query, &flat), warmup, iters);
-                let ratio = gpu_stats.mean.as_secs_f64() * 1e9 / simd.mean.as_secs_f64() * 1e9;
+                let ratio = gpu_stats.mean.as_secs_f64() / simd.mean.as_secs_f64();
                 let winner = if ratio < 1.0 { "GPU" } else { "SIMD" };
                 println!(
                     "  {:>7} │ {} │ {} │ {} │ {} │ {:>6.2}× │ {winner}",
@@ -245,7 +245,7 @@ fn measure_gpu_overhead(
     let simd1 = bench_sync(|| { std::hint::black_box(nanna_simd::cosine_similarity_f32(q, &sv)); }, 3, 20);
     println!("    GPU dispatch: {} (±{})", fmt_dur(overhead.mean), fmt_spread(&overhead).trim());
     println!("    SIMD single:  {} (±{})", fmt_dur(simd1.mean), fmt_spread(&simd1).trim());
-    println!("    Overhead ratio: {:.0}×", overhead.mean.as_secs_f64() * 1e9 / simd1.mean.as_secs_f64() * 1e9);
+    println!("    Overhead ratio: {:.0}×", overhead.mean.as_secs_f64() / simd1.mean.as_secs_f64());
     println!();
 }
 

@@ -129,6 +129,45 @@ impl ModelHealth {
     }
 }
 
+/// Consecutive failures at which a model enters cooldown.
+const COOLDOWN_FAILURES: u32 = 5;
+
+/// The longest a model is held out after its last failure: 10 min, the top of
+/// [`cooldown_retry_after_ms`]'s backoff — and the horizon after which a model
+/// with a poor *lifetime* record is tried again (see
+/// [`LlmRouter::model_health`]).
+const COOLDOWN_BACKOFF_MAX_MS: u64 = 600_000;
+
+/// When a model with `consecutive_failures` may be tried again: the last
+/// failure plus an exponential backoff (30 s doubling per further failure,
+/// capped at 10 min). `None` below the cooldown threshold.
+///
+/// Anchored to the failure, not to the moment of asking. It used to be
+/// `now + backoff`, recomputed on every call, so the deadline moved with the
+/// clock and never arrived — and because a model in cooldown is skipped, no
+/// request could ever succeed and reset the streak. Five failures in a row
+/// retired a model until the daemon restarted.
+#[must_use]
+pub fn cooldown_retry_after_ms(
+    consecutive_failures: u32,
+    last_failure_epoch_ms: u64,
+) -> Option<u64> {
+    if consecutive_failures < COOLDOWN_FAILURES {
+        return None;
+    }
+    let exponent = consecutive_failures
+        .saturating_sub(COOLDOWN_FAILURES)
+        .min(8);
+    let backoff_ms = 30_000u64
+        .saturating_mul(1u64 << exponent)
+        .min(COOLDOWN_BACKOFF_MAX_MS);
+    debug_assert!(
+        (30_000..=COOLDOWN_BACKOFF_MAX_MS).contains(&backoff_ms),
+        "backoff stays in its band"
+    );
+    Some(last_failure_epoch_ms.saturating_add(backoff_ms))
+}
+
 /// Multi-provider LLM router
 pub struct LlmRouter {
     /// Available providers and their clients.
@@ -478,9 +517,14 @@ impl LlmRouter {
     /// Check the health of a model based on recent stats.
     ///
     /// Thresholds:
-    /// - Unhealthy: `success_rate` < 50% with 5+ requests, or 5+ consecutive failures
-    /// - Degraded: `success_rate` < 80% or avg latency > 30s
-    /// - Cooldown: was unhealthy, apply exponential backoff before retry
+    /// - Cooldown: 5+ consecutive failures (exponential backoff from the last
+    ///   one), or `success_rate` < 50% with 5+ requests while the last call
+    ///   failed (held [`COOLDOWN_BACKOFF_MAX_MS`] from it)
+    /// - Degraded: `success_rate` < 80% (including < 50% once the last call
+    ///   succeeded) or avg latency > 30s
+    ///
+    /// Nothing here answers `Unhealthy`: every hold expires, because a model
+    /// that is never called can never show it recovered.
     pub async fn model_health(&self, model: &str) -> ModelHealth {
         // A clone of the tracker shares its state, so the lock is needed only
         // to read which tracker is installed, not while summarizing.
@@ -505,30 +549,38 @@ impl LlmRouter {
         );
 
         // Check for consecutive failures (unhealthy → cooldown)
-        if summary.consecutive_failures >= 5 {
-            // Exponential cooldown: 30s * 2^(consecutive-5), capped at 10 min
-            let exponent = (summary.consecutive_failures.saturating_sub(5)).min(8);
-            let backoff_secs = (30u64).saturating_mul(1u64 << exponent).min(600);
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, crate::numeric::millis_u64);
-            // Estimate: cooldown started ~now (conservative; we don't have exact last-error time)
-            let retry_after_ms = now_ms + (backoff_secs * 1000);
-
+        if let Some(retry_after_ms) =
+            cooldown_retry_after_ms(summary.consecutive_failures, summary.last_failure_epoch_ms)
+        {
             return ModelHealth::Cooldown {
                 reason: format!("{} consecutive failures", summary.consecutive_failures),
                 retry_after_ms,
             };
         }
 
-        // High error rate → unhealthy
+        // High error rate. The rate is over the model's whole lifetime, so it
+        // cannot fall unless the model is called — and it used to answer
+        // `Unhealthy`, which is never usable, so it was never called: five
+        // failures then one recovery (5/6 errors) retired a model for good.
+        // A model whose LAST call succeeded is only `Degraded` (tried after the
+        // healthy ones); one whose last call failed is held for the longest
+        // cooldown and then tried again.
         if error_rate > 0.5 && summary.total_requests >= 5 {
-            return ModelHealth::Unhealthy(format!(
+            let reason = format!(
                 "Success rate {:.0}% ({} errors in {} requests)",
                 summary.success_rate * 100.0,
                 total_errors,
                 summary.total_requests
-            ));
+            );
+            if summary.consecutive_failures == 0 {
+                return ModelHealth::Degraded(reason);
+            }
+            return ModelHealth::Cooldown {
+                reason,
+                retry_after_ms: summary
+                    .last_failure_epoch_ms
+                    .saturating_add(COOLDOWN_BACKOFF_MAX_MS),
+            };
         }
 
         // Moderate error rate or high latency → degraded
@@ -814,7 +866,124 @@ impl ProviderCredentials {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnthropicCredential, LlmRouter, ProviderCredentials, ProviderId};
+    use super::{
+        AnthropicCredential, LlmRouter, ModelHealth, ProviderCredentials, ProviderId,
+        cooldown_retry_after_ms,
+    };
+
+    #[test]
+    fn a_cooldown_is_measured_from_the_last_failure() {
+        assert_eq!(
+            cooldown_retry_after_ms(4, 1_000),
+            None,
+            "below the threshold"
+        );
+        assert_eq!(cooldown_retry_after_ms(5, 1_000), Some(31_000));
+        assert_eq!(cooldown_retry_after_ms(6, 1_000), Some(61_000), "doubles");
+        assert_eq!(
+            cooldown_retry_after_ms(40, 1_000),
+            Some(601_000),
+            "capped at 10 min"
+        );
+        // A failure long enough ago is a cooldown that has ended.
+        let ended = ModelHealth::Cooldown {
+            reason: "old".to_string(),
+            retry_after_ms: cooldown_retry_after_ms(5, 1_000).expect("in cooldown"),
+        };
+        assert!(
+            ended.is_usable(),
+            "the model is tried again once the backoff has passed"
+        );
+    }
+
+    /// The live bug: `retry_after` was `now + backoff`, recomputed on every
+    /// call, so asking twice gave two different deadlines and neither ever
+    /// arrived. Five failures retired a model until restart.
+    #[tokio::test]
+    async fn a_cooldown_deadline_does_not_move_between_calls() {
+        let tracker = nanna_agent::ModelStatsTracker::new();
+        for _ in 0..5 {
+            tracker
+                .record(nanna_agent::RequestObservation {
+                    model: "flaky".to_string(),
+                    success: false,
+                    latency: std::time::Duration::from_millis(5),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    cache_creation_1h_tokens: 0,
+                    tier: None,
+                    escalated: false,
+                })
+                .await;
+        }
+        let router = LlmRouter::new();
+        router.set_stats(tracker).await;
+
+        let deadline = |health: ModelHealth| match health {
+            ModelHealth::Cooldown { retry_after_ms, .. } => retry_after_ms,
+            other => panic!("five failures must be a cooldown, got {other:?}"),
+        };
+        let first = deadline(router.model_health("flaky").await);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let second = deadline(router.model_health("flaky").await);
+        assert_eq!(first, second, "the deadline is a fixed point in time");
+    }
+
+    fn observation(model: &str, success: bool) -> nanna_agent::RequestObservation {
+        nanna_agent::RequestObservation {
+            model: model.to_string(),
+            success,
+            latency: std::time::Duration::from_millis(5),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_creation_1h_tokens: 0,
+            tier: None,
+            escalated: false,
+        }
+    }
+
+    /// A poor lifetime record never retires a model: the rate cannot fall
+    /// unless the model is called, and `Unhealthy` was never called.
+    #[tokio::test]
+    async fn a_poor_record_is_held_for_a_while_never_for_good() {
+        let tracker = nanna_agent::ModelStatsTracker::new();
+        // 2 successes, then 3 failures: 60 % errors, last call failed, below
+        // the consecutive-failure cooldown.
+        for success in [true, true, false, false, false] {
+            tracker.record(observation("flaky", success)).await;
+        }
+        let router = LlmRouter::new();
+        router.set_stats(tracker.clone()).await;
+        match router.model_health("flaky").await {
+            ModelHealth::Cooldown { retry_after_ms, .. } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, crate::numeric::millis_u64);
+                assert!(retry_after_ms > now, "held out for now");
+                assert!(
+                    retry_after_ms <= now + super::COOLDOWN_BACKOFF_MAX_MS,
+                    "but only for the longest cooldown"
+                );
+            }
+            other => panic!("expected a bounded hold, got {other:?}"),
+        }
+
+        // It recovers: one success. 4/7 is still a poor record, but the model
+        // is usable again — ordered after the healthy ones.
+        tracker.record(observation("flaky", false)).await;
+        tracker.record(observation("flaky", true)).await;
+        let health = router.model_health("flaky").await;
+        assert!(matches!(health, ModelHealth::Degraded(_)), "{health:?}");
+        assert!(health.is_usable());
+        assert_eq!(
+            router.health_sorted_models(&["flaky".to_string()]).await,
+            ["flaky".to_string()]
+        );
+    }
 
     /// The live failure this guards: a provider authenticated after boot must
     /// register on rebuild (no daemon restart), and one whose credential goes

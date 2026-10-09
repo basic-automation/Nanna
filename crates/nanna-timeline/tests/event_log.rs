@@ -281,3 +281,32 @@ async fn every_kind_survives_a_round_trip_through_the_database() {
         .collect();
     assert_eq!(round_tripped, kinds);
 }
+
+/// One card's series, by lineage: `task:1` must not pull in `task:10`'s
+/// events (the id is matched with its own quotes), and the series comes back
+/// oldest first, the order `compress_episode` folds in.
+#[tokio::test]
+async fn a_cards_series_is_found_by_exact_lineage_oldest_first() {
+    let storage = open("for_source").await;
+    let timeline = Timeline::new(&storage);
+    for (ts, card) in [(30, "task:1"), (10, "task:1"), (20, "task:10")] {
+        let mut e = episode(EventKind::Message, ts, card);
+        e.source_ids = vec![card.to_string()];
+        timeline.append(&e).await.expect("append");
+    }
+    let series = storage
+        .memory_events()
+        .for_source("task:1", 10)
+        .await
+        .expect("series");
+    let stamps: Vec<i64> = series.iter().map(|r| r.ts_unix_ms).collect();
+    assert_eq!(stamps, [10, 30], "task:10's event is not task:1's");
+    assert!(storage.memory_events().for_source("", 10).await.is_err());
+    assert!(
+        storage
+            .memory_events()
+            .for_source("a\"b", 10)
+            .await
+            .is_err()
+    );
+}

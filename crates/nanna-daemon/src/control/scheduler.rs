@@ -7,7 +7,11 @@ impl ControlPlane {
     // Scheduler Handlers
     // =========================================================================
     
-    pub(super) async fn handle_scheduler(&self, _client_id: &str, action: SchedulerAction) -> Value {
+    pub(super) async fn handle_scheduler(
+        &self,
+        _client_id: &str,
+        action: SchedulerAction,
+    ) -> Value {
         let Some(ref scheduler) = self.scheduler else {
             return json!({ "error": "scheduler_unavailable", "message": "Scheduler not configured" });
         };
@@ -34,28 +38,8 @@ impl ControlPlane {
                 self.scheduler_add(scheduler, schedule, task, name, session_id)
                     .await
             }
-            SchedulerAction::Update { id, schedule, task: _, enabled } => {
-                let scheduler = scheduler.read().await;
-                
-                // Update schedule if provided
-                if let Some(new_schedule) = schedule {
-                    match scheduler.update_schedule(&id, &new_schedule).await {
-                        Ok(true) => {}
-                        Ok(false) => return json!({ "error": "not_found", "id": id }),
-                        Err(e) => return json!({ "error": "invalid_schedule", "message": e.to_string() }),
-                    }
-                }
-                
-                // Update enabled state if provided
-                if let Some(en) = enabled {
-                    scheduler.set_task_enabled(&id, en).await;
-                }
-                // Held across both updates above, so no writer lands between
-                // them; the reply needs no lock.
-                drop(scheduler);
-                
-                // Note: task/payload update would require more logic
-                json!({ "status": "updated", "id": id })
+            SchedulerAction::Update { id, schedule, task, enabled } => {
+                Self::scheduler_update(&*scheduler.read().await, id, schedule, task, enabled).await
             }
             SchedulerAction::Remove { id } => {
                 let scheduler = scheduler.read().await;
@@ -97,6 +81,44 @@ impl ControlPlane {
                 json!({ "history": history, "job_id": id })
             }
         }
+    }
+
+    /// `SchedulerAction::Update`: change a job's schedule, payload and/or
+    /// enabled flag.
+    ///
+    /// An unknown id is `not_found` whatever was asked. It used to answer
+    /// `updated` whenever no schedule was given (enabling a job that does not
+    /// exist "succeeded"), and a new payload was accepted and silently dropped.
+    async fn scheduler_update(
+        scheduler: &nanna_core::Scheduler,
+        id: String,
+        schedule: Option<String>,
+        task: Option<String>,
+        enabled: Option<bool>,
+    ) -> Value {
+        if scheduler.get_task(&id).await.is_none() {
+            return json!({ "error": "not_found", "id": id });
+        }
+        if let Some(new_schedule) = schedule {
+            match scheduler.update_schedule(&id, &new_schedule).await {
+                Ok(true) => {}
+                Ok(false) => return json!({ "error": "not_found", "id": id }),
+                Err(e) => {
+                    return json!({ "error": "invalid_schedule", "message": e.to_string() });
+                }
+            }
+        }
+        if let Some(payload) = task
+            && !scheduler.update_payload(&id, &payload).await
+        {
+            return json!({ "error": "not_found", "id": id });
+        }
+        if let Some(en) = enabled
+            && !scheduler.set_task_enabled(&id, en).await
+        {
+            return json!({ "error": "not_found", "id": id });
+        }
+        json!({ "status": "updated", "id": id })
     }
 
     /// `SchedulerAction::Add`: parse `schedule` as cron and store the job.

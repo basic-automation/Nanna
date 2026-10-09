@@ -33,6 +33,24 @@ const notes = process.argv[3] || `Nanna ${tag}`;
 const conf = JSON.parse(readFileSync(join(guiDir, 'src-tauri', 'tauri.conf.json'), 'utf8'));
 const version = conf.version;
 
+// The repository the release assets live in: CI's own `GITHUB_REPOSITORY`,
+// else the workspace manifest's `repository`. Never a literal — the repo moved
+// from physics515 to basic-automation, and a hardcoded owner here wrote the old
+// one into every manifest since, leaving each installed client's download one
+// GitHub rename-redirect away from breaking.
+function releaseRepo() {
+  const fromCi = process.env.GITHUB_REPOSITORY;
+  if (fromCi && /^[\w.-]+\/[\w.-]+$/.test(fromCi)) return fromCi;
+  const cargo = readFileSync(join(rootDir, 'Cargo.toml'), 'utf8');
+  const declared = /^repository\s*=\s*"https:\/\/github\.com\/([\w.-]+\/[\w.-]+?)\/?"/m.exec(cargo)?.[1];
+  if (!declared) {
+    console.error('No GitHub repository: set GITHUB_REPOSITORY or `repository` in Cargo.toml.');
+    process.exit(1);
+  }
+  return declared;
+}
+const repo = releaseRepo();
+
 // Same target-dir resolution as build-daemon.js: `<root>/target` is only the
 // default and a global .cargo/config.toml target-dir moves it.
 function resolveTargetDir() {

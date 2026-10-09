@@ -36,7 +36,7 @@ pub async fn execute(
     let timeout_ms = tool.timeout_ms;
 
     let result = tokio::task::spawn_blocking(move || {
-        execute_sync(&source_clone, &input_clone, &bridge_clone)
+        execute_sync(&source_clone, &input_clone, &bridge_clone, timeout_ms)
     });
 
     // Apply timeout
@@ -45,6 +45,33 @@ pub async fn execute(
         Ok(Err(e)) => Err(ScriptError::Execution(format!("Task panicked: {e}"))),
         Err(_) => Err(ScriptError::Timeout(timeout_ms)),
     }
+}
+
+/// Loop iterations per second no Boa loop can exceed on the reference machine.
+///
+/// Bound justification: the simplest possible loop body (`s += i % 7; i++`)
+/// measured 10.0 M iterations/s on the reference AMD Zen 4 in a release build
+/// (2026-09-26); twice that is a ceiling no real loop body reaches.
+const LOOP_ITERATIONS_PER_SEC_CEILING: u64 = 20_000_000;
+
+/// The per-loop iteration limit for a script allowed `timeout_ms`.
+///
+/// Boa cannot be interrupted, so when the caller's timeout fires the blocking
+/// thread keeps running — a `while (true)` in a tool used to spin a core for
+/// the life of the process. This limit makes such a loop THROW. It is sized so
+/// that a loop able to finish within the timeout can never reach it (no loop
+/// runs faster than [`LOOP_ITERATIONS_PER_SEC_CEILING`]), while a runaway loop
+/// stops within about twice the timeout.
+fn loop_iteration_limit(timeout_ms: u64) -> u64 {
+    let limit = timeout_ms
+        .max(1)
+        .saturating_mul(LOOP_ITERATIONS_PER_SEC_CEILING)
+        / 1000;
+    debug_assert!(
+        limit >= LOOP_ITERATIONS_PER_SEC_CEILING / 1000,
+        "at least 1 ms of loop"
+    );
+    limit
 }
 
 /// The exact text Boa is asked to evaluate for a tool.
@@ -126,11 +153,15 @@ fn execute_sync(
     source: &str,
     input: &Value,
     bridge: &Arc<NannaBridge>,
+    timeout_ms: u64,
 ) -> Result<Value> {
     // Store bridge in thread-local for native function access
     BRIDGE.with(|b| *b.borrow_mut() = Some(bridge.clone()));
-    
+
     let mut context = Context::default();
+    context
+        .runtime_limits_mut()
+        .set_loop_iteration_limit(loop_iteration_limit(timeout_ms));
 
     // Register console.log
     register_console(&mut context)?;
@@ -407,6 +438,56 @@ fn log_excerpt(text: &str) -> String {
     format!("{}…", &line[..end])
 }
 
+/// Run `work`'s future to completion on a fresh current-thread runtime in its
+/// own OS thread — a script's native call is synchronous, but the bridge is
+/// async, and the calling thread may already be inside a runtime.
+///
+/// A runtime that cannot be built (no file descriptor left for its epoll, say)
+/// is a JS error for the calling script, never a panic: under the release
+/// profile's `panic = "abort"`, the `expect` this replaced took the whole
+/// daemon down with it, and the `join` that "caught" it never ran.
+fn run_on_own_runtime<T, F, Fut>(work: F) -> JsResult<T>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T>,
+    T: Send + 'static,
+{
+    let outcome = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("could not start the I/O runtime for this call: {e}"))?;
+        Ok::<T, String>(runtime.block_on(work()))
+    })
+    .join()
+    .map_err(|e| {
+        // Reachable only in an unwinding build (tests); release aborts first.
+        tracing::error!(target: "script", "Thread panicked: {:?}", e);
+        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
+    })?;
+    outcome.map_err(|e| {
+        tracing::warn!(target: "script", "{e}");
+        boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.as_str())))
+    })
+}
+
+/// A script's `exec` timeout in whole seconds, or `None` for the bridge's
+/// auto-detected default.
+///
+/// The truncating conversion turned `0`, a negative, `NaN` or a fraction under
+/// one second into `Some(0)` — a deadline that killed the command on its first
+/// poll, which the `exec` skill then reported as "killed at the auto-detected
+/// deadline". Below one second is no usable request, so it means "default";
+/// a fraction above it rounds UP, never short of what was asked.
+fn exec_timeout_from_script(secs: f64) -> Option<u64> {
+    if secs.is_nan() || secs < 1.0 {
+        return None;
+    }
+    let whole = crate::f64_to_u64(secs.ceil());
+    debug_assert!(whole >= 1, "a requested deadline is at least a second");
+    Some(whole)
+}
+
 fn nanna_exec(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let command = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
     let workdir = args.get(1)
@@ -416,7 +497,7 @@ fn nanna_exec(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<
     let timeout_secs = args.get(2)
         .filter(|v| !v.is_undefined() && !v.is_null())
         .and_then(|v| v.to_number(context).ok())
-        .map(crate::f64_to_u64);
+        .and_then(exec_timeout_from_script);
     
     tracing::info!(target: "script", "Nanna.exec called with command: {}", command);
     
@@ -431,18 +512,7 @@ fn nanna_exec(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<
     
     // Execute synchronously using a new thread with its own runtime
     // (we're in a blocking task but need async for the bridge)
-    let result = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create runtime");
-        rt.block_on(bridge.exec_with_timeout(&command, workdir.as_deref(), timeout_secs))
-    })
-    .join()
-    .map_err(|e| {
-        tracing::error!(target: "script", "Thread panicked: {:?}", e);
-        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
-    })?;
+    let result = run_on_own_runtime(move || async move { bridge.exec_with_timeout(&command, workdir.as_deref(), timeout_secs).await })?;
     
     match result {
         Ok(response) => {
@@ -496,17 +566,7 @@ fn nanna_read_file(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsRe
             boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
         })?;
 
-    let result = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create runtime");
-        rt.block_on(bridge.read_file(&path))
-    })
-    .join()
-    .map_err(|_| {
-        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
-    })?;
+    let result = run_on_own_runtime(move || async move { bridge.read_file(&path).await })?;
 
     match result {
         Ok(text) => Ok(JsValue::from(js_string!(text.as_str()))),
@@ -523,17 +583,7 @@ fn nanna_write_file(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsR
             boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
         })?;
 
-    let result = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create runtime");
-        rt.block_on(bridge.write_file(&path, &text))
-    })
-    .join()
-    .map_err(|_| {
-        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
-    })?;
+    let result = run_on_own_runtime(move || async move { bridge.write_file(&path, &text).await })?;
 
     match result {
         Ok(()) => Ok(JsValue::undefined()),
@@ -561,17 +611,7 @@ fn nanna_list_dir(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
             boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
         })?;
 
-    let result = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create runtime");
-        rt.block_on(bridge.list_dir(&path, recursive, max_entries))
-    })
-    .join()
-    .map_err(|_| {
-        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
-    })?;
+    let result = run_on_own_runtime(move || async move { bridge.list_dir(&path, recursive, max_entries).await })?;
 
     match result {
         Ok(entries) => {
@@ -599,21 +639,12 @@ fn nanna_stat(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<
             boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
         })?;
 
-    let result = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create runtime");
-        rt.block_on(bridge.stat(&path))
-    })
-    .join()
-    .map_err(|_| {
-        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
-    })?;
+    let result = run_on_own_runtime(move || async move { bridge.stat(&path).await })?;
 
     match result {
         Ok(stat) => {
             let obj = boa_engine::object::JsObject::with_object_proto(context.intrinsics());
+            obj.set(js_string!("path"), JsValue::from(js_string!(stat.path.to_string_lossy().as_ref())), false, context)?;
             obj.set(js_string!("size"), JsValue::from(crate::u64_to_f64(stat.size)), false, context)?;
             obj.set(js_string!("is_file"), JsValue::from(stat.is_file), false, context)?;
             obj.set(js_string!("is_dir"), JsValue::from(stat.is_dir), false, context)?;
@@ -642,17 +673,7 @@ fn nanna_fetch(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult
             boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
         })?;
 
-    let result = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create runtime");
-        rt.block_on(bridge.fetch(&url, options))
-    })
-    .join()
-    .map_err(|_| {
-        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
-    })?;
+    let result = run_on_own_runtime(move || async move { bridge.fetch(&url, options).await })?;
 
     match result {
         Ok(response) => {
@@ -722,17 +743,7 @@ fn nanna_service(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResu
             boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
         })?;
 
-    let result = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create runtime");
-        rt.block_on(bridge.call_service(&name, params))
-    })
-    .join()
-    .map_err(|_| {
-        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
-    })?;
+    let result = run_on_own_runtime(move || async move { bridge.call_service(&name, params).await })?;
 
     match result {
         Ok(value) => json_to_js(&value, context).map_err(|e| {
@@ -775,11 +786,52 @@ fn json_to_js(value: &Value, context: &mut Context) -> Result<JsValue> {
     }
 }
 
+/// Deepest nesting a script's value may have on its way to JSON.
+///
+/// Bound justification: `serde_json` itself refuses to parse past 128 levels,
+/// and a real tool result is a few levels deep; 64 is generous for data and
+/// small enough that the recursion can never approach the thread's stack.
+const JS_TO_JSON_DEPTH_MAX: usize = 64;
+
+/// Most values one conversion may visit.
+///
+/// Bound justification: a depth bound alone does not stop a DAG whose levels
+/// share one sub-object (`a.x = a.y = b`), which converts 2^depth times. A
+/// million values is far past any tool result and a few hundred ms of work.
+const JS_TO_JSON_NODES_MAX: usize = 1_000_000;
+
 /// Convert Boa `JsValue` to JSON Value
+///
+/// Bounded in depth and in total values. Unbounded, a tool returning a cyclic
+/// object (`o.self = o`) recursed until the stack overflowed — which aborts the
+/// whole daemon, not just the call.
 fn js_to_json(value: &JsValue, context: &mut Context) -> Result<Value> {
+    let mut visited = 0usize;
+    js_to_json_bounded(value, context, 0, &mut visited)
+}
+
+fn js_to_json_bounded(
+    value: &JsValue,
+    context: &mut Context,
+    depth: usize,
+    visited: &mut usize,
+) -> Result<Value> {
     // Use Boa's variant enum for pattern matching
     use boa_engine::value::JsVariant;
-    
+
+    if depth > JS_TO_JSON_DEPTH_MAX {
+        return Err(ScriptError::Execution(format!(
+            "result nests deeper than {JS_TO_JSON_DEPTH_MAX} levels — a cyclic object? \
+             Return plain data"
+        )));
+    }
+    *visited += 1;
+    if *visited > JS_TO_JSON_NODES_MAX {
+        return Err(ScriptError::Execution(format!(
+            "result has more than {JS_TO_JSON_NODES_MAX} values — a shared or cyclic \
+             object? Return plain data"
+        )));
+    }
     match value.variant() {
         // BigInt and Symbol have no JSON representation either.
         JsVariant::Undefined | JsVariant::Null | JsVariant::BigInt(_) | JsVariant::Symbol(_) => {
@@ -807,7 +859,7 @@ fn js_to_json(value: &JsValue, context: &mut Context) -> Result<Value> {
                     let item = obj
                         .get(i, context)
                         .map_err(|e| ScriptError::Execution(format!("Array get failed: {e}")))?;
-                    arr.push(js_to_json(&item, context)?);
+                    arr.push(js_to_json_bounded(&item, context, depth + 1, visited)?);
                 }
                 Ok(Value::Array(arr))
             } else {
@@ -831,7 +883,10 @@ fn js_to_json(value: &JsValue, context: &mut Context) -> Result<Value> {
                     
                     // Skip functions
                     if !val.is_callable() {
-                        map.insert(key_str, js_to_json(&val, context)?);
+                        map.insert(
+                            key_str,
+                            js_to_json_bounded(&val, context, depth + 1, visited)?,
+                        );
                     }
                 }
                 Ok(Value::Object(map))
@@ -841,16 +896,97 @@ fn js_to_json(value: &JsValue, context: &mut Context) -> Result<Value> {
 }
 
 /// Transpile TypeScript to JavaScript
-/// Note: Boa doesn't support TypeScript natively. If actual TS syntax is present,
-/// execution will fail and trigger Deno fallback (which has real TS support).
+/// Note: Boa doesn't support TypeScript natively, and there is no other
+/// engine: a `tool.ts` with real TS syntax fails to parse, which
+/// `check_syntax` catches for every shipped skill before it can ship.
 fn transpile_typescript(source: &str) -> String {
-    // Just pass through - Boa handles plain JS, Deno handles TS
+    // Pass through: shipped `tool.ts` files are plain JS by construction.
     source.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unusable_exec_timeout_means_the_default_not_an_instant_kill() {
+        for unusable in [0.0, -5.0, 0.5, f64::NAN] {
+            assert_eq!(exec_timeout_from_script(unusable), None, "{unusable}");
+        }
+        assert_eq!(exec_timeout_from_script(1.0), Some(1));
+        assert_eq!(exec_timeout_from_script(2.2), Some(3), "rounded up");
+        assert_eq!(exec_timeout_from_script(600.0), Some(600));
+    }
+
+    /// A native call runs its async bridge work on its own runtime and hands
+    /// back the value — also from a thread already inside a runtime, which is
+    /// where a tool script's natives are called from.
+    #[tokio::test]
+    async fn a_native_call_runs_on_its_own_runtime_inside_another() {
+        let owned = String::from("moved into the future");
+        let got = run_on_own_runtime(move || async move {
+            tokio::task::yield_now().await;
+            owned.len()
+        });
+        assert_eq!(got.ok(), Some(21));
+    }
+
+    /// A cyclic or explosively shared result used to recurse until the stack
+    /// overflowed, aborting the daemon. Both are refused as errors now.
+    #[test]
+    fn a_cyclic_or_exploding_result_is_an_error_not_a_crash() {
+        let bridge = Arc::new(crate::bridge::NannaBridge::new(
+            crate::ToolPermissions::none(),
+        ));
+        let cyclic = "export default { name: 'c', description: 'c', \
+                      execute: function(input) { var o = {}; o.self = o; return o; } };";
+        let err = execute_sync(cyclic, &serde_json::json!({}), &bridge, 1000)
+            .expect_err("a cycle is refused");
+        assert!(err.to_string().contains("cyclic"), "{err}");
+
+        // 40 levels, each pointing twice at the next: 2^40 visits unbounded.
+        let dag = "export default { name: 'd', description: 'd', \
+                   execute: function(input) { var n = {v: 1}; \
+                   for (var i = 0; i < 40; i++) { n = {a: n, b: n}; } return n; } };";
+        let err = execute_sync(dag, &serde_json::json!({}), &bridge, 1000)
+            .expect_err("an exploding DAG is refused");
+        assert!(err.to_string().contains("values"), "{err}");
+
+        let fine = "export default { name: 'f', description: 'f', \
+                    execute: function(input) { return {a: [1, {b: 2}]}; } };";
+        let ok = execute_sync(fine, &serde_json::json!({}), &bridge, 1000).expect("plain data");
+        assert_eq!(ok, serde_json::json!({"a": [1, {"b": 2}]}));
+    }
+
+/// Boa cannot be interrupted, so a runaway loop used to outlive its
+    /// timeout forever. The iteration limit makes it throw; a loop that fits
+    /// its budget still completes.
+    #[test]
+    fn a_runaway_loop_ends_and_a_bounded_one_completes() {
+        let bridge = Arc::new(crate::bridge::NannaBridge::new(
+            crate::ToolPermissions::none(),
+        ));
+        let runaway = "export default { name: 'spin', description: 'spin', \
+                       execute: function(input) { while (true) {} } };";
+        let started = std::time::Instant::now();
+        let ended = execute_sync(runaway, &serde_json::json!({}), &bridge, 10);
+        assert!(
+            ended.is_err(),
+            "a while(true) must throw, not spin: {ended:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "bounded by the limit: {:?}",
+            started.elapsed()
+        );
+
+        let bounded = "export default { name: 'count', description: 'count', \
+                       execute: function(input) { let s = 0; \
+                       for (let i = 0; i < 1000; i++) { s += i; } return s; } };";
+        let done = execute_sync(bounded, &serde_json::json!({}), &bridge, 10).expect("fits");
+        assert_eq!(done.as_f64(), Some(499_500.0));
+        assert_eq!(loop_iteration_limit(30_000), 600_000_000);
+    }
 
     #[test]
     fn test_json_roundtrip() {

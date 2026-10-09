@@ -135,13 +135,18 @@ impl TelegramChannel {
             .json(&params)
             .send()
             .await
-            .map_err(|e| ChannelError::Send(e.to_string()))?;
+            // `without_url`: the request URL embeds the bot token
+            // (`/bot<token>/…`), and reqwest's Display prints it — every
+            // connection error put the token in logs and channel status.
+            .map_err(|e| ChannelError::Send(e.without_url().to_string()))?;
 
         let status = response.status();
         let body: TelegramApiResponse<T> = response
             .json()
             .await
-            .map_err(|e| ChannelError::Send(format!("Failed to parse response: {e}")))?;
+            .map_err(|e| {
+                ChannelError::Send(format!("Failed to parse response: {}", e.without_url()))
+            })?;
 
         if body.ok {
             body.result
@@ -185,16 +190,39 @@ impl TelegramChannel {
             reply_to_message_id: Option<i64>,
         }
 
-        self.request(
-            "sendMessage",
-            SendMessageParams {
-                chat_id,
-                text,
-                parse_mode: self.default_parse_mode.as_deref(),
-                reply_to_message_id: reply_to,
-            },
-        )
-        .await
+        let formatted = self
+            .request(
+                "sendMessage",
+                SendMessageParams {
+                    chat_id,
+                    text,
+                    parse_mode: self.default_parse_mode.as_deref(),
+                    reply_to_message_id: reply_to,
+                },
+            )
+            .await;
+        // Model text is not written for Telegram's Markdown: one unmatched
+        // `_` or `*` (a file name, a split code fence) and Telegram refuses
+        // the whole message with "can't parse entities" — the reply was
+        // lost. Sent again as plain text, it arrives unformatted but whole.
+        match formatted {
+            Err(ChannelError::Send(ref why))
+                if self.default_parse_mode.is_some() && why.contains("can't parse entities") =>
+            {
+                tracing::debug!("Telegram refused the Markdown ({why}); resending as plain text");
+                self.request(
+                    "sendMessage",
+                    SendMessageParams {
+                        chat_id,
+                        text,
+                        parse_mode: None,
+                        reply_to_message_id: reply_to,
+                    },
+                )
+                .await
+            }
+            other => other,
+        }
     }
 
     /// Send a photo.
@@ -686,8 +714,8 @@ impl Channel for TelegramChannel {
 
         let reply_to: Option<i64> = message
             .reply_to
-            .as_ref()
-            .and_then(|r| r.parse().ok());
+            .as_deref()
+            .and_then(|r| crate::native_reply_id(r).parse().ok());
 
         let result = match message.content {
             MessageContent::Text { text } => {
@@ -897,6 +925,19 @@ impl Channel for TelegramChannel {
 
 #[cfg(test)]
 mod tests {
+    /// A failed request names what failed, never the token in its URL.
+    #[tokio::test]
+    async fn a_connection_error_does_not_carry_the_token() {
+        let token = "123456:SECRET-token-value";
+        let channel = super::TelegramChannel::new(token).with_api_base("http://127.0.0.1:9");
+        let err = channel
+            .send_message_draft(1, 1, "hi")
+            .await
+            .expect_err("nothing listens on port 9");
+        let shown = format!("{err} {err:?}");
+        assert!(!shown.contains("SECRET"), "{shown}");
+    }
+
     use super::*;
 
     #[test]
@@ -976,6 +1017,54 @@ mod tests {
             .send_draft(&ChannelId::new("telegram", "-1001"), 7, "x")
             .await
             .expect("a no-op, not an error");
+    }
+
+    /// A reply Telegram's Markdown parser refuses is sent again as plain
+    /// text instead of being lost.
+    #[tokio::test]
+    async fn a_reply_telegram_cannot_parse_is_resent_as_plain_text() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for reply_body in [
+                r#"{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities: Can't find end of the entity starting at byte offset 7"}"#,
+                r#"{"ok":true,"result":{"message_id":11,"chat":{"id":4242,"type":"private"},"date":0}}"#,
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 4096];
+                while !request.ends_with(b"}") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                }
+                let status = if reply_body.contains("\"ok\":false") { "400 Bad Request" } else { "200 OK" };
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{reply_body}",
+                    reply_body.len()
+                );
+                socket.write_all(reply.as_bytes()).await.unwrap();
+                let request = String::from_utf8(request).unwrap();
+                bodies.push(request[request.find('{').unwrap()..].to_string());
+            }
+            bodies
+        });
+        let telegram = TelegramChannel::new("123:ABC").with_api_base(base);
+        let sent = telegram
+            .send_text(4242, "edit my_file.rs", None)
+            .await
+            .expect("delivered as plain text");
+        assert_eq!(sent.message_id, 11);
+        let bodies = server.await.unwrap();
+        let first: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+        assert_eq!(first["parse_mode"], "Markdown");
+        assert!(second.get("parse_mode").is_none(), "{second}");
+        assert_eq!(second["text"], "edit my_file.rs");
     }
 
     #[test]

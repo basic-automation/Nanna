@@ -95,6 +95,51 @@ async fn creating_a_card_announces_it() {
     assert_eq!(event.detail["title"], "write the thing");
 }
 
+/// The `created` actor is whoever made the card, never its assignee (the
+/// activity row stamps the assignee in its own column). Before, a card made
+/// by one member for another named the wrong member as its author, and the
+/// board router could not tell cards it split off itself from new work.
+#[tokio::test]
+async fn the_created_actor_is_the_creator_not_the_assignee() {
+    let (storage, recorder) = storage_with_recorder().await;
+    let task = storage
+        .tasks()
+        .create(NewTask {
+            assignee: Some("human".to_string()),
+            created_by: Some("router:global".to_string()),
+            ..card("clarify the brief")
+        })
+        .await
+        .expect("created");
+    let events = recorder.of_kind(TaskEventKind::Created);
+    assert_eq!(events[0].actor.as_deref(), Some("router:global"));
+    let activity = storage
+        .tasks()
+        .activity(task.id, 10)
+        .await
+        .expect("activity");
+    assert_eq!(activity[0].actor.as_deref(), Some("router:global"));
+    assert_eq!(
+        activity[0].assignee.as_deref(),
+        Some("human"),
+        "the assignee has its own column"
+    );
+
+    storage
+        .tasks()
+        .create(NewTask {
+            assignee: Some("human".to_string()),
+            ..card("unknown author")
+        })
+        .await
+        .expect("created");
+    let events = recorder.of_kind(TaskEventKind::Created);
+    assert_eq!(
+        events[1].actor, None,
+        "an unknown creator is not guessed from the assignee"
+    );
+}
+
 #[tokio::test]
 async fn a_status_change_is_announced_once_and_only_when_it_changes() {
     let (storage, recorder) = storage_with_recorder().await;

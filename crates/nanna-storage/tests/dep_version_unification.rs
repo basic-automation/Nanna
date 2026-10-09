@@ -85,11 +85,12 @@ const UNIFIED_CRATES: &[UnifiedCrate] = &[
         name: "malachite-bigint",
         reason: "`pymath` requires `malachite-bigint = \"0\"` — any 0.x, so a \
                  bare `cargo update` always takes the newest — while `rustpython-common` \
-                 resolves 0.9, and `rustpython-stdlib`, which depends on both, then fails to \
-                 compile with 17 E0277/E0308 errors about `malachite_bigint::{BigInt, \
-                 BigUint}`. The `=0.9.2` req in crates/nanna-scripting/Cargo.toml pins only \
-                 OUR edge and does not constrain `pymath`, so the split recurs every sweep",
-        remedy: Remedy::PinBackTo("0.9.2"),
+                 holds one exact minor, and `rustpython-stdlib`, which depends on both, then \
+                 fails to compile with 17 E0277/E0308 errors about `malachite_bigint::{BigInt, \
+                 BigUint}`. rustpython 0.6 moved every one of its paths to 0.12 (until then a \
+                 `=0.9.2` req in crates/nanna-scripting held 0.9), so the graph agrees today and \
+                 splits again the day malachite publishes a 0.13 that `pymath` takes",
+        remedy: Remedy::PinBackTo("0.12.0"),
     },
     UnifiedCrate {
         name: "rten",
@@ -134,22 +135,12 @@ struct CeilingCrate {
 /// As with `UNIFIED_CRATES`, an entry earns its place by having broken a real
 /// build. A ceiling is a liability — it holds back security fixes — so each one
 /// carries the condition that retires it.
-const CEILING_CRATES: &[CeilingCrate] = &[CeilingCrate {
-    name: "libc",
-    version_max: "0.2.186",
-    reason: "libc 0.2.187 corrected `POSIX_SPAWN_SETSID` from `c_int` to `c_short` on linux-gnu \
-             (glibc really does store spawn flags in a `short`). `rustpython-vm 0.5.0` passes that \
-             constant straight into `nix::spawn::PosixSpawnFlags::from_bits_retain`, which nix \
-             types as `c_int` — E0308 at rustpython-vm-0.5.0/src/stdlib/posix.rs:1812. That kills \
-             the `python` feature, and with it the `nanna` binary, on Linux only. Note \
-             `rustpython-stdlib 0.5.0` requires `libc ^0.2.183`, so the buildable window is the \
-             four releases 0.2.183..=0.2.186 — narrow enough that a bare `cargo update` always \
-             lands outside it",
-    remedy: "cargo update -p libc --precise 0.2.186",
-    lift_when: "rustpython publishes any release after 0.5.0 — the fix is upstream already \
-                (RustPython PR #8343 `Fix building against new libc`, merged 2026-07-22), it has \
-                simply never been released",
-}];
+// Empty since 2026-10-02. Its one entry held `libc` at 0.2.186, because libc
+// 0.2.187 retyped `POSIX_SPAWN_SETSID` and `rustpython-vm 0.5.0` stopped
+// compiling against it (E0308 at `stdlib/posix.rs:1812`, Linux only). rustpython
+// 0.6.0 shipped the upstream fix (RustPython PR #8343), so the ceiling was
+// lifted as its entry said to. The mechanism stays for the next one.
+const CEILING_CRATES: &[CeilingCrate] = &[];
 
 /// Compare two dotted numeric versions positionally.
 ///
@@ -436,9 +427,11 @@ fn version_comparison_orders_releases_and_respects_the_boundary() {
     assert!(version_is_at_most("0.2", "0.2.0"), "0.2 == 0.2.0");
 }
 
-/// The crates.io `tauri-build` release carried in `vendor/tauri-build` with the
-/// target-dir fix from tauri-apps/tauri#15831 applied on top.
-const TAURI_BUILD_VENDORED_VERSION: &str = "2.6.3";
+/// The first crates.io `tauri-build` carrying tauri-apps/tauri#15831. Below it,
+/// cargo's build-dir layout v2 sends the sidecar into `target/<profile>/build/`
+/// and panics the Linux GUI build (`IsADirectory`); until 2.7.0 shipped, a
+/// vendored 2.6.3 plus that diff stood in through `[patch.crates-io]`.
+const TAURI_BUILD_FIRST_FIXED_VERSION: &str = "2.7.0";
 
 /// Return the single `[[package]]` block for `name`, or `None` if it is absent.
 ///
@@ -467,52 +460,26 @@ fn block_version(block: &str) -> Option<&str> {
     version
 }
 
-/// A path `[patch]` is sticky: cargo keeps the vendored 2.6.3 even after a
-/// fixed release exists, so "is it still registry-sourced?" can never fire.
-/// `tauri-codegen` is the trigger instead — it ships in lockstep with
-/// `tauri-build` (both 2.6.3 today) and moves the moment `cargo update` takes
-/// the next tauri release, every one of which carries #15831.
+/// The vendored patch retired on 2026-09-26, when 2.7.0 reached crates.io. What
+/// must not come back: a lockfile walked below the fixed release (a pin-back or
+/// a `--precise` typo), or a path `[patch]` shadowing crates.io again.
 #[test]
-fn vendored_tauri_build_retires_with_the_next_tauri_release() {
+fn tauri_build_resolves_from_crates_io_at_the_fixed_release() {
     let lockfile = workspace_lockfile();
     let contents = std::fs::read_to_string(&lockfile)
         .unwrap_or_else(|e| panic!("cannot read {lockfile:?}: {e}"));
-    let retire = "delete vendor/tauri-build plus the [patch.crates-io] table and the \
-                  `exclude` entry in the root Cargo.toml, then confirm `cargo check -p \
-                  nanna-gui` on Linux";
 
     let build = package_block(&contents, "tauri-build")
-        .unwrap_or_else(|| panic!("`tauri-build` left the graph — {retire}, and this test"));
+        .unwrap_or_else(|| panic!("`tauri-build` left the graph — re-decide this guard"));
     assert!(
-        !build.contains("source = \"registry+"),
-        "tauri-build resolves from crates.io, so the vendored patch is not applied — {retire}"
+        build.contains("source = \"registry+"),
+        "tauri-build no longer resolves from crates.io — a `[patch]` is shadowing it"
     );
-    assert_eq!(
-        block_version(build),
-        Some(TAURI_BUILD_VENDORED_VERSION),
-        "the patched tauri-build is not the vendored release"
-    );
-
-    let codegen = package_block(&contents, "tauri-codegen")
-        .unwrap_or_else(|| panic!("`tauri-codegen` left the graph — re-decide this guard"));
-    assert_eq!(
-        block_version(codegen),
-        Some(TAURI_BUILD_VENDORED_VERSION),
-        "tauri released past the vendored tauri-build (tauri-codegen moved); the new \
-         tauri-build carries tauri-apps/tauri#15831 — {retire}"
-    );
-
-    // A re-vendor of plain 2.6.3 would pass everything above and bring back the
-    // `IsADirectory` panic, so the fix itself is part of the invariant.
-    let vendored_lib = lockfile
-        .parent()
-        .map(|root| root.join("vendor/tauri-build/src/lib.rs"))
-        .expect("the lockfile sits in the workspace root");
-    let source = std::fs::read_to_string(&vendored_lib)
-        .unwrap_or_else(|e| panic!("cannot read {vendored_lib:?}: {e}"));
+    let version = block_version(build).expect("a lockfile package block carries a version");
     assert!(
-        source.contains("fn target_dir_from_out_dir("),
-        "vendor/tauri-build lost the tauri-apps/tauri#15831 fix"
+        !version_is_at_most(version, "2.6.3"),
+        "tauri-build {version} predates {TAURI_BUILD_FIRST_FIXED_VERSION}, the first release \
+         with tauri-apps/tauri#15831 — the Linux GUI build panics below it"
     );
 }
 

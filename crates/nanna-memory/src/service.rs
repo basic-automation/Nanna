@@ -423,14 +423,15 @@ impl MemoryService {
                         debug!("Backfill for '{model}' abandoned — provider changed underneath it");
                         break;
                     }
-                    if let Err(e) = self
+                    match self
                         .store
-                        .set_embedding_for_model(&id, model, embedding, true)
+                        .set_embedding_if_content(&id, model, embedding, &content)
                         .await
                     {
-                        debug!("Backfill could not store embedding for {id}: {e}");
-                    } else {
-                        filled += 1;
+                        Ok(true) => filled += 1,
+                        // Edited mid-embed: this vector is of the old text.
+                        Ok(false) => debug!("Backfill skipped {id}: its content changed"),
+                        Err(e) => debug!("Backfill could not store embedding for {id}: {e}"),
                     }
                 }
                 Err(e) => {
@@ -880,18 +881,29 @@ impl MemoryService {
             }
         };
 
-        // Check for similar existing memories
-        let results = self.store.search(&embedding, 1).await;
+        // Check for similar existing GLOBAL memories: this path writes a
+        // global row, so a workspace's private row is never its neighbour.
+        let results = self.store.search_owned_by(&embedding, 1, None).await;
         
         if let Some((existing, similarity)) = results.first() {
             let action = IngestAction::from_similarity(*similarity);
             
             match action {
-                IngestAction::Reinforce => {
+                // Same rule as `remember_with_importance`: only a neighbour that
+                // already holds this text verbatim may absorb it unwritten.
+                IngestAction::Reinforce if existing.content.trim().contains(content.trim()) => {
                     // Just strengthen existing memory
                     self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
                     info!("Reinforced: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
                     return Ok((existing.id.clone(), action));
+                }
+                // Near-identical but not contained: rate the neighbour, keep the
+                // text as its own row (no second embed; dreaming folds later).
+                IngestAction::Reinforce => {
+                    self.pending_updates
+                        .write()
+                        .await
+                        .push((existing.id.clone(), Rating::Good));
                 }
                 IngestAction::Update => {
                     // Related-but-distinct: fold new information into the existing
@@ -913,7 +925,9 @@ impl MemoryService {
                             );
                             return Ok((existing.id.clone(), IngestAction::Update));
                         }
-                        FoldResult::Subset => {
+                        // `Subset` is also the byte bound declining the append,
+                        // so it discards only what is provably already there.
+                        FoldResult::Subset if existing.content.trim().contains(content.trim()) => {
                             info!(
                                 "Update no-op (subset): {} (sim: {:.3})",
                                 truncate(&existing.content, 30),
@@ -921,9 +935,10 @@ impl MemoryService {
                             );
                             return Ok((existing.id.clone(), IngestAction::Update));
                         }
-                        // The neighbour changed under the fold; the content
-                        // landed nowhere, so it must still become a row.
-                        FoldResult::Contended => {
+                        // The neighbour changed under the fold, or the bound
+                        // declined it: the content landed nowhere, so it must
+                        // still become a row.
+                        FoldResult::Subset | FoldResult::Contended => {
                             debug!(
                                 "Fold contended (memory changed mid-merge); \
                                  storing separately (sim: {:.3})",
@@ -1134,8 +1149,10 @@ impl MemoryService {
             }
         };
 
-        // Check for similar existing memories (duplicate detection)
-        let results = self.store.search(&embedding, 1).await;
+        // Check for similar existing GLOBAL memories (duplicate detection):
+        // this path writes a global row, so a workspace's private row is never
+        // its neighbour.
+        let results = self.store.search_owned_by(&embedding, 1, None).await;
         
         if let Some((existing, similarity)) = results.first() {
             let action = IngestAction::from_similarity(*similarity);
@@ -1145,7 +1162,14 @@ impl MemoryService {
                 || existing.content.contains("Command failed");
 
             match action {
-                IngestAction::Reinforce if !skip_reinforce => {
+                // A near-duplicate that already holds this text verbatim: only
+                // strengthen it. Without the containment check, any new detail
+                // in the top similarity band ("…, allergic to chicken") was
+                // dropped and logged as a reinforcement — the invariant
+                // `remember_scoped` keeps: discard only what is provably present.
+                IngestAction::Reinforce
+                    if !skip_reinforce && existing.content.trim().contains(content.trim()) =>
+                {
                     // Just strengthen existing memory (testing effect)
                     self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
                     // Also boost importance if new fact has higher importance
@@ -1159,6 +1183,17 @@ impl MemoryService {
                     }
                     info!("Reinforced: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
                     return Ok((existing.id.clone(), action));
+                }
+                // Near-identical but NOT contained: the neighbour is rated, and
+                // the text gets a row of its own. Its embedding is already in
+                // hand, so this costs the write path no second round-trip (a
+                // fold would re-embed the merged text); squeezing the pair is
+                // dreaming's job, with the whole corpus in view.
+                IngestAction::Reinforce if !skip_reinforce => {
+                    self.pending_updates
+                        .write()
+                        .await
+                        .push((existing.id.clone(), Rating::Good));
                 }
                 IngestAction::Update if !skip_reinforce => {
                     // Related-but-distinct: fold new information in (dedup) and reinforce.
@@ -1303,8 +1338,8 @@ impl MemoryService {
             }
         };
 
-        // Check for similar existing memories (within same scope)
-        let results = self.store.search_scoped(&embedding, 1, workspace_id.as_deref()).await;
+        let owner = workspace_id.as_deref(); // same-scope neighbours only
+        let results = self.store.search_owned_by(&embedding, 1, owner).await;
         
         if let Some((existing, similarity)) = results.first() {
             let action = IngestAction::from_similarity(*similarity);
@@ -1519,6 +1554,23 @@ impl MemoryService {
         query: &str,
         workspace_id: Option<&str>,
     ) -> Result<RecallReport, MemoryError> {
+        self.recall_in_scope_with_report(query, crate::RecallScope::from_workspace(workspace_id))
+            .await
+    }
+
+    /// [`Self::recall_scoped_with_report`] over any [`crate::RecallScope`] —
+    /// including [`crate::RecallScope::GlobalOnly`], which the `Option<&str>`
+    /// form cannot express.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if no embedding function is configured, or if
+    /// embedding the query fails.
+    pub async fn recall_in_scope_with_report(
+        &self,
+        query: &str,
+        scope: crate::RecallScope<'_>,
+    ) -> Result<RecallReport, MemoryError> {
         let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
 
         let embed_started = std::time::Instant::now();
@@ -1533,11 +1585,7 @@ impl MemoryService {
         // Scoped search
         let (results, coverage) = self
             .store
-            .search_scoped_with_coverage(
-                &query_embedding,
-                self.config.max_results * 2,
-                workspace_id,
-            )
+            .search_in_scope_with_coverage(&query_embedding, self.config.max_results * 2, scope)
             .await;
         let min_score = self.get_min_score();
 
@@ -1558,13 +1606,13 @@ impl MemoryService {
                 &query_embedding,
                 &active_model,
                 self.config.max_results * 2,
-                workspace_id,
+                scope.sql_workspace(),
                 min_score,
             )
             .await;
 
         let filtered = self
-            .rank_and_assemble(results, &chunk_hits, workspace_id, min_score)
+            .rank_and_assemble(results, &chunk_hits, scope, min_score)
             .await;
 
         let timings = RecallTimings {
@@ -1576,7 +1624,7 @@ impl MemoryService {
         // without ever saying how long either half took.
         info!(
             "Recall (scoped {:?}) '{}': embed {} ms, search {} ms, {} results from {} memories",
-            workspace_id,
+            scope,
             truncate(query, 30),
             timings.embed_ms(),
             timings.search_ms(),
@@ -1615,7 +1663,7 @@ impl MemoryService {
         &self,
         results: Vec<(MemoryEntry, f32)>,
         chunk_hits: &HashMap<String, crate::chunk_rank::ChunkHit>,
-        workspace_id: Option<&str>,
+        scope: crate::RecallScope<'_>,
         min_score: f32,
     ) -> Vec<RecallResult> {
         debug_assert!(min_score.is_finite(), "a similarity floor is a number");
@@ -1626,19 +1674,26 @@ impl MemoryService {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for (entry, score) in results {
+            // A non-finite similarity is no evidence at all (a zero vector
+            // yields NaN), and NaN slips through `<`: it compares false against
+            // the floor and would be admitted. It is also why the sort below
+            // can use a total order.
+            let row = score.is_finite().then_some(score);
             let hit = chunk_hits.get(&entry.id);
             // Admitted on the better of the two TRUE similarities. Neither is
             // inflated for the test: `rank` carries the corroboration bonus and
             // is used only for ordering, so the threshold keeps the exact
             // meaning it was calibrated with.
-            let best = hit.map_or(score, |h| h.best.max(score));
+            let Some(best) = best_similarity(row, hit) else { continue };
             if best < min_score {
                 continue;
             }
-            let rank = hit.map_or(score, |h| h.rank().max(score));
+            let rank = hit.map_or(best, |h| h.rank().max(best));
             // Only name a chunk when the chunk is what actually won; a row-level
             // hit has no "part that matched" to point at.
-            let best_chunk = hit.filter(|h| h.best >= score).map(|h| h.best_ordinal);
+            let best_chunk = hit
+                .filter(|h| row.is_none_or(|r| h.best >= r))
+                .map(|h| h.best_ordinal);
             seen.insert(entry.id.clone());
             scored.push((entry, best, rank, best_chunk));
         }
@@ -1651,15 +1706,22 @@ impl MemoryService {
             if seen.contains(id) {
                 continue;
             }
+            debug_assert!(hit.best >= min_score, "collapse_chunk_hits admits on the floor");
             if let Some(entry) = self.store.get(id).await {
-                if workspace_id.is_some() && entry.workspace_id.as_deref() != workspace_id {
+                // The same rule the row scan applied. The chunk SQL narrows
+                // only to `sql_workspace`, so `GlobalOnly` is cut here.
+                if !scope.admits(entry.workspace_id.as_deref()) {
                     continue;
                 }
                 scored.push((entry, hit.best, hit.rank(), Some(hit.best_ordinal)));
             }
         }
 
-        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        debug_assert!(
+            scored.iter().all(|s| s.1.is_finite() && s.2.is_finite()),
+            "only finite scores reach the ordering"
+        );
+        scored.sort_by(|a, b| b.2.total_cmp(&a.2));
 
         for (entry, score, _rank, best_chunk) in scored {
             let weight = entry.fsrs.weight(&self.config.fsrs);
@@ -1844,16 +1906,18 @@ impl MemoryService {
 
     /// Get memory statistics
     pub async fn stats(&self) -> MemoryStats {
-        let entries = self.store.all_entries().await;
         let params = &self.config.fsrs;
-        
+        // Projected, not `all_entries`: that clones every vector of every
+        // entry to count four states.
+        let fsrs_states = self.store.map_entries(|entry| entry.fsrs.state(params)).await;
+
         let mut stats = MemoryStats {
-            total: entries.len(),
+            total: fsrs_states.len(),
             ..MemoryStats::default()
         };
-        
-        for entry in entries {
-            match entry.fsrs.state(params) {
+
+        for state in fsrs_states {
+            match state {
                 MemoryState::Active => stats.active += 1,
                 MemoryState::Dormant => stats.dormant += 1,
                 MemoryState::Silent => stats.silent += 1,
@@ -1866,28 +1930,29 @@ impl MemoryService {
     }
 
     /// Get all memories with their FSRS state
+    ///
+    /// Projected under the store's read lock rather than through
+    /// `all_entries`, which clones every entry whole: the current embedding
+    /// and every model bucket (6 KiB per 1536-dim vector per model), none of
+    /// which a list entry carries. On a 3 730-memory store that clone was
+    /// most of a `memory.list` call's transient heap, and glibc kept the high
+    /// water: one call took an idle daemon from ~142 to ~217 MB RSS.
     pub async fn list_all(&self) -> Vec<MemoryListEntry> {
-        let entries = self.store.all_entries().await;
         let params = &self.config.fsrs;
-        
-        entries.into_iter().map(|e| {
-            let weight = e.fsrs.weight(params);
-            let state = e.fsrs.state(params);
-            let retrievability = e.fsrs.retrievability(params);
-            
-            MemoryListEntry {
-                id: e.id,
-                content: e.content,
-                metadata: e.metadata,
+        self.store
+            .map_entries(|e| MemoryListEntry {
+                id: e.id.clone(),
+                content: e.content.clone(),
+                metadata: e.metadata.clone(),
                 timestamp: e.timestamp,
-                state,
-                weight,
-                retrievability,
+                state: e.fsrs.state(params),
+                weight: e.fsrs.weight(params),
+                retrievability: e.fsrs.retrievability(params),
                 importance: e.fsrs.importance,
                 access_count: e.fsrs.access_count,
-                workspace_id: e.workspace_id,
-            }
-        }).collect()
+                workspace_id: e.workspace_id.clone(),
+            })
+            .await
     }
 
     /// Every memory as an export record: content, provenance, workspace, the
@@ -1958,10 +2023,28 @@ impl MemoryService {
         Ok(())
     }
 
-    /// Clear all memories
-    pub async fn clear(&self) {
-        self.store.clear().await;
-        info!("Cleared all memories");
+    /// Replace a memory's tags. See [`crate::VectorStore::set_tags`].
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::VectorStore::set_tags`].
+    pub async fn set_tags(&self, id: &str, tags: &[String]) -> Result<(), MemoryError> {
+        self.store.set_tags(id, tags).await
+    }
+
+    /// Forget every memory in `ids`, durably. See
+    /// [`crate::VectorStore::remove_many_durable`]: a memory reported removed
+    /// is gone from disk too, and one reported failed is still there.
+    ///
+    /// Replaces a `clear()` that emptied RAM only — the daemon reported
+    /// "cleared" and the next restart loaded every memory back.
+    pub async fn forget_many(&self, ids: &[&str]) -> crate::DurableRemoval {
+        let outcome = self.store.remove_many_durable(ids).await;
+        info!(
+            "Forgot {} memories ({} refused by the backend)",
+            outcome.removed, outcome.failed
+        );
+        outcome
     }
 
     /// Save memories to file.
@@ -2217,11 +2300,8 @@ impl MemoryService {
     async fn with_store_timescale(&self, config: &ConsolidationConfig) -> ConsolidationConfig {
         let mut config = config.clone();
         let span_minutes = {
-            let all = self.store.all_entries().await;
-            match (
-                all.iter().map(|e| e.timestamp).min(),
-                all.iter().map(|e| e.timestamp).max(),
-            ) {
+            let times = self.store.map_entries(|e| e.timestamp).await;
+            match (times.iter().min(), times.iter().max()) {
                 (Some(first), Some(last)) => (last - first).lossy_f32() / 60.0,
                 _ => 0.0,
             }
@@ -2900,6 +2980,30 @@ impl RecallResult {
     }
 }
 
+/// The better of a memory's row and chunk similarity, or `None` when neither
+/// is evidence.
+///
+/// `row` is already `None` for a non-finite score; a chunk hit is finite by
+/// construction (`collapse_chunk_hits` drops NaN). Returning `None` rather
+/// than a sentinel keeps a memory with no usable score from being compared
+/// against the floor at all.
+fn best_similarity(row: Option<f32>, hit: Option<&crate::chunk_rank::ChunkHit>) -> Option<f32> {
+    debug_assert!(
+        row.is_none_or(f32::is_finite),
+        "a row score reaching here is finite"
+    );
+    debug_assert!(
+        hit.is_none_or(|h| h.best.is_finite()),
+        "a chunk hit is finite"
+    );
+    match (row, hit) {
+        (Some(r), Some(h)) => Some(r.max(h.best)),
+        (Some(r), None) => Some(r),
+        (None, Some(h)) => Some(h.best),
+        (None, None) => None,
+    }
+}
+
 fn chrono_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3406,6 +3510,119 @@ mod tests {
             "every byte handed in is a byte stored"
         );
         assert!(stored.content.ends_with("TAIL"), "the tail survived");
+    }
+
+    /// A write folds into, reinforces, or is discarded against only a memory
+    /// owned like the one it writes. The neighbour search used to be the READ
+    /// scope (a workspace's rows plus the global ones, or everything), so a
+    /// workspace's private detail was folded into a global row every other
+    /// workspace recalls, and a global fact was swallowed by one workspace's
+    /// private row.
+    #[tokio::test]
+    async fn an_ingest_never_folds_across_a_workspace_boundary() {
+        use std::sync::Arc;
+
+        // Every text embeds identically: each neighbour is in the Reinforce band.
+        let embed: EmbedFn =
+            Arc::new(|_text: &str| Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0]) }));
+        let config = MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        };
+        let service = MemoryService::new(config).with_embed_fn(embed);
+
+        let (global, _) = service
+            .remember_with_importance("deploy uses port 5149", HashMap::new(), 3.0)
+            .await
+            .expect("global write");
+        let (private, action) = service
+            .remember_scoped(
+                "deploy uses port 5149 behind the A-only VPN",
+                HashMap::new(),
+                3.0,
+                Some("ws-a".into()),
+            )
+            .await
+            .expect("workspace write");
+        assert_ne!(private, global, "the private detail got its own row");
+        assert_eq!(action, IngestAction::Create);
+        let global_row = service.store.get(&global).await.expect("global row");
+        assert_eq!(
+            global_row.content, "deploy uses port 5149",
+            "the global row is untouched"
+        );
+        assert_eq!(global_row.workspace_id, None);
+        let private_row = service.store.get(&private).await.expect("private row");
+        assert_eq!(private_row.workspace_id.as_deref(), Some("ws-a"));
+
+        // And the other way: with only a private neighbour, a global fact is a
+        // global row of its own, not a "reinforcement" of ws-a's memory.
+        let fresh = MemoryService::new(MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        })
+        .with_embed_fn(Arc::new(|_text: &str| {
+            Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0]) })
+        }));
+        let (private, _) = fresh
+            .remember_scoped("a private note", HashMap::new(), 3.0, Some("ws-a".into()))
+            .await
+            .expect("workspace write");
+        let (public, _) = fresh
+            .remember_with_importance("a public note", HashMap::new(), 3.0)
+            .await
+            .expect("global write");
+        assert_ne!(public, private);
+        let public_row = fresh.store.get(&public).await.expect("public row");
+        assert_eq!(public_row.workspace_id, None);
+        assert_eq!(public_row.content, "a public note");
+    }
+
+    /// The top similarity band is "probably the same fact", not "provably the
+    /// same text": a new detail there must land somewhere — folded into the
+    /// neighbour or as its own row — never be dropped as a reinforcement.
+    #[tokio::test]
+    async fn a_new_detail_in_the_reinforce_band_is_kept() {
+        use std::sync::Arc;
+
+        for path in ["smart_ingest", "remember_with_importance"] {
+            let service = MemoryService::new(MemoryServiceConfig {
+                dimension: 3,
+                ..Default::default()
+            })
+            .with_embed_fn(Arc::new(|_text: &str| {
+                Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0]) })
+            }));
+            let ingest = |text: &'static str| {
+                let service = &service;
+                async move {
+                    if path == "smart_ingest" {
+                        service.smart_ingest(text, HashMap::new()).await
+                    } else {
+                        service
+                            .remember_with_importance(text, HashMap::new(), 3.0)
+                            .await
+                    }
+                }
+            };
+            ingest("dog Rex is a beagle").await.expect("first write");
+            // Identical embeddings: cosine 1.0, the Reinforce band.
+            ingest("dog Rex is a beagle, allergic to chicken")
+                .await
+                .expect("second write");
+            let kept = service
+                .store
+                .all_entries()
+                .await
+                .iter()
+                .any(|entry| entry.content.contains("allergic to chicken"));
+            assert!(kept, "{path}: the new detail was dropped");
+
+            // A true restatement is still only a reinforcement.
+            let before = service.store.all_entries().await.len();
+            ingest("dog Rex is a beagle").await.expect("restatement");
+            assert_eq!(service.store.all_entries().await.len(), before, "{path}");
+        }
     }
 
     #[test]
@@ -4707,6 +4924,140 @@ mod tests {
         assert!(
             service.recall_scoped("the query", None).await.unwrap().is_empty(),
             "thirty near-misses must not clear a threshold none of them clears"
+        );
+    }
+
+    fn scoped_entry(id: &str, workspace_id: Option<&str>) -> MemoryEntry {
+        MemoryEntry {
+            id: id.to_string(),
+            content: format!("memory {id}"),
+            embeddings: HashMap::new(),
+            // No row vector yet (queued for backfill), so the row scan cannot
+            // reach it and only the chunk-only pass can admit it — the path
+            // under test. An orthogonal vector would not do: a small store's
+            // row scan returns every row, sub-floor scores included, and chunk
+            // evidence would admit them through the row loop instead.
+            embedding_model: None,
+            embedding: Vec::new(),
+            metadata: HashMap::new(),
+            timestamp: 0,
+            fsrs: crate::FsrsState::default(),
+            workspace_id: workspace_id.map(str::to_string),
+        }
+    }
+
+    /// A workspace-scoped recall sees that workspace AND the global memories —
+    /// the chunk SQL applies exactly that rule. The chunk-only pass used to
+    /// re-filter with a narrower one (`owner == scope`), so a global memory that
+    /// only a chunk matched was found by the index and then thrown away.
+    #[tokio::test]
+    async fn a_global_memory_found_only_by_a_chunk_survives_a_workspace_scope() {
+        let embed: EmbedFn =
+            Arc::new(|_text: &str| Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0, 0.0]) }));
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 4,
+            min_score: 0.4,
+            max_results: 2,
+            ..Default::default()
+        })
+        .with_embed_fn(embed)
+        .with_persistence(Arc::new(StubChunkSearch {
+            hits: vec![
+                ("global".to_string(), 0, 0.9),
+                ("mine".to_string(), 0, 0.8),
+                ("theirs".to_string(), 0, 0.95),
+            ],
+            model: "prov:a".to_string(),
+        }));
+        service.rebind_embeddings("prov:a", 4, None).await;
+        for entry in [
+            scoped_entry("global", None),
+            scoped_entry("mine", Some("ws-a")),
+            scoped_entry("theirs", Some("ws-b")),
+        ] {
+            service.store.add(entry).await.expect("add");
+        }
+        // Another workspace's perfect row matches fill the row scan's whole
+        // over-fetch (max_results * 2 * 3 = 12) and are then scoped away, so no
+        // memory above reaches the row loop: the chunk-only pass is the only
+        // way in.
+        for i in 0..12 {
+            let mut crowd = scoped_entry(&format!("crowd-{i}"), Some("ws-b"));
+            crowd.embedding = vec![1.0, 0.0, 0.0, 0.0];
+            crowd.embedding_model = Some("prov:a".to_string());
+            service.store.add(crowd).await.expect("add");
+        }
+
+        let found = service
+            .recall_scoped("the query", Some("ws-a"))
+            .await
+            .unwrap();
+        let ids: Vec<&str> = found.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["global", "mine"],
+            "global + this workspace, ranked; another workspace's memory stays out"
+        );
+
+        // `GlobalOnly` has no SQL form (the chunk scan runs unscoped), so the
+        // cut is `admits` alone — and it must hold on the chunk-only pass too.
+        let global = service
+            .recall_in_scope_with_report("the query", crate::RecallScope::GlobalOnly)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = global.results.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["global"], "global-only admits no workspace's memory");
+    }
+
+    /// NaN compares false against every floor, so `best < min_score` let a
+    /// NaN-scored row through — and then `partial_cmp` fell back to `Equal`,
+    /// leaving the order of the whole answer to wherever the NaN happened to
+    /// sit. A non-finite score is no evidence and never reaches the ordering.
+    #[tokio::test]
+    async fn a_nan_score_is_not_evidence() {
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 4,
+            min_score: 0.4,
+            ..Default::default()
+        });
+        let results = vec![
+            (scoped_entry("nan", None), f32::NAN),
+            (scoped_entry("real", None), 0.7),
+            (scoped_entry("weak", None), 0.2),
+        ];
+        let out = service
+            .rank_and_assemble(results, &HashMap::new(), crate::RecallScope::Everything, 0.4)
+            .await;
+        let ids: Vec<&str> = out.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["real"], "NaN is rejected like any sub-floor score");
+
+        // A NaN row beside a real chunk hit is admitted on the chunk, and the
+        // chunk is named as what matched.
+        let hits = crate::chunk_rank::collapse_chunk_hits(
+            &[
+                ("nan".to_string(), 3, 0.8),
+                ("nan".to_string(), 4, f32::NAN),
+            ],
+            0.4,
+        );
+        let out = service
+            .rank_and_assemble(
+                vec![(scoped_entry("nan", None), f32::NAN)],
+                &hits,
+                crate::RecallScope::Everything,
+                0.4,
+            )
+            .await;
+        assert_eq!(out.len(), 1, "the chunk evidence stands on its own");
+        assert!(
+            (out[0].score - 0.8).abs() < 1e-6,
+            "scored on the chunk: {}",
+            out[0].score
+        );
+        assert_eq!(
+            out[0].best_chunk,
+            Some(3),
+            "the NaN chunk never corroborated or won"
         );
     }
 

@@ -7,15 +7,17 @@ impl ControlPlane {
     // Memory Handlers
     // =========================================================================
     
-    /// Does a memory in `workspace_id` belong to `scope`? `None` = every
+    /// The wire `scope` as a [`nanna_memory::RecallScope`]: `None` = every
     /// memory, `"global"` = global memories only, a workspace id = global
-    /// memories plus that workspace's. One rule for `list` and `export`, so the
-    /// two can never disagree about what a scope contains.
-    fn memory_in_scope(scope: Option<&str>, workspace_id: Option<&str>) -> bool {
+    /// memories plus that workspace's. One parse for `search`, `list` and
+    /// `export`, so they can never disagree about what a scope contains —
+    /// `search` used to read `"global"` as *every* memory while the other two
+    /// read it as the global ones.
+    pub(super) fn memory_scope(scope: Option<&str>) -> nanna_memory::RecallScope<'_> {
         match scope {
-            None => true,
-            Some("global") => workspace_id.is_none(),
-            Some(workspace) => workspace_id.is_none() || workspace_id == Some(workspace),
+            None => nanna_memory::RecallScope::Everything,
+            Some("global") => nanna_memory::RecallScope::GlobalOnly,
+            Some(workspace) => nanna_memory::RecallScope::Workspace(workspace),
         }
     }
 
@@ -72,19 +74,24 @@ impl ControlPlane {
                     Err(e) => json!({ "error": "create_failed", "message": e.to_string() })
                 }
             }
-            MemoryAction::Update { id, content, tags: _ } => {
-                // Update memory content
-                if let Some(new_content) = content {
-                    match memory.update_content(&id, &new_content).await {
-                        Ok(()) => {
-                            // Memory auto-persisted to Turso via write-through.
-                            json!({ "status": "updated", "id": id })
-                        }
-                        Err(e) => json!({ "error": "update_failed", "message": e.to_string() })
-                    }
-                } else {
-                    json!({ "error": "no_changes", "id": id })
+            MemoryAction::Update { id, content, tags } => {
+                // Tags used to be destructured as `_`: content + tags said
+                // `updated` with the tags dropped, tags alone said `no_changes`.
+                if content.is_none() && tags.is_none() {
+                    return json!({ "error": "no_changes", "id": id });
                 }
+                if let Some(new_content) = content
+                    && let Err(e) = memory.update_content(&id, &new_content).await
+                {
+                    return json!({ "error": "update_failed", "message": e.to_string() });
+                }
+                if let Some(tags) = tags
+                    && let Err(e) = memory.set_tags(&id, &tags).await
+                {
+                    return json!({ "error": "update_failed", "message": e.to_string() });
+                }
+                // Memory auto-persisted to Turso via write-through.
+                json!({ "status": "updated", "id": id })
             }
             MemoryAction::Delete { id } => {
                 match memory.forget(&id).await {
@@ -120,15 +127,14 @@ impl ControlPlane {
     }
 
     /// `MemoryAction::Search`: scoped recall, saying how much of the store was searchable.
-    async fn memory_search(memory: &MemoryService, query: String, limit: Option<usize>, scope: Option<String>) -> Value {
-        // Use scoped recall: None = all, Some("global") = global only, Some(ws_id) = global + workspace
-        let scope_filter = match &scope {
-            Some(ws_id) if ws_id != "global" => Some(ws_id.as_str()),
-            // "global" or None → all
-            _ => None,
-        };
+    async fn memory_search(
+        memory: &MemoryService,
+        query: String,
+        limit: Option<usize>,
+        scope: Option<String>,
+    ) -> Value {
         let result = memory
-            .recall_scoped_with_report(&query, scope_filter)
+            .recall_in_scope_with_report(&query, Self::memory_scope(scope.as_deref()))
             .await;
         match result {
             Ok(nanna_memory::RecallReport {
@@ -189,42 +195,50 @@ impl ControlPlane {
         }
     }
 
-    /// `MemoryAction::Clear`: all memories (in-memory only), or one scope's durably.
+    /// `MemoryAction::Clear`: every memory, or one scope's — durably either way.
+    ///
+    /// `None` used to empty RAM only and answer `"cleared"`, so the next restart
+    /// loaded every memory back from Turso. Both arms now go through
+    /// [`MemoryService::forget_many`], which removes a memory from RAM only once
+    /// its row is gone; a partial failure is reported as one, never as success.
+    ///
+    /// Destructive scopes stay narrow, unlike `list`'s: `"global"` clears only
+    /// unscoped memories, and a workspace id clears ONLY that workspace's —
+    /// never the globals its tab also displays.
     async fn memory_clear(memory: &MemoryService, scope: Option<String>) -> Value {
-        match scope.as_deref() {
-            None => {
-                memory.clear().await;
-                // Note: clear() removes all in-memory entries. Individual removes
-                // write-through to Turso, but bulk clear would require a separate
-                // DB call. For now we log a warning.
-                warn!("Memory cleared in-memory. Turso entries are NOT cleared — restart will reload them.");
-                info!("Cleared all memories (in-memory only)");
-                json!({ "status": "cleared", "scope": "all" })
-            }
-            Some(s) => {
-                // Scoped clear removes each matching entry via
-                // forget(), which write-throughs to Turso — durable,
-                // unlike the legacy all-clear above. "global" clears
-                // only unscoped entries; a workspace id clears ONLY
-                // that workspace's entries (never the globals its
-                // tab also displays — destructive ops stay narrow).
-                let target_global = s == "global";
-                let entries = memory.list_all().await;
-                let mut removed = 0usize;
-                for m in entries {
-                    let matches = if target_global {
-                        m.workspace_id.is_none()
-                    } else {
-                        m.workspace_id.as_deref() == Some(s)
-                    };
-                    if matches && memory.forget(&m.id).await.is_ok() {
-                        removed += 1;
-                    }
-                }
-                info!("Cleared {} memories in scope {}", removed, s);
-                json!({ "status": "cleared", "scope": s, "removed": removed })
-            }
+        let entries = memory.list_all().await;
+        let ids: Vec<&str> = entries
+            .iter()
+            .filter(|m| match scope.as_deref() {
+                None => true,
+                Some("global") => m.workspace_id.is_none(),
+                Some(ws) => m.workspace_id.as_deref() == Some(ws),
+            })
+            .map(|m| m.id.as_str())
+            .collect();
+        let outcome = memory.forget_many(&ids).await;
+        let scope_name = scope.as_deref().unwrap_or("all");
+        info!(
+            "Cleared {} of {} memories in scope {} ({} refused)",
+            outcome.removed,
+            ids.len(),
+            scope_name,
+            outcome.failed
+        );
+        if outcome.failed > 0 {
+            return json!({
+                "error": "clear_incomplete",
+                "scope": scope_name,
+                "removed": outcome.removed,
+                "failed": outcome.failed,
+                "message": format!(
+                    "{} memories could not be deleted from storage and were kept: {}",
+                    outcome.failed,
+                    outcome.first_error.unwrap_or_default()
+                ),
+            });
         }
+        json!({ "status": "cleared", "scope": scope_name, "removed": outcome.removed })
     }
 
     /// `MemoryAction::Consolidate`: one explicit, non-idle-gated dream cycle.
@@ -346,39 +360,63 @@ impl ControlPlane {
     }
 
     /// `MemoryAction::List`: every memory in `scope`, newest state included.
+    ///
+    /// The tree form, for callers that read the reply in-process (channels,
+    /// tests). The IPC server sends [`Self::memory_list_raw`] instead, so the
+    /// two can never disagree: this is that document, parsed.
     async fn memory_list(memory: &MemoryService, scope: Option<String>) -> Value {
-        let all_memories = memory.list_all().await;
-        let memories: Vec<_> = all_memories.into_iter()
-            .filter(|m| Self::memory_in_scope(scope.as_deref(), m.workspace_id.as_deref()))
-            .map(|m| {
-                // Absent provenance is "unknown" — NOT "stated". A legacy
-                // memory stored before provenance was captured must not be
-                // able to impersonate a user assertion.
-                let fact_type = m.metadata.get("fact_type")
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string());
-                let created_at = chrono::DateTime::from_timestamp(m.timestamp, 0).map_or_else(|| m.timestamp.to_string(), |dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
+        match Self::memory_list_raw(memory, scope).await {
+            Ok(raw) => serde_json::from_str(raw.get()).unwrap_or_else(|e| Self::memory_list_failed(&e)),
+            Err(e) => Self::memory_list_failed(&e),
+        }
+    }
 
-                json!({
-                    "id": m.id,
-                    "content": m.content,
-                    "fact_type": fact_type,
-                    "importance": m.importance,
-                    "state": format!("{:?}", m.state).to_lowercase(),
-                    "weight": m.weight,
-                    "retrievability": m.retrievability,
-                    "access_count": m.access_count,
-                    "created_at": created_at,
-                    "session_id": m.metadata.get("session_id"),
-                    "workspace_id": m.workspace_id,
-                })
-            })
+    /// `MemoryAction::List` as serialized JSON, written straight from typed
+    /// rows that borrow the listing.
+    ///
+    /// On a real store this reply is ~14 MB (3 730 memories). Built as a
+    /// `serde_json::Value` tree it cost the tree (a heap node per field), a
+    /// deep copy of the tree into the `Response`, and then the string; this
+    /// writes the string once. Rows are projected under the store's read lock
+    /// by `list_all`, which is released before serializing.
+    pub(super) async fn memory_list_raw(
+        memory: &MemoryService,
+        scope: Option<String>,
+    ) -> serde_json::Result<crate::protocol::RawJson> {
+        // Per row beyond its content: eleven keys, three numbers, two dates
+        // and ids, ~300 B on a real store; 512 leaves room for escapes.
+        const ROW_OVERHEAD_BYTES: usize = 512;
+        let listed = memory.list_all().await;
+        let admitted = Self::memory_scope(scope.as_deref());
+        let memories: Vec<MemoryListRow<'_>> = listed
+            .iter()
+            .filter(|m| admitted.admits(m.workspace_id.as_deref()))
+            .map(MemoryListRow::from_entry)
             .collect();
-        json!({ "memories": memories })
+        debug_assert!(memories.len() <= listed.len(), "a scope only removes rows");
+        // Content is most of the reply. An eighth more covers its escapes
+        // (quotes, newlines) on prose; the buffer grows once if it must.
+        let capacity_bytes = memories
+            .iter()
+            .map(|row| row.content.len() + row.content.len() / 8 + ROW_OVERHEAD_BYTES)
+            .sum::<usize>()
+            + 64;
+        let raw = crate::protocol::RawJson::to_json(&MemoryListReply { memories }, capacity_bytes)?;
+        debug_assert!(raw.get().starts_with('{'), "the reply is one JSON object");
+        Ok(raw)
+    }
+
+    pub(super) fn memory_list_failed(e: &serde_json::Error) -> Value {
+        error!("memory.list could not be serialized: {e}");
+        json!({ "error": "list_failed", "message": format!("Memories could not be listed: {e}") })
     }
 
     /// `MemoryAction::Export`: render the scope's memories as a document.
-    async fn memory_export(memory: &MemoryService, scope: Option<String>, format: crate::protocol::ExportFormat) -> Value {
+    async fn memory_export(
+        memory: &MemoryService,
+        scope: Option<String>,
+        format: crate::protocol::ExportFormat,
+    ) -> Value {
         // Rendered here for the same reason as `session.export`: the
         // store's owner renders once and every client gets that
         // document. Filtered by the same rule `list` uses.
@@ -386,7 +424,7 @@ impl ControlPlane {
             .export_records()
             .await
             .into_iter()
-            .filter(|m| Self::memory_in_scope(scope.as_deref(), m.workspace_id.as_deref()))
+            .filter(|m| Self::memory_scope(scope.as_deref()).admits(m.workspace_id.as_deref()))
             .collect();
         match crate::export::export_memories(
             &records,
@@ -404,6 +442,61 @@ impl ControlPlane {
                 "error": "export_failed",
                 "message": format!("Memories could not be exported: {e}"),
             }),
+        }
+    }
+}
+
+/// The `memory.list` document: `{"memories": [row, ...]}`.
+#[derive(serde::Serialize)]
+struct MemoryListReply<'a> {
+    memories: Vec<MemoryListRow<'a>>,
+}
+
+/// One `memory.list` row. Field names and value shapes are the wire contract
+/// the GUI reads (`gui/src-tauri/src/commands/memory.rs`);
+/// `a_typed_memory_list_is_the_tree_it_replaced`
+/// pins them against the `json!` form this replaced.
+#[derive(serde::Serialize)]
+struct MemoryListRow<'a> {
+    // Declared in the order the tree emitted them (a `serde_json::Map` is
+    // sorted by key), so the reply is the same text, not just the same data.
+    access_count: u32,
+    content: &'a str,
+    created_at: String,
+    fact_type: &'a str,
+    id: &'a str,
+    // Widened to f64 exactly as `json!` widened them: an f32 serialized as
+    // itself prints its shortest f32 digits (`0.7`), the tree printed the
+    // f64 value (`0.699999988079071`). Same number to an f32 reader, but
+    // not the same document, and this one is a wire contract.
+    importance: f64,
+    retrievability: f64,
+    session_id: Option<&'a str>,
+    state: String,
+    weight: f64,
+    workspace_id: Option<&'a str>,
+}
+
+impl<'a> MemoryListRow<'a> {
+    fn from_entry(m: &'a nanna_memory::MemoryListEntry) -> Self {
+        // Absent provenance is "unknown" — NOT "stated". A legacy memory
+        // stored before provenance was captured must not be able to
+        // impersonate a user assertion.
+        let fact_type = m.metadata.get("fact_type").map_or("unknown", String::as_str);
+        let created_at = chrono::DateTime::from_timestamp(m.timestamp, 0)
+            .map_or_else(|| m.timestamp.to_string(), |dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
+        Self {
+            id: &m.id,
+            content: &m.content,
+            fact_type,
+            importance: f64::from(m.importance),
+            state: format!("{:?}", m.state).to_lowercase(),
+            weight: f64::from(m.weight),
+            retrievability: f64::from(m.retrievability),
+            access_count: m.access_count,
+            created_at,
+            session_id: m.metadata.get("session_id").map(String::as_str),
+            workspace_id: m.workspace_id.as_deref(),
         }
     }
 }

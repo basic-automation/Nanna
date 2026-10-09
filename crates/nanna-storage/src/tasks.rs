@@ -13,9 +13,9 @@
 
 use crate::{
     NewTask, StorageError, Task, TaskActivityEntry, TaskEvent, TaskEventKind, TaskEventSink,
-    TaskNote, TaskNoteKind, TaskPatch, task_filter,
+    TaskNote, TaskNoteKind, TaskPatch, VerdictTally, task_filter,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use turso::Connection;
@@ -34,6 +34,44 @@ pub const TASK_TITLE_MAX_BYTES: usize = 500;
 /// ever usefully contribute to a context injection.
 pub const TASK_NOTE_MAX_BYTES: usize = 16 * 1024;
 
+/// Maximum labels on one task.
+///
+/// Bound justification: labels are filters (`#label` in the quick-add and
+/// the filter language) and are shown whole on a card, in the board's filter
+/// row and in the router's prompt (which previews them at 800 B). 32 labels
+/// is several times any real filing and keeps a card's label set, at
+/// [`TASK_LABEL_MAX_BYTES`] each, within 2 KiB.
+pub const TASK_LABELS_MAX: usize = 32;
+
+/// Maximum bytes of one label.
+///
+/// Bound justification: a label is a short token, not prose; 64 bytes holds
+/// any word-or-phrase tag and keeps one label inside a filter chip.
+pub const TASK_LABEL_MAX_BYTES: usize = 64;
+
+/// Most actions [`TaskRepository::newest_activity_of`] takes in one read.
+///
+/// Bound justification: it answers "the latest of these markers", and every
+/// marker set read today is two actions (a run's start and end, a rate-limit
+/// wait and a start); four leaves room without making the `IN` list a query
+/// builder.
+pub const ACTIVITY_ACTIONS_MAX: usize = 4;
+
+/// Maximum tool names in one task's `tool_scope`.
+///
+/// Bound justification: the scope is a hint (it gates nothing — the harness
+/// logs it and the card shows it), naming tools the task is expected to use.
+/// The registry serves ~60 tools at boot, so a scope wider than 64 names no
+/// longer says anything a card could show usefully.
+pub const TASK_TOOLS_MAX: usize = 64;
+
+/// Maximum bytes of one tool name in a `tool_scope`.
+///
+/// Bound justification: 64 is the providers' own tool-name ceiling (the Anthropic
+/// and `OpenAI` APIs both admit `^[a-zA-Z0-9_-]{1,64}$`), so a longer name cannot be
+/// a tool any model was ever offered.
+pub const TASK_TOOL_NAME_MAX_BYTES: usize = 64;
+
 /// Maximum direct dependencies per task.
 ///
 /// Bound justification: `next()` and the cycle check walk dependency edges;
@@ -48,12 +86,28 @@ pub const TASK_DEPS_MAX: usize = 100;
 /// and keeps every walk trivially bounded.
 pub const TASK_DEPTH_MAX: usize = 32;
 
+/// Most verdicts [`TaskRepository::verdict_rollup`] will scan.
+///
+/// Bound justification: a verdict row is ~200 B decoded, so the cap holds a
+/// scan under ~20 MiB and a few hundred ms on this store, while being two
+/// orders of magnitude past the few hundred recent outcomes the router needs
+/// to tell members apart.
+pub const VERDICT_WINDOW_MAX: usize = 100_000;
+
 /// Maximum tasks per scope.
 ///
 /// Bound justification: `next()`, filters, and cycle checks load a scope into
 /// memory (~1 KiB/task ⇒ ≤10 MiB); the bound also brakes a runaway agent
 /// stuck in a task-creation loop long before the store degrades.
 pub const TASKS_PER_SCOPE_MAX: usize = 10_000;
+
+/// Most cards one member's Inbox/Upcoming read returns.
+///
+/// Bound justification: it is one person's (or agent's) open work across
+/// every board; 1 000 cards is months of a busy board and still a few hundred
+/// KiB on the wire, while a member with more is better served by a board
+/// filter than by one list.
+pub const ASSIGNED_CARDS_MAX: usize = 1_000;
 
 const TASK_COLUMNS: &str = "id, parent_id, scope, scope_id, project, title, description, status, \
      priority, labels, tool_scope, due_at, recurrence, depends_on, acceptance, assignee, \
@@ -281,9 +335,18 @@ impl TaskRepository {
         drop(rows);
         drop(conn);
 
-        self.log_activity(task.id, new.assignee.as_deref(), "created", None)
+        // The actor is the creator. It used to be the assignee, which the row
+        // already carries in its own `assignee` column (migration 021) — so the
+        // creator was recorded nowhere, and the router could not tell a card it
+        // split off itself from one a person made.
+        self.log_activity(task.id, new.created_by.as_deref(), "created", None)
             .await?;
-        self.emit(TaskEventKind::Created, &task, new.assignee.as_deref(), created_detail(&task));
+        self.emit(
+            TaskEventKind::Created,
+            &task,
+            new.created_by.as_deref(),
+            created_detail(&task),
+        );
         Ok(task)
     }
 
@@ -451,31 +514,30 @@ impl TaskRepository {
         patch: TaskPatch,
         actor: Option<&str>,
     ) -> Result<Task, StorageError> {
-        let mut task = self.get_raw(id).await?;
         let needs_graph_check = patch.depends_on.is_some() || patch.parent_id.is_some();
         let parent_changed = patch.parent_id.is_some();
-        let changed = apply_patch(&mut task, patch)?;
-        validate_dates(task.due_at.as_deref(), task.deadline_at.as_deref())?;
-        // Snapshot before the write when this update can change what blocks
-        // what: a status transition opens or closes a dependency, and a
-        // `depends_on` change moves the edges themselves. `task` is already
-        // patched in memory, but the rows still hold the pre-update state.
-        let blocking_before = if self.events.is_some()
-            && (changed.contains(&"status") || changed.contains(&"depends_on"))
-        {
-            Some(
-                self.load_scope(&task.scope, task.scope_id.as_deref())
-                    .await?,
-            )
-        } else {
-            None
-        };
-
-        {
-            // Validate and write under ONE connection guard: the mutex is the
-            // transaction, so a concurrent writer cannot slip a conflicting
-            // graph change between the checks and the write.
+        let (task, changed, blocking_before) = {
+            // Read, validate and write under ONE connection guard: the mutex is
+            // the transaction. The row is read under it too — `write_task_with`
+            // rewrites every column from this copy, so a copy read before the
+            // lock let a concurrent `complete` (or any other write) between the
+            // read and the write be silently undone: a reorder could put a
+            // finished card back to `in_progress`.
             let conn = self.conn.lock().await;
+            let mut task = get_raw_with(&conn, id).await?;
+            let changed = apply_patch(&mut task, patch)?;
+            validate_dates(task.due_at.as_deref(), task.deadline_at.as_deref())?;
+            // Snapshot before the write when this update can change what blocks
+            // what: a status transition opens or closes a dependency, and a
+            // `depends_on` change moves the edges themselves. `task` is already
+            // patched in memory, but the rows still hold the pre-update state.
+            let blocking_before = if self.events.is_some()
+                && (changed.contains(&"status") || changed.contains(&"depends_on"))
+            {
+                Some(load_scope_with(&conn, &task.scope, task.scope_id.as_deref()).await?)
+            } else {
+                None
+            };
             if changed.contains(&"assignee")
                 && let Err(err) =
                     ensure_member_exists(&conn, task.assignee.as_deref(), "assignee").await
@@ -494,9 +556,11 @@ impl TaskRepository {
                 check_graph_update(&borrow, &task, parent_changed)?;
             }
             write_task_with(&conn, &task).await?;
-            // Held from the graph check through the write (see above).
+            // Held from the read through the write (see above).
             drop(conn);
-        }
+            (task, changed, blocking_before)
+        };
+        debug_assert_eq!(task.id, id, "the row written is the row asked for");
         if !changed.is_empty() {
             self.log_activity(
                 task.id,
@@ -862,6 +926,418 @@ impl TaskRepository {
         Ok(notes)
     }
 
+    /// The `limit` most recently closed board cards (done or cancelled, any
+    /// scope but `session`), newest first — the dream fold's candidates.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a row does not
+    /// decode.
+    ///
+    /// # Panics
+    /// Panics if `limit` is 0.
+    pub async fn closed_board_cards(&self, limit: usize) -> Result<Vec<Task>, StorageError> {
+        assert!(
+            limit > 0,
+            "a scan for closed cards is bounded and non-empty"
+        );
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT {TASK_COLUMNS} FROM tasks \
+                     WHERE status IN ('done', 'cancelled') AND scope != 'session' \
+                     ORDER BY COALESCE(completed_at, updated_at) DESC, id DESC LIMIT ?1"
+                ),
+                turso::params![limit],
+            )
+            .await?;
+        let mut cards = Vec::new();
+        while let Some(row) = rows.next().await? {
+            cards.push(decode_task_row(&row)?);
+        }
+        drop(rows);
+        drop(conn);
+        debug_assert!(cards.iter().all(|t| is_closed_status(&t.status)));
+        Ok(cards)
+    }
+
+    /// Up to `limit` open, not-yet-started board cards assigned to
+    /// `member_id` (any scope but `session`), best first: priority, then the
+    /// oldest — what that member works next when it is free. `blocked` is not
+    /// derived here; read a card with [`Self::get`] before acting on it.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a row does not
+    /// decode.
+    ///
+    /// # Panics
+    /// Panics if `limit` is 0.
+    pub async fn open_board_cards_assigned_to(
+        &self,
+        member_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Task>, StorageError> {
+        assert!(
+            limit > 0,
+            "a scan for waiting cards is bounded and non-empty"
+        );
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT {TASK_COLUMNS} FROM tasks \
+                     WHERE assignee = ?1 AND status = 'pending' AND scope != 'session' \
+                     ORDER BY priority, id LIMIT ?2"
+                ),
+                turso::params![member_id, limit],
+            )
+            .await?;
+        let mut cards = Vec::new();
+        while let Some(row) = rows.next().await? {
+            cards.push(decode_task_row(&row)?);
+        }
+        drop(rows);
+        drop(conn);
+        debug_assert!(
+            cards
+                .iter()
+                .all(|t| t.assignee.as_deref() == Some(member_id)),
+            "every card is the member's"
+        );
+        Ok(cards)
+    }
+
+    /// Up to `limit` board cards (any scope but `session`) that are
+    /// `in_progress` and assigned to a member whose id starts with
+    /// `assignee_prefix`, least recently updated first — the candidates the
+    /// stall sweep checks (P25 decision 7's `stalled` trigger). `blocked` is
+    /// not derived here.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a row does not
+    /// decode.
+    ///
+    /// # Panics
+    /// Panics if `limit` is 0 or above [`ASSIGNED_CARDS_MAX`], or if
+    /// `assignee_prefix` is empty or holds a `LIKE` wildcard.
+    pub async fn in_progress_board_cards(
+        &self,
+        assignee_prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<Task>, StorageError> {
+        assert!(
+            (1..=ASSIGNED_CARDS_MAX).contains(&limit),
+            "an in-progress scan is bounded and non-empty"
+        );
+        assert!(!assignee_prefix.is_empty(), "a prefix names some members");
+        assert!(
+            !assignee_prefix.contains(['%', '_']),
+            "the prefix is matched literally"
+        );
+        let pattern = format!("{assignee_prefix}%");
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT {TASK_COLUMNS} FROM tasks \
+                     WHERE status = 'in_progress' AND scope != 'session' AND assignee LIKE ?1 \
+                     ORDER BY updated_at, id LIMIT ?2"
+                ),
+                turso::params![pattern, limit],
+            )
+            .await?;
+        let mut cards = Vec::new();
+        while let Some(row) = rows.next().await? {
+            cards.push(decode_task_row(&row)?);
+        }
+        drop(rows);
+        drop(conn);
+        debug_assert!(
+            cards.iter().all(|t| t.status == "in_progress"
+                && t.scope != "session"
+                && t.assignee
+                    .as_deref()
+                    .is_some_and(|a| a.starts_with(assignee_prefix))),
+            "every card matches the scan"
+        );
+        Ok(cards)
+    }
+
+    /// When card `task_id` last changed in any way a reader could see: the
+    /// newest of its row's `updated_at`, its newest activity row and its
+    /// newest thread post, as the stored timestamp strings (absent ones left
+    /// out). The stall sweep reads this as "last sign of life".
+    ///
+    /// # Errors
+    /// Returns [`StorageError::NotFound`] if no task has `task_id`, or
+    /// [`StorageError::Database`] if a query fails.
+    pub async fn touch_times(&self, task_id: i64) -> Result<Vec<String>, StorageError> {
+        debug_assert!(task_id > 0, "store ids start at 1");
+        let conn = self.conn.lock().await;
+        let mut times = Vec::with_capacity(3);
+        for (index, sql) in [
+            "SELECT updated_at FROM tasks WHERE id = ?1",
+            "SELECT created_at FROM task_activity WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
+            "SELECT created_at FROM task_notes WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut rows = conn.query(sql, turso::params![task_id]).await?;
+            let time: Option<Option<String>> = match rows.next().await? {
+                Some(row) => Some(row.get(0)?),
+                None => None,
+            };
+            // Each cursor is gone before the next query: an open `Rows` on
+            // the shared connection swallows later writes.
+            drop(rows);
+            // The first query reads the card itself: no row, no card.
+            if index == 0 && time.is_none() {
+                drop(conn);
+                return Err(StorageError::NotFound(format!("task #{task_id}")));
+            }
+            times.extend(time.flatten());
+        }
+        drop(conn);
+        debug_assert!(times.len() <= 3, "one time per source at most");
+        Ok(times)
+    }
+
+    /// Every open board card assigned to `member_id`, on every board (any
+    /// scope but `session`), with `blocked` derived — the read behind a
+    /// member's Inbox and Upcoming (P25 decision 11), which span workspaces.
+    ///
+    /// Ordered by defer date (undated first — no date means now), then
+    /// priority, then id; at most `limit` cards.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if a query fails or a row does not
+    /// decode.
+    ///
+    /// # Panics
+    /// Panics if `limit` is 0 or above [`ASSIGNED_CARDS_MAX`].
+    pub async fn assigned_open(
+        &self,
+        member_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Task>, StorageError> {
+        assert!(
+            (1..=ASSIGNED_CARDS_MAX).contains(&limit),
+            "an assigned-cards read is bounded and non-empty"
+        );
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT {TASK_COLUMNS} FROM tasks \
+                     WHERE assignee = ?1 AND status IN ('pending', 'in_progress') \
+                       AND scope != 'session' \
+                     ORDER BY due_at IS NOT NULL, substr(due_at, 1, 10), priority, id \
+                     LIMIT ?2"
+                ),
+                turso::params![member_id, limit],
+            )
+            .await?;
+        let mut cards = Vec::new();
+        while let Some(row) = rows.next().await? {
+            cards.push(decode_task_row(&row)?);
+        }
+        drop(rows);
+        let open = open_ids_among(&conn, cards.iter().flat_map(|c| c.depends_on.iter().copied()))
+            .await?;
+        drop(conn);
+        for card in &mut cards {
+            card.blocked = card.depends_on.iter().any(|dep| open.contains(dep));
+        }
+        debug_assert!(
+            cards
+                .iter()
+                .all(|t| t.assignee.as_deref() == Some(member_id) && t.scope != "session"),
+            "every card is the member's, on a board"
+        );
+        Ok(cards)
+    }
+
+    /// Cards whose newest `started` / `ended` activity row (by those two
+    /// action names) is a `started` — work something began and never closed
+    /// out — among the newest `scan_rows` such rows, newest first.
+    ///
+    /// A daemon reads this at boot, when nothing can be running, to find the
+    /// runs it died inside. The scan is bounded: interrupted runs are the
+    /// last ones started before the death, so they are among the newest rows.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails.
+    ///
+    /// # Panics
+    /// Panics if `scan_rows` is 0 or the two action names are equal.
+    pub async fn cards_with_unended(
+        &self,
+        started: &str,
+        ended: &str,
+        scan_rows: usize,
+    ) -> Result<Vec<i64>, StorageError> {
+        assert!(scan_rows > 0, "the scan is bounded and non-empty");
+        assert_ne!(started, ended, "a start and an end are different rows");
+        let limit = i64::try_from(scan_rows).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT task_id, action FROM task_activity WHERE action IN (?1, ?2) \
+                 ORDER BY id DESC LIMIT ?3",
+                turso::params![started, ended, limit],
+            )
+            .await?;
+        let mut seen: HashSet<i64> = HashSet::new();
+        let mut unended = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let task_id: i64 = row.get(0)?;
+            let action: String = row.get(1)?;
+            // Newest first: the first row seen for a card is its latest.
+            if seen.insert(task_id) && action == started {
+                unended.push(task_id);
+            }
+        }
+        drop(rows);
+        drop(conn);
+        debug_assert!(unended.len() <= seen.len(), "one answer per card at most");
+        Ok(unended)
+    }
+
+    /// Who created card `task_id`: the actor on its `created` activity row.
+    ///
+    /// `None` when the creator was not recorded (a writer that named no
+    /// actor, or a row older than `NewTask::created_by`) — never guessed from
+    /// the assignee. The row is looked up by its action, so however long the
+    /// card's activity log grows, the answer does not fall out of a window.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::NotFound`] if the card has no `created` row
+    /// (it does not exist), or [`StorageError::Database`] if the query fails.
+    pub async fn created_by(&self, task_id: i64) -> Result<Option<String>, StorageError> {
+        debug_assert!(task_id > 0, "store ids start at 1");
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT actor FROM task_activity WHERE task_id = ?1 AND action = 'created' \
+                 ORDER BY id LIMIT 1",
+                turso::params![task_id],
+            )
+            .await?;
+        let found: Option<Option<String>> = match rows.next().await? {
+            Some(row) => Some(row.get(0)?),
+            None => None,
+        };
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        found.ok_or_else(|| StorageError::NotFound(format!("created row for task #{task_id}")))
+    }
+
+    /// The newest activity row of card `task_id` whose action is one of
+    /// `actions`, or `None` when it has none.
+    ///
+    /// For markers whose meaning is "the latest of these": a run's start and
+    /// end, a rate-limit wait. Reading the newest N rows of any kind and
+    /// searching them lost the marker once N later edits (a rename, a board
+    /// reorder) pushed it out, and a card the human had paused with Stop then
+    /// read as never run. Looked up by action, like [`Self::created_by`], so
+    /// the answer does not depend on how busy the card's log is.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or the row does
+    /// not decode. Unparseable detail JSON loads as `None`.
+    ///
+    /// # Panics
+    /// When `actions` is empty or longer than [`ACTIVITY_ACTIONS_MAX`].
+    pub async fn newest_activity_of(
+        &self,
+        task_id: i64,
+        actions: &[&str],
+    ) -> Result<Option<TaskActivityEntry>, StorageError> {
+        assert!(
+            (1..=ACTIVITY_ACTIONS_MAX).contains(&actions.len()),
+            "one to {ACTIVITY_ACTIONS_MAX} actions"
+        );
+        debug_assert!(task_id > 0, "store ids start at 1");
+        let placeholders = (0..actions.len())
+            .map(|index| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT id, task_id, actor, action, detail, created_at, assignee \
+             FROM task_activity WHERE task_id = ?1 AND action IN ({placeholders}) \
+             ORDER BY id DESC LIMIT 1"
+        );
+        let mut params = vec![turso::Value::Integer(task_id)];
+        params.extend(
+            actions
+                .iter()
+                .map(|action| turso::Value::Text((*action).to_string())),
+        );
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(&sql, params).await?;
+        let entry = match rows.next().await? {
+            Some(row) => {
+                let detail_str: Option<String> = row.get(4)?;
+                Some(TaskActivityEntry {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    actor: row.get(2)?,
+                    action: row.get(3)?,
+                    detail: detail_str.and_then(|s| serde_json::from_str(&s).ok()),
+                    created_at: row.get(5)?,
+                    assignee: row.get(6)?,
+                })
+            }
+            None => None,
+        };
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        debug_assert!(
+            entry
+                .as_ref()
+                .is_none_or(|e| actions.contains(&e.action.as_str())),
+            "only an asked-for action comes back"
+        );
+        Ok(entry)
+    }
+
+    /// One thread post by its id.
+    ///
+    /// Task events name a post by id rather than carrying it (the bus is not a
+    /// replication channel), so a consumer that needs the text reads it here.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::NotFound`] if no post has `note_id`, or
+    /// [`StorageError::Database`] if the query fails or the row does not decode.
+    pub async fn note(&self, note_id: i64) -> Result<TaskNote, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, task_id, author, content, created_at, author_member_id, kind \
+                 FROM task_notes WHERE id = ?1",
+                turso::params![note_id],
+            )
+            .await?;
+        let note = match rows.next().await? {
+            Some(row) => Some(decode_task_note(&row)?),
+            None => None,
+        };
+        drop(rows);
+        drop(conn);
+        let note = note.ok_or_else(|| StorageError::NotFound(format!("task note #{note_id}")))?;
+        debug_assert_eq!(note.id, note_id, "looked up by primary key");
+        Ok(note)
+    }
+
     /// Last `limit` activity entries for a task, oldest first.
     ///
     /// # Errors
@@ -875,8 +1351,8 @@ impl TaskRepository {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, task_id, actor, action, detail, created_at FROM task_activity \
-                 WHERE task_id = ?1 ORDER BY id DESC LIMIT ?2",
+                "SELECT id, task_id, actor, action, detail, created_at, assignee \
+                 FROM task_activity WHERE task_id = ?1 ORDER BY id DESC LIMIT ?2",
                 turso::params![task_id, limit],
             )
             .await?;
@@ -890,6 +1366,7 @@ impl TaskRepository {
                 action: row.get(3)?,
                 detail: detail_str.and_then(|s| serde_json::from_str(&s).ok()),
                 created_at: row.get(5)?,
+                assignee: row.get(6)?,
             });
         }
         // Held until the cursor is gone: an open `Rows` on the shared
@@ -916,13 +1393,88 @@ impl TaskRepository {
     ) -> Result<(), StorageError> {
         let detail_json = detail.as_ref().map(std::string::ToString::to_string);
         let conn = self.conn.lock().await;
+        // The assignee is read inside the INSERT, so the row names whoever held
+        // the card at the instant it was written — no caller supplies it and
+        // no concurrent re-assignment can land between a read and the write.
         conn.execute(
-            "INSERT INTO task_activity (task_id, actor, action, detail) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO task_activity (task_id, actor, action, detail, assignee) \
+             VALUES (?1, ?2, ?3, ?4, (SELECT assignee FROM tasks WHERE id = ?1))",
             turso::params![task_id, actor, action, detail_json.as_deref()],
         )
         .await?;
         drop(conn);
         Ok(())
+    }
+
+    /// Each member's acceptance verdicts over the last `window` of them, per
+    /// label and overall — the router's evidence of what each member actually
+    /// passes (P25 decisions 4 and 15).
+    ///
+    /// A verdict is an `acceptance_checked` row, the one both the `tasks.complete`
+    /// tool and the harness write. It counts toward the member stamped on that
+    /// row — assigned when it was judged, not now (migration 021). Rows with no
+    /// stamped member (pre-021, or an unassigned card) and verdicts the check
+    /// itself marked `unknown` are left out: neither says anything about a
+    /// member. Labels are the card's current ones.
+    ///
+    /// `window` bounds the scan to the most recent verdicts: the history is
+    /// unbounded, and recent outcomes are the ones that predict.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a row does not
+    /// decode.
+    ///
+    /// # Panics
+    /// Panics if `window` is 0 or above [`VERDICT_WINDOW_MAX`].
+    pub async fn verdict_rollup(&self, window: usize) -> Result<Vec<VerdictTally>, StorageError> {
+        assert!(
+            window > 0 && window <= VERDICT_WINDOW_MAX,
+            "verdict window must be in 1..={VERDICT_WINDOW_MAX}, got {window}"
+        );
+        let window_i64 = i64::try_from(window).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT a.assignee, t.labels, a.detail FROM task_activity a \
+                 JOIN tasks t ON t.id = a.task_id \
+                 WHERE a.action = 'acceptance_checked' AND a.assignee IS NOT NULL \
+                 ORDER BY a.id DESC LIMIT ?1",
+                turso::params![window_i64],
+            )
+            .await?;
+        let mut tallies: BTreeMap<(String, Option<String>), (u64, u64)> = BTreeMap::new();
+        let mut scanned = 0usize;
+        while let Some(row) = rows.next().await? {
+            scanned += 1;
+            let member: String = row.get(0)?;
+            let labels: String = row.get(1)?;
+            let detail: Option<String> = row.get(2)?;
+            let Some(passed) = verdict_outcome(detail.as_deref()) else {
+                continue;
+            };
+            let labels: Vec<String> = serde_json::from_str(&labels)?;
+            let keys = std::iter::once(None).chain(labels.into_iter().map(Some));
+            for label in keys {
+                let tally = tallies.entry((member.clone(), label)).or_default();
+                if passed {
+                    tally.0 += 1;
+                } else {
+                    tally.1 += 1;
+                }
+            }
+        }
+        drop(rows);
+        drop(conn);
+        debug_assert!(scanned <= window, "the scan is bounded by the window");
+        Ok(tallies
+            .into_iter()
+            .map(|((member_id, label), (passed, failed))| VerdictTally {
+                member_id,
+                label,
+                passed,
+                failed,
+            })
+            .collect())
     }
 
     /// Query tasks in a scope with the filter language
@@ -958,10 +1510,13 @@ impl TaskRepository {
     /// back: rows deleted before a failure stay deleted, and a failure while
     /// stripping references leaves some `depends_on` lists naming deleted ids.
     pub async fn delete(&self, id: i64, actor: Option<&str>) -> Result<u64, StorageError> {
-        let task = self.get_raw(id).await?;
-        let scope_tasks = self
-            .load_scope(&task.scope, task.scope_id.as_deref())
-            .await?;
+        // Read, delete and strip under ONE guard. The dependents are rewritten
+        // whole from `scope_tasks`, so a copy read before the lock let a write
+        // in between (a status change, a new dependency) be undone, and a child
+        // created in between survived its deleted parent.
+        let conn = self.conn.lock().await;
+        let task = get_raw_with(&conn, id).await?;
+        let scope_tasks = load_scope_with(&conn, &task.scope, task.scope_id.as_deref()).await?;
 
         // Collect the subtree, bounded by scope size.
         let mut doomed: Vec<i64> = vec![id];
@@ -975,7 +1530,6 @@ impl TaskRepository {
             }
         }
 
-        let conn = self.conn.lock().await;
         for task_id in &doomed {
             conn.execute(
                 "DELETE FROM task_notes WHERE task_id = ?1",
@@ -990,7 +1544,6 @@ impl TaskRepository {
             conn.execute("DELETE FROM tasks WHERE id = ?1", turso::params![*task_id])
                 .await?;
         }
-        drop(conn);
 
         // Strip dangling dependency references. This is itself an unblocking
         // mechanism — a dependent whose only dependency was deleted is free —
@@ -1003,9 +1556,11 @@ impl TaskRepository {
             if t.depends_on.iter().any(|d| doomed_set.contains(d)) {
                 let mut kept = t.clone();
                 kept.depends_on.retain(|d| !doomed_set.contains(d));
-                self.write_task(&kept).await?;
+                write_task_with(&conn, &kept).await?;
             }
         }
+        // Held from the read through the last strip (see above).
+        drop(conn);
 
         if self.events.is_some() {
             let after = self
@@ -1059,9 +1614,14 @@ impl TaskRepository {
                     continue;
                 }
             }
-            // The subtree may already be gone via an earlier parent delete.
-            if self.get_raw(target.id).await.is_ok() {
-                deleted += self.delete(target.id, None).await?;
+            // The subtree may already be gone via an earlier parent delete —
+            // that, and only that, is a skip. A read that FAILED is not
+            // evidence the row is gone; treating it as "already deleted" made
+            // a database error look like a smaller, successful clear.
+            match self.get_raw(target.id).await {
+                Ok(_) => deleted += self.delete(target.id, None).await?,
+                Err(StorageError::NotFound(_)) => {}
+                Err(e) => return Err(e),
             }
         }
         Ok(deleted)
@@ -1385,19 +1945,7 @@ impl TaskRepository {
 
     async fn get_raw(&self, id: i64) -> Result<Task, StorageError> {
         let conn = self.conn.lock().await;
-        let mut rows = conn
-            .query(
-                &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
-                turso::params![id],
-            )
-            .await?;
-        let task = rows.next().await?.map_or_else(
-            || Err(StorageError::NotFound(format!("Task: #{id}"))),
-            |row| decode_task_row(&row),
-        );
-        // Held until the cursor is gone: an open `Rows` on the shared
-        // connection swallows later writes.
-        drop(rows);
+        let task = get_raw_with(&conn, id).await;
         drop(conn);
         task
     }
@@ -1424,6 +1972,29 @@ impl TaskRepository {
 
 /// Load a scope's tasks using an already-held connection guard (the mutex is
 /// the transaction: validate-then-write sequences hold one guard throughout).
+/// One task row as stored (no derived `blocked`), on a connection the caller
+/// already holds.
+async fn get_raw_with(conn: &Connection, id: i64) -> Result<Task, StorageError> {
+    let mut rows = conn
+        .query(
+            &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
+            turso::params![id],
+        )
+        .await?;
+    let task = rows.next().await?.map_or_else(
+        || Err(StorageError::NotFound(format!("Task: #{id}"))),
+        |row| decode_task_row(&row),
+    );
+    // Dropped before the caller's next statement: an open `Rows` on the
+    // shared connection swallows later writes.
+    drop(rows);
+    debug_assert!(
+        task.as_ref().ok().is_none_or(|t| t.id == id),
+        "the row read is the row asked for"
+    );
+    task
+}
+
 async fn load_scope_with(
     conn: &Connection,
     scope: &str,
@@ -1547,6 +2118,17 @@ fn apply_status_patch(
 /// What a `Created` event carries: enough for the router to place a new card
 /// without re-reading it, and nothing more — the event says what happened, and
 /// a full row on every mutation would make the bus a replication channel.
+/// What an `acceptance_checked` row says about the member: `Some(passed)`, or
+/// `None` when it says nothing — no detail, no boolean `passed`, or a check
+/// that marked its own verdict `unknown` (it could not tell).
+fn verdict_outcome(detail: Option<&str>) -> Option<bool> {
+    let detail: serde_json::Value = serde_json::from_str(detail?).ok()?;
+    if detail.get("unknown").and_then(serde_json::Value::as_bool) == Some(true) {
+        return None;
+    }
+    detail.get("passed").and_then(serde_json::Value::as_bool)
+}
+
 fn created_detail(task: &Task) -> serde_json::Value {
     serde_json::json!({
         "title": task.title,
@@ -1579,10 +2161,15 @@ fn apply_patch(task: &mut Task, patch: TaskPatch) -> Result<Vec<&'static str>, S
         task.priority = priority;
     }
     if let Some(labels) = patch.labels {
+        // Checked only when the patch sets labels: a card stored before the
+        // bound existed stays editable in every other field.
+        validate_labels(&labels)?;
         changed.push("labels");
         task.labels = labels;
     }
     if let Some(tool_scope) = patch.tool_scope {
+        // Like labels: checked only when the patch sets it.
+        validate_tool_scope(&tool_scope)?;
         changed.push("tool_scope");
         task.tool_scope = tool_scope;
     }
@@ -1775,6 +2362,41 @@ fn validate_title(title: &str) -> Result<(), StorageError> {
             trimmed.len()
         )));
     }
+    Ok(())
+}
+
+fn validate_labels(labels: &[String]) -> Result<(), StorageError> {
+    if labels.len() > TASK_LABELS_MAX {
+        return Err(StorageError::Invalid(format!(
+            "too many labels: {} (max {TASK_LABELS_MAX})",
+            labels.len()
+        )));
+    }
+    if let Some(long) = labels.iter().find(|l| l.len() > TASK_LABEL_MAX_BYTES) {
+        return Err(StorageError::Invalid(format!(
+            "label exceeds {TASK_LABEL_MAX_BYTES} bytes (got {})",
+            long.len()
+        )));
+    }
+    debug_assert!(labels.len() <= TASK_LABELS_MAX, "count checked");
+    Ok(())
+}
+
+fn validate_tool_scope(tools: &[String]) -> Result<(), StorageError> {
+    if tools.len() > TASK_TOOLS_MAX {
+        return Err(StorageError::Invalid(format!(
+            "too many tools in scope: {} (max {TASK_TOOLS_MAX})",
+            tools.len()
+        )));
+    }
+    if let Some(long) = tools.iter().find(|t| t.len() > TASK_TOOL_NAME_MAX_BYTES) {
+        return Err(StorageError::Invalid(format!(
+            "tool name exceeds {TASK_TOOL_NAME_MAX_BYTES} bytes (got {}) — no provider admits \
+             a tool name that long",
+            long.len()
+        )));
+    }
+    debug_assert!(tools.len() <= TASK_TOOLS_MAX, "count checked");
     Ok(())
 }
 
@@ -2006,8 +2628,12 @@ fn repair_js_object_literal(text: &str) -> Option<String> {
 ///
 /// Every write path funnels through here, so what `create`/`update` persist
 /// is exactly what [`canonicalize_acceptance`] admits — never the raw value a
-/// caller happened to hold.
-fn admit_acceptance(value: &serde_json::Value) -> Result<serde_json::Value, StorageError> {
+/// caller happened to hold. Public so a caller can refuse a check before it
+/// reaches a write (the board router re-asks its model with the reason).
+///
+/// # Errors
+/// [`StorageError::Invalid`] naming what is wrong with the check.
+pub fn admit_acceptance(value: &serde_json::Value) -> Result<serde_json::Value, StorageError> {
     let canonical = canonicalize_acceptance(value).map_err(StorageError::Invalid)?;
     validate_acceptance(&canonical)?;
     Ok(canonical)
@@ -2555,6 +3181,53 @@ fn day_of(at: &str) -> String {
 /// from this predicate on every read, so a copy that drifts does not produce a
 /// visibly wrong field — it produces a task that is blocked to one reader and
 /// actionable to another. Adding a third closed status is now one edit.
+/// How many ids one `IN (…)` status lookup names.
+///
+/// Bound justification: keeps each statement's parameter list far below
+/// SQLite's default 32 766-variable limit while making the worst case — every
+/// one of [`ASSIGNED_CARDS_MAX`] cards at [`TASK_DEPS_MAX`] dependencies —
+/// a few hundred small queries, not one unbounded one.
+const STATUS_LOOKUP_IDS_MAX: usize = 256;
+
+/// Which of `ids` name a task that is still open (not done or cancelled).
+/// A missing id is not open: a deleted dependency blocks nothing.
+async fn open_ids_among(
+    conn: &Connection,
+    ids: impl Iterator<Item = i64>,
+) -> Result<std::collections::HashSet<i64>, StorageError> {
+    let mut wanted: Vec<i64> = ids.collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let mut open = std::collections::HashSet::new();
+    for chunk in wanted.chunks(STATUS_LOOKUP_IDS_MAX) {
+        debug_assert!(!chunk.is_empty() && chunk.len() <= STATUS_LOOKUP_IDS_MAX);
+        // Ids are integers we formatted ourselves, so inlining them is safe.
+        let list = chunk
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT id FROM tasks WHERE id IN ({list}) \
+                     AND status NOT IN ('done', 'cancelled')"
+                ),
+                (),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            open.insert(id);
+        }
+        // Gone before the next statement: an open cursor on the shared
+        // connection swallows later writes.
+        drop(rows);
+    }
+    debug_assert!(open.iter().all(|id| wanted.binary_search(id).is_ok()));
+    Ok(open)
+}
+
 fn is_closed_status(status: &str) -> bool {
     matches!(status, "done" | "cancelled")
 }
@@ -2772,6 +3445,8 @@ fn validate_new_task_fields(new: &NewTask) -> Result<(), StorageError> {
     validate_title(&new.title)?;
     validate_priority(new.priority)?;
     validate_dates(new.due_at.as_deref(), new.deadline_at.as_deref())?;
+    validate_labels(&new.labels)?;
+    validate_tool_scope(&new.tool_scope)?;
     if new.depends_on.len() > TASK_DEPS_MAX {
         return Err(StorageError::Invalid(format!(
             "too many dependencies: {} (max {TASK_DEPS_MAX})",
@@ -2936,6 +3611,200 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_members_open_cards_are_read_across_every_board() {
+        let (_s, repo) = repo().await;
+        let card = |title: &str, scope: &str, scope_id: Option<&str>, due: Option<&str>| NewTask {
+            scope: scope.to_string(),
+            scope_id: scope_id.map(str::to_string),
+            title: title.to_string(),
+            priority: 3,
+            due_at: due.map(str::to_string),
+            assignee: Some(crate::HUMAN_MEMBER_ID.to_string()),
+            ..NewTask::default()
+        };
+        let later = repo
+            .create(card("later", "workspace", Some("ws1"), Some("2026-12-01")))
+            .await
+            .unwrap();
+        let soon = repo
+            .create(card("soon", "global", None, Some("2026-10-05T09:00:00Z")))
+            .await
+            .unwrap();
+        let undated = repo.create(card("undated", "workspace", Some("ws2"), None)).await.unwrap();
+        let chat = repo.create(card("chat's own", "session", Some("s1"), None)).await.unwrap();
+        let finished = repo.create(card("finished", "workspace", Some("ws2"), None)).await.unwrap();
+        repo.complete(finished.id, Some("test"), None).await.unwrap();
+        let unassigned = repo
+            .create(NewTask { assignee: None, ..card("nobody's", "global", None, None) })
+            .await
+            .unwrap();
+        // `soon` waits on an open card; `undated` on a closed one.
+        repo.update(
+            soon.id,
+            TaskPatch { depends_on: Some(vec![unassigned.id]), ..TaskPatch::default() },
+            Some("test"),
+        )
+        .await
+        .unwrap();
+        repo.update(
+            undated.id,
+            TaskPatch { depends_on: Some(vec![finished.id]), ..TaskPatch::default() },
+            Some("test"),
+        )
+        .await
+        .unwrap();
+
+        let mine = repo.assigned_open(crate::HUMAN_MEMBER_ID, 10).await.unwrap();
+        let ids: Vec<i64> = mine.iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![undated.id, soon.id, later.id], "undated first, then by date");
+        assert!(!ids.contains(&chat.id), "a session card is on no board");
+        assert!(mine.iter().find(|t| t.id == soon.id).unwrap().blocked);
+        assert!(!mine.iter().find(|t| t.id == undated.id).unwrap().blocked, "a done dependency blocks nothing");
+        assert_eq!(repo.assigned_open(crate::HUMAN_MEMBER_ID, 1).await.unwrap().len(), 1, "bounded");
+        assert!(repo.assigned_open("agent:nobody", 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_newest_of_some_actions_is_found_however_long_the_log_is() {
+        let storage = crate::Storage::in_memory().await.expect("storage");
+        let tasks = storage.tasks();
+        let card = tasks
+            .create(NewTask {
+                title: "busy card".to_string(),
+                scope: "global".to_string(),
+                priority: 3,
+                ..NewTask::default()
+            })
+            .await
+            .expect("card");
+        assert!(
+            tasks
+                .newest_activity_of(card.id, &["run_started", "run_ended"])
+                .await
+                .expect("read")
+                .is_none(),
+            "no marker yet"
+        );
+        tasks
+            .log_activity(card.id, None, "run_started", None)
+            .await
+            .expect("start");
+        tasks
+            .log_activity(
+                card.id,
+                None,
+                "run_ended",
+                Some(serde_json::json!({"stop": "Cancelled"})),
+            )
+            .await
+            .expect("end");
+        for _ in 0..100 {
+            tasks
+                .log_activity(card.id, Some("gui"), "updated", None)
+                .await
+                .expect("edit");
+        }
+        let newest = tasks
+            .newest_activity_of(card.id, &["run_started", "run_ended"])
+            .await
+            .expect("read")
+            .expect("the marker is still found");
+        assert_eq!(newest.action, "run_ended");
+        assert_eq!(
+            newest.detail,
+            Some(serde_json::json!({"stop": "Cancelled"}))
+        );
+        let start = tasks
+            .newest_activity_of(card.id, &["run_started"])
+            .await
+            .expect("read")
+            .expect("start");
+        assert!(start.id < newest.id);
+    }
+
+    #[tokio::test]
+    async fn the_stall_scan_reads_agents_in_progress_board_cards_and_their_last_touch() {
+        let (storage, repo) = repo().await;
+        storage
+            .members()
+            .create(crate::NewMember {
+                id: "agent:builder".to_string(),
+                name: "Builder".to_string(),
+                avatar: None,
+                kind: crate::MemberKind::Agent,
+                owner_kind: crate::MemberOwner::Workspace,
+                owner_id: None,
+                status: crate::MemberStatus::Idle,
+                profile: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let card = |title: &str, scope: &str, assignee: &str| NewTask {
+            scope: scope.to_string(),
+            scope_id: (scope == "session").then(|| "s1".to_string()),
+            title: title.to_string(),
+            priority: 3,
+            assignee: Some(assignee.to_string()),
+            ..NewTask::default()
+        };
+        let picked_up = TaskPatch {
+            status: Some("in_progress".to_string()),
+            ..TaskPatch::default()
+        };
+        let working = repo
+            .create(card("working", "global", "agent:builder"))
+            .await
+            .unwrap();
+        let waiting = repo
+            .create(card("waiting", "global", "agent:builder"))
+            .await
+            .unwrap();
+        let human = repo
+            .create(card("a person's", "global", crate::HUMAN_MEMBER_ID))
+            .await
+            .unwrap();
+        let chat = repo
+            .create(card("chat's own", "session", "agent:builder"))
+            .await
+            .unwrap();
+        for id in [working.id, human.id, chat.id] {
+            repo.update(id, picked_up.clone(), Some("test"))
+                .await
+                .unwrap();
+        }
+
+        let found = repo.in_progress_board_cards("agent:", 10).await.unwrap();
+        let ids: Vec<i64> = found.iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![working.id], "an agent's, on a board, picked up");
+        assert!(!ids.contains(&waiting.id) && !ids.contains(&human.id) && !ids.contains(&chat.id));
+
+        let before = repo.touch_times(working.id).await.unwrap();
+        assert_eq!(
+            before.len(),
+            2,
+            "the row and its activity; no post yet: {before:?}"
+        );
+        repo.post(
+            working.id,
+            Some("agent:builder"),
+            Some("agent:builder"),
+            TaskNoteKind::Progress,
+            "halfway",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.touch_times(working.id).await.unwrap().len(),
+            3,
+            "a post is a touch"
+        );
+        assert!(matches!(
+            repo.touch_times(999_999).await,
+            Err(StorageError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn create_assigns_id_and_logs_activity() {
         let (_s, repo) = repo().await;
         let task = repo.create(new_task("first")).await.unwrap();
@@ -2944,6 +3813,82 @@ mod tests {
         let activity = repo.activity(task.id, 10).await.unwrap();
         assert_eq!(activity.len(), 1);
         assert_eq!(activity[0].action, "created");
+    }
+
+    #[tokio::test]
+    async fn labels_are_bounded_on_create_and_on_update() {
+        let (_s, repo) = repo().await;
+        let mut too_many = new_task("filed everywhere");
+        too_many.labels = (0..=TASK_LABELS_MAX).map(|i| format!("l{i}")).collect();
+        let err = repo.create(too_many).await.unwrap_err();
+        assert!(err.to_string().contains("too many labels"), "{err}");
+
+        let mut at_bound = new_task("filed widely");
+        at_bound.labels = (0..TASK_LABELS_MAX).map(|i| format!("l{i}")).collect();
+        let card = repo.create(at_bound).await.unwrap();
+        assert_eq!(
+            card.labels.len(),
+            TASK_LABELS_MAX,
+            "the bound itself is admitted"
+        );
+
+        let long = TaskPatch {
+            labels: Some(vec!["x".repeat(TASK_LABEL_MAX_BYTES + 1)]),
+            ..TaskPatch::default()
+        };
+        let err = repo.update(card.id, long, None).await.unwrap_err();
+        assert!(err.to_string().contains("label exceeds"), "{err}");
+        assert_eq!(
+            repo.get(card.id).await.unwrap().labels.len(),
+            TASK_LABELS_MAX,
+            "a refused patch changes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_scope_is_bounded_on_create_and_on_update() {
+        let (_s, repo) = repo().await;
+        let mut too_many = new_task("uses everything");
+        too_many.tool_scope = (0..=TASK_TOOLS_MAX).map(|i| format!("t{i}")).collect();
+        let err = repo.create(too_many).await.unwrap_err();
+        assert!(err.to_string().contains("too many tools"), "{err}");
+
+        let mut at_bound = new_task("uses a lot");
+        at_bound.tool_scope = (0..TASK_TOOLS_MAX).map(|i| format!("t{i}")).collect();
+        let card = repo.create(at_bound).await.unwrap();
+        assert_eq!(card.tool_scope.len(), TASK_TOOLS_MAX, "the bound is admitted");
+
+        let long = TaskPatch {
+            tool_scope: Some(vec!["x".repeat(TASK_TOOL_NAME_MAX_BYTES + 1)]),
+            ..TaskPatch::default()
+        };
+        let err = repo.update(card.id, long, None).await.unwrap_err();
+        assert!(err.to_string().contains("tool name exceeds"), "{err}");
+        assert_eq!(
+            repo.get(card.id).await.unwrap().tool_scope.len(),
+            TASK_TOOLS_MAX,
+            "a refused patch changes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn created_by_names_the_creator_and_never_the_assignee() {
+        let (_s, repo) = repo().await;
+        let mut by_gui = new_task("from the board");
+        by_gui.created_by = Some("gui".to_string());
+        by_gui.assignee = Some("human".to_string());
+        let by_gui = repo.create(by_gui).await.unwrap();
+        let anonymous = repo.create(new_task("nobody said")).await.unwrap();
+
+        assert_eq!(
+            repo.created_by(by_gui.id).await.unwrap().as_deref(),
+            Some("gui")
+        );
+        assert_eq!(repo.created_by(anonymous.id).await.unwrap(), None);
+        assert!(matches!(
+            repo.created_by(anonymous.id + 100).await,
+            Err(StorageError::NotFound(_))
+        ));
     }
 
     #[tokio::test]

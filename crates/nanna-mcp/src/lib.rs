@@ -24,6 +24,18 @@
 //! let result = client.call_tool("read_file", json!({"path": "/tmp/test.txt"})).await?;
 //! ```
 
+/// How long one MCP request may take, send to response, on every transport.
+///
+/// Bound justification: MCP tools wrap real work (a search, a build, a
+/// browser step), so they get double the 30 s a local tool call is allowed,
+/// and one number is shared by stdio, Streamable HTTP and the registry
+/// deadline derived from it so the three can never disagree again.
+pub const MCP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Seconds the tool registry's deadline for an MCP tool sits past
+/// [`MCP_REQUEST_TIMEOUT`], so the transport's own timeout fires first.
+pub const MCP_DEADLINE_MARGIN_SECS: u64 = 5;
+
 mod adapter;
 mod client;
 pub mod elicit;

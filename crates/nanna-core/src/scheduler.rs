@@ -294,6 +294,9 @@ pub struct Scheduler {
     /// this is the authority for the three live settings — `config` keeps the
     /// boot-time values and is updated alongside by [`Self::apply_settings`].
     runtime: Arc<SchedulerRuntime>,
+    /// Ids with a run in progress, shared by the loop and [`Self::run_now`]
+    /// so a manual run and a scheduled one never overlap.
+    in_flight: InFlight,
 }
 
 impl Scheduler {
@@ -308,6 +311,7 @@ impl Scheduler {
             storage: None,
             history: Arc::new(RwLock::new(HashMap::new())),
             runtime,
+            in_flight: InFlight::default(),
         }
     }
 
@@ -550,56 +554,60 @@ impl Scheduler {
 
     /// Update a task's schedule
     ///
-    /// Returns `Ok(false)` when no task has `task_id`. The storage update is
-    /// best-effort and its failure is ignored.
+    /// Returns `Ok(false)` when no task has `task_id`. The new schedule is
+    /// persisted like a new task is (a failure is logged, as in
+    /// [`Self::add_task`]). It used to write only `next_run` — and an empty
+    /// `last_run` over the real one — so the new expression never reached the
+    /// store and a restart put the old schedule back.
     ///
     /// # Errors
     ///
     /// Returns the [`CronError`] from [`CronExpr::parse`] when `schedule` is not
     /// a valid cron expression; the task is left unchanged.
-    pub async fn update_schedule(
-        &self,
-        task_id: &str,
-        schedule: &str,
-    ) -> Result<bool, CronError> {
+    pub async fn update_schedule(&self, task_id: &str, schedule: &str) -> Result<bool, CronError> {
         let parsed = CronExpr::parse(schedule)?;
         let next_run = parsed.next_from_now();
-
-        let mut tasks = self.tasks.write().await;
-        if let Some(task) = tasks.get_mut(task_id) {
-            task.task_type = TaskType::Cron {
-                schedule: schedule.to_string(),
-                parsed: Some(Box::new(parsed)),
-                next_run,
-            };
-
-            // Update storage
-            if let Some(storage) = &self.storage {
-                let next_run_str = next_run.map(|dt| dt.to_rfc3339());
-                let _ = storage
-                    .cron_jobs()
-                    .update_last_run(task_id, "", next_run_str.as_deref())
-                    .await;
-            }
-
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        let updated = self
+            .modify_task(task_id, |task| {
+                task.task_type = TaskType::Cron {
+                    schedule: schedule.to_string(),
+                    parsed: Some(Box::new(parsed)),
+                    next_run,
+                };
+            })
+            .await;
+        Ok(updated)
     }
 
-    /// Enable/disable a task (persisted)
-    pub async fn set_task_enabled(&self, task_id: &str, enabled: bool) {
-        // Update storage
-        if let Some(storage) = &self.storage
-            && let Err(e) = storage.cron_jobs().set_enabled(task_id, enabled).await {
-                warn!("Failed to update task {} enabled state: {}", task_id, e);
-            }
+    /// Enable/disable a task (persisted). `false` when no task has `task_id`.
+    pub async fn set_task_enabled(&self, task_id: &str, enabled: bool) -> bool {
+        self.modify_task(task_id, |task| task.enabled = enabled)
+            .await
+    }
 
+    /// Replace a task's payload (persisted). `false` when no task has
+    /// `task_id`.
+    pub async fn update_payload(&self, task_id: &str, payload: &str) -> bool {
+        self.modify_task(task_id, |task| task.payload = payload.to_string())
+            .await
+    }
+
+    /// Apply `change` to the task in RAM and persist the whole row, the same
+    /// upsert [`Self::add_task`] writes, so every field changed together
+    /// reaches the store together. `false` when no task has `task_id`.
+    async fn modify_task(&self, task_id: &str, change: impl FnOnce(&mut ScheduledTask)) -> bool {
         let mut tasks = self.tasks.write().await;
-        if let Some(task) = tasks.get_mut(task_id) {
-            task.enabled = enabled;
+        let Some(task) = tasks.get_mut(task_id) else {
+            return false;
+        };
+        change(task);
+        let snapshot = task.clone();
+        drop(tasks);
+        debug_assert_eq!(snapshot.id, task_id, "the change kept the task's id");
+        if let Err(e) = self.persist_task(&snapshot).await {
+            warn!("Failed to persist the change to task {task_id}: {e}");
         }
+        true
     }
 
     /// Get all tasks
@@ -678,11 +686,6 @@ impl Scheduler {
             .map_or_default(|runs| runs.iter().rev().take(limit).cloned().collect())
     }
 
-    /// Record a job run
-    async fn record_run(&self, result: &TaskResult) {
-        record_run_in(&self.history, &result.task_id, result).await;
-    }
-
     /// How often the loop looks for due work — the resolution of every
     /// non-heartbeat schedule, reminders included.
     #[must_use]
@@ -690,38 +693,36 @@ impl Scheduler {
         self.config.check_interval
     }
 
-    /// Run a task immediately (bypass schedule)
+    /// Run a task immediately (bypass schedule), settled exactly like a
+    /// scheduled run: a delivered one-shot (a reminder) is removed and the
+    /// outcome persisted. `None` when there is no such task, no executor, or a
+    /// run of it is already in progress.
+    ///
+    /// It used to bump `run_count` in memory only and skip the in-flight claim:
+    /// a "Run now" reminder stayed listed but never fired at its time (count
+    /// 1), came back at 0 after a restart and was delivered a second time, and
+    /// could run concurrently with the loop's own run of it.
     pub async fn run_now(&self, task_id: &str) -> Option<TaskResult> {
         let executor = self.executor.as_ref()?;
+        let Some(claim) = InFlightClaim::take(&self.in_flight, task_id) else {
+            info!("Task {task_id} is already running; run-now skipped");
+            return None;
+        };
         let task = {
             let tasks = self.tasks.read().await;
             tasks.get(task_id).cloned()?
         };
-
+        let one_shot = task.task_type.is_one_shot();
         let result = executor(task).await;
-
-        // Record the run
-        self.record_run(&result).await;
-
-        // Update last_run
-        {
-            let mut tasks = self.tasks.write().await;
-            if let Some(t) = tasks.get_mut(task_id) {
-                t.last_run = Some(result.finished_at);
-                t.run_count += 1;
-
-                // Update next_run for cron tasks
-                if let TaskType::Cron {
-                    parsed: Some(ref p),
-                    ref mut next_run,
-                    ..
-                } = t.task_type
-                {
-                    *next_run = p.next_from_now();
-                }
-            }
-        }
-
+        settle_run(
+            &self.tasks,
+            self.storage.as_ref(),
+            &self.history,
+            one_shot,
+            &result,
+        )
+        .await;
+        drop(claim);
         Some(result)
     }
 
@@ -742,14 +743,19 @@ impl Scheduler {
         let storage = self.storage.clone();
         let history = self.history.clone();
         let runtime = self.runtime.clone();
-        let in_flight = InFlight::default();
+        let in_flight = Arc::clone(&self.in_flight);
 
         // Spawn the scheduler loop
         tokio::spawn(async move {
             // The heartbeat period is retunable at runtime, so track the value
             // this timer was built from and rebuild when it changes.
             let mut heartbeat_secs = runtime.heartbeat_interval().as_secs();
-            let mut heartbeat_interval = interval(Duration::from_secs(heartbeat_secs));
+            // A full period out, like the retune below: `interval()` fires its
+            // first tick immediately, which ran a model turn at every boot.
+            let mut heartbeat_interval = {
+                let period = Duration::from_secs(heartbeat_secs);
+                interval_at(Instant::now() + period, period)
+            };
             let mut check_interval = interval(config.check_interval);
 
             info!(
@@ -767,16 +773,21 @@ impl Scheduler {
                     }
                     _ = heartbeat_interval.tick() => {
                         if runtime.enabled() && runtime.heartbeat_enabled() {
-                            debug!("Heartbeat tick");
-                            let task = heartbeat_task(&config.heartbeat_prompt);
-                            let result = executor(task).await;
-
-                            // Record heartbeat run
-                            record_run_in(&history, "heartbeat", &result).await;
-
-                            if !result.success {
-                                warn!("Heartbeat failed: {:?}", result.error);
-                            }
+                            // Spawned like every due task, never awaited here:
+                            // a heartbeat is a model turn, and awaiting it in
+                            // this `select!` stalled every other due task (and
+                            // shutdown) behind it. The claim keeps a slow one
+                            // from overlapping the next tick.
+                            let Some(claim) = InFlightClaim::take(&in_flight, HEARTBEAT_CLAIM) else {
+                                debug!("Heartbeat still running; skipping this tick");
+                                continue;
+                            };
+                            tokio::spawn(run_heartbeat(
+                                claim,
+                                executor.clone(),
+                                history.clone(),
+                                config.heartbeat_prompt.clone(),
+                            ));
                         }
                     }
                     _ = check_interval.tick() => {
@@ -851,6 +862,30 @@ impl Scheduler {
 /// restart does not silently retry it. (Before this, a fired `Delayed` task
 /// was disabled in memory only; storage kept `enabled = 1`, so every daemon
 /// restart re-armed it and it fired again.)
+/// In-flight key for the heartbeat. Not a task id: the heartbeat is built
+/// fresh on every tick, so its own id would never repeat and never collide.
+const HEARTBEAT_CLAIM: &str = "\0heartbeat";
+
+/// One heartbeat run, holding `claim` until it has been recorded.
+async fn run_heartbeat(
+    claim: InFlightClaim,
+    executor: TaskExecutor,
+    history: Arc<RwLock<HashMap<String, Vec<JobRun>>>>,
+    prompt: String,
+) {
+    debug_assert_eq!(
+        claim.task_id, HEARTBEAT_CLAIM,
+        "the heartbeat holds its own claim"
+    );
+    debug!("Heartbeat tick");
+    let result = executor(heartbeat_task(&prompt)).await;
+    record_run_in(&history, "heartbeat", &result).await;
+    if !result.success {
+        warn!("Heartbeat failed: {:?}", result.error);
+    }
+    drop(claim);
+}
+
 async fn run_due_task(
     claim: InFlightClaim,
     task: ScheduledTask,
@@ -871,12 +906,34 @@ async fn run_due_task(
         result.task_id, task_id,
         "executor must answer for the task it ran"
     );
+    settle_run(&tasks, storage.as_ref(), &history, one_shot, &result).await;
+    // Released only now: the in-memory state settled above is what the next
+    // tick reads.
+    drop(claim);
+
+    if result.success {
+        info!("Task {} completed in {}ms", task_id, result.duration_ms);
+    } else {
+        error!("Task {} failed: {:?}", task_id, result.error);
+    }
+}
+
+/// Settle a finished run, scheduled or manual: record it, remove a delivered
+/// one-shot (or disable a failed one), advance a cron's next run, and persist.
+async fn settle_run(
+    tasks: &Arc<RwLock<HashMap<String, ScheduledTask>>>,
+    storage: Option<&Arc<Storage>>,
+    history: &Arc<RwLock<HashMap<String, Vec<JobRun>>>>,
+    one_shot: bool,
+    result: &TaskResult,
+) {
+    let task_id = result.task_id.clone();
     debug_assert!(
         result.finished_at >= result.started_at,
         "a run cannot finish before it starts"
     );
 
-    record_run_in(&history, &result.task_id, &result).await;
+    record_run_in(history, &result.task_id, result).await;
 
     let next_run = {
         let mut tasks_guard = tasks.write().await;
@@ -904,15 +961,7 @@ async fn run_due_task(
     };
 
     if let Some(storage) = storage {
-        settle_in_storage(&storage, &task_id, one_shot, &result, next_run.as_deref()).await;
-    }
-    // Released only now: the in-memory state above is what the next tick reads.
-    drop(claim);
-
-    if result.success {
-        info!("Task {} completed in {}ms", task_id, result.duration_ms);
-    } else {
-        error!("Task {} failed: {:?}", task_id, result.error);
+        settle_in_storage(storage, &task_id, one_shot, result, next_run.as_deref()).await;
     }
 }
 
@@ -1283,6 +1332,150 @@ mod tests {
             peak.load(Ordering::SeqCst),
             1,
             "never two runs of one task at once"
+        );
+    }
+
+    /// The heartbeat is a model turn. It used to be awaited inside the loop's
+    /// `select!`, so one that took long — here, one that never returns — froze
+    /// every other due task; and `interval()` fired it once at boot. Paused
+    /// clock: the 30 s period passes instantly.
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_never_fires_at_boot_and_never_stalls_due_tasks() {
+        let heartbeats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (heartbeats_in, runs_in) = (heartbeats.clone(), runs.clone());
+        let executor: TaskExecutor = Arc::new(move |task: ScheduledTask| {
+            let (heartbeats, runs) = (heartbeats_in.clone(), runs_in.clone());
+            Box::pin(async move {
+                if task.name == "heartbeat" {
+                    heartbeats.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                }
+                runs.fetch_add(1, Ordering::SeqCst);
+                TaskResult {
+                    task_id: task.id.clone(),
+                    task_name: task.name.clone(),
+                    success: true,
+                    output: None,
+                    error: None,
+                    duration_ms: 0,
+                    started_at: Utc::now(),
+                    finished_at: Utc::now(),
+                }
+            })
+        });
+        let config = SchedulerConfig {
+            heartbeat_enabled: true,
+            heartbeat_interval: Duration::from_secs(MIN_HEARTBEAT_INTERVAL_SECS),
+            check_interval: Duration::from_millis(10),
+            ..SchedulerConfig::default()
+        };
+        let mut scheduler = Scheduler::new(config).with_executor(executor);
+        scheduler
+            .add_task(recurring_task("sweep", Duration::from_nanos(1), "x"))
+            .await;
+        scheduler.start();
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(heartbeats.load(Ordering::SeqCst), 0, "no heartbeat at boot");
+
+        tokio::time::sleep(Duration::from_secs(MIN_HEARTBEAT_INTERVAL_SECS + 1)).await;
+        assert_eq!(
+            heartbeats.load(Ordering::SeqCst),
+            1,
+            "one heartbeat per period"
+        );
+        let before = runs.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let after = runs.load(Ordering::SeqCst);
+        scheduler.stop().await;
+        assert!(
+            after > before,
+            "due tasks keep running beside a stuck heartbeat ({before} → {after})"
+        );
+    }
+
+    /// An edited job must come back edited after a restart. `update_schedule`
+    /// wrote only `next_run` (and blanked `last_run`), so the new expression
+    /// never reached the store; a payload edit was not even attempted.
+    #[tokio::test]
+    async fn an_edited_job_survives_a_reload() {
+        let storage = Arc::new(Storage::in_memory().await.expect("in-memory storage"));
+        let scheduler = Scheduler::new(SchedulerConfig::default()).with_storage(storage.clone());
+        let task = Scheduler::cron_task("digest", "0 9 * * *", "old prompt").expect("cron");
+        let id = task.id.clone();
+        scheduler.add_task(task).await;
+
+        assert!(
+            scheduler
+                .update_schedule(&id, "30 18 * * *")
+                .await
+                .expect("valid")
+        );
+        assert!(scheduler.update_payload(&id, "new prompt").await);
+        assert!(scheduler.set_task_enabled(&id, false).await);
+        assert!(
+            !scheduler.set_task_enabled("no-such-job", true).await,
+            "unknown is not updated"
+        );
+        assert!(!scheduler.update_payload("no-such-job", "x").await);
+        assert!(
+            !scheduler
+                .update_schedule("no-such-job", "0 1 * * *")
+                .await
+                .expect("valid")
+        );
+
+        let reloaded = Scheduler::new(SchedulerConfig::default()).with_storage(storage);
+        reloaded.load_jobs().await.expect("load");
+        let job = reloaded
+            .get_task(&id)
+            .await
+            .expect("the job is still there");
+        assert!(
+            matches!(&job.task_type, TaskType::Cron { schedule, .. } if schedule == "30 18 * * *"),
+            "{:?}",
+            job.task_type
+        );
+        assert_eq!(job.payload, "new prompt");
+        assert!(!job.enabled);
+    }
+
+    #[tokio::test]
+    async fn run_now_delivers_a_reminder_once_and_for_good() {
+        let storage = Arc::new(Storage::in_memory().await.expect("in-memory storage"));
+        let executor: TaskExecutor = Arc::new(|task: ScheduledTask| {
+            Box::pin(async move {
+                TaskResult {
+                    task_id: task.id.clone(),
+                    task_name: task.name.clone(),
+                    success: true,
+                    output: None,
+                    error: None,
+                    duration_ms: 1,
+                    started_at: Utc::now(),
+                    finished_at: Utc::now(),
+                }
+            })
+        });
+        let scheduler = Scheduler::new(SchedulerConfig::default())
+            .with_storage(storage.clone())
+            .with_executor(executor);
+        let later = at_task("reminder", Utc::now() + chrono::Duration::hours(1), "x");
+        let id = later.id.clone();
+        scheduler.add_task(later).await;
+
+        assert!(scheduler.run_now(&id).await.is_some_and(|r| r.success));
+        assert!(
+            scheduler.get_task(&id).await.is_none(),
+            "a delivered reminder is gone, not left pending with run_count 1"
+        );
+        // And after a restart it is not delivered again.
+        let reloaded = Scheduler::new(SchedulerConfig::default()).with_storage(storage);
+        reloaded.load_jobs().await.expect("load");
+        assert!(
+            reloaded.get_task(&id).await.is_none(),
+            "not re-armed by a reload"
         );
     }
 

@@ -11,6 +11,7 @@ export type PaletteAction = {
 /** Primary IA vs Admin — order within groups is list order. */
 export const NAV_ACTIONS: PaletteAction[] = [
   // Primary
+  { id: 'nav-board', label: 'Board', group: 'Primary', keywords: ['cards', 'tasks', 'kanban', 'todo', 'inbox'], href: '/board' },
   { id: 'nav-chat', label: 'Chat', group: 'Primary', keywords: ['home', 'messages', 'conversation'], href: '/', shortcut: '⌘1' },
   { id: 'nav-memory', label: 'Memory', group: 'Primary', keywords: ['memories', 'knowledge', 'cards'], href: '/memory' },
   { id: 'nav-tools', label: 'Tools', group: 'Primary', keywords: ['mcp', 'functions'], href: '/tools' },

@@ -95,10 +95,14 @@ impl GpuVectorStore {
             });
         }
 
-        let start_idx = self.vectors.len();
         for chunk in new_vectors.chunks(self.vector_dim) {
+            // The index the vector is about to occupy. `start + len - 1`
+            // counted the store's old length twice, so on a non-empty store
+            // the new vectors were never marked dirty and never reached the
+            // GPU buffer — the search ran on stale data.
+            let index = self.vectors.len();
             self.vectors.push(chunk.to_vec());
-            self.dirty_indices.insert(start_idx + self.vectors.len() - 1);
+            self.dirty_indices.insert(index);
         }
 
         Ok(())
@@ -470,6 +474,13 @@ mod tests {
                 let vectors = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
                 assert!(store.append(&vectors).is_ok());
                 assert_eq!(store.len(), 2);
+                assert_eq!(store.dirty_indices, HashSet::from([0, 1]));
+
+                // Appending to a NON-empty store marks the new slots — the
+                // old arithmetic marked 2·start + k and missed them.
+                store.dirty_indices.clear();
+                assert!(store.append(&[9.0, 10.0, 11.0, 12.0]).is_ok());
+                assert_eq!(store.dirty_indices, HashSet::from([2]));
             }
             Err(GpuError::NoAdapter) => {
                 println!("No GPU adapter, skipping test");

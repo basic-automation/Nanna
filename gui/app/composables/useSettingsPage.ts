@@ -45,7 +45,6 @@ export interface ExtendedSettings {
    *  configured, ahead of any saved one. */
   ollama_token_from_env: boolean
   tools: ToolInfo[]
-  dreaming_enabled: boolean
   auto_remember_messages: boolean
   max_compression_ratio: number
   min_remaining_memories: number

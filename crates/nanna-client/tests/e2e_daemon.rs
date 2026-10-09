@@ -196,7 +196,6 @@ impl TestDaemon {
     async fn connect_client(&self) -> Client {
         Client::connect(ClientConfig {
             url: self.url(),
-            auto_reconnect: false,
             connect_timeout: READY_HANG_CEILING,
             request_timeout: READY_HANG_CEILING,
             ..Default::default()
@@ -1033,6 +1032,13 @@ impl ScriptedOllama {
                     };
                     seen.lock().await.push(body);
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    // `STATUS <code> <body>` answers with that HTTP status —
+                    // a provider refusing the request.
+                    if let Some(refusal) = line.strip_prefix("STATUS ") {
+                        let (code, body) = refusal.split_once(' ').unwrap_or((refusal, "{}"));
+                        respond_status(&mut socket, &format!("{code} Refused"), body).await;
+                        return;
+                    }
                     // One NDJSON line serves both shapes: a streamed request
                     // reads it as its only (final) chunk.
                     respond(&mut socket, &format!("{line}\n")).await;
@@ -1049,6 +1055,10 @@ impl ScriptedOllama {
 /// One scripted model message as an Ollama NDJSON line. `CALL <tool> <json>`
 /// is a tool call with those arguments; anything else is reply text.
 fn scripted_reply(script: &str) -> String {
+    if script.starts_with("STATUS ") {
+        // Not a model message: the server answers with that status instead.
+        return script.to_string();
+    }
     let message = script.strip_prefix("CALL ").map_or_else(
         || serde_json::json!({ "role": "assistant", "content": script }),
         |call| {
@@ -2347,6 +2357,7 @@ async fn open_tasks(client: &Client, session: &str) -> Vec<serde_json::Value> {
             scope: Some("session".to_string()),
             session_id: Some(session.to_string()),
             include_closed: Some(false),
+            workspace_id: None,
         }))
         .await
         .expect("tasks.list answers");
@@ -2968,6 +2979,1149 @@ async fn a_request_longer_than_the_window_says_so() {
         "no demotion happened: {reply}"
     );
 
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// A sub-session that overruns its timeout is cancelled and wound down, not
+/// dropped mid-flight. Dropped, its chat's `active_chats` entry was never
+/// released: the daemon kept reporting the long-dead run as live — `chat.cancel`
+/// on it answered `cancelled` forever — and the agent service read as busy.
+#[tokio::test]
+async fn a_timed_out_sub_session_leaves_no_live_run_behind() {
+    use nanna_daemon::protocol::{Action, SessionAction};
+
+    // Every model reply is held back far past the sub-session's 1 s timeout.
+    let ollama =
+        ScriptedOllama::start(vec!["WAIT 20000 Too late.\nTASK COMPLETE".to_string()]).await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let spawned = client
+        .request(Action::Session(SessionAction::SpawnSubSession {
+            task: "take your time".to_string(),
+            label: Some("slow".to_string()),
+            parent_id: None,
+            model: None,
+            max_iterations: None,
+            timeout_secs: Some(1),
+            system_prompt: None,
+        }))
+        .await
+        .expect("sessions.spawn_sub_session answers");
+    assert!(spawned.get("error").is_none(), "{spawned}");
+
+    let status = tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            let status = client
+                .request(Action::Session(SessionAction::GetSubSessionStatus {
+                    target: "slow".to_string(),
+                }))
+                .await
+                .expect("status answers");
+            if status["error"].is_string() {
+                return status;
+            }
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the sub-session times out");
+    assert!(
+        status["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("timed out")),
+        "{status}"
+    );
+    let sub = status["session_id"].as_str().expect("an id").to_string();
+
+    let cancel = client
+        .chat()
+        .cancel(&sub)
+        .await
+        .expect("chat.cancel answers");
+    assert_eq!(
+        cancel["status"], "not_active",
+        "the timed-out run is gone: {cancel}"
+    );
+}
+
+/// Killing a sub-session stops its run, and it stays killed. Kill used to set
+/// a flag nothing read: the sub-agent ran on to the end, and its finish then
+/// overwrote `killed` with `completed`.
+#[tokio::test]
+async fn a_killed_sub_session_stops_and_stays_killed() {
+    use nanna_daemon::protocol::{Action, SessionAction};
+
+    let ollama = ScriptedOllama::start(vec![
+        "WAIT 20000 Finished anyway.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    client
+        .request(Action::Session(SessionAction::SpawnSubSession {
+            task: "work slowly".to_string(),
+            label: Some("doomed".to_string()),
+            parent_id: None,
+            model: None,
+            max_iterations: None,
+            timeout_secs: None,
+            system_prompt: None,
+        }))
+        .await
+        .expect("spawn answers");
+    // Kill once the run is really in flight: the stub has seen its request.
+    tokio::time::timeout(READY_HANG_CEILING, async {
+        while ollama.chat_bodies.lock().await.is_empty() {
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the sub-agent reaches the model");
+    let killed = client
+        .request(Action::Session(SessionAction::KillSubSession {
+            target: "doomed".to_string(),
+        }))
+        .await
+        .expect("kill answers");
+    assert_eq!(killed["status"], "killed", "{killed}");
+
+    // Without touching the run otherwise, it winds down well before the
+    // stub's 20 s reply: the kill itself stopped it.
+    let after = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = doomed_status(&client).await;
+            if status["result"].is_string() || status["error"].is_string() {
+                return status;
+            }
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the killed run stopped instead of running on");
+    assert!(
+        !after.to_string().contains("Finished anyway"),
+        "the run did not finish its work: {after}"
+    );
+    assert_eq!(
+        after["state"], "killed",
+        "still killed after the run ended: {after}"
+    );
+}
+
+/// `sessions.get_sub_session_status` for the sub-session labelled `doomed`.
+async fn doomed_status(client: &Client) -> serde_json::Value {
+    client
+        .request(nanna_daemon::protocol::Action::Session(
+            nanna_daemon::protocol::SessionAction::GetSubSessionStatus {
+                target: "doomed".to_string(),
+            },
+        ))
+        .await
+        .expect("status answers")
+}
+
+/// A fork's copied conversation is stored like any other: it survives a
+/// restart, and the original keeps its own. The fork used to be written through
+/// `update`, which stores only the session row — its messages existed in memory
+/// alone and came back empty after a restart.
+#[tokio::test]
+async fn a_forked_conversation_survives_a_restart() {
+    use nanna_daemon::protocol::{Action, SessionAction};
+
+    let ollama =
+        ScriptedOllama::start(vec!["The original answer.\nTASK COMPLETE".to_string()]).await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), {
+        let host = host.clone();
+        move |b| {
+            b.with_model(STUB_MODEL)
+                .with_ollama_host(host)
+                .with_scheduler(false)
+        }
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let original = session_id_of(
+        &client
+            .sessions()
+            .create(Some("original".to_string()))
+            .await
+            .expect("create"),
+    );
+    converse(&client, &original, "ask something").await;
+    let count = |history: &serde_json::Value| history["messages"].as_array().map_or(0, Vec::len);
+    let before = count(
+        &client
+            .sessions()
+            .history(&original, None)
+            .await
+            .expect("history"),
+    );
+    assert!(before >= 2, "a question and an answer");
+
+    let forked = client
+        .request(Action::Session(SessionAction::Fork {
+            id: original.clone(),
+            name: Some("the fork".to_string()),
+        }))
+        .await
+        .expect("fork answers");
+    let fork_id = forked["session"]["id"]
+        .as_str()
+        .expect("the fork's id")
+        .to_string();
+
+    client.disconnect().await;
+    let restarted = TestDaemon::start_with(daemon.stop(), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = restarted.connect_client().await;
+    let fork_after = count(
+        &client
+            .sessions()
+            .history(&fork_id, None)
+            .await
+            .expect("history"),
+    );
+    let original_after = count(
+        &client
+            .sessions()
+            .history(&original, None)
+            .await
+            .expect("history"),
+    );
+    assert_eq!(fork_after, before, "the fork's messages were stored");
+    assert_eq!(original_after, before, "the original is untouched");
+    client.disconnect().await;
+    restarted.stop();
+}
+
+/// Regenerate's dropped reply leaves the store too: after a restart the
+/// conversation holds the question and the NEW answer only. It was dropped
+/// through `update`, which never deleted the old rows, so the stale answer
+/// came back from the store on the next start.
+#[tokio::test]
+async fn a_regenerated_reply_stays_replaced_after_a_restart() {
+    use nanna_daemon::protocol::{Action, ChatAction};
+
+    let ollama = ScriptedOllama::start(vec![
+        "The first answer.\nTASK COMPLETE".to_string(),
+        "The second answer.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), {
+        let host = host.clone();
+        move |b| {
+            b.with_model(STUB_MODEL)
+                .with_ollama_host(host)
+                .with_scheduler(false)
+        }
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("regen".to_string()))
+            .await
+            .expect("create"),
+    );
+    converse(&client, &session, "ask once").await;
+    let mut events = client.subscribe_session(session.clone());
+    client
+        .request(Action::Chat(ChatAction::Regenerate {
+            session_id: session.clone(),
+        }))
+        .await
+        .expect("regenerate answers");
+    tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            if let Ok(nanna_client::Event::MessageEnd { .. }) = events.recv().await {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the regenerated turn ends");
+    let live = client
+        .sessions()
+        .history(&session, None)
+        .await
+        .expect("history");
+
+    client.disconnect().await;
+    let restarted = TestDaemon::start_with(daemon.stop(), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = restarted.connect_client().await;
+    let stored = client
+        .sessions()
+        .history(&session, None)
+        .await
+        .expect("history");
+    let texts = |h: &serde_json::Value| -> Vec<String> {
+        h["messages"]
+            .as_array()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|m| m["content"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        texts(&stored),
+        texts(&live),
+        "the store matches what the client saw"
+    );
+    assert!(
+        !texts(&stored).iter().any(|t| t.contains("first answer")),
+        "the replaced reply stayed gone: {stored}"
+    );
+    client.disconnect().await;
+    restarted.stop();
+}
+
+/// Poll card `id` until `done` holds for it, bounded by the hang ceiling.
+async fn card_when(
+    client: &Client,
+    id: i64,
+    what: &str,
+    done: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let started = std::time::Instant::now();
+    loop {
+        let card = client
+            .request(nanna_client::Action::Task(nanna_client::TaskAction::Get {
+                id,
+            }))
+            .await
+            .expect("task.get answers");
+        if done(&card) {
+            return card;
+        }
+        assert!(
+            started.elapsed() < READY_HANG_CEILING,
+            "card #{id} never reached: {what}: {card}"
+        );
+        tokio::time::sleep(READY_POLL_INTERVAL).await;
+    }
+}
+
+/// Create a global-scope card over IPC, as the board client does.
+async fn create_global_card(client: &Client, title: &str) -> i64 {
+    let created = client
+        .request(nanna_client::Action::Task(
+            nanna_client::TaskAction::Create {
+                title: title.to_string(),
+                scope: Some("global".to_string()),
+                session_id: None,
+                parent_id: None,
+                description: None,
+                priority: None,
+                labels: None,
+                tools: None,
+                due_at: None,
+                deadline_at: None,
+                recurrence: None,
+                depends_on: None,
+                acceptance: None,
+                project: None,
+                assignee: None,
+            },
+        ))
+        .await
+        .expect("task.create answers");
+    created["task"]["id"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("a created card: {created}"))
+}
+
+/// A card the board client creates wakes the board router (P25 Stage 2), and
+/// so does the human answering the clarification the router asked for
+/// (decision 6): the router first blocks the card on a question card for the
+/// human; the human posts an answer and completes it over IPC; the router
+/// decides again, with the answer in its prompt, and assigns the card. No chat
+/// turn is involved — the card is the only ingress.
+#[tokio::test]
+async fn the_board_router_asks_the_human_then_routes_on_the_answer() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"{"decision":"clarify","question":"Which lease, the flat or the garage?","reason":"two leases renew this month"}"#
+            .to_string(),
+        concat!(
+            r#"{"decision":"assign","member":"human","labels":["paperwork"],"#,
+            r#""acceptance":{"kind":"file_exists","path":"lease-signed.pdf"},"#,
+            r#""reason":"only a person can sign this"}"#
+        )
+        .to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+
+    let id = create_global_card(&client, "Sign the lease renewal").await;
+
+    // First decision: a clarification card the work card waits on.
+    let blocked = card_when(&client, id, "blocked on a clarification", |card| {
+        card["task"]["depends_on"]
+            .as_array()
+            .is_some_and(|d| !d.is_empty())
+    })
+    .await;
+    assert_eq!(blocked["task"]["blocked"], true, "{blocked}");
+    let clarification = blocked["task"]["depends_on"][0]
+        .as_i64()
+        .unwrap_or_else(|| panic!("a clarification id: {blocked}"));
+    let question = client
+        .request(nanna_client::Action::Task(nanna_client::TaskAction::Get {
+            id: clarification,
+        }))
+        .await
+        .expect("task.get answers");
+    assert_eq!(question["task"]["assignee"], "human", "{question}");
+
+    // The human answers on the clarification's thread and completes it.
+    for action in [
+        nanna_client::TaskAction::Note {
+            id: clarification,
+            content: "The garage one.".to_string(),
+        },
+        nanna_client::TaskAction::Done {
+            id: clarification,
+            workdir: None,
+        },
+    ] {
+        let reply = client
+            .request(nanna_client::Action::Task(action))
+            .await
+            .expect("the human's write answers");
+        assert!(reply.get("error").is_none(), "{reply}");
+    }
+
+    // Second decision, made with the answer in hand.
+    let card = card_when(&client, id, "assigned after the answer", |card| {
+        card["task"]["assignee"].as_str().is_some()
+    })
+    .await;
+    assert_eq!(
+        card["task"]["assignee"], "human",
+        "the member it named: {card}"
+    );
+    // Decision 5: what the human left blank, the router filled in.
+    assert_eq!(
+        card["task"]["labels"],
+        serde_json::json!(["paperwork"]),
+        "{card}"
+    );
+    assert_eq!(
+        card["task"]["acceptance"]["path"], "lease-signed.pdf",
+        "the blank acceptance check was written: {card}"
+    );
+    let notes = card["notes"].as_array().cloned().unwrap_or_default();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n["author_member_id"] == "router:global"
+                && n["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("only a person can sign this"))),
+        "the router posts its reason on the card's thread: {card}"
+    );
+    let asked = ollama.chat_bodies.lock().await;
+    let router_prompts: Vec<&String> = asked
+        .iter()
+        .filter(|body| body.contains("Task Management Agent"))
+        .collect();
+    assert_eq!(router_prompts.len(), 2, "one decision per wake: {asked:?}");
+    assert!(
+        router_prompts[1].contains(&format!("#{clarification} answered: The garage one.")),
+        "the second decision saw the answer: {}",
+        router_prompts[1]
+    );
+    drop(asked);
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// P25 Stage 3, end to end on the real daemon: the router assigns a card to an
+/// agent member, the assignment alone starts that member's run on the card,
+/// and the work lands on the card's thread as the member's verdict post —
+/// while the member shows busy only for as long as the run lives.
+#[tokio::test]
+async fn an_assigned_card_is_worked_by_its_member_and_closed_with_a_verdict_post() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"{"decision":"assign","member":"agent:builder","reason":"it writes release notes"}"#
+            .to_string(),
+        "Added the 0.3.34 entry to the changelog.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let created = client
+        .request(nanna_client::Action::Member(
+            nanna_client::MemberAction::Create {
+                name: "Builder".to_string(),
+                workspace_id: None,
+                personal: false,
+                avatar: None,
+                profile: None,
+            },
+        ))
+        .await
+        .expect("member.create answers");
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+
+    let id = create_global_card(&client, "Write the changelog entry").await;
+    card_when(&client, id, "assigned to the builder", |card| {
+        card["task"]["assignee"] == "agent:builder"
+    })
+    .await;
+
+    // No start call: assigning a board card to an agent starts its run.
+
+    let card = card_when(&client, id, "closed by the run", |card| {
+        card["task"]["status"] == "done"
+    })
+    .await;
+    let notes = card["notes"].as_array().cloned().unwrap_or_default();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n["author_member_id"] == "agent:builder"
+                && n["kind"] == "verdict"
+                && n["content"].as_str().is_some_and(|c| c.starts_with("Done"))),
+        "the member's verdict is on the card's thread: {card}"
+    );
+
+    let started = std::time::Instant::now();
+    loop {
+        let member = client
+            .request(nanna_client::Action::Member(
+                nanna_client::MemberAction::Get {
+                    id: "agent:builder".to_string(),
+                },
+            ))
+            .await
+            .expect("member.get answers");
+        let status = client
+            .request(nanna_client::Action::Task(
+                nanna_client::TaskAction::RunStatus {
+                    card_id: Some(id),
+                    scope: None,
+                    session_id: None,
+                },
+            ))
+            .await
+            .expect("task.run_status answers");
+        if member["member"]["status"] == "idle" && status["running"] == false {
+            assert!(
+                status["last_report"].is_object(),
+                "the run reported: {status}"
+            );
+            break;
+        }
+        assert!(
+            started.elapsed() < READY_HANG_CEILING,
+            "the member never went idle: {member} / {status}"
+        );
+        tokio::time::sleep(READY_POLL_INTERVAL).await;
+    }
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// P25 decision 7, end to end: a member's run that cannot pass its card's
+/// check hands the card back — pending, unassigned, the failure posted as the
+/// member's verdict — and that hand-back wakes the router to decide again.
+#[tokio::test]
+async fn a_card_its_member_cannot_finish_goes_back_to_the_router() {
+    let ollama = ScriptedOllama::start(vec![
+        concat!(
+            r#"{"decision":"assign","member":"agent:builder","#,
+            r#""acceptance":{"kind":"file_exists","path":"never-written-by-anyone.txt"},"#,
+            r#""reason":"it builds things"}"#
+        )
+        .to_string(),
+        "Still looking into it.".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let created = client
+        .request(nanna_client::Action::Member(
+            nanna_client::MemberAction::Create {
+                name: "Builder".to_string(),
+                workspace_id: None,
+                personal: false,
+                avatar: None,
+                profile: None,
+            },
+        ))
+        .await
+        .expect("member.create answers");
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+
+    let id = create_global_card(&client, "Write the file nobody can write").await;
+    // No start call, and no wait for the assignment either: assigning a board
+    // card to an agent starts its run, which can be over before a poll lands.
+
+    let card = card_when(&client, id, "handed back", |card| {
+        card["activity"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|row| row["action"] == "handed_back"))
+    })
+    .await;
+    assert_eq!(card["task"]["status"], "pending", "never cancelled: {card}");
+    assert!(card["task"]["assignee"].is_null(), "released: {card}");
+    let notes = card["notes"].as_array().cloned().unwrap_or_default();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n["author_member_id"] == "agent:builder"
+                && n["kind"] == "verdict"
+                && n["content"]
+                    .as_str()
+                    .is_some_and(|c| c.starts_with("Not done"))),
+        "the failure is on the card's thread: {card}"
+    );
+    // The hand-back woke the router: a second decision was asked for.
+    let started = std::time::Instant::now();
+    loop {
+        let asked = ollama
+            .chat_bodies
+            .lock()
+            .await
+            .iter()
+            .filter(|body| body.contains("Task Management Agent"))
+            .count();
+        if asked >= 2 {
+            break;
+        }
+        assert!(
+            started.elapsed() < READY_HANG_CEILING,
+            "the router was never woken by the hand-back ({asked} decisions asked)"
+        );
+        tokio::time::sleep(READY_POLL_INTERVAL).await;
+    }
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// A card run the provider refuses outright (a bad key: HTTP 401) is not
+/// resumed and not handed back to the router: the member asks the human to fix
+/// the setup at once, and the card waits on that question with its member.
+/// Before, the run manager resumed it eight times with a 15 s pause each and
+/// then handed it to the router, which would route it to a member on the same
+/// broken provider.
+#[tokio::test]
+async fn a_card_run_the_provider_refuses_asks_the_human_at_once() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"{"decision":"assign","member":"agent:builder","reason":"it builds things"}"#.to_string(),
+        r#"STATUS 401 {"error":"unauthorized"}"#.to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let created = client
+        .request(nanna_client::Action::Member(
+            nanna_client::MemberAction::Create {
+                name: "Builder".to_string(),
+                workspace_id: None,
+                personal: false,
+                avatar: None,
+                profile: None,
+            },
+        ))
+        .await
+        .expect("member.create answers");
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+
+    let started = std::time::Instant::now();
+    let id = create_global_card(&client, "Build the thing").await;
+    let card = card_when(&client, id, "waiting on the human", |card| {
+        card["task"]["depends_on"]
+            .as_array()
+            .is_some_and(|deps| !deps.is_empty())
+            && card["task"]["status"] == "pending"
+    })
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "asked at once, not after the resume loop: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        card["task"]["assignee"], "agent:builder",
+        "kept by its member: {card}"
+    );
+    let activity = card["activity"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !activity.iter().any(|row| row["action"] == "handed_back"),
+        "not a hand-back: {card}"
+    );
+    let question_id = card["task"]["depends_on"][0].as_i64().expect("a card id");
+    let question = card_when(&client, question_id, "the question", |_| true).await;
+    assert_eq!(question["task"]["assignee"], "human", "{question}");
+    assert!(
+        question["task"]["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("401")),
+        "the question names the refusal: {question}"
+    );
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// A card run the provider rate-limits (HTTP 429) waits it out with its
+/// member: no hand-back to the router, no question to the human, and a
+/// `rate_limited` row saying when it is tried again.
+#[tokio::test]
+async fn a_rate_limited_card_run_waits_with_its_member() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"{"decision":"assign","member":"agent:builder","reason":"it builds things"}"#.to_string(),
+        r#"STATUS 429 {"error":"rate limit exceeded"}"#.to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let created = client
+        .request(nanna_client::Action::Member(
+            nanna_client::MemberAction::Create {
+                name: "Builder".to_string(),
+                workspace_id: None,
+                personal: false,
+                avatar: None,
+                profile: None,
+            },
+        ))
+        .await
+        .expect("member.create answers");
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+
+    let id = create_global_card(&client, "Build the thing").await;
+    let card = card_when(&client, id, "waiting out the limit", |card| {
+        card["activity"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|row| row["action"] == "rate_limited"))
+            && card["task"]["status"] == "pending"
+    })
+    .await;
+    assert_eq!(
+        card["task"]["assignee"], "agent:builder",
+        "kept by its member: {card}"
+    );
+    let activity = card["activity"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !activity.iter().any(|row| row["action"] == "handed_back"),
+        "not a hand-back: {card}"
+    );
+    assert!(
+        card["task"]["depends_on"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "nobody is asked: {card}"
+    );
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// P25 decision 3 on the real daemon: one member, one card at a time. Two
+/// cards assigned to the same agent at once are both worked — the second
+/// waits while the member is busy and starts when its first card ends.
+#[tokio::test]
+async fn a_member_given_two_cards_works_them_one_after_the_other() {
+    // One script serves both prompts: the router reads the JSON object, a
+    // step reads the `TASK COMPLETE` line.
+    let ollama = ScriptedOllama::start(vec![
+        "{\"decision\":\"assign\",\"member\":\"agent:builder\",\"reason\":\"builder's queue\"}\n\
+         TASK COMPLETE"
+            .to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let created = client
+        .request(nanna_client::Action::Member(
+            nanna_client::MemberAction::Create {
+                name: "Builder".to_string(),
+                workspace_id: None,
+                personal: false,
+                avatar: None,
+                profile: None,
+            },
+        ))
+        .await
+        .expect("member.create answers");
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+
+    let first = create_global_card(&client, "Tag the release").await;
+    let second = create_global_card(&client, "Announce the release").await;
+    for id in [first, second] {
+        let card = card_when(&client, id, "worked to done", |card| {
+            card["task"]["status"] == "done"
+        })
+        .await;
+        let notes = card["notes"].as_array().cloned().unwrap_or_default();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n["author_member_id"] == "agent:builder" && n["kind"] == "verdict"),
+            "card #{id} was closed by its member: {card}"
+        );
+    }
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// Stopping a member's run on a card is a pause, not a release: the card
+/// stays picked up by its member (so nothing restarts it on its own), the
+/// thread says it was stopped, and the member is free for other work.
+#[tokio::test]
+async fn a_cancelled_card_run_leaves_the_card_paused_with_its_member() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"{"decision":"assign","member":"agent:builder","reason":"it builds things"}"#.to_string(),
+        "WAIT 20000 TASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let created = client
+        .request(nanna_client::Action::Member(
+            nanna_client::MemberAction::Create {
+                name: "Builder".to_string(),
+                workspace_id: None,
+                personal: false,
+                avatar: None,
+                profile: None,
+            },
+        ))
+        .await
+        .expect("member.create answers");
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+
+    let id = create_global_card(&client, "Rebuild the index").await;
+    card_when(&client, id, "picked up by its run", |card| {
+        card["task"]["status"] == "in_progress"
+    })
+    .await;
+    let cancelled = client
+        .request(nanna_client::Action::Task(
+            nanna_client::TaskAction::CancelRun {
+                card_id: Some(id),
+                scope: None,
+                session_id: None,
+            },
+        ))
+        .await
+        .expect("task.cancel_run answers");
+    assert_eq!(cancelled["cancelled"], true, "{cancelled}");
+
+    let card = card_when(&client, id, "settled as paused", |card| {
+        card["notes"].as_array().is_some_and(|notes| {
+            notes.iter().any(|n| {
+                n["content"]
+                    .as_str()
+                    .is_some_and(|c| c.starts_with("Stopped on request"))
+            })
+        })
+    })
+    .await;
+    assert_eq!(card["task"]["status"], "in_progress", "{card}");
+    assert_eq!(card["task"]["assignee"], "agent:builder", "{card}");
+    let started = std::time::Instant::now();
+    loop {
+        let member = client
+            .request(nanna_client::Action::Member(
+                nanna_client::MemberAction::Get {
+                    id: "agent:builder".to_string(),
+                },
+            ))
+            .await
+            .expect("member.get answers");
+        if member["member"]["status"] == "idle" {
+            break;
+        }
+        assert!(
+            started.elapsed() < READY_HANG_CEILING,
+            "the member never went idle: {member}"
+        );
+        tokio::time::sleep(READY_POLL_INTERVAL).await;
+    }
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// P25 decision 6 on the real daemon: a member that calls `ask_user` while
+/// working a card asks on the board — a clarification card for the human
+/// that its card waits on, the question posted by the member — through the
+/// real skill, service and tool-session scope.
+#[tokio::test]
+async fn a_card_runs_question_becomes_a_clarification_card() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"{"decision":"assign","member":"agent:builder","reason":"it merges"}"#.to_string(),
+        r#"CALL ask_user {"question":"Which branch should I merge?"}"#.to_string(),
+        "WAIT 60000 Waiting for the answer.".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let created = client
+        .request(nanna_client::Action::Member(
+            nanna_client::MemberAction::Create {
+                name: "Builder".to_string(),
+                workspace_id: None,
+                personal: false,
+                avatar: None,
+                profile: None,
+            },
+        ))
+        .await
+        .expect("member.create answers");
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+
+    let id = create_global_card(&client, "Merge the release branch").await;
+    // `ask_on_card` writes the dependency before it posts the question, so
+    // wait for the post too — a poll landing between the two writes saw the
+    // card blocked with no question on it yet.
+    let card = card_when(&client, id, "waiting on a question", |card| {
+        card["task"]["depends_on"]
+            .as_array()
+            .is_some_and(|d| !d.is_empty())
+            && card["notes"]
+                .as_array()
+                .is_some_and(|notes| notes.iter().any(|n| n["kind"] == "question"))
+    })
+    .await;
+    assert_eq!(card["task"]["blocked"], true, "{card}");
+    let notes = card["notes"].as_array().cloned().unwrap_or_default();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n["author_member_id"] == "agent:builder"
+                && n["kind"] == "question"
+                && n["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("Which branch should I merge?"))),
+        "the member asked on its card: {card}"
+    );
+    let question = card["task"]["depends_on"][0].as_i64().expect("an id");
+    let clarification = client
+        .request(nanna_client::Action::Task(nanna_client::TaskAction::Get {
+            id: question,
+        }))
+        .await
+        .expect("task.get answers");
+    assert_eq!(
+        clarification["task"]["assignee"], "human",
+        "{clarification}"
+    );
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// A member that splits its card with the real `todo` tool puts the pieces
+/// on the board under that card — where its own run is served them — not in
+/// a conversation nobody can see.
+#[tokio::test]
+async fn a_card_runs_todo_adds_sub_cards_under_its_card() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"{"decision":"assign","member":"agent:builder","reason":"it builds"}"#.to_string(),
+        r#"CALL todo {"action":"add","title":"Write the lexer first"}"#.to_string(),
+        "Split it: the lexer comes first.".to_string(),
+        "Done.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let created = client
+        .request(nanna_client::Action::Member(
+            nanna_client::MemberAction::Create {
+                name: "Builder".to_string(),
+                workspace_id: None,
+                personal: false,
+                avatar: None,
+                profile: None,
+            },
+        ))
+        .await
+        .expect("member.create answers");
+    assert_eq!(created["member"]["id"], "agent:builder", "{created}");
+
+    let id = create_global_card(&client, "Ship the parser").await;
+    let started = std::time::Instant::now();
+    let sub_card = loop {
+        let board = client
+            .request(nanna_client::Action::Task(
+                nanna_client::TaskAction::Query {
+                    filter: "subtask".to_string(),
+                    scope: Some("global".to_string()),
+                    session_id: None,
+                },
+            ))
+            .await
+            .expect("task.query answers");
+        if let Some(found) = board["tasks"]
+            .as_array()
+            .and_then(|t| t.iter().find(|t| t["title"] == "Write the lexer first"))
+        {
+            break found.clone();
+        }
+        assert!(
+            started.elapsed() < READY_HANG_CEILING,
+            "no sub-card on the board: {board}"
+        );
+        tokio::time::sleep(READY_POLL_INTERVAL).await;
+    };
+    assert_eq!(sub_card["parent_id"], id, "under the card: {sub_card}");
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// P25 Stage 3 on the real daemon: a member hands part of its card to
+/// another member with the real `todo` tool. The sub-card is that member's —
+/// it gets its own run beside the first one, never served to the first — and
+/// its verdict closes the parent card.
+#[tokio::test]
+async fn a_member_hands_a_sub_card_to_another_member() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"{"decision":"assign","member":"agent:builder","reason":"it builds"}"#.to_string(),
+        r#"CALL todo {"action":"add","title":"Review the parser","assignee":"agent:reviewer"}"#
+            .to_string(),
+        "Reviewed: it holds up.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    for name in ["Builder", "Reviewer"] {
+        let created = client
+            .request(nanna_client::Action::Member(
+                nanna_client::MemberAction::Create {
+                    name: name.to_string(),
+                    workspace_id: None,
+                    personal: false,
+                    avatar: None,
+                    profile: None,
+                },
+            ))
+            .await
+            .expect("member.create answers");
+        assert!(created.get("error").is_none(), "{created}");
+    }
+
+    let id = create_global_card(&client, "Ship the parser").await;
+    let card = card_when(&client, id, "closed", |card| {
+        card["task"]["status"] == "done"
+    })
+    .await;
+    let board = client
+        .request(nanna_client::Action::Task(
+            nanna_client::TaskAction::Query {
+                filter: "subtask".to_string(),
+                scope: Some("global".to_string()),
+                session_id: None,
+            },
+        ))
+        .await
+        .expect("task.query answers");
+    let handed_on = board["tasks"]
+        .as_array()
+        .and_then(|t| t.iter().find(|t| t["title"] == "Review the parser"))
+        .cloned()
+        .unwrap_or_else(|| panic!("the handed-on sub-card: {board} / {card}"));
+    assert_eq!(handed_on["parent_id"], id, "{handed_on}");
+    assert_eq!(handed_on["assignee"], "agent:reviewer", "{handed_on}");
+    let sub_id = handed_on["id"].as_i64().expect("id");
+    let sub = card_when(&client, sub_id, "closed by its member", |c| {
+        c["task"]["status"] == "done"
+    })
+    .await;
+    let notes = sub["notes"].as_array().cloned().unwrap_or_default();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n["author_member_id"] == "agent:reviewer" && n["kind"] == "verdict"),
+        "the reviewer's own run closed it: {sub}"
+    );
     client.disconnect().await;
     daemon.stop();
 }

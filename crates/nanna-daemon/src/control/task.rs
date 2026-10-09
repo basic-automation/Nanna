@@ -12,7 +12,7 @@ impl ControlPlane {
     /// Control-plane clients have no session of their own to fall back on
     /// (unlike a tool call, where the bridge supplies the running session), so
     /// the error names the field to send and the scopes that need no id.
-    async fn resolve_task_scope(
+    pub(super) async fn resolve_task_scope(
         &self,
         scope: Option<&str>,
         session_id: Option<&str>,
@@ -52,8 +52,18 @@ impl ControlPlane {
         let repo = storage.tasks();
 
         match action {
-            TaskAction::List { scope, session_id, include_closed } => {
-                self.task_list(&repo, scope, session_id, include_closed).await
+            TaskAction::List {
+                scope,
+                session_id,
+                include_closed,
+                workspace_id,
+            } => {
+                let board = BoardScope {
+                    scope,
+                    session_id,
+                    workspace_id,
+                };
+                self.task_list(&repo, board, include_closed).await
             }
 
             TaskAction::Get { id } => {
@@ -75,8 +85,17 @@ impl ControlPlane {
                 let request = CreateTask {
                     title, scope, session_id, parent_id, description, priority, labels, tools,
                     due_at, deadline_at, recurrence, depends_on, acceptance, project, assignee,
+                    workspace_id: None,
                 };
                 self.task_create(&repo, request).await
+            }
+
+            TaskAction::QuickAdd { text, scope, parent_id, workspace_id } => {
+                self.task_quick_add(&repo, &text, scope, parent_id, workspace_id).await
+            }
+
+            TaskAction::Assigned { member_id, limit } => {
+                Self::task_assigned(&repo, member_id, limit).await
             }
 
             TaskAction::Update { id, patch } => Self::task_update(&repo, id, &patch).await,
@@ -88,30 +107,25 @@ impl ControlPlane {
                 Err(e) => json!({"error": "task_delete_failed", "message": e.to_string()}),
             },
 
-            TaskAction::Note { id, content } => {
-                // A note from the GUI is the human posting on the card's
-                // thread, so it names the human member (P25 decision 2). The
-                // legacy `author` string stays "gui" until Stage 4 drops it.
-                match repo
-                    .post(
-                        id,
-                        Some("gui"),
-                        Some(nanna_storage::HUMAN_MEMBER_ID),
-                        nanna_storage::TaskNoteKind::Comment,
-                        &content,
-                    )
-                    .await
-                {
-                    Ok(note) => json!({"note": note}),
-                    Err(e) => json!({"error": "task_note_failed", "message": e.to_string()}),
-                }
-            }
+            TaskAction::Note { id, content } => Self::task_note(&repo, id, &content).await,
 
             TaskAction::Query { filter, scope, session_id } => {
                 self.task_query(&repo, &filter, scope, session_id).await
             }
 
             TaskAction::StartRun {
+                card_id: Some(card_id),
+                workdir,
+                max_wall_clock_secs,
+                max_total_tokens,
+                ..
+            } => {
+                let limits = (max_wall_clock_secs, max_total_tokens);
+                self.start_card_run(storage, card_id, workdir, limits).await
+            }
+
+            TaskAction::StartRun {
+                card_id: None,
                 goal,
                 scope,
                 session_id,
@@ -123,9 +137,91 @@ impl ControlPlane {
                 self.start_task_run(storage, goal, (scope, session_id), workdir, limits).await
             }
 
-            TaskAction::RunStatus { scope, session_id } => self.task_run_status(scope, session_id).await,
+            TaskAction::RunStatus {
+                card_id: Some(card_id),
+                ..
+            } => self.card_run_status(card_id).await,
 
-            TaskAction::CancelRun { scope, session_id } => self.cancel_task_run(scope, session_id).await,
+            TaskAction::RunStatus {
+                card_id: None,
+                scope,
+                session_id,
+            } => self.task_run_status(scope, session_id).await,
+
+            TaskAction::CancelRun {
+                card_id: Some(card_id),
+                ..
+            } => self.cancel_card_run(card_id).await,
+
+            TaskAction::CancelRun {
+                card_id: None,
+                scope,
+                session_id,
+            } => self.cancel_task_run(scope, session_id).await,
+
+            TaskAction::Verdicts { window } => Self::task_verdicts(&repo, window).await,
+        }
+    }
+
+    /// `TaskAction::Note`: a note from the GUI is the human posting on the
+    /// card's thread, so it names the human member (P25 decision 2). The
+    /// legacy `author` string stays "gui" until Stage 4 drops it.
+    async fn task_note(repo: &TaskRepository, id: i64, content: &str) -> Value {
+        match repo
+            .post(
+                id,
+                Some("gui"),
+                Some(nanna_storage::HUMAN_MEMBER_ID),
+                nanna_storage::TaskNoteKind::Comment,
+                content,
+            )
+            .await
+        {
+            Ok(note) => json!({"note": note}),
+            Err(e) => json!({"error": "task_note_failed", "message": e.to_string()}),
+        }
+    }
+
+    /// `TaskAction::Assigned`: a member's open cards on every board.
+    async fn task_assigned(
+        repo: &TaskRepository,
+        member_id: Option<String>,
+        limit: Option<usize>,
+    ) -> Value {
+        let limit = limit.unwrap_or(nanna_storage::ASSIGNED_CARDS_MAX);
+        if limit == 0 || limit > nanna_storage::ASSIGNED_CARDS_MAX {
+            return json!({
+                "error": "bad_limit",
+                "message": format!(
+                    "limit must be in 1..={}, got {limit}",
+                    nanna_storage::ASSIGNED_CARDS_MAX
+                ),
+            });
+        }
+        let member_id =
+            member_id.unwrap_or_else(|| nanna_storage::HUMAN_MEMBER_ID.to_string());
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        match repo.assigned_open(&member_id, limit).await {
+            Ok(cards) => json!({ "member_id": member_id, "today": today, "cards": cards }),
+            Err(e) => json!({"error": "task_assigned_failed", "message": e.to_string()}),
+        }
+    }
+
+    /// `TaskAction::Verdicts`: the per-member, per-label verdict rollup.
+    async fn task_verdicts(repo: &TaskRepository, window: Option<usize>) -> Value {
+        let window = window.unwrap_or(crate::protocol::TASK_VERDICT_WINDOW_DEFAULT);
+        if window == 0 || window > nanna_storage::VERDICT_WINDOW_MAX {
+            return json!({
+                "error": "bad_window",
+                "message": format!(
+                    "window must be in 1..={}, got {window}",
+                    nanna_storage::VERDICT_WINDOW_MAX
+                ),
+            });
+        }
+        match repo.verdict_rollup(window).await {
+            Ok(tallies) => json!({ "window": window, "verdicts": tallies }),
+            Err(e) => json!({"error": "task_verdicts_failed", "message": e.to_string()}),
         }
     }
 
@@ -140,17 +236,58 @@ impl ControlPlane {
             .map_err(|message| json!({"error": "bad_scope", "message": message}))
     }
 
+    /// [`Self::resolve_task_scope`], except that a `workspace` scope with an
+    /// explicit `workspace_id` names that registered workspace's board instead
+    /// of the daemon's active one. A client shows its own board; resolving
+    /// "workspace" to whatever another client last activated would list, and
+    /// put cards on, a board it is not showing.
+    ///
+    /// # Errors
+    /// The reason, worded for the client: an unknown scope, a missing session
+    /// id or active workspace, or a `workspace_id` that is not registered.
+    pub(super) async fn resolve_board_scope(
+        &self,
+        scope: Option<&str>,
+        session_id: Option<&str>,
+        workspace_id: Option<&str>,
+    ) -> Result<(String, Option<String>), String> {
+        let explicit = workspace_id.map(str::trim).filter(|id| !id.is_empty());
+        let wants_workspace = scope.is_some_and(|s| s.eq_ignore_ascii_case("workspace"));
+        let Some(id) = explicit.filter(|_| wants_workspace) else {
+            return self.resolve_task_scope(scope, session_id).await;
+        };
+        if self.workspaces.read().await.get(id).is_none() {
+            return Err(format!(
+                "workspace '{id}' is not registered — open it first, or leave workspace_id out \
+                 for the active workspace's board"
+            ));
+        }
+        debug_assert!(!id.is_empty(), "filtered above");
+        Ok(("workspace".to_string(), Some(id.to_string())))
+    }
+
     /// `TaskAction::List`.
     async fn task_list(
         &self,
         repo: &TaskRepository,
-        scope: Option<String>,
-        session_id: Option<String>,
+        board: BoardScope,
         include_closed: Option<bool>,
     ) -> Value {
-        let (scope, scope_id) = match self.task_scope_or_reply(scope, session_id).await {
+        let BoardScope {
+            scope,
+            session_id,
+            workspace_id,
+        } = board;
+        let resolved = self
+            .resolve_board_scope(
+                scope.as_deref(),
+                session_id.as_deref(),
+                workspace_id.as_deref(),
+            )
+            .await;
+        let (scope, scope_id) = match resolved {
             Ok(resolved) => resolved,
-            Err(reply) => return reply,
+            Err(message) => return json!({"error": "bad_scope", "message": message}),
         };
         match repo
             .list(&scope, scope_id.as_deref(), include_closed.unwrap_or(true))
@@ -180,11 +317,17 @@ impl ControlPlane {
 
     /// `TaskAction::Create`: place the task (a subtask in its parent's scope),
     /// canonicalize its acceptance, and create it.
-    async fn task_create(&self, repo: &TaskRepository, request: CreateTask) -> Value {
+    pub(super) async fn task_create(&self, repo: &TaskRepository, request: CreateTask) -> Value {
         let CreateTask {
             title, scope, session_id, parent_id, description, priority, labels, tools,
             due_at, deadline_at, recurrence, depends_on, acceptance, project, assignee,
+            workspace_id,
         } = request;
+        let recurrence = match recurrence.as_deref().map(crate::tasks::admit_recurrence) {
+            None => None,
+            Some(Ok(admitted)) => admitted,
+            Some(Err(message)) => return json!({"error": "bad_recurrence", "message": message}),
+        };
         // A subtask always lives in its parent's scope and inherits
         // its ladder position; a new root task appends after
         // everything (sort_order 0 would jump the whole queue).
@@ -197,7 +340,11 @@ impl ControlPlane {
             }
         } else {
             let (scope, scope_id) = match self
-                .resolve_task_scope(scope.as_deref(), session_id.as_deref())
+                .resolve_board_scope(
+                    scope.as_deref(),
+                    session_id.as_deref(),
+                    workspace_id.as_deref(),
+                )
                 .await
             {
                 Ok(resolved) => resolved,
@@ -248,6 +395,8 @@ impl ControlPlane {
             acceptance,
             assignee,
             sort_order,
+            // IPC writers are recorded as `gui`, as its update and complete are.
+            created_by: Some("gui".to_string()),
         };
         // No `created` event is emitted here. `TaskRepository::create` emits
         // `Event::TaskEvent{ kind: Created }` for every writer, not just this
@@ -288,6 +437,16 @@ impl ControlPlane {
             }
             None => None,
         };
+        // An empty string clears it, like the dates; anything else must parse.
+        let recurrence = match patch
+            .get("recurrence")
+            .and_then(Value::as_str)
+            .map(crate::tasks::admit_recurrence)
+        {
+            None => None,
+            Some(Ok(admitted)) => Some(admitted),
+            Some(Err(message)) => return json!({"error": "bad_recurrence", "message": message}),
+        };
         let task_patch = TaskPatch {
             title: patch
                 .get("title")
@@ -296,7 +455,7 @@ impl ControlPlane {
             description: patch
                 .get("description")
                 .and_then(Value::as_str)
-                .map(|s| Some(s.to_string())),
+                .map(clearable),
             status: patch
                 .get("status")
                 .and_then(Value::as_str)
@@ -305,20 +464,20 @@ impl ControlPlane {
             labels: patch
                 .get("labels")
                 .filter(|v| v.is_array())
-                .map(&string_vec),
-            tool_scope: patch.get("tools").filter(|v| v.is_array()).map(&string_vec),
+                .map(string_vec),
+            tool_scope: patch.get("tools").filter(|v| v.is_array()).map(string_vec),
+            // `null` skips a field like everywhere else in a patch, so an
+            // empty string is how a client clears a date or a description
+            // (the board's inputs send "" when emptied).
             due_at: patch
                 .get("due_at")
                 .and_then(Value::as_str)
-                .map(|s| Some(s.to_string())),
+                .map(clearable),
             deadline_at: patch
                 .get("deadline_at")
                 .and_then(Value::as_str)
-                .map(|s| Some(s.to_string())),
-            recurrence: patch
-                .get("recurrence")
-                .and_then(Value::as_str)
-                .map(|s| Some(s.to_string())),
+                .map(clearable),
+            recurrence,
             depends_on: patch.get("depends_on").filter(|v| v.is_array()).map(|v| {
                 v.as_array()
                     .map(|arr| arr.iter().filter_map(Value::as_i64).collect())
@@ -357,16 +516,16 @@ impl ControlPlane {
                     return json!({"error": "bad_acceptance", "message": message});
                 }
             };
-            // Default to the active workspace root — the daemon's own
-            // cwd is meaningless for workspace artifacts.
+            // Explicit > the card's own board > the active workspace — the
+            // same order a card run uses. Judging a board card against the
+            // ACTIVE workspace computed its verdict from another project's
+            // files whenever a different board was open.
             let dir = match workdir {
                 Some(dir) => PathBuf::from(dir),
                 None => self
-                    .workspaces
-                    .read()
+                    .card_workspace_root(&task)
                     .await
-                    .active()
-                    .map_or_else(|| PathBuf::from("."), |w| w.path.clone()),
+                    .unwrap_or_else(|| PathBuf::from(".")),
             };
             let verdict = check.run(&dir).await;
             let _ = repo
@@ -389,6 +548,21 @@ impl ControlPlane {
             }),
             Err(e) => json!({"error": "task_done_failed", "message": e.to_string()}),
         }
+    }
+
+    /// The root a card's work is judged in: its own board's workspace when it
+    /// is on one that is registered, else the active workspace.
+    async fn card_workspace_root(&self, card: &nanna_storage::Task) -> Option<PathBuf> {
+        let registry = self.workspaces.read().await;
+        let root = card
+            .scope_id
+            .as_deref()
+            .filter(|_| card.scope == "workspace")
+            .and_then(|id| registry.get(id))
+            .or_else(|| registry.active())
+            .map(|w| w.path.clone());
+        drop(registry);
+        root
     }
 
     /// `TaskAction::Query`.
@@ -460,7 +634,39 @@ impl ControlPlane {
             "harness".to_string(),
             Some(event_tx.clone()),
         );
-        let runner = AgentStepRunner {
+        let models = agent.chat_model_chain().await;
+        let runner = self
+            .background_runner((agent, router, tools), workspace_root, models)
+            .await;
+        let mut config = LongHorizonConfig::default();
+        if let Some(secs) = max_wall_clock_secs {
+            config.max_wall_clock = std::time::Duration::from_secs(secs);
+        }
+        config.max_total_tokens = max_total_tokens;
+
+        match task_runs
+            .start(goal, source, runner, config, dir, event_tx)
+            .await
+        {
+            Ok(()) => json!({"started": true, "scope": scope, "scope_id": scope_id}),
+            Err(message) => json!({"error": "run_start_failed", "message": message}),
+        }
+    }
+
+    /// The step runner a background run uses: no chat, no transcript, no
+    /// attachments, one repeat ledger for the whole run, and `models` walked
+    /// with failover (empty = the router's own default).
+    async fn background_runner(
+        &self,
+        (agent, router, tools): (
+            &Arc<crate::agent_service::AgentService>,
+            &Arc<crate::llm_router::LlmRouter>,
+            &Arc<nanna_tools::ToolRegistry>,
+        ),
+        workspace_root: Option<PathBuf>,
+        models: Vec<String>,
+    ) -> AgentStepRunner {
+        AgentStepRunner {
             discovered_tools: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
             // Background runs have no chat, so no user tool picks.
             user_selected_tools: Vec::new(),
@@ -486,24 +692,159 @@ impl ControlPlane {
             attachments: Arc::default(),
             // Background runs fall back down the priority list like chat.
             model_chain: {
-                let models = agent.chat_model_chain().await;
                 (!models.is_empty())
                     .then(|| Arc::new(crate::tasks::ModelChain::new(models, router)))
             },
+        }
+    }
+
+    /// What a card run needs to know before it may start: the card and the
+    /// member it is assigned to. Every refusal is the IPC reply.
+    pub(super) async fn card_claim(
+        storage: &nanna_storage::Storage,
+        card_id: i64,
+    ) -> Result<
+        (
+            nanna_storage::Task,
+            nanna_storage::Member,
+            crate::tasks::CardClaim,
+        ),
+        Value,
+    > {
+        let repo = storage.tasks();
+        let card = repo
+            .get(card_id)
+            .await
+            .map_err(|e| json!({"error": "task_not_found", "message": e.to_string()}))?;
+        if card.scope == "session" {
+            return Err(json!({"error": "not_a_board_card", "message": format!(
+                "card #{card_id} is session-scoped; only board cards (workspace or global) are worked by members"
+            )}));
+        }
+        if card.status != "pending" && card.status != "in_progress" {
+            return Err(json!({"error": "card_closed", "message": format!(
+                "card #{card_id} is {}", card.status
+            )}));
+        }
+        let Some(assignee) = card.assignee.clone() else {
+            return Err(json!({"error": "card_unassigned", "message": format!(
+                "card #{card_id} has no assignee; assign it to an agent first"
+            )}));
         };
+        let member = storage
+            .members()
+            .get(&assignee)
+            .await
+            .map_err(|e| json!({"error": "member_unreadable", "message": e.to_string()}))?;
+        if member.kind != nanna_storage::MemberKind::Agent
+            || member.id.starts_with(nanna_storage::ROUTER_MEMBER_PREFIX)
+        {
+            return Err(json!({"error": "not_an_agent", "message": format!(
+                "card #{card_id} is assigned to {}, who is not an agent that takes work", member.id
+            )}));
+        }
+        let claim = crate::tasks::CardClaim {
+            card_id,
+            member_id: member.id.clone(),
+        };
+        Ok((card, member, claim))
+    }
+
+    /// Start card `card_id`'s run as its assignment does (P25 Stage 3, see
+    /// [`crate::card_run_trigger`]): no explicit workdir, the default bounds.
+    pub(crate) async fn start_assigned_card(&self, card_id: i64) -> Value {
+        let Some(storage) = self.storage.clone() else {
+            return json!({"error": "storage_unavailable", "message": "no task store"});
+        };
+        self.start_card_run(&storage, card_id, None, (None, None))
+            .await
+    }
+
+    /// `TaskAction::StartRun {card_id}`: the card's assignee works the card's
+    /// subtree in the background (P25 Stage 3). Its notes and closings become
+    /// posts on the card threads, and it shows as busy until the run ends.
+    async fn start_card_run(
+        &self,
+        storage: &Arc<nanna_storage::Storage>,
+        card_id: i64,
+        workdir: Option<String>,
+        (max_wall_clock_secs, max_total_tokens): (Option<u64>, Option<u64>),
+    ) -> Value {
+        let Some(ref task_runs) = self.task_runs else {
+            return json!({"error": "task_runs_unavailable", "message": "run manager not attached"});
+        };
+        let (Some(agent), Some(router), Some(tools)) = (
+            self.agent.as_ref(),
+            self.router.as_ref(),
+            self.tools.as_ref(),
+        ) else {
+            return json!({"error": "agent_unavailable", "message": "agent service required"});
+        };
+        let Some(event_tx) = self.event_tx.clone() else {
+            return json!({"error": "events_unavailable", "message": "event bus required"});
+        };
+        let (card, member, claim) = match Self::card_claim(storage, card_id).await {
+            Ok(found) => found,
+            Err(reply) => return reply,
+        };
+        // Workdir: explicit > the card's own board > the active workspace.
+        let workspace_root = self.card_workspace_root(&card).await;
+        let dir = workdir
+            .map(PathBuf::from)
+            .or_else(|| workspace_root.clone())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let models = crate::board_router_trigger::router_models(
+            &member.profile,
+            &agent.chat_model_chain().await,
+        );
+        let runner = self
+            .background_runner((agent, router, tools), workspace_root, models)
+            .await;
+        let source = TursoTaskSource::new(
+            storage.clone(),
+            card.scope.clone(),
+            card.scope_id.clone(),
+            member.id.clone(),
+            Some(event_tx.clone()),
+        )
+        .within_subtree(card_id)
+        .posting_as(member.id.clone());
         let mut config = LongHorizonConfig::default();
         if let Some(secs) = max_wall_clock_secs {
             config.max_wall_clock = std::time::Duration::from_secs(secs);
         }
         config.max_total_tokens = max_total_tokens;
-
-        match task_runs
-            .start(goal, source, runner, config, dir, event_tx)
-            .await
-        {
-            Ok(()) => json!({"started": true, "scope": scope, "scope_id": scope_id}),
+        let goal = card.description.as_deref().map_or_else(
+            || card.title.clone(),
+            |description| format!("{}\n\n{description}", card.title),
+        );
+        let spec = crate::tasks::TaskRunSpec {
+            goal,
+            source,
+            runner,
+            config,
+            workdir: dir,
+        };
+        match task_runs.start_card(spec, claim, event_tx).await {
+            Ok(()) => json!({"started": true, "card_id": card_id, "member_id": member.id}),
             Err(message) => json!({"error": "run_start_failed", "message": message}),
         }
+    }
+    /// `TaskAction::RunStatus {card_id}`.
+    async fn card_run_status(&self, card_id: i64) -> Value {
+        let Some(ref task_runs) = self.task_runs else {
+            return json!({"error": "task_runs_unavailable", "message": "run manager not attached"});
+        };
+        serde_json::to_value(task_runs.card_status(card_id).await)
+            .unwrap_or_else(|_| json!({"running": false}))
+    }
+
+    /// `TaskAction::CancelRun {card_id}`.
+    async fn cancel_card_run(&self, card_id: i64) -> Value {
+        let Some(ref task_runs) = self.task_runs else {
+            return json!({"error": "task_runs_unavailable", "message": "run manager not attached"});
+        };
+        json!({"cancelled": task_runs.cancel_card(card_id).await})
     }
 
     /// `TaskAction::RunStatus`.
@@ -539,24 +880,41 @@ impl ControlPlane {
     }
 }
 
-/// The fields of a `TaskAction::Create`.
-struct CreateTask {
-    title: String,
-    scope: Option<String>,
-    session_id: Option<String>,
-    parent_id: Option<i64>,
-    description: Option<String>,
-    priority: Option<i64>,
-    labels: Option<Vec<String>>,
-    tools: Option<Vec<String>>,
-    due_at: Option<String>,
-    deadline_at: Option<String>,
-    recurrence: Option<String>,
-    depends_on: Option<Vec<i64>>,
+/// A patch's string for an optional field: `""` clears it, anything else sets it.
+fn clearable(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// The fields of a `TaskAction::Create` (and of the card a
+/// `TaskAction::QuickAdd` line becomes).
+pub(super) struct CreateTask {
+    pub(super) title: String,
+    pub(super) scope: Option<String>,
+    pub(super) session_id: Option<String>,
+    pub(super) parent_id: Option<i64>,
+    pub(super) description: Option<String>,
+    pub(super) priority: Option<i64>,
+    pub(super) labels: Option<Vec<String>>,
+    pub(super) tools: Option<Vec<String>>,
+    pub(super) due_at: Option<String>,
+    pub(super) deadline_at: Option<String>,
+    pub(super) recurrence: Option<String>,
+    pub(super) depends_on: Option<Vec<i64>>,
     /// Boxed to match `TaskAction::Create`, whose field it is moved from; see
     /// the note there. Unboxed again by `task_create` before it reaches
     /// `NewTask`, which stores the canonicalized value inline.
-    acceptance: Option<Box<Value>>,
-    project: Option<String>,
-    assignee: Option<String>,
+    pub(super) acceptance: Option<Box<Value>>,
+    pub(super) project: Option<String>,
+    pub(super) assignee: Option<String>,
+    /// With `scope: "workspace"`, this registered workspace's board rather
+    /// than the daemon's active one (see `ControlPlane::resolve_board_scope`).
+    pub(super) workspace_id: Option<String>,
+}
+
+/// Which board a request names: `scope` plus whichever id it needs.
+pub(super) struct BoardScope {
+    pub(super) scope: Option<String>,
+    pub(super) session_id: Option<String>,
+    pub(super) workspace_id: Option<String>,
 }

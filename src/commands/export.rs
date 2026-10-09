@@ -11,8 +11,6 @@ use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use nanna_client::{Client, ClientConfig, ExportFormat};
-use nanna_config::bind::LOOPBACK_HOST;
-use nanna_daemon::DEFAULT_IPC_PORT;
 use serde_json::Value;
 
 /// Wait this long for the daemon to accept the connection — the budget
@@ -73,13 +71,16 @@ impl ExportTarget {
 }
 
 /// Export `target` to `output` — a file, or a directory that receives the
-/// daemon's suggested file name — or to stdout when `output` is `None`.
+/// daemon's suggested file name — or to stdout when `output` is `None`, via
+/// the daemon at `daemon` (the local default when `None`).
 pub async fn export(
     target: ExportTarget,
     format: ExportFormatArg,
     output: Option<PathBuf>,
+    daemon: Option<String>,
 ) -> anyhow::Result<()> {
-    let client = connect().await?;
+    let address = daemon.unwrap_or_else(super::mcp::default_daemon_url);
+    let client = connect(&address).await?;
     let reply = match &target {
         ExportTarget::Session(id) => client.sessions().export(id, format.into()).await,
         ExportTarget::Memories { scope } => {
@@ -118,14 +119,8 @@ fn write_document(mut out: impl std::io::Write, content: &str) -> anyhow::Result
     }
 }
 
-async fn connect() -> anyhow::Result<Client> {
-    let address = format!("ws://{LOOPBACK_HOST}:{DEFAULT_IPC_PORT}");
-    match tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        Client::connect(ClientConfig::new(&address)),
-    )
-    .await
-    {
+async fn connect(address: &str) -> anyhow::Result<Client> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, Client::connect(ClientConfig::new(address))).await {
         Ok(Ok(client)) => Ok(client),
         Ok(Err(e)) => bail!(
             "could not reach the Nanna daemon at {address}: {e}. Start it with \

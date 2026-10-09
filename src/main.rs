@@ -155,6 +155,11 @@ enum Commands {
         /// file name. Prints to stdout when omitted.
         #[arg(short, long)]
         output: Option<std::path::PathBuf>,
+
+        /// The daemon's IPC address (default: the local daemon on the default
+        /// port) — for a daemon started with `daemon start --port`
+        #[arg(long)]
+        daemon: Option<String>,
     },
 
     /// Run a single prompt and exit
@@ -233,8 +238,8 @@ enum McpSecretAction {
 enum WorkspaceAction {
     /// Initialize a new workspace in the current directory
     Init {
-        /// Template to use (minimal, standard, project, assistant, research)
-        #[arg(short, long, default_value = "standard")]
+        /// Template to use (minimal, project)
+        #[arg(short, long, default_value = "project")]
         template: String,
 
         /// Path to initialize (defaults to current directory)
@@ -286,7 +291,15 @@ enum DaemonAction {
     Stop,
 
     /// Check daemon status
-    Status,
+    Status {
+        /// Host the daemon was started on
+        #[arg(short = 'H', long, default_value = LOOPBACK_HOST)]
+        host: String,
+
+        /// Port the daemon was started on (`daemon start --port`)
+        #[arg(short, long, default_value_t = DEFAULT_IPC_PORT)]
+        port: u16,
+    },
 
     /// Restart the daemon
     Restart {
@@ -298,6 +311,23 @@ enum DaemonAction {
         #[arg(short, long, default_value_t = DEFAULT_IPC_PORT)]
         port: u16,
     },
+}
+
+/// `nanna export`, out of `main`'s match.
+async fn run_export(command: Commands) -> anyhow::Result<()> {
+    let Commands::Export {
+        session,
+        memories,
+        scope,
+        format,
+        output,
+        daemon,
+    } = command
+    else {
+        anyhow::bail!("not the export command");
+    };
+    let target = commands::export::ExportTarget::from_cli(session, memories, scope)?;
+    commands::export::export(target, format, output, daemon).await
 }
 
 /// Parse the `--log-level` string into a level, defaulting to INFO for an
@@ -357,6 +387,41 @@ async fn run_mcp(config: &Config, action: McpAction) -> anyhow::Result<()> {
     }
 }
 
+
+/// The default config file as loaded, or — when it exists but cannot be read
+/// — an error, except for `doctor`, which runs on the defaults to report it.
+///
+/// A file that did not parse used to become the DEFAULTS, logged at info
+/// level, and every command ran on them: the first one that saved (quick
+/// setup asking for an API key, a credentials command) wrote the defaults
+/// over the user's file. A missing file is not an error (`Config::load`
+/// answers the defaults for it).
+fn config_or_refusal<E: std::fmt::Display>(
+    loaded: Result<Config, E>,
+    diagnosing: bool,
+) -> anyhow::Result<Config> {
+    match loaded {
+        Ok(config) => Ok(config),
+        Err(e) if diagnosing => {
+            info!("Using default config ({e}) — doctor reports why");
+            Ok(Config::default())
+        }
+        Err(e) => anyhow::bail!(
+            "config.toml could not be read: {e}. Fix it (`nanna doctor` checks it) — \
+             running on the defaults instead could write them over your file"
+        ),
+    }
+}
+
+/// The file `nanna doctor` reports on: the one the config was loaded from
+/// (`--config`), not always the default path.
+fn doctor_config_path(given: Option<&PathBuf>) -> anyhow::Result<PathBuf> {
+    Ok(match given {
+        Some(path) => path.clone(),
+        None => Config::default_config_path()?,
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -389,17 +454,14 @@ async fn main() -> anyhow::Result<()> {
     let config = if let Some(path) = &cli.config {
         Config::load_from(path)?
     } else {
-        Config::load().unwrap_or_else(|e| {
-            info!("Using default config ({})", e);
-            Config::default()
-        })
+        config_or_refusal(Config::load(), matches!(cli.command, Some(Commands::Doctor { .. })))?
     }
     .with_env_overrides();
 
     // Handle commands
     match cli.command {
         Some(Commands::Init) => {
-            let _config = onboarding::run_onboarding()?;
+            let _config = onboarding::run_onboarding(&doctor_config_path(cli.config.as_ref())?)?;
             return Ok(());
         }
         Some(Commands::Status) => {
@@ -407,7 +469,7 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some(Commands::Doctor { online }) => {
-            let path = Config::default_config_path()?;
+            let path = doctor_config_path(cli.config.as_ref())?;
             let worst = commands::doctor::run(&config, &path, online).await;
             // Non-zero on a real fault so this is usable from a script or a
             // health probe, not just by eye.
@@ -420,7 +482,9 @@ async fn main() -> anyhow::Result<()> {
             if generate {
                 println!("{}", nanna_config::generate_default_config());
             } else {
-                let path = Config::default_config_path()?;
+                // The file this config came from: under `--config` the
+                // default path labelled another file's settings.
+                let path = doctor_config_path(cli.config.as_ref())?;
                 println!("Config path: {}", path.display());
                 println!("\n{}", toml::to_string_pretty(&config)?);
             }
@@ -444,35 +508,25 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Server { host, port }) => {
             // Check for API key, offer quick setup if missing
-            let config = ensure_api_key(config)?;
+            let config = ensure_api_key(config, &doctor_config_path(cli.config.as_ref())?)?;
             let port = commands::serve::server_port(port, &config);
             run_server(&config, host, port).await?;
         }
         Some(Commands::Chat { session, model, stream }) => {
-            let config = interactive_config(config)?;
+            let config = interactive_config(config, &doctor_config_path(cli.config.as_ref())?)?;
             run_cli(&config, session, model, stream).await?;
         }
-        Some(Commands::Export {
-            session,
-            memories,
-            scope,
-            format,
-            output,
-        }) => {
-            let target = commands::export::ExportTarget::from_cli(session, memories, scope)?;
-            commands::export::export(target, format, output).await?;
-            return Ok(());
-        }
+        Some(export @ Commands::Export { .. }) => return run_export(export).await,
         Some(Commands::Sessions { limit }) => {
             list_sessions(&config, limit).await?;
         }
         Some(Commands::Run { prompt, model }) => {
-            let config = ensure_api_key(config)?;
+            let config = ensure_api_key(config, &doctor_config_path(cli.config.as_ref())?)?;
             run_once(&config, &prompt, model).await?;
         }
         None => {
             // Default: interactive chat.
-            let config = interactive_config(config)?;
+            let config = interactive_config(config, &doctor_config_path(cli.config.as_ref())?)?;
             run_cli(&config, None, None, false).await?;
         }
     }
@@ -482,12 +536,12 @@ async fn main() -> anyhow::Result<()> {
 
 /// The config an interactive chat starts with: onboarding on a first run,
 /// otherwise the loaded config, with quick setup offered if no API key is set.
-fn interactive_config(config: Config) -> anyhow::Result<Config> {
-    if onboarding::is_first_run() {
+fn interactive_config(config: Config, config_path: &std::path::Path) -> anyhow::Result<Config> {
+    if onboarding::is_first_run(config_path) {
         println!("Welcome! Let's get you set up first.\n");
-        return onboarding::run_onboarding();
+        return onboarding::run_onboarding(config_path);
     }
-    ensure_api_key(config)
+    ensure_api_key(config, config_path)
 }
 
 #[cfg(test)]
@@ -542,6 +596,57 @@ mod tests {
         assert_eq!(cli.config, None);
         assert_eq!(cli.host, "127.0.0.2");
         assert_eq!(cli.port, 6001);
+    }
+
+    /// `daemon status` probes the port the daemon was started on: a daemon
+    /// started with `--port` used to be reported "Not responding" because
+    /// status always probed the default.
+    #[test]
+    fn daemon_status_takes_the_port_start_was_given() {
+        let parse = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["nanna", "daemon", "status"].iter().chain(args))
+                .expect("`nanna daemon status` parses");
+            match cli.command {
+                Some(Commands::Daemon {
+                    action: DaemonAction::Status { host, port },
+                }) => (host, port),
+                _ => panic!("expected daemon status"),
+            }
+        };
+        assert_eq!(parse(&[]), (LOOPBACK_HOST.to_string(), DEFAULT_IPC_PORT));
+        assert_eq!(parse(&["--port", "6001"]).1, 6001);
+        assert_eq!(parse(&["-H", "127.0.0.2"]).0, "127.0.0.2");
+    }
+
+    /// `export` reaches a daemon started on another port: it always dialled
+    /// the default.
+    #[test]
+    fn export_takes_the_daemon_address() {
+        let daemon_of = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["nanna", "export", "--memories"].iter().chain(args))
+                .expect("`nanna export --memories` parses");
+            match cli.command {
+                Some(Commands::Export { daemon, .. }) => daemon,
+                _ => panic!("expected export"),
+            }
+        };
+        assert_eq!(daemon_of(&[]), None, "the default is resolved at run time");
+        assert_eq!(
+            daemon_of(&["--daemon", "ws://127.0.0.1:6001"]).as_deref(),
+            Some("ws://127.0.0.1:6001")
+        );
+    }
+
+    /// A config file that does not parse stops every command but `doctor`.
+    #[test]
+    fn a_config_that_does_not_parse_is_refused_not_defaulted() {
+        let broken = || Err::<Config, &str>("TOML parse error at line 3");
+        let refused = config_or_refusal(broken(), false).expect_err("refused");
+        assert!(refused.to_string().contains("line 3"), "{refused}");
+        assert!(config_or_refusal(broken(), true).is_ok(), "doctor runs to report it");
+        let mut mine = Config::default();
+        mine.llm.model = "mine".to_string();
+        assert_eq!(config_or_refusal::<&str>(Ok(mine), false).expect("ok").llm.model, "mine");
     }
 
     /// A daemon is never given its config file as `--config`, which only part

@@ -20,3 +20,7 @@ rand = "0.10"
 # WebSocket listeners
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+
+[dev-dependencies]
+# Paused-clock time control (`start_paused`) for the Discord heartbeat test.
+tokio = { workspace = true, features = ["test-util"] }

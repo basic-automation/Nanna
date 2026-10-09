@@ -18,16 +18,6 @@ pub fn millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// `value` as a `usize`: exact on 64-bit targets.
-///
-/// On a 32-bit target a value past `usize::MAX` saturates rather than
-/// truncating to its low bits — for the counts and limits read from tool
-/// parameters here, "as many as possible" is the reading of an oversized
-/// number, where truncation would turn `2^32 + 5` into `5`.
-pub fn usize_saturating(value: u64) -> usize {
-    usize::try_from(value).unwrap_or(usize::MAX)
-}
-
 /// A collection length or index as an `i64`, saturating at `i64::MAX`.
 ///
 /// Lengths and indices never exceed `isize::MAX`, which fits `i64` on every

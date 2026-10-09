@@ -14,17 +14,29 @@ use tauri::State;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-/// Persist the `[scheduler]` section and make the daemon adopt it live.
-async fn save_scheduler_config(state: &AppState) -> Result<(), String> {
-    state.config.save().map_err(|e| {
-        warn!("Failed to save scheduler settings to config: {e}");
-        format!("Failed to save scheduler settings: {e}")
-    })?;
+/// Apply `change` to the `[scheduler]` section, persist it, and make the
+/// daemon adopt it live.
+///
+/// The lock covers the change and the save — the part that must be ordered —
+/// and is released BEFORE the daemon round trip. Held across it, every other
+/// command waited on `AppState` for as long as the daemon took to answer.
+async fn update_scheduler_config(
+    state: &RwLock<AppState>,
+    change: impl FnOnce(&mut nanna_config::SchedulerConfig),
+) -> Result<(), String> {
+    let backend = {
+        let mut guard = state.write().await;
+        change(&mut guard.config.scheduler);
+        guard.config.save().map_err(|e| {
+            warn!("Failed to save scheduler settings to config: {e}");
+            format!("Failed to save scheduler settings: {e}")
+        })?;
+        Arc::clone(&guard.backend)
+    };
     // The daemon re-reads the file and pushes the section onto its live
     // scheduler. A failure here means the setting is saved but not yet in
     // effect, so surface it rather than reporting success.
-    state
-        .backend
+    backend
         .config_reload()
         .await
         .map(|_| ())
@@ -44,10 +56,7 @@ pub async fn set_scheduler_enabled(
     state: State<'_, Arc<RwLock<AppState>>>,
     enabled: bool,
 ) -> Result<(), String> {
-    let mut state_guard = state.write().await;
-    state_guard.config.scheduler.enabled = enabled;
-    save_scheduler_config(&state_guard).await?;
-    drop(state_guard);
+    update_scheduler_config(&state, |scheduler| scheduler.enabled = enabled).await?;
     info!("Scheduler enabled: {enabled}");
     Ok(())
 }
@@ -65,10 +74,7 @@ pub async fn set_heartbeat_enabled(
     state: State<'_, Arc<RwLock<AppState>>>,
     enabled: bool,
 ) -> Result<(), String> {
-    let mut state_guard = state.write().await;
-    state_guard.config.scheduler.heartbeat_enabled = enabled;
-    save_scheduler_config(&state_guard).await?;
-    drop(state_guard);
+    update_scheduler_config(&state, |scheduler| scheduler.heartbeat_enabled = enabled).await?;
     info!("Heartbeat enabled: {enabled}");
     Ok(())
 }
@@ -92,10 +98,10 @@ pub async fn set_heartbeat_interval(
             nanna_core::MIN_HEARTBEAT_INTERVAL_SECS
         ));
     }
-    let mut state_guard = state.write().await;
-    state_guard.config.scheduler.heartbeat_interval_secs = seconds;
-    save_scheduler_config(&state_guard).await?;
-    drop(state_guard);
+    update_scheduler_config(&state, |scheduler| {
+        scheduler.heartbeat_interval_secs = seconds;
+    })
+    .await?;
     info!("Heartbeat interval: {seconds}s");
     Ok(())
 }
@@ -288,40 +294,6 @@ pub async fn delete_cron_job(
 ) -> Result<bool, String> {
     let result = backend_handle(&state).await.scheduler_remove(&job_id).await?;
     Ok(result.get("status").and_then(|v| v.as_str()) == Some("deleted"))
-}
-
-/// Delete all cron jobs with a given name (useful for cleanup).
-///
-/// # Errors
-///
-/// Fails when the daemon cannot be reached or the `scheduler.list` request, or
-/// any `scheduler.remove` that follows it, is dropped or times out. Removals
-/// made before such a failure stand.
-#[tauri::command]
-pub async fn delete_cron_jobs_by_name(
-    state: State<'_, Arc<RwLock<AppState>>>,
-    name: String,
-) -> Result<usize, String> {
-    let backend = backend_handle(&state).await;
-    // No by-name removal over IPC — list, filter, remove each.
-    let result = backend.scheduler_list().await?;
-    let ids: Vec<String> = result
-        .get("jobs")
-        .and_then(|v| v.as_array())
-        .map_or_default(|arr| {
-            arr.iter()
-                .filter(|j| j.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
-                .filter_map(|j| j.get("id").and_then(|v| v.as_str()).map(str::to_string))
-                .collect()
-        });
-    let mut removed = 0;
-    for id in &ids {
-        let result = backend.scheduler_remove(id).await?;
-        if result.get("status").and_then(|v| v.as_str()) == Some("deleted") {
-            removed += 1;
-        }
-    }
-    Ok(removed)
 }
 
 /// Run a cron job immediately.

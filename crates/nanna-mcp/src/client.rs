@@ -69,6 +69,13 @@ pub struct McpClient<T: Transport> {
     elicitor: Option<Arc<dyn crate::elicit::Elicitor>>,
 }
 
+/// Most `tools/list` pages followed.
+///
+/// Bound justification: at the smallest page size a server would sensibly use
+/// (about 10 tools) this is ~640 tools — far past what a model can be offered —
+/// while a server that never stops returning cursors cannot hold the client.
+const TOOL_LIST_PAGES_MAX: usize = 64;
+
 impl<T: Transport> McpClient<T> {
     /// Create a new MCP client with the given transport
     pub fn new(transport: T) -> Self {
@@ -293,20 +300,31 @@ impl<T: Transport> McpClient<T> {
         *self.capabilities.write().await = Some(result.capabilities.clone());
         *self.initialized.write().await = true;
 
-        if result.capabilities.tools.is_some()
-            && let Ok(tools_result) = self.list_tools_internal().await
-        {
-            *self.tools.write().await = Self::gate_tool_schemas(tools_result.tools);
+        // A failed pre-fetch leaves that list empty — for tools, a server that
+        // connected but offers nothing. That used to be silent, so "my MCP tools
+        // are missing" had no trace in the log; now it names the server and why.
+        let server = &result.server_info.name;
+        if result.capabilities.tools.is_some() {
+            match self.list_tools_internal().await {
+                Ok(tools_result) => {
+                    *self.tools.write().await = Self::gate_tool_schemas(tools_result.tools);
+                }
+                Err(e) => warn!(%server, error = %e, "MCP tools/list failed; no tools registered"),
+            }
         }
-        if result.capabilities.resources.is_some()
-            && let Ok(resources_result) = self.list_resources_internal().await
-        {
-            *self.resources.write().await = resources_result.resources;
+        if result.capabilities.resources.is_some() {
+            match self.list_resources_internal().await {
+                Ok(resources_result) => {
+                    *self.resources.write().await = resources_result.resources;
+                }
+                Err(e) => warn!(%server, error = %e, "MCP resources/list failed"),
+            }
         }
-        if result.capabilities.prompts.is_some()
-            && let Ok(prompts_result) = self.list_prompts_internal().await
-        {
-            *self.prompts.write().await = prompts_result.prompts;
+        if result.capabilities.prompts.is_some() {
+            match self.list_prompts_internal().await {
+                Ok(prompts_result) => *self.prompts.write().await = prompts_result.prompts,
+                Err(e) => warn!(%server, error = %e, "MCP prompts/list failed"),
+            }
         }
     }
 
@@ -375,8 +393,40 @@ impl<T: Transport> McpClient<T> {
     }
 
     /// List available tools (internal, no init check)
+    /// Every page of `tools/list`, following `nextCursor`.
+    ///
+    /// Only the first page used to be read, so a server that paginates had
+    /// every tool past its first page silently unregistered. Bounded by
+    /// [`TOOL_LIST_PAGES_MAX`], and a cursor that repeats ends the walk: a
+    /// server returning the same cursor forever would otherwise hold boot.
     async fn list_tools_internal(&self) -> Result<ListToolsResult> {
-        self.request("tools/list", None).await
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..TOOL_LIST_PAGES_MAX {
+            let params = cursor.as_ref().map(|c| serde_json::json!({ "cursor": c }));
+            let page: ListToolsResult = self.request("tools/list", params).await?;
+            tools.extend(page.tools);
+            match page.next_cursor {
+                Some(next) if !next.is_empty() && cursor.as_ref() != Some(&next) => {
+                    cursor = Some(next);
+                }
+                _ => {
+                    return Ok(ListToolsResult {
+                        tools,
+                        next_cursor: None,
+                    });
+                }
+            }
+        }
+        warn!(
+            "MCP server still paginating after {TOOL_LIST_PAGES_MAX} tools/list pages; \
+             using the {} tools read so far",
+            tools.len()
+        );
+        Ok(ListToolsResult {
+            tools,
+            next_cursor: cursor,
+        })
     }
 
     /// List available tools
@@ -785,22 +835,6 @@ impl McpClient<crate::StdioTransport> {
 }
 
 #[cfg(feature = "http")]
-impl McpClient<crate::HttpTransport> {
-    /// Connect to an HTTP MCP server
-    ///
-    /// # Errors
-    ///
-    /// Returns error if connection or initialization fails
-    pub async fn connect(url: impl Into<String>) -> Result<Self> {
-        let transport = crate::HttpTransport::connect(url).await?;
-        let client = Self::new(transport);
-        // The deprecated HTTP+SSE transport predates the modern era entirely.
-        client.initialize_legacy().await?;
-        Ok(client)
-    }
-}
-
-#[cfg(feature = "http")]
 impl McpClient<crate::StreamableHttpTransport> {
     /// Connect to a Streamable HTTP MCP endpoint in whichever era it speaks:
     /// a modern (2026-07-28) server is used statelessly, a 2025-era one
@@ -894,6 +928,82 @@ mod tests {
         // Flag was consumed: a following call serves the refreshed cache, no request.
         let after = client.list_tools().await.unwrap();
         assert_eq!(after[0].name, "tool-1");
+    }
+
+    /// A server that paginates `tools/list` two tools at a time over three
+    /// pages, and one that never stops returning the same cursor.
+    struct PagingTransport {
+        stuck: bool,
+        pages_served: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for PagingTransport {
+        async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
+            self.pages_served.fetch_add(1, Ordering::SeqCst);
+            let cursor = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("cursor"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let (page, next) = match (self.stuck, cursor.as_deref()) {
+                (true, _) => (0, Some("again")),
+                (false, None) => (0, Some("p1")),
+                (false, Some("p1")) => (1, Some("p2")),
+                (false, _) => (2, None),
+            };
+            let result = serde_json::json!({
+                "tools": [
+                    { "name": format!("t{page}a"), "inputSchema": {} },
+                    { "name": format!("t{page}b"), "inputSchema": {} },
+                ],
+                "nextCursor": next,
+            });
+            Ok(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: Some(result),
+                error: None,
+            })
+        }
+        async fn notify(&self, _n: JsonRpcNotification) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Only the first page was ever read: a paginating server had every tool
+    /// past it silently unregistered.
+    #[tokio::test]
+    async fn every_page_of_tools_list_is_read_and_a_repeating_cursor_ends_it() {
+        let client = McpClient::new(PagingTransport {
+            stuck: false,
+            pages_served: AtomicUsize::new(0),
+        });
+        *client.initialized.write().await = true;
+        let names: Vec<String> = client
+            .refresh_tools()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, ["t0a", "t0b", "t1a", "t1b", "t2a", "t2b"]);
+
+        let stuck = McpClient::new(PagingTransport {
+            stuck: true,
+            pages_served: AtomicUsize::new(0),
+        });
+        *stuck.initialized.write().await = true;
+        let tools = stuck.refresh_tools().await.unwrap();
+        assert_eq!(
+            tools.len(),
+            4,
+            "the first page, then the repeated cursor stops the walk"
+        );
     }
 
     /// A transport that returns a fixed mix of safe and unsafe tool schemas, so a test
