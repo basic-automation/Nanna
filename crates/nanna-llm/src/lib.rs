@@ -1122,8 +1122,13 @@ impl PaceState {
         if let Some(remaining) = remaining {
             self.remaining = Some(remaining);
         }
-        if let Some(reset_in) = reset_in {
-            self.reset_at = Some(tokio::time::Instant::now() + reset_in);
+        // `checked_add`: the header is the provider's, and `Instant + Duration`
+        // panics past what an `Instant` can hold. A reset that far out is no
+        // usable window; keep the last one.
+        if let Some(reset_at) =
+            reset_in.and_then(|delay| tokio::time::Instant::now().checked_add(delay))
+        {
+            self.reset_at = Some(reset_at);
         }
     }
 }

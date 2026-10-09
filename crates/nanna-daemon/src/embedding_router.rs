@@ -49,6 +49,21 @@ const BACKOFF_SECS: [u64; 7] = [2, 5, 15, 30, 60, 120, 240];
 /// stays put. Reuse that rather than invent a second number.
 const DEMOTION_SECS: u64 = BACKOFF_SECS[BACKOFF_SECS.len() - 1];
 
+/// When a bench of `cooldown` starting at `now` ends.
+///
+/// `cooldown` can come straight from a provider's `Retry-After`, which nothing
+/// upstream caps, and `Instant + Duration` PANICS on overflow — under
+/// `panic = "abort"` a buggy or hostile endpoint publishing ~1e19 seconds took
+/// the daemon down. A horizon past what `Instant` can hold is no usable
+/// instruction, so it is treated as none: the standard [`DEMOTION_SECS`].
+fn bench_until(now: Instant, cooldown: Duration) -> Instant {
+    let until = now
+        .checked_add(cooldown)
+        .unwrap_or_else(|| now + Duration::from_secs(DEMOTION_SECS));
+    debug_assert!(until >= now, "a bench never ends before it starts");
+    until
+}
+
 /// A provider held out after a deterministic failure.
 #[derive(Debug, Clone, Copy)]
 struct Bench {
@@ -182,7 +197,7 @@ impl EmbeddingRouter {
     /// again sooner with that credential is a guaranteed error per call.
     async fn demote(&self, idx: usize, cooldown: Duration, credential: u64) {
         self.demoted_until.write().await[idx] = Some(Bench {
-            until: Instant::now() + cooldown,
+            until: bench_until(Instant::now(), cooldown),
             credential,
         });
     }
@@ -485,6 +500,19 @@ fn announce_congestion_wait(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unrepresentable_retry_after_benches_for_the_standard_horizon() {
+        let now = Instant::now();
+        assert_eq!(
+            bench_until(now, Duration::MAX),
+            now + Duration::from_secs(DEMOTION_SECS)
+        );
+        assert_eq!(
+            bench_until(now, Duration::from_secs(45)),
+            now + Duration::from_secs(45)
+        );
+    }
     use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

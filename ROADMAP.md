@@ -9130,6 +9130,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       Both paths now reinforce-and-return only when the neighbour contains the text verbatim, fold
       otherwise, and fall through to a row of its own when the fold lands nothing. Test
       `a_new_detail_in_the_reinforce_band_is_kept` (both paths; fails with the old `Reinforce` arm).
+- [x] *(found 2026-10-09, same audit)* **A huge `Retry-After` could abort the daemon.**
+      `embedding_router::demote` computed `Instant::now() + cooldown` with the cooldown taken
+      straight from a provider's published retry (no upstream cap); `Instant + Duration` panics on
+      overflow and `panic = "abort"` turns that into a dead daemon. Same shape in `nanna-llm`'s
+      rate-limit `learn` (`reset_in` from a header epoch). Now `bench_until` uses `checked_add`
+      and treats an unrepresentable horizon as none (the standard `DEMOTION_SECS`); `learn` keeps
+      its last window. 1 test.
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
