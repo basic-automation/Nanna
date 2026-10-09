@@ -111,7 +111,7 @@ impl SessionRepository {
         let mut rows = conn
             .query(
                 "SELECT id, session_id, channel, user_id, created_at, updated_at, metadata, workspace_id, name 
-                 FROM sessions ORDER BY updated_at DESC LIMIT ?1",
+                 FROM sessions ORDER BY datetime(updated_at) DESC, id DESC LIMIT ?1",
                 turso::params![limit],
             )
             .await?;
@@ -151,14 +151,14 @@ impl SessionRepository {
             Some(ws_id) => {
                 conn.query(
                     "SELECT id, session_id, channel, user_id, created_at, updated_at, metadata, workspace_id, name 
-                     FROM sessions WHERE workspace_id = ?1 ORDER BY updated_at DESC LIMIT ?2",
+                     FROM sessions WHERE workspace_id = ?1 ORDER BY datetime(updated_at) DESC, id DESC LIMIT ?2",
                     turso::params![ws_id, limit],
                 ).await?
             }
             None => {
                 conn.query(
                     "SELECT id, session_id, channel, user_id, created_at, updated_at, metadata, workspace_id, name 
-                     FROM sessions WHERE workspace_id IS NULL ORDER BY updated_at DESC LIMIT ?1",
+                     FROM sessions WHERE workspace_id IS NULL ORDER BY datetime(updated_at) DESC, id DESC LIMIT ?1",
                     turso::params![limit],
                 ).await?
             }

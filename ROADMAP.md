@@ -9295,9 +9295,12 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       maintained as `MAX(...)`, so the daily tooltip now says "Slowest" rather than "P95" (the
       table's P95 comes from the live tracker and is a real percentile). The tool-call log sorted
       on one-second `created_at` alone; it now breaks ties on `id`.
-      **Filed from the same audit, not fixed this run:** `sessions.updated_at` is written as RFC
-      3339 by some paths and as `datetime('now')` by others and sorted as text (a rename can make
-      the wrong session the default after a restart); `update_content` NULLs `memories.embedding`
+      *(same run)* `sessions.updated_at` is written as RFC 3339 by the daemon's paths and as
+      `datetime('now')` by rename/workspace/touch, and was sorted as text (a space sorts below
+      `T`): a session renamed at 15:00 listed below one touched at 09:00 the same day, and the
+      first row is the default session on boot. Every session list now orders by
+      `datetime(updated_at)`, ties on `id` (test `sessions_sort_by_time_not_by_timestamp_text`).
+      **Filed from the same audit, not fixed this run:** `update_content` NULLs `memories.embedding`
       without the zero-then-checkpoint the other vector-clearing paths do; the usage/daily windows
       cover `days + 1` calendar days.
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with

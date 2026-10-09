@@ -1372,8 +1372,13 @@ impl Storage {
     pub async fn list_daemon_sessions(&self) -> Result<Vec<Session>, StorageError> {
         let conn = self.conn.lock().await;
         let mut rows = conn.query(
+            // `datetime(...)`: `updated_at` is written as RFC 3339 by the
+            // daemon's own paths and as `datetime('now')` by the rename /
+            // workspace / touch paths, and as text a space sorts below `T` —
+            // a session renamed at 15:00 sorted below one touched at 09:00
+            // the same day, and the first row is the default session on boot.
             "SELECT id, session_id, channel, user_id, created_at, updated_at, metadata, workspace_id, name
-             FROM sessions ORDER BY updated_at DESC",
+             FROM sessions ORDER BY datetime(updated_at) DESC, id DESC",
             (),
         ).await?;
         let mut sessions = Vec::new();
