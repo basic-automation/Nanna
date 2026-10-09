@@ -4519,13 +4519,18 @@ impl DaemonServer {
             }));
             let health_state = Arc::new(state);
 
-            // Update session count
+            // Update the session and client counts. The client count had no
+            // writer at all, so `/status` always said `clients: 0` with the
+            // GUI connected.
             let sessions_for_health = self.sessions.clone();
+            let ipc_for_health = Arc::clone(&self.ipc);
             let health_state_clone = health_state.clone();
             tokio::spawn(async move {
                 loop {
                     let count = sessions_for_health.count().await;
                     health_state_clone.set_session_count(count).await;
+                    let clients = ipc_for_health.client_count().await;
+                    health_state_clone.set_client_count(clients).await;
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             });

@@ -9274,10 +9274,11 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       form `memory.create` writes; empty removes; written through) and the handler applies both
       fields. `system.restart` answered `{"status":"restarting"}` and did nothing; it now says
       `unsupported`, as `system.shutdown` does when it cannot act (nothing calls it). Test
-      `tags_can_be_replaced_and_removed`. **Filed, not fixed:** `health.rs`'s
-      `set_client_count` / `set_last_error` have no production caller, so `/status` always shows
-      `clients: 0`, `last_error: null`; and a failed config save on a tool toggle / `config.set`
-      still replies success.
+      `tags_can_be_replaced_and_removed`. *(same run)* `/status` always said `clients: 0` —
+      `set_client_count` had no caller; the health loop now feeds it the IPC server's count
+      (live: one WebSocket client connected → `clients: 1`). **Filed, not fixed:**
+      `set_last_error` still has no caller (`last_error` is always null), and a failed config save
+      on a tool toggle / `config.set` still replies success.
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
