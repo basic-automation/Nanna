@@ -644,6 +644,7 @@ fn nanna_stat(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<
     match result {
         Ok(stat) => {
             let obj = boa_engine::object::JsObject::with_object_proto(context.intrinsics());
+            obj.set(js_string!("path"), JsValue::from(js_string!(stat.path.to_string_lossy().as_ref())), false, context)?;
             obj.set(js_string!("size"), JsValue::from(crate::u64_to_f64(stat.size)), false, context)?;
             obj.set(js_string!("is_file"), JsValue::from(stat.is_file), false, context)?;
             obj.set(js_string!("is_dir"), JsValue::from(stat.is_dir), false, context)?;

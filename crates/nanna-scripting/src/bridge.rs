@@ -1312,6 +1312,7 @@ impl NannaBridge {
             .map(|d| d.as_secs());
 
         Ok(FileStat {
+            path,
             size: metadata.len(),
             is_file: metadata.is_file(),
             is_dir: metadata.is_dir(),
@@ -1398,6 +1399,11 @@ pub struct DirEntry {
 /// File stat result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileStat {
+    /// The path as resolved — `~` expanded, a relative path joined onto the
+    /// workspace — and permitted. A skill hands THIS to a service: services
+    /// take a raw path, so a relative one resolved against the daemon's own
+    /// working directory and skipped the skill's read scope entirely.
+    pub path: std::path::PathBuf,
     pub size: u64,
     pub is_file: bool,
     pub is_dir: bool,
@@ -2178,6 +2184,28 @@ mod tests {
         ] {
             assert_eq!(strip_outer_quotes(input), want, "input: {input}");
         }
+    }
+
+    /// `stat` hands back the path the bridge resolved — the one a skill passes
+    /// on to a service, which would otherwise resolve a relative path against
+    /// the daemon's own working directory and skip the skill's read scope.
+    #[tokio::test]
+    async fn stat_returns_the_resolved_permitted_path() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("spec.pdf"), b"%PDF").expect("file");
+        let root = workspace.path().to_string_lossy().to_string();
+        let bridge = NannaBridge::new(ToolPermissions::none().with_read([root.as_str()]))
+            .with_default_workdir(workspace.path());
+        let stat = bridge.stat("spec.pdf").await.expect("stat");
+        assert_eq!(stat.path, workspace.path().join("spec.pdf"));
+        assert!(stat.is_file);
+        // Outside the read scope, stat refuses — so a skill cannot reach a
+        // service with that path either.
+        let refused = bridge.stat("../outside.pdf").await;
+        assert!(
+            matches!(refused, Err(ScriptError::Permission(_))),
+            "{refused:?}"
+        );
     }
 
     #[test]

@@ -9571,6 +9571,19 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `an_unusable_exec_timeout_means_the_default_not_an_instant_kill`. **Not capped, on purpose:**
       a long build legitimately asks for more than the 120 s auto window, and the run's own wall
       clock already bounds it.
+- [x] *(found 2026-10-09, audit of the tool runtime)* **`read_pdf`, `analyze_image`,
+      `describe_image`, `ocr` and `transcribe` handed the services a raw path.** `pdf.read`,
+      `vision.analyze` and `audio.transcribe` take the path as given, so `read_pdf("docs/spec.pdf")`
+      in a workspace resolved against the daemon's own working directory ("Cannot stat…", reported
+      as "PDF reading service not available") — and the call skipped the skill's read scope
+      entirely. `Nanna.stat` now returns the `path` the bridge resolved and permitted, and all five
+      skills pass that on (a refused or missing file answers "Error: cannot read …"). Test
+      `stat_returns_the_resolved_permitted_path`.
+      **Filed from the same audit, not fixed this run:** the `python` tool's default workdir is
+      the daemon's cwd (and a given one `os.chdir`s the whole process); GUI user tools execute
+      with no workspace, services or session (`user_tools.rs` passes `None, None`); `web_fetch`
+      throws on network errors instead of returning `{content, success:false}`, and the bridge
+      reads a response body whole before `max_chars` applies.
 - [x] Tool authoring: `tools.update` refuses bundled names and runs `check_syntax`; GUI
       `update_skill` validates the name (`tool_authoring.rs:99,236`, `gui/.../tools.rs:458`). Both
       move with the `default-skills` → tools rename.
