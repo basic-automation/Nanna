@@ -9215,6 +9215,14 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       silently (`job_to_task` recomputes `next_run` from now and ignores the stored one), while
       one-shots and intervals catch up — "missed-job handling on startup" is a backlog feature,
       so the catch-up policy (once? never?) is an owner call.
+- [x] *(found 2026-10-09, audit of the control plane)* **The IPC read deadline never fired.**
+      `pump_incoming` wrapped `ws_rx.next()` in a fresh `timeout(45 s)` on every pass through its
+      `select!`, and the 15 s ping tick ends a pass — so the deadline restarted before it could
+      expire, and a peer that went silent without a FIN (network drop, laptop sleep) held its
+      connection until the kernel's TCP retransmission gave up, many minutes later. Now one timer,
+      reset only when a frame (a pong included) arrives. `pump_incoming` is generic over the
+      stream so a test can drive it: `a_silent_peer_is_dropped_at_the_read_deadline` (paused
+      clock, a never-yielding stream).
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
