@@ -3066,17 +3066,69 @@ impl MemoryEventRepository {
         source_id: &str,
         limit: usize,
     ) -> Result<Vec<MemoryEventRow>, StorageError> {
-        check_page(limit)?;
-        if source_id.is_empty() || source_id.contains('"') {
-            return Err(StorageError::Invalid(format!(
-                "a source id to match must be non-empty and unquoted, got {source_id:?}"
-            )));
-        }
-        let pattern = format!("%\"{source_id}\"%");
+        self.page_for_source(source_id, limit, MEMORY_EVENTS_FOR_SOURCE).await
+    }
+
+    /// The NEWEST `limit` events naming `source_id`, oldest first.
+    ///
+    /// [`Self::for_source`] pages from the start, so a source with more than a
+    /// page of events (a long-running card) is otherwise known only by its
+    /// beginning.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::for_source`].
+    pub async fn newest_for_source(
+        &self,
+        source_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryEventRow>, StorageError> {
+        let mut newest = self
+            .page_for_source(source_id, limit, MEMORY_EVENTS_FOR_SOURCE_NEWEST)
+            .await?;
+        newest.reverse();
+        debug_assert!(
+            newest.windows(2).all(|w| (w[0].ts_unix_ms, w[0].id) <= (w[1].ts_unix_ms, w[1].id)),
+            "oldest first"
+        );
+        Ok(newest)
+    }
+
+    /// How many events name `source_id` — all of them, not a page.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::for_source`].
+    pub async fn count_for_source(&self, source_id: &str) -> Result<usize, StorageError> {
+        let pattern = source_pattern(source_id)?;
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                MEMORY_EVENTS_FOR_SOURCE,
+                "SELECT COUNT(*) FROM memory_events WHERE source_ids LIKE ?1",
+                turso::params![pattern],
+            )
+            .await?;
+        let count = match rows.next().await? {
+            Some(row) => row.get::<i64>(0)?,
+            None => 0,
+        };
+        drop(rows);
+        drop(conn);
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    async fn page_for_source(
+        &self,
+        source_id: &str,
+        limit: usize,
+        sql: &str,
+    ) -> Result<Vec<MemoryEventRow>, StorageError> {
+        check_page(limit)?;
+        let pattern = source_pattern(source_id)?;
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                sql,
                 turso::params![pattern, i64::try_from(limit).unwrap_or(i64::MAX)],
             )
             .await?;
@@ -3089,6 +3141,17 @@ impl MemoryEventRepository {
         debug_assert!(out.len() <= limit, "the page cap must hold");
         Ok(out)
     }
+}
+
+/// The `LIKE` pattern matching events whose `source_ids` JSON array names
+/// `source_id`.
+fn source_pattern(source_id: &str) -> Result<String, StorageError> {
+    if source_id.is_empty() || source_id.contains('"') {
+        return Err(StorageError::Invalid(format!(
+            "a source id to match must be non-empty and unquoted, got {source_id:?}"
+        )));
+    }
+    Ok(format!("%\"{source_id}\"%"))
 }
 
 /// Reject a backwards window rather than returning an empty page for it: an
@@ -3163,6 +3226,14 @@ SELECT id, event_id, ts_unix_ms, kind, workspace_id, content,
 FROM memory_events
 WHERE source_ids LIKE ?1
 ORDER BY ts_unix_ms ASC, id ASC
+LIMIT ?2";
+
+const MEMORY_EVENTS_FOR_SOURCE_NEWEST: &str = "
+SELECT id, event_id, ts_unix_ms, kind, workspace_id, content,
+       content_len_chars, embedding, embedding_model, salience, created_at, source_ids
+FROM memory_events
+WHERE source_ids LIKE ?1
+ORDER BY ts_unix_ms DESC, id DESC
 LIMIT ?2";
 
 const RECENT_MEMORY_EVENTS: &str = "

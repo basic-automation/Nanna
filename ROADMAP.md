@@ -9224,8 +9224,11 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       returned, coverage "complete"); `search_owned_by` filtered once more after that. Both now go
       through `search_admitting`, which widens the window ×4 until `k` are admitted or it covers
       every comparable row (test `a_small_scope_is_not_starved_by_the_rest_of_the_store`).
-      **Filed from the same audit, not fixed this run:** the card fold
-      (`memory_write_through`) reads only a card's oldest 1 000 episodes and never re-folds past it.
+      *(same run)* The card fold (`memory_write_through`) read only a card's oldest 1 000
+      episodes, recorded that as covered, and never re-folded however many came after. It now
+      counts every episode (`count_for_source`) for the covered mark, and a card past one page is
+      folded from its oldest and newest half-pages (`newest_for_source`) — test
+      `a_long_card_folds_from_both_ends_and_refolds_when_it_grows`.
 - [x] *(found 2026-10-09, audit of scheduling)* **Cron matched day-of-month AND day-of-week.**
       `CronExpr::matches` required both, while standard (Vixie) cron fires on EITHER when both are
       restricted — so `0 9 1,15 * 1` ran only on a Monday that was the 1st or 15th, and
