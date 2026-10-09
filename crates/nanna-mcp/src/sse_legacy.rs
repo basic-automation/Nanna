@@ -168,7 +168,7 @@ async fn post_message(
     if status.is_success() {
         return Ok(());
     }
-    let body = response.text().await.unwrap_or_default();
+    let body = crate::streamable_http::read_error_body(response, 2048).await;
     Err(McpError::HttpStatus {
         status: status.as_u16(),
         body: body.chars().take(512).collect(),

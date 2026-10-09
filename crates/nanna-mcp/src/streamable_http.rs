@@ -43,6 +43,59 @@ pub const HTTP_REQUEST_TIMEOUT: Duration = crate::MCP_REQUEST_TIMEOUT;
 /// memory without limit.
 pub const HTTP_BODY_BYTES_MAX: usize = 16 * 1024 * 1024;
 
+/// A response body, read chunk by chunk and refused past `cap` bytes.
+///
+/// `Response::bytes` buffered the whole body before the size check could run,
+/// so the cap bounded nothing: a non-SSE multi-GB body (bounded only by the
+/// 60 s request timeout) was held in memory first. Declared lengths are
+/// refused up front; undeclared ones as soon as they cross the cap.
+///
+/// # Errors
+/// `McpError::Protocol` past the cap, `McpError::Transport` on a read error.
+pub(crate) async fn read_body_capped(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>> {
+    let too_large = || McpError::Protocol(format!("response body exceeded {cap} bytes"));
+    if response
+        .content_length()
+        .is_some_and(|declared| usize::try_from(declared).map_or(true, |len| len > cap))
+    {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| McpError::Transport(e.to_string()))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > cap {
+            return Err(too_large());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    debug_assert!(bytes.len() <= cap, "never more than the cap is held");
+    Ok(bytes)
+}
+
+/// At most the first `max` bytes of an error body, as text — read only that
+/// far. Error bodies are shown in a message, so the rest is never wanted, and
+/// `Response::text` read all of it first, however large.
+pub(crate) async fn read_error_body(mut response: reqwest::Response, max: usize) -> String {
+    let mut bytes = Vec::new();
+    while bytes.len() < max {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = max - bytes.len();
+                bytes.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    debug_assert!(bytes.len() <= max, "never more than asked for");
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// A `subscriptions/listen` stream that has been silent this long is
 /// reopened.
 ///
@@ -511,15 +564,7 @@ impl StreamableHttpTransport {
         if is_sse && status.is_success() {
             return self.read_sse(request, response).await;
         }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| McpError::Transport(e.to_string()))?;
-        if bytes.len() > HTTP_BODY_BYTES_MAX {
-            return Err(McpError::Protocol(format!(
-                "response body exceeded {HTTP_BODY_BYTES_MAX} bytes"
-            )));
-        }
+        let bytes = read_body_capped(response, HTTP_BODY_BYTES_MAX).await?;
         // A JSON-RPC body is the server's answer whatever the status: modern
         // servers put their era-identifying errors in 400 and 404 bodies.
         if let Some(answer) = json_rpc_answer(&bytes, &request.id) {
@@ -777,7 +822,7 @@ impl Transport for StreamableHttpTransport {
         if status.is_success() {
             return Ok(());
         }
-        let body = response.text().await.unwrap_or_default();
+        let body = read_error_body(response, ERROR_BODY_BYTES_MAX).await;
         Err(McpError::HttpStatus {
             status: status.as_u16(),
             body: body.chars().take(ERROR_BODY_BYTES_MAX).collect(),
@@ -831,6 +876,54 @@ impl Transport for StreamableHttpTransport {
 
 #[cfg(test)]
 mod tests {
+    /// Serve one canned HTTP response on a loopback port; its URL.
+    async fn serve_once(head: &'static str, body: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0_u8; 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// The cap bounds what is READ, not what is kept after reading it all.
+    #[tokio::test]
+    async fn a_body_past_the_cap_is_refused_and_an_error_body_is_cut() {
+        let client = reqwest::Client::new();
+        let declared = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n",
+            vec![b'a'; 64],
+        )
+        .await;
+        let response = client.get(&declared).send().await.expect("send");
+        assert!(read_body_capped(response, 16).await.is_err());
+
+        let streamed = serve_once(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+            vec![b'b'; 64],
+        )
+        .await;
+        let response = client.get(&streamed).send().await.expect("send");
+        assert!(read_body_capped(response, 16).await.is_err());
+
+        let error = serve_once(
+            "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n",
+            vec![b'e'; 64],
+        )
+        .await;
+        let response = client.get(&error).send().await.expect("send");
+        assert_eq!(read_error_body(response, 10).await, "e".repeat(10));
+    }
+
     use super::*;
     use serde_json::json;
 

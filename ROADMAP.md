@@ -9643,11 +9643,16 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       the TypeScript SDK does. Test `a_message_endpoint_must_stay_on_the_connections_origin`.
       **Filed from the same audit, not fixed this run:** a stdio MCP server started via `npx`/`uvx`
       is killed without its process group, orphaning the real server (`nanna-proc` has the group
-      kill); Streamable HTTP buffers a whole body before its 16 MiB check (and `notify`/SSE error
-      bodies are unbounded); the encrypted-credentials file fallback has no cross-process lock
+      kill); the encrypted-credentials file fallback has no cross-process lock
       (a CLI `mcp secret set` racing the daemon can lose a key or corrupt the envelope via the fixed
       `credentials.enc.tmp`); a 404 on a legacy Streamable-HTTP session never re-initializes; and a
       dropped legacy SSE GET stream leaves every later request waiting its full 60 s.
+      *(same run)* **Streamable HTTP's 16 MiB cap bounded nothing.** `read_answer` buffered the
+      whole body (`Response::bytes`) before comparing it to `HTTP_BODY_BYTES_MAX`, and the
+      `notify` and legacy-SSE error paths read error bodies with `Response::text`, unbounded. Now
+      `read_body_capped` reads chunk by chunk (declared lengths refused up front) and
+      `read_error_body` reads only the prefix it will show. Test
+      `a_body_past_the_cap_is_refused_and_an_error_body_is_cut` (loopback server).
 - [x] Tool authoring: `tools.update` refuses bundled names and runs `check_syntax`; GUI
       `update_skill` validates the name (`tool_authoring.rs:99,236`, `gui/.../tools.rs:458`). Both
       move with the `default-skills` → tools rename.
