@@ -431,8 +431,7 @@ struct DiscordInteraction {
 #[derive(Debug, Deserialize)]
 struct DiscordInteractionData {
     name: Option<String>,
-#[serde(rename = "options")]
-    _options: Option<Vec<DiscordOption>>,
+    options: Option<Vec<DiscordOption>>,
     custom_id: Option<String>,
 }
 
@@ -440,8 +439,28 @@ struct DiscordInteractionData {
 struct DiscordOption {
 #[serde(rename = "name")]
     _name: String,
-#[serde(rename = "value")]
-    _value: Value,
+    #[serde(default)]
+    value: Value,
+}
+
+impl DiscordInteractionData {
+    /// What the user asked: the command's string options, joined — not the
+    /// command's name. `/ask question:"what's the weather"` used to reach the
+    /// agent as `ask`. A command with no string option (or a component's
+    /// `custom_id`) falls back to the name, as before.
+    fn content(&self) -> Option<String> {
+        let typed: Vec<&str> = self
+            .options
+            .iter()
+            .flatten()
+            .filter_map(|option| option.value.as_str())
+            .filter(|text| !text.trim().is_empty())
+            .collect();
+        if typed.is_empty() {
+            return self.name.clone().or_else(|| self.custom_id.clone());
+        }
+        Some(typed.join(" "))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -571,9 +590,7 @@ async fn discord_webhook(
     let user = interaction.member.map(|m| m.user).or(interaction.user);
     
     let webhook_message = user.and_then(|u| {
-        let content = interaction.data.as_ref().and_then(|d| {
-            d.name.clone().or_else(|| d.custom_id.clone())
-        })?;
+        let content = interaction.data.as_ref().and_then(DiscordInteractionData::content)?;
         
         Some(WebhookMessage {
             sender_id: u.id.clone(),
@@ -598,8 +615,16 @@ async fn discord_webhook(
         error!("Failed to send Discord webhook event: {}", e);
     }
     
-    // Acknowledge the interaction (type 5 = DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE)
-    (StatusCode::OK, Json(json!({"type": 5}))).into_response()
+    // Answer the interaction now (type 4 = CHANNEL_MESSAGE_WITH_SOURCE). The
+    // agent's reply goes out later as an ordinary channel message, never as
+    // this interaction's follow-up — so the deferred answer (type 5) this
+    // used to send was never completed, and Discord marked every command
+    // "The application did not respond" when its token expired.
+    (
+        StatusCode::OK,
+        Json(json!({"type": 4, "data": {"content": "Working on it…"}})),
+    )
+        .into_response()
 }
 
 // =============================================================================
@@ -1184,6 +1209,32 @@ impl WebhookServer {
 
 /// Default webhook server port
 pub const DEFAULT_WEBHOOK_PORT: u16 = 3000;
+
+#[cfg(test)]
+mod discord_content_tests {
+    use super::DiscordInteractionData;
+
+    fn data(json: serde_json::Value) -> DiscordInteractionData {
+        serde_json::from_value(json).expect("an interaction's data parses")
+    }
+
+    #[test]
+    fn a_slash_command_carries_what_the_user_typed() {
+        let ask = data(serde_json::json!({
+            "name": "ask",
+            "options": [{ "name": "question", "type": 3, "value": "what's the weather" }]
+        }));
+        assert_eq!(ask.content().as_deref(), Some("what's the weather"));
+        let bare = data(serde_json::json!({ "name": "status" }));
+        assert_eq!(bare.content().as_deref(), Some("status"), "no option: the name");
+        let button = data(serde_json::json!({ "custom_id": "approve" }));
+        assert_eq!(button.content().as_deref(), Some("approve"));
+        let numeric = data(serde_json::json!({
+            "name": "roll", "options": [{ "name": "sides", "type": 4, "value": 6 }]
+        }));
+        assert_eq!(numeric.content().as_deref(), Some("roll"), "only text options are text");
+    }
+}
 
 #[cfg(test)]
 mod tests {

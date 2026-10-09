@@ -9335,14 +9335,17 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       started a second turn — `message.or(edited_message)` in the listener and both webhook
       handlers — so fixing a typo ran the agent again (a duplicate reply, tool side effects
       again). Edits are now acknowledged and ignored, and the listener no longer subscribes to
-      them (test `an_edited_message_does_not_start_a_turn`).
+      them (test `an_edited_message_does_not_start_a_turn`). *(same run)* The daemon's Discord
+      interaction webhook handed the agent the command's NAME (`/ask question:"…"` arrived as
+      `ask`) and answered with a deferred response it never completed, so Discord marked every
+      command failed; the string options are now the message and the interaction is answered at
+      once ("Working on it…"), the reply following as a channel message (test
+      `a_slash_command_carries_what_the_user_typed`).
       *(same run)* Telegram replies went out as legacy `Markdown` with no fallback, so an
       unmatched `_` (a file name) made Telegram refuse the whole reply; a refused parse is now
       resent once as plain text (test `a_reply_telegram_cannot_parse_is_resent_as_plain_text`).
       **Filed from the same audit, not fixed this run:** model text is not converted to
-      Telegram's MarkdownV2/HTML (it arrives unformatted when refused); the daemon's
-      Discord interaction webhook passes the command name instead of its options and never
-      completes the deferred response; `nanna serve`'s Slack and Discord handlers return the
+      Telegram's MarkdownV2/HTML (it arrives unformatted when refused); `nanna serve`'s Slack and Discord handlers return the
       reply in the HTTP body (Slack ignores it and retries the event up to 3 times; Discord needs
       an answer within 3 s).
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
