@@ -1320,13 +1320,17 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       "Memory saved", and activating a workspace another client had closed showed it Active while
       the daemon's tool cwd never moved (the GUI now asks the daemon first and changes its own view
       only on success). New shared `commands::daemon_refusal` (1 test).
-      **Filed from the same audit, not fixed this run — the first is serious:** the GUI loads its
-      config copy once at boot and every local settings setter (`set_agent_name`,
+      *(same run)* **The GUI's settings setters reverted the daemon's config changes.** The GUI
+      loaded its config copy once at boot and every local setter (`set_agent_name`,
       `set_streaming_enabled`, `set_max_tokens`, the iteration policy, the memory setters) saves
-      that whole stale copy over `config.toml`, which the daemon's watcher then loads — so a tool
-      disabled on the Tools page (written by the daemon) is silently re-enabled by the next
-      settings change, and hand edits are reverted; the fix is to route setters through
-      `config.set`. Also: `init_workspace` re-registers the active workspace as inactive;
+      that whole copy over `config.toml` — so a tool disabled on the Tools page (the daemon writes
+      that) was silently re-enabled by the next unrelated setting, and `nanna config set` / hand
+      edits were reverted. The event forwarder now reloads the copy (`load_gui_config`, the boot
+      path, off the runtime) on every `ConfigChanged` before the views hear it. **Verified in the
+      real GUI over WebDriver** (isolated daemon): `set_tool_enabled web_fetch false` →
+      `set_agent_name Verifier` → `config.toml` holds both `name = "Verifier"` and
+      `disabled = ["web_fetch"]`. Residual: a setter racing the event by milliseconds; routing
+      setters through `config.set` is the full fix. Also open from this audit: `init_workspace` re-registers the active workspace as inactive;
       `set_embedding_config` reports success on a failed save and never tells the daemon.
       *(same run)* Two fixed: the Memory page's Workspace tab with no workspace open forwarded the
       literal `"workspace"` (listed the globals under that label; Clear matched nothing and said

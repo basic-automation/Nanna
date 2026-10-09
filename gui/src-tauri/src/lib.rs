@@ -99,11 +99,14 @@ async fn hydrate_workspaces(backend: &Backend, cache: &RwLock<WorkspaceRegistry>
     }
 }
 
-/// Build the thin-client [`AppState`]. All heavy subsystems live in the daemon.
+/// The GUI's copy of the config, read from disk the way the boot reads it.
 ///
-/// Nothing here needs the daemon. The state has to exist before the daemon
-/// answers, which can take minutes, because every command needs it.
-fn setup_state(backend: Arc<Backend>, log_buffer: LogBuffer) -> AppState {
+/// Also how the copy is REFRESHED when the daemon announces a change: the copy
+/// used to be read once at boot, and every local settings setter saves the
+/// whole copy back — so a change the daemon had written in between (a tool
+/// disabled on the Tools page, a `config set`, a hand edit) was silently
+/// reverted by the next unrelated setting.
+pub(crate) fn load_gui_config() -> Config {
     let mut config = Config::load().unwrap_or_default().with_env_overrides();
 
     // `Config::load` already hydrated `llm.anthropic_oauth_token` from the
@@ -118,6 +121,15 @@ fn setup_state(backend: Arc<Backend>, log_buffer: LogBuffer) -> AppState {
         info!("Rehydrated Anthropic OAuth token from Claude CLI credential store");
         config.llm.anthropic_oauth_token = Some(loaded.credential.access_token);
     }
+    config
+}
+
+/// Build the thin-client [`AppState`]. All heavy subsystems live in the daemon.
+///
+/// Nothing here needs the daemon. The state has to exist before the daemon
+/// answers, which can take minutes, because every command needs it.
+fn setup_state(backend: Arc<Backend>, log_buffer: LogBuffer) -> AppState {
+    let config = load_gui_config();
 
     let workspaces = Arc::new(RwLock::new(WorkspaceRegistry::new()));
 
