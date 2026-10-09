@@ -10005,8 +10005,12 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `ToolsApi::execute_until_answered` — no client-side deadline, the tool's own timeout bounds
       the call, and a dropped connection still ends the wait (test
       `a_tool_call_waits_for_the_daemons_answer`, slow mock daemon).
-      **Filed from the same audit, not fixed this run:** `nanna mcp serve` never reconnects. *(same run)* `nanna-daemon install` wrote the defaults whatever it was
-      given; the unit/plist/SCM arguments now carry its `--host`/`--port`/`--health-port`/
+      *(same run)* `nanna mcp serve` never reconnected: after a daemon restart every proxied call
+      failed `NotConnected` for the life of the process. It now goes through
+      `nanna_client::DaemonLink`, which reopens the connection before a call when it has dropped
+      and retries once only a call that was never sent (test
+      `the_next_call_after_a_daemon_restart_works`).
+      *(same run)* `nanna-daemon install` wrote the defaults whatever it was given; the unit/plist/SCM arguments now carry its `--host`/`--port`/`--health-port`/
       `--data-dir` (absolute), and a set `NANNA_CONFIG_PATH` becomes the unit's `Environment=` /
       the plist's `EnvironmentVariables` (tests
       `the_installed_service_runs_the_daemon_install_was_given`,
