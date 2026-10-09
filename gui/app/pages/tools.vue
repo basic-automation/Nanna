@@ -760,14 +760,14 @@ async function saveTool() {
       await invoke('create_user_tool', {
         name: editingTool.value.name,
         description: editingTool.value.description,
-        code: editingTool.value.code,
+        source: editingTool.value.code,
       })
       creating.value = false
     } else {
       await invoke('update_user_tool', {
         name: editingTool.value.name,
         description: editingTool.value.description,
-        code: editingTool.value.code,
+        source: editingTool.value.code,
       })
     }
     originalCode.value = editingTool.value.code

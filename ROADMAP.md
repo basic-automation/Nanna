@@ -1302,6 +1302,17 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       recoverable alert panel + Try again/Reload; e2e force hook `__NANNA_FORCE_ERROR__` asserted in
       `e2e/error-boundary.spec.ts`.
 
+- [x] *(found 2026-10-09, audit of the GUI)* **The Tools page could not create a tool, and "saved"
+      code edits it never sent.** `tools.vue` passed `code` to `create_user_tool` /
+      `update_user_tool`, which take `source`; Tauri ignores unknown keys, so create failed on the
+      missing required `source` and update changed only the description while the page marked the
+      code saved. Fixed, and the class is now guarded: `tests/unit/invokeArguments.spec.ts` reads
+      every `#[tauri::command]` signature (camelCase keys, `Option` = optional, injected
+      `State`/`AppHandle`/`Window` skipped) and checks every literal `invoke('x', {…})` passes
+      only known keys and every required one (calls with a non-literal or spread argument are
+      skipped). It also caught `ChannelStatusLive`'s `interval_ms` (Tauri wants `intervalMs`).
+      Mutation-checked: the old `code` keys fail it.
+
 ##### UI / UX bugfix (known + sweep)
 - [x] **Empty / loading / error / offline** states for every page (chat, logs, memory, tools, channels, stats,
       scheduler, workspaces, agents) — no silent blank panels; retry or next-step where recovery exists.
