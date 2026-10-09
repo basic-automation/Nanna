@@ -9500,6 +9500,17 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       and the state flipping, with no deterministic hook). e2e daemon suite: 42/42.
 
 **Independent — fix when in the file:**
+- [x] *(review 2026-09-22, "fix when in the file")* **The REST reply returned the session's oldest
+      message.** `POST /api/sessions/{id}/messages` ran the turn, then re-read the session with
+      `get_by_session(id, 1)` — an `ORDER BY created_at ASC LIMIT` query — so every reply after a
+      session's first answered with the session's FIRST message (usually the user's opening line).
+      *(2026-10-09)* `AppState::process_message_reply` hands back the row `create` returned for this
+      turn (`ProcessedReply { text, stored }`); the route answers from it and never re-reads. A failed
+      write is now logged instead of `let _ =`-discarded, and the reply still carries the agent's
+      text with id 0. `process_message` (webhooks, `/api/chat`) keeps its `String` shape. 2 tests.
+      **Not changed:** `GET …/messages` still returns the *oldest* 100 messages of a long session —
+      the repository has no newest-N read; `nanna-server` is not a supported surface until P25
+      decides what stays (see the webhooks item), so that is filed rather than built.
 - [x] `nanna-simd` NEON arm has a trailing semicolon and does not compile on aarch64
       (`lib.rs:174,204`); `nanna-gpu` `search` must check buffer limits, `append` dirty index
       off-by-one; `nanna-bench` fixture divides by 24 576 instead of 2^24; `src/installer/windows/
