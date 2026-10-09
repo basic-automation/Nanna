@@ -8709,6 +8709,14 @@ as its turn (`TurnAdmission`, scope default `session`).
             are store (UTC) days while the date picker means a local day, so in UTC−5 after 19:00
             a deadline set "today" already reads overdue and `friday` typed on Thursday evening
             resolves a week out. Which clock a board's "today" is belongs with decision 10.
+      - [x] *(found 2026-10-09, audit of the P25 store/daemon)* **A card deferred by quick-add or
+            the date picker started at once.** Both store `due_at` as a bare `YYYY-MM-DD`;
+            `card_run_trigger::is_deferred` read it with `parse_db_time` (RFC 3339 or
+            `%Y-%m-%d %H:%M:%S` only), and an unreadable date defers nothing by design — so
+            `Ship docs @builder next friday` started builder's run immediately while the board said
+            "Deferred until …". A bare date now arrives at 00:00 UTC of its day, the same day the
+            store's `due` announcement (the run worker's wake) uses. 2 cases added to
+            `only_an_open_unblocked_agent_card_whose_date_has_come_starts`.
 - [ ] Delete: session table + `SessionManager`, `ChatAction::*`, `chat_harness.rs` continuation
       loop, empty-bubble gating, per-session pinned model, GUI chat pages and commands, channel
       adapters + `channel_secrets` + per-channel pinned models, `scheduler.target_channel/
