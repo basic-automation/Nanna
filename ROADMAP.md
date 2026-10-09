@@ -9521,6 +9521,14 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `permissions.run` stayed `true` — and `true` replaced the tool's whole permission set with a
       default one, dropping its read/write/net scopes. It now sets `run` on the tool's current
       permissions either way. Test `needs_shell_grants_and_revokes_without_dropping_scopes`.
+- [x] *(found 2026-10-09, audit of the tool runtime)* **`exec(timeout=0)` killed the command on
+      its first poll.** `Nanna.exec`'s timeout went through a truncating conversion, so `0`, a
+      negative, `NaN` or `0.5` became `Some(0)` — a zero-second deadline — which the `exec` skill
+      then misreported as "killed at the auto-detected deadline". Below one second now means the
+      bridge's auto-detected default; fractions round up. Test
+      `an_unusable_exec_timeout_means_the_default_not_an_instant_kill`. **Not capped, on purpose:**
+      a long build legitimately asks for more than the 120 s auto window, and the run's own wall
+      clock already bounds it.
 - [x] Tool authoring: `tools.update` refuses bundled names and runs `check_syntax`; GUI
       `update_skill` validates the name (`tool_authoring.rs:99,236`, `gui/.../tools.rs:458`). Both
       move with the `default-skills` → tools rename.
