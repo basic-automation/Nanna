@@ -1326,10 +1326,13 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       that whole stale copy over `config.toml`, which the daemon's watcher then loads — so a tool
       disabled on the Tools page (written by the daemon) is silently re-enabled by the next
       settings change, and hand edits are reverted; the fix is to route setters through
-      `config.set`. Also: the Memory page's Workspace tab with no workspace open sends the literal
-      `"workspace"` (lists globals, clears nothing, says cleared); `init_workspace` re-registers the
-      active workspace as inactive; clearing an Agent Loop number field saves `1`;
+      `config.set`. Also: `init_workspace` re-registers the active workspace as inactive;
       `set_embedding_config` reports success on a failed save and never tells the daemon.
+      *(same run)* Two fixed: the Memory page's Workspace tab with no workspace open forwarded the
+      literal `"workspace"` (listed the globals under that label; Clear matched nothing and said
+      "cleared") — `resolve_memory_scope` now refuses it with a reason (1 test); and clearing an
+      Agent Loop number field saved `1` (`Math.max(1, Math.round(""))`, capping every run at one
+      iteration) — the save now refuses anything but a whole number ≥ 1.
 
 ##### UI / UX bugfix (known + sweep)
 - [x] **Empty / loading / error / offline** states for every page (chat, logs, memory, tools, channels, stats,

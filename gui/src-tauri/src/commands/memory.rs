@@ -286,10 +286,21 @@ fn memory_item_from_json(m: &serde_json::Value) -> Option<MemoryItem> {
 /// literal "workspace" plus the active workspace's id — forwarding the
 /// literal matched a workspace named "workspace" (nothing) and showed the
 /// global set on both tabs (observed live).
-fn resolve_memory_scope(scope: Option<String>, workspace_id: Option<String>) -> Option<String> {
+///
+/// With no workspace open the Workspace tab names no workspace at all. It used
+/// to forward the literal `"workspace"` anyway: the list showed the global
+/// memories under the Workspace label, and Clear matched nothing and still
+/// said "Memories cleared". That is now refused with a reason.
+fn resolve_memory_scope(
+    scope: Option<String>,
+    workspace_id: Option<String>,
+) -> Result<Option<String>, String> {
     match scope.as_deref() {
-        Some("workspace") => workspace_id.or(scope),
-        _ => scope,
+        Some("workspace") => workspace_id
+            .filter(|id| !id.trim().is_empty())
+            .map(Some)
+            .ok_or_else(|| "No workspace is open — open one to see its memories".to_string()),
+        _ => Ok(scope),
     }
 }
 
@@ -306,7 +317,7 @@ pub async fn list_memories(
     scope: Option<String>,
     workspace_id: Option<String>,
 ) -> Result<Vec<MemoryItem>, String> {
-    let effective = resolve_memory_scope(scope, workspace_id);
+    let effective = resolve_memory_scope(scope, workspace_id)?;
     let result = backend_handle(&state)
         .await
         .memory_list(effective.as_deref())
@@ -387,7 +398,7 @@ pub async fn clear_memories(
     scope: Option<String>,
     workspace_id: Option<String>,
 ) -> Result<(), String> {
-    let effective = resolve_memory_scope(scope, workspace_id);
+    let effective = resolve_memory_scope(scope, workspace_id)?;
     let reply = backend_handle(&state)
         .await
         .memory_clear(effective.as_deref())
@@ -403,4 +414,24 @@ pub async fn clear_memories(
     }
     info!("Cleared memories (scope: {:?}, via daemon)", effective);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_memory_scope;
+
+    #[test]
+    fn the_workspace_tab_needs_an_open_workspace() {
+        assert!(resolve_memory_scope(Some("workspace".into()), None).is_err());
+        assert!(resolve_memory_scope(Some("workspace".into()), Some(" ".into())).is_err());
+        assert_eq!(
+            resolve_memory_scope(Some("workspace".into()), Some("ws-1".into())),
+            Ok(Some("ws-1".to_string()))
+        );
+        assert_eq!(
+            resolve_memory_scope(Some("global".into()), None),
+            Ok(Some("global".to_string()))
+        );
+        assert_eq!(resolve_memory_scope(None, None), Ok(None));
+    }
 }
