@@ -10185,6 +10185,8 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            are expected to ship native builds "within a release cycle or two" after it. So the
            earliest realistic retry is Q4, and the two version numbers below (npm `typescript`
            `latest` still 7.0.2, `vue-tsc` still 3.3.11 on 2026-09-11) remain the cheap gate.
+           *(2026-10-09)* npm `typescript` `latest` is still 7.0.2; the `dev` channel is
+           publishing daily `7.1.0-dev.2026100x` builds, `vue-tsc` still 3.3.12. Nothing to retry.
            Sources: [DEV Community](https://dev.to/the-modern-web/why-angular-vue-and-eslint-cant-upgrade-to-typescript-70-yet-and-why-ts-71-changes-441g),
            [vuejs/language-tools#6121](https://github.com/vuejs/language-tools/discussions/6121).
      - [ ] *(2026-07-23)* **`typescript 5.9 → 7.0` (GA 2026-07-08, the Go-native `tsgo` port).** Breaking:
@@ -10196,6 +10198,22 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `pnpm outdated` reports `4.1.0 → 2.24.3` — the v4 line is published under `next`, so `latest`
            points at the *older* Vue-2 package. **Never let `pnpm update --latest` "upgrade" this one**;
            it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
+   - *(2026-10-09 sweep)* `cargo update` offered 15: taken **`toml 1.1.8` / `toml_edit 0.25.17` /
+     `toml_parser 1.1.5`** (the lock also re-resolved `cssparser-macros`' `syn` from 3 to 2 — same
+     checksum, the registry's dependency metadata changed). **Held back:** `rustpython-ruff_*
+     0.16.10` (re-checked: `cargo check -p rustpython-codegen` still fails E0026/E0308, so the
+     `get-size2 0.11`/`malachite 0.13`/`char_str` it drags in stay out too), and **`tauri 2.12.2`**
+     — `cargo update -p tauri` alone re-resolves ~20 Windows-only dependency edges *downwards*
+     (`windows-sys 0.61 → 0.59/0.60` for `rustix`, `tempfile`, `socket2`, `tray-icon`, …;
+     `windows 0.62 → 0.61` for `gpu-allocator`), a Windows-surface change this Linux host cannot
+     build. Take it as its own PR where `release-check`'s Windows job judges it. `cargo upgrade
+     --incompatible`: only `rten 0.27` (still blocked on `ocrs 0.13.1`). GUI: `@tauri-apps/api
+     2.12.2`, `plugin-shell 2.4.1`, `plugin-updater 2.13.2` (matching the Rust plugins already in
+     the lock), `marked 18.1.0`, `@lucide/vue 1.54.0`, `@playwright/test 1.64.0`, `happy-dom
+     20.14.6`; nuxt stays exactly 4.5.2 (the item below), TypeScript 7 still blocked. The pnpm
+     lock moved nuxt's peer set to `rolldown 1.2.13` / `oxc-parser 0.153.0` — `frontend-windows`
+     judges that. Verified: clippy 0 warnings, **2835 Rust tests / 89 binaries, 0 failures**,
+     vitest 437/437, typecheck 0 errors, `pnpm generate` green.
    - *(2026-10-08 sweep)* `cargo update` → 37 compatible bumps, led by **`turso 0.8.2`** (stable,
      2026-10-06; the exact pin moved `=0.8.1 → =0.8.2` so `turso` and `turso_core` stay in
      lockstep) plus `hyper 1.12`, `h2 0.4.20`, `jiff 0.2.38`, `toml 1.1.7`, `zerocopy 0.8.62`,
@@ -10278,6 +10296,12 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            Upstream: [branches#10](https://github.com/fereidani/branches/issues/10), fix in
            [branches#11](https://github.com/fereidani/branches/pull/11) (the intrinsic was renamed in
            rust-lang/rust#163574) — a 0.4.x patch release from that PR unblocks us with no turso change.
+           *(re-checked 2026-10-09)* Still blocked: no `branches 0.4.7` on crates.io (0.4.6, then
+           0.5.0/0.5.1), and `turso_core 0.8.3-pre.1` still requires `^0.4.3`. The same chain now
+           breaks docs.rs for 11 **burn 0.22.0** crates (`turso` comes in via `cubecl`'s optional
+           cache), so burn has filed it upstream too —
+           [tracel-ai/burn#6014](https://github.com/tracel-ai/burn/issues/6014) (2026-10-08). Mummu's
+           burn bump inherits this pin; check both trackers before moving either toolchain.
      - [x] **`turso` 0.7.2 is the latest stable (2026-07-30); we are exact-pinned at `=0.6.1`.** 0.7.0
            brought MVCC passive checkpoints, recovery fixes and an MVCC-safe AUTOINCREMENT
            ([notes](https://github.com/tursodatabase/turso/releases/tag/v0.7.0)); 0.8.0 is in
