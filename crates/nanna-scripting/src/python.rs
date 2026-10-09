@@ -928,6 +928,12 @@ print(msg)
     /// advancing (the interrupt lands within ~100 ms of set-up), so stillness
     /// alone is the signal. Bounded well past the reaper's grace plus a
     /// debug-build interpreter start-up.
+    ///
+    /// A loop that never wrote at all across the whole window is still too:
+    /// under load (a full-workspace run beside other builds, load average
+    /// ~60) an interpreter's start-up can eat its 1 s budget, so it is stopped
+    /// before its 2000th iteration and the file never appears. A loop still
+    /// running for 40 s would have written thousands of times.
     async fn wait_until_still(path: &std::path::Path) -> bool {
         let read = || {
             std::fs::read_to_string(path)
@@ -946,7 +952,7 @@ print(msg)
             }
             last = Some(now);
         }
-        false
+        last.is_none()
     }
 
     /// A timed-out `while True` is stopped, not abandoned: it used to spin a
