@@ -9687,9 +9687,14 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       interleaved, corrupt envelope from the shared `credentials.enc.tmp`. Set/delete now hold an
       OS advisory lock on `credentials.enc.lock`, and every temp file is unique (test
       `concurrent_writers_on_one_file_lose_no_key` — fails 3/3 with the lock removed).
-      **Filed from the same audit, not fixed this run:** a 404 on a legacy Streamable-HTTP session
-      never re-initializes; and a dropped legacy SSE GET stream leaves every later request waiting
-      its full 60 s.
+      *(same run)* A 404 to a legacy Streamable-HTTP session (the server ended it) was returned to
+      every later call until a reconnect; the spec says the client must initialize again. The
+      transport now keeps the `initialize` that opened the session, and on a 404 to that session
+      replays it without the old id, sends `initialized`, and retries the request once (test
+      `a_lost_legacy_session_is_renewed_and_the_request_retried`, scripted loopback server; fails
+      with the renewal disabled).
+      **Filed from the same audit, not fixed this run:** a dropped legacy SSE GET stream leaves
+      every later request waiting its full 60 s.
       *(same run)* **Streamable HTTP's 16 MiB cap bounded nothing.** `read_answer` buffered the
       whole body (`Response::bytes`) before comparing it to `HTTP_BODY_BYTES_MAX`, and the
       `notify` and legacy-SSE error paths read error bodies with `Response::text`, unbounded. Now
