@@ -9641,9 +9641,7 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       back to SSE could name `https://attacker.example/x` (or `//attacker.example/x`) and receive
       the stored credential. `same_origin_endpoint` now refuses an endpoint on another origin, as
       the TypeScript SDK does. Test `a_message_endpoint_must_stay_on_the_connections_origin`.
-      **Filed from the same audit, not fixed this run:** a stdio MCP server started via `npx`/`uvx`
-      is killed without its process group, orphaning the real server (`nanna-proc` has the group
-      kill); the encrypted-credentials file fallback has no cross-process lock
+      **Filed from the same audit, not fixed this run:** the encrypted-credentials file fallback has no cross-process lock
       (a CLI `mcp secret set` racing the daemon can lose a key or corrupt the envelope via the fixed
       `credentials.enc.tmp`); a 404 on a legacy Streamable-HTTP session never re-initializes; and a
       dropped legacy SSE GET stream leaves every later request waiting its full 60 s.
@@ -9653,6 +9651,14 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `read_body_capped` reads chunk by chunk (declared lengths refused up front) and
       `read_error_body` reads only the prefix it will show. Test
       `a_body_past_the_cap_is_refused_and_an_error_body_is_cut` (loopback server).
+      *(same run)* **A stdio MCP server's real process outlived its close.** Servers are usually
+      launched through `npx`/`uvx`/`sh -c`, and `child.kill()` / `kill_on_drop` reached only that
+      launcher — the server itself, a grandchild, kept running after the grace kill, an aborted
+      start or a failed `initialize`. The child now leads its own process group (Unix) or a
+      kill-on-close job (Windows, `nanna_proc::ChildJob`); `close` kills the tree with
+      `nanna_proc::kill_process_tree` before reaping the launcher, and a transport dropped without
+      `close` kills its group while the launcher is still unreaped. Test
+      `close_kills_the_servers_whole_tree` (fails with the tree kill removed).
 - [x] Tool authoring: `tools.update` refuses bundled names and runs `check_syntax`; GUI
       `update_skill` validates the name (`tool_authoring.rs:99,236`, `gui/.../tools.rs:458`). Both
       move with the `default-skills` → tools rename.

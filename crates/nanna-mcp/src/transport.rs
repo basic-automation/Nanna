@@ -310,6 +310,41 @@ pub mod stdio {
         /// Per-list "server said this changed" flags, set by the reader task and
         /// consumed by the client to refresh a stale cache lazily.
         list_changed: Arc<ListChangedFlags>,
+        /// The launcher's pid, which on Unix also names its process group
+        /// (`process_group(0)` at spawn): the handle for killing the server's
+        /// whole tree. A server is usually started through `npx`, `uvx` or
+        /// `sh -c`, and `kill`/`kill_on_drop` reach only that launcher — the
+        /// real server, a grandchild, was left running.
+        pid: Option<u32>,
+        /// Windows: the kill-on-close job holding the tree; dropping the
+        /// transport reaps it. Always `None` on Unix (the group covers it).
+        _job: Option<nanna_proc::ChildJob>,
+    }
+
+    impl Drop for StdioTransport {
+        fn drop(&mut self) {
+            // A transport dropped without `close` (an aborted start, a failed
+            // `initialize`) still takes its server's tree with it — but only
+            // while the launcher is unreaped, so the group id cannot have been
+            // reused by an unrelated process.
+            #[cfg(unix)]
+            if let (Some(pid), Ok(mut child)) = (self.pid, self.child.try_lock())
+                && matches!(child.try_wait(), Ok(None))
+            {
+                kill_group_now(pid);
+            }
+        }
+    }
+
+    /// `kill(-pgid, SIGKILL)` now. `nanna_proc::kill_process_tree` is the same
+    /// single syscall on Unix, wrapped in a future that is ready on its first
+    /// poll; polled here directly so `Drop` can use it.
+    #[cfg(unix)]
+    fn kill_group_now(pid: u32) {
+        let kill = std::pin::pin!(nanna_proc::kill_process_tree(pid));
+        let waker = std::task::Waker::noop();
+        let polled = kill.poll(&mut std::task::Context::from_waker(waker));
+        debug_assert!(polled.is_ready(), "the Unix group kill completes at once");
     }
 
     impl StdioTransport {
@@ -340,12 +375,18 @@ pub mod stdio {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit()) // Let stderr pass through for debugging
                 .kill_on_drop(true);
+            // Its own process group, so the kill below reaches the server the
+            // launcher started, not only the launcher.
+            #[cfg(unix)]
+            cmd.process_group(0);
 
             for (key, value) in env {
                 cmd.env(key, value);
             }
 
             let mut child = cmd.spawn()?;
+            let pid = child.id();
+            let job = nanna_proc::ChildJob::assign(&child);
 
             let stdin = child
                 .stdin
@@ -380,6 +421,8 @@ pub mod stdio {
                 pending,
                 shutdown_tx,
                 list_changed,
+                pid,
+                _job: job,
             })
         }
 
@@ -527,6 +570,11 @@ pub mod stdio {
                         grace_ms = MCP_EXIT_GRACE.as_millis(),
                         "MCP server ignored stdin EOF; killing it"
                     );
+                    // The whole tree first (the launcher's group, or its job
+                    // on Windows), then the launcher itself is reaped.
+                    if let Some(pid) = self.pid {
+                        nanna_proc::kill_process_tree(pid).await;
+                    }
                     child.kill().await?;
                 }
             }
@@ -611,6 +659,53 @@ pub mod stdio {
             assert!(
                 status.is_some_and(|s| !s.success()),
                 "killed, not exited: {status:?}"
+            );
+        }
+
+        /// A launcher that ignores EOF is killed with everything it started:
+        /// `sh -c` here, `npx`/`uvx` in practice, whose real server is a
+        /// grandchild that `child.kill()` alone left running.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn close_kills_the_servers_whole_tree() {
+            let dir = std::env::temp_dir().join(format!("nanna-mcp-tree-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let pid_file = dir.join("grandchild.pid");
+            let script = format!("sleep 300 & echo $! > {}; wait", pid_file.display());
+            let transport = super::StdioTransport::spawn("sh", &["-c", &script]).unwrap();
+            let mut grandchild = None;
+            for _ in 0..50 {
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<i32>().ok())
+                {
+                    grandchild = Some(pid);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let grandchild = grandchild.expect("the grandchild started");
+            transport.close().await.unwrap();
+            // `kill -0` only probes whether the pid exists.
+            let alive = |pid: i32| {
+                std::process::Command::new("kill")
+                    .args(["-0", &pid.to_string()])
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+            };
+            let mut gone = false;
+            for _ in 0..50 {
+                if !alive(grandchild) {
+                    gone = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(
+                gone,
+                "the grandchild {grandchild} outlived its server's close"
             );
         }
 

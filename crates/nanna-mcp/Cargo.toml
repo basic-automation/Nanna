@@ -28,6 +28,10 @@ base64 = { version = "0.23", optional = true }
 # For stdio line reading
 futures = "0.3"
 
+# A stdio server's whole process tree is killed, not just the launcher
+# (`npx`/`uvx`/`sh -c` leave the real server as a grandchild).
+nanna-proc = { path = "../nanna-proc" }
+
 # JSON-RPC
 uuid = { workspace = true, optional = true }
 
