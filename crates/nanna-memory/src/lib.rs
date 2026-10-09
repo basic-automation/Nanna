@@ -1207,14 +1207,9 @@ impl VectorStore {
         top_k: usize,
         owner: Option<&str>,
     ) -> Vec<(MemoryEntry, f32)> {
-        let scope = owner.map_or(RecallScope::GlobalOnly, RecallScope::Workspace);
-        let (hits, _) = self
-            .search_in_scope_with_coverage(query_embedding, top_k, scope)
+        let (neighbours, _) = self
+            .search_admitting(query_embedding, top_k, |workspace| workspace == owner)
             .await;
-        let neighbours: Vec<(MemoryEntry, f32)> = hits
-            .into_iter()
-            .filter(|(entry, _)| entry.workspace_id.as_deref() == owner)
-            .collect();
         debug_assert!(neighbours.len() <= top_k, "never more than asked for");
         debug_assert!(
             neighbours
@@ -1252,20 +1247,49 @@ impl VectorStore {
         top_k: usize,
         scope: RecallScope<'_>,
     ) -> (Vec<(MemoryEntry, f32)>, SearchCoverage) {
-        // Get more to filter
-        let (all_results, coverage) = self.search_with_coverage(query_embedding, top_k * 3).await;
-
-        let filtered: Vec<(MemoryEntry, f32)> = all_results
-            .into_iter()
-            .filter(|(entry, _)| scope.admits(entry.workspace_id.as_deref()))
-            .take(top_k)
-            .collect();
-
+        let (filtered, coverage) = self
+            .search_admitting(query_embedding, top_k, |workspace| scope.admits(workspace))
+            .await;
         debug_assert!(
             filtered.len() <= top_k,
             "the scoped answer is bounded by top_k"
         );
         (filtered, coverage)
+    }
+
+    /// The `top_k` nearest memories whose workspace `admit` accepts.
+    ///
+    /// The scan ranks the whole store, so a filter applied to its global top
+    /// `3·top_k` (what this did) starved any scope that is a small part of the
+    /// store: a workspace's matches ranked below other workspaces' rows were
+    /// cut before the filter saw them, and the caller got fewer than `top_k`
+    /// (often none) while the coverage reported a complete scan. The window is
+    /// widened (×4) until `top_k` are admitted or it holds every comparable
+    /// row — so the bound is the store itself, and a narrow scope costs a few
+    /// more scans, never a missed match.
+    async fn search_admitting(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        admit: impl Fn(Option<&str>) -> bool,
+    ) -> (Vec<(MemoryEntry, f32)>, SearchCoverage) {
+        let mut window = top_k.saturating_mul(3);
+        loop {
+            let (ranked, coverage) = self.search_with_coverage(query_embedding, window).await;
+            let exhausted = ranked.len() < window || window >= coverage.comparable;
+            let admitted: Vec<(MemoryEntry, f32)> = ranked
+                .into_iter()
+                .filter(|(entry, _)| admit(entry.workspace_id.as_deref()))
+                .take(top_k)
+                .collect();
+            if admitted.len() >= top_k || exhausted {
+                debug_assert!(admitted.len() <= top_k);
+                return (admitted, coverage);
+            }
+            let wider = window.saturating_mul(4).min(coverage.comparable);
+            debug_assert!(wider > window, "each round widens until the store is covered");
+            window = wider;
+        }
     }
 
     /// Get entry by ID
@@ -2727,6 +2751,36 @@ mod tests {
         async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
             Ok(vec![health_test_entry("ok")])
         }
+    }
+
+    /// A workspace whose matches all rank below other workspaces' rows still
+    /// gets them: the filter used to see only the store's global top 3·k.
+    #[tokio::test]
+    async fn a_small_scope_is_not_starved_by_the_rest_of_the_store() {
+        let store = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(4),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        });
+        for n in 0..40 {
+            let mut entry = chunked_entry(&format!("other-{n}"), "x", vec![1.0, 0.0, 0.0, 0.0], None);
+            entry.workspace_id = Some("other".to_string());
+            store.entries.write().await.push(entry);
+        }
+        let mut mine = chunked_entry("mine", "y", vec![0.6, 0.8, 0.0, 0.0], None);
+        mine.workspace_id = Some("mine".to_string());
+        store.entries.write().await.push(mine);
+        let query = [1.0, 0.0, 0.0, 0.0];
+
+        let owned = store.search_owned_by(&query, 2, Some("mine")).await;
+        assert_eq!(owned.len(), 1, "{owned:?}");
+        assert_eq!(owned[0].0.id, "mine");
+        let (scoped, coverage) = store
+            .search_in_scope_with_coverage(&query, 2, RecallScope::Workspace("mine"))
+            .await;
+        assert_eq!(scoped.iter().map(|(e, _)| e.id.as_str()).collect::<Vec<_>>(), ["mine"]);
+        assert_eq!(coverage.comparable, 41);
+        assert!(store.search_owned_by(&query, 2, None).await.is_empty(), "no global rows");
     }
 
     /// A backing store whose first `save_entry` waits at a gate, holding the

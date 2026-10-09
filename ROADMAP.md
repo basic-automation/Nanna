@@ -9219,8 +9219,12 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       the upsert on the next restart. `VectorStore::persist_serial` is now held across
       snapshot-and-save and across every delete (test
       `a_delete_during_a_vector_install_is_not_undone`, gated backing store; fails without it).
-      **Filed from the same audit, not fixed this run:** `search_in_scope_with_coverage` takes the global top `3·k` before filtering, so a small
-      workspace's matches can be crowded out while coverage reports complete; and the card fold
+      *(same run)* `search_in_scope_with_coverage` filtered the store's global top `3·k`, so a
+      small workspace's matches ranked below other rows were cut before the filter saw them (none
+      returned, coverage "complete"); `search_owned_by` filtered once more after that. Both now go
+      through `search_admitting`, which widens the window ×4 until `k` are admitted or it covers
+      every comparable row (test `a_small_scope_is_not_starved_by_the_rest_of_the_store`).
+      **Filed from the same audit, not fixed this run:** the card fold
       (`memory_write_through`) reads only a card's oldest 1 000 episodes and never re-folds past it.
 - [x] *(found 2026-10-09, audit of scheduling)* **Cron matched day-of-month AND day-of-week.**
       `CronExpr::matches` required both, while standard (Vixie) cron fires on EITHER when both are
