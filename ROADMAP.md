@@ -10611,6 +10611,8 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      checksum, the registry's dependency metadata changed). **Held back:** `rustpython-ruff_*
      0.16.10` (re-checked: `cargo check -p rustpython-codegen` still fails E0026/E0308, so the
      `get-size2 0.11`/`malachite 0.13`/`char_str` it drags in stay out too), and **`tauri 2.12.2`**
+     (its changes are two `@tauri-apps/api` fixes — awaitable unlisten for drag-drop/focus
+     listeners, `MenuItemOptions` in menu ops; [releases](https://v2.tauri.app/release/))
      — `cargo update -p tauri` alone re-resolves ~20 Windows-only dependency edges *downwards*
      (`windows-sys 0.61 → 0.59/0.60` for `rustix`, `tempfile`, `socket2`, `tray-icon`, …;
      `windows 0.62 → 0.61` for `gpu-allocator`), a Windows-surface change this Linux host cannot
@@ -10834,6 +10836,15 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            drops the C builds outright (and whether our feature list can shrink). Also re-checked:
            `vue-tsc` is still 3.3.11 with no TypeScript 7 support, and TS 7.1 (the stable API)
            has no date.
+     - [ ] *(P20, research 2026-10-09)* **Liquid's LFM2.5-8B-A1B is an MoE built for tool calling
+           on consumer hardware** — 8.3 B total, ~1.5 B active per token, so it decodes at
+           small-model speed while fitting the 16 GB tier with room for the context. Our LFM
+           history (2026-08-03 paces: the gap was capability, not dialect) is with the dense
+           1.2 B; this is the first LFM with a plausible capability jump at our VRAM budget.
+           Run it through the scripted e2e and one endurance leg before considering it as a
+           default (Ollama tag permitting). Sources:
+           [LocalAI Master — Ollama tool-calling models](https://localaimaster.com/blog/best-ollama-models-tool-calling),
+           [Medium — tiny models for tool calling](https://medium.com/@minhle_0210/5-tiny-language-models-for-tool-calling-part-3-ebcda32c2518).
      - [ ] *(P20, research 2026-09-28)* **Qwen 3.8 ships no model for the 16 GB tier.** The open
            weights are 27B dense (2026-08-14, Apache-2.0), Flash-Next (180B-A6B) and 2.4T-A95B —
            no 4B/8B/14B this generation ([lineup](https://codersera.com/blog/qwen-3-8-model-lineup-2026/),
