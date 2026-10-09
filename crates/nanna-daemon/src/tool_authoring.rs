@@ -233,10 +233,13 @@ pub fn build_tool_authoring_services(
                 // the tools dir may not hold one yet — and a user tool of the
                 // same name would shadow it.
                 refuse_bundled(&name)?;
+                // The name is judged first: the source check compares the
+                // declared name against it, and a name that is no tool name
+                // at all (`../escape`) must be refused as that.
+                let dir = resolve_tool_dir(&tools_dir, &name)?;
                 let source = string_arg(&params, "source")?;
                 validate_source(&source, &name)?;
 
-                let dir = resolve_tool_dir(&tools_dir, &name)?;
                 if dir.join("tool.ts").exists() || dir.join("tool.js").exists() {
                     return Err(format!(
                         "a tool named '{name}' already exists; use tools.update to change it"
