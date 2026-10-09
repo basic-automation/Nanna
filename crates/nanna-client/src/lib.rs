@@ -26,8 +26,10 @@
 //! ```
 
 mod connection;
+mod link;
 
 pub use connection::{Client, ClientConfig, ConnectionState};
+pub use link::DaemonLink;
 pub use nanna_daemon::protocol::*;
 
 use thiserror::Error;
