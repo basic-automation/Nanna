@@ -117,7 +117,9 @@ pub async fn serve_via_daemon(client: Client) -> anyhow::Result<()> {
                 let client = Arc::clone(&executor);
                 let name = tool_name.clone();
                 async move {
-                    Ok(match client.tools().execute(&name, input).await {
+                    // No client-side window: the daemon bounds the call by
+                    // the tool's own timeout, which may exceed any fixed one.
+                    Ok(match client.tools().execute_until_answered(&name, input).await {
                         Ok(reply) => daemon_reply_to_result(&reply),
                         Err(e) => error_result(format!("the daemon did not run {name}: {e}")),
                     })

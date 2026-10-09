@@ -9994,8 +9994,12 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `daemon_status_takes_the_port_start_was_given`).
       *(same run)* `nanna export` always dialled the default port; it now takes `--daemon <url>`,
       as `nanna mcp serve` does (test `export_takes_the_daemon_address`).
-      **Filed from the same audit, not fixed this run:** `nanna mcp serve` fails tool calls over 30 s and
-      never reconnects; `nanna-daemon install` drops `--data-dir`/`--port`/`NANNA_CONFIG_PATH` from
+      *(same run)* `nanna mcp serve` cut every proxied tool call at the client's 30 s request
+      window while the daemon was still running it (a long build); it now uses
+      `ToolsApi::execute_until_answered` — no client-side deadline, the tool's own timeout bounds
+      the call, and a dropped connection still ends the wait (test
+      `a_tool_call_waits_for_the_daemons_answer`, slow mock daemon).
+      **Filed from the same audit, not fixed this run:** `nanna mcp serve` never reconnects; `nanna-daemon install` drops `--data-dir`/`--port`/`NANNA_CONFIG_PATH` from
       the unit. *(same run)* `systemctl`/`launchctl` exit statuses are now checked: a refused
       `systemctl --user enable` (bad unit, no user bus) used to print its error while `install`
       reported success; `run_checked` fails with the status and stderr (test
