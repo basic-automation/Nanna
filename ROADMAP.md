@@ -8924,6 +8924,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       (`tasks.rs`). No critical section awaits. 1 test (a write meeting a held guard lands; a
       poisoned buffer still reads); daemon 637 + e2e 44 green. **Still open:**
       `SubSessionInfo` overwrite on other paths.
+- [x] *(found 2026-10-09, audit of the control plane)* **Forking a channel conversation sent the
+      fork's replies to the channel's user.** `SessionManager::fork` copied all `metadata`,
+      including the `reply_channel` route, and the channel bridge forwards every reply of a
+      session carrying one — so forking a Telegram chat in the GUI and talking in the fork
+      messaged (and showed typing to) the Telegram user. The fork keeps its settings but drops the
+      route. Test `a_fork_of_a_channel_session_does_not_inherit_its_reply_route`. (Fixed rather
+      than left for the P25 deletion: it leaks the owner's words to a third party today.)
 - [ ] `chat_harness.rs` park-waiter hot loop and the continuation loop; GUI
       `subscribe_channel_status` task leak, per-channel pinned model, `daemon_client.rs` dead
       "not connected" path.
