@@ -9383,8 +9383,10 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       reports the file, the file is untouched).
       **Filed from the same audit, not fixed this run:** quick setup saves to the default path,
       not `--config`'s, which `is_first_run` also ignores (so `--config alt.toml chat` runs the wizard whenever the
-      default file is missing); credential commands print ❌ and exit 0 on failure, and
-      `persist_oauth_credential` only warns when the secure-store save fails.
+      default file is missing). *(same run)* Credential commands printed ❌ and exited 0 on every
+      failure, and `persist_oauth_credential` only warned when the secure-store save failed
+      before printing "✅ Token refreshed!"; each failure is now the command's error (non-zero
+      exit), the store save included.
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
