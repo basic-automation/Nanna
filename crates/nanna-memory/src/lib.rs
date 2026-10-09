@@ -1419,6 +1419,40 @@ impl VectorStore {
         Ok(())
     }
 
+    /// Replace an entry's tags (`metadata["tags"]`, comma-joined — the form
+    /// `memory.create` writes); an empty list removes them. Written through.
+    ///
+    /// # Errors
+    ///
+    /// `MemoryError::NotFound` for an unknown id, or the backend's error when
+    /// the write-through fails (the in-memory change then stands until restart,
+    /// which the caller is told).
+    pub async fn set_tags(&self, id: &str, tags: &[String]) -> Result<(), MemoryError> {
+        let joined = tags
+            .iter()
+            .map(|tag| tag.trim())
+            .filter(|tag| !tag.is_empty())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut entries = self.entries.write().await;
+        let entry = entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
+        if joined.is_empty() {
+            entry.metadata.remove("tags");
+        } else {
+            entry.metadata.insert("tags".to_string(), joined);
+        }
+        let snapshot = entry.clone();
+        drop(entries);
+        debug_assert_eq!(snapshot.id, id, "the entry changed is the one named");
+        match self.db {
+            Some(ref db) => db.save_entry(&snapshot).await,
+            None => Ok(()),
+        }
+    }
+
     /// Update content for an entry (used during expansion).
     ///
     /// # Errors
@@ -2457,6 +2491,37 @@ mod tests {
             fsrs: FsrsState::default(),
             workspace_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn tags_can_be_replaced_and_removed() {
+        let store = store_of_width(3);
+        store.add(unembedded("m", 0)).await.expect("stored");
+        store
+            .set_tags(
+                "m",
+                &[" work ".to_string(), String::new(), "urgent".to_string()],
+            )
+            .await
+            .expect("tagged");
+        let row = store.get("m").await.expect("row");
+        assert_eq!(
+            row.metadata.get("tags").map(String::as_str),
+            Some("work,urgent")
+        );
+        store.set_tags("m", &[]).await.expect("cleared");
+        assert!(
+            !store
+                .get("m")
+                .await
+                .expect("row")
+                .metadata
+                .contains_key("tags")
+        );
+        assert!(matches!(
+            store.set_tags("nope", &[]).await,
+            Err(MemoryError::NotFound(_))
+        ));
     }
 
     /// A vector computed from text the memory no longer holds is not

@@ -2023,6 +2023,15 @@ impl MemoryService {
         Ok(())
     }
 
+    /// Replace a memory's tags. See [`crate::VectorStore::set_tags`].
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::VectorStore::set_tags`].
+    pub async fn set_tags(&self, id: &str, tags: &[String]) -> Result<(), MemoryError> {
+        self.store.set_tags(id, tags).await
+    }
+
     /// Forget every memory in `ids`, durably. See
     /// [`crate::VectorStore::remove_many_durable`]: a memory reported removed
     /// is gone from disk too, and one reported failed is still there.

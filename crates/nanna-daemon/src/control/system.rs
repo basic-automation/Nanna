@@ -45,8 +45,16 @@ impl ControlPlane {
         match action {
             SystemAction::Status => self.system_status().await,
             SystemAction::Restart => {
-                info!("Restart requested");
-                json!({ "status": "restarting" })
+                // Nothing here can restart the process; answering
+                // "restarting" and doing nothing told the caller to wait for
+                // a restart that never came. Say so, as Shutdown does when it
+                // cannot act.
+                info!("Restart requested; not supported by the daemon itself");
+                json!({
+                    "status": "unsupported",
+                    "error": "the daemon cannot restart itself; shut it down and let its \
+                              supervisor (the GUI or the service manager) start it again",
+                })
             }
             SystemAction::Shutdown => self.system_shutdown(),
             SystemAction::Version => {

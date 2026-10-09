@@ -9231,6 +9231,17 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       refused (`unknown_path`) before anything is applied or saved. Empty values (optional and
       `skip_serializing_if` fields) and secrets (never serialized) are not judged. Every GUI
       `config_set` path checked present. Test `config_set_of_an_unknown_path_is_refused`.
+- [x] *(found 2026-10-09, audit of the control plane)* **Two replies for things that did not
+      happen.** `memory.update` destructured `tags` as `_`: with content it said `updated` and
+      dropped the tags, with tags alone it said `no_changes` — the GUI's edit sends both. New
+      `VectorStore::set_tags` / `MemoryService::set_tags` (comma-joined `metadata["tags"]`, the
+      form `memory.create` writes; empty removes; written through) and the handler applies both
+      fields. `system.restart` answered `{"status":"restarting"}` and did nothing; it now says
+      `unsupported`, as `system.shutdown` does when it cannot act (nothing calls it). Test
+      `tags_can_be_replaced_and_removed`. **Filed, not fixed:** `health.rs`'s
+      `set_client_count` / `set_last_error` have no production caller, so `/status` always shows
+      `clients: 0`, `last_error: null`; and a failed config save on a tool toggle / `config.set`
+      still replies success.
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
