@@ -461,7 +461,7 @@ async fn main() -> anyhow::Result<()> {
     // Handle commands
     match cli.command {
         Some(Commands::Init) => {
-            let _config = onboarding::run_onboarding()?;
+            let _config = onboarding::run_onboarding(&doctor_config_path(cli.config.as_ref())?)?;
             return Ok(());
         }
         Some(Commands::Status) => {
@@ -508,12 +508,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Server { host, port }) => {
             // Check for API key, offer quick setup if missing
-            let config = ensure_api_key(config)?;
+            let config = ensure_api_key(config, &doctor_config_path(cli.config.as_ref())?)?;
             let port = commands::serve::server_port(port, &config);
             run_server(&config, host, port).await?;
         }
         Some(Commands::Chat { session, model, stream }) => {
-            let config = interactive_config(config)?;
+            let config = interactive_config(config, &doctor_config_path(cli.config.as_ref())?)?;
             run_cli(&config, session, model, stream).await?;
         }
         Some(export @ Commands::Export { .. }) => return run_export(export).await,
@@ -521,12 +521,12 @@ async fn main() -> anyhow::Result<()> {
             list_sessions(&config, limit).await?;
         }
         Some(Commands::Run { prompt, model }) => {
-            let config = ensure_api_key(config)?;
+            let config = ensure_api_key(config, &doctor_config_path(cli.config.as_ref())?)?;
             run_once(&config, &prompt, model).await?;
         }
         None => {
             // Default: interactive chat.
-            let config = interactive_config(config)?;
+            let config = interactive_config(config, &doctor_config_path(cli.config.as_ref())?)?;
             run_cli(&config, None, None, false).await?;
         }
     }
@@ -536,12 +536,12 @@ async fn main() -> anyhow::Result<()> {
 
 /// The config an interactive chat starts with: onboarding on a first run,
 /// otherwise the loaded config, with quick setup offered if no API key is set.
-fn interactive_config(config: Config) -> anyhow::Result<Config> {
-    if onboarding::is_first_run() {
+fn interactive_config(config: Config, config_path: &std::path::Path) -> anyhow::Result<Config> {
+    if onboarding::is_first_run(config_path) {
         println!("Welcome! Let's get you set up first.\n");
-        return onboarding::run_onboarding();
+        return onboarding::run_onboarding(config_path);
     }
-    ensure_api_key(config)
+    ensure_api_key(config, config_path)
 }
 
 #[cfg(test)]

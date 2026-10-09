@@ -9381,9 +9381,10 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       command but `doctor` now stops with the parse error instead (`config_or_refusal`, test
       `a_config_that_does_not_parse_is_refused_not_defaulted`; live: `run` exits 1, `doctor`
       reports the file, the file is untouched).
-      **Filed from the same audit, not fixed this run:** quick setup saves to the default path,
-      not `--config`'s, which `is_first_run` also ignores (so `--config alt.toml chat` runs the wizard whenever the
-      default file is missing). *(same run)* Credential commands printed ❌ and exited 0 on every
+      *(same run)* Quick setup and the wizard saved to the default path, not `--config`'s, and
+      `is_first_run` checked the default path too (so `--config alt.toml chat` ran the wizard
+      whenever the default file was missing); the loaded file's path is now threaded through
+      (live: no wizard, no default file created, `alt.toml` untouched). *(same run)* Credential commands printed ❌ and exited 0 on every
       failure, and `persist_oauth_credential` only warned when the secure-store save failed
       before printing "✅ Token refreshed!"; each failure is now the command's error (non-zero
       exit), the store save included.

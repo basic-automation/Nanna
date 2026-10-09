@@ -16,9 +16,11 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 /// Ensure API key is configured, prompt if not.
-pub fn ensure_api_key(mut config: Config) -> anyhow::Result<Config> {
+///
+/// A key entered here is saved to `config_path`, the file this command loaded.
+pub fn ensure_api_key(mut config: Config, config_path: &std::path::Path) -> anyhow::Result<Config> {
     if !onboarding::has_api_key(&config) {
-        onboarding::quick_setup(&mut config)?;
+        onboarding::quick_setup(&mut config, config_path)?;
     }
     Ok(config)
 }
