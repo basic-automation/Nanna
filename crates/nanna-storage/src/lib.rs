@@ -944,7 +944,7 @@ impl Storage {
                         CAST(SUM(success_count) AS INTEGER),
                         CAST(SUM(failure_count) AS INTEGER),
                         CAST(SUM(total_duration_ms) AS INTEGER),
-                        CAST(AVG(avg_duration_ms) AS INTEGER),
+                        CAST(SUM(total_duration_ms) / MAX(SUM(call_count), 1) AS INTEGER),
                         CAST(MAX(p95_duration_ms) AS INTEGER)
                  FROM tool_stats_hourly
                  WHERE hour >= ?1
@@ -1004,7 +1004,7 @@ impl Storage {
                         CAST(SUM(success_count) AS INTEGER),
                         CAST(SUM(failure_count) AS INTEGER),
                         CAST(SUM(total_duration_ms) AS INTEGER),
-                        CAST(AVG(avg_duration_ms) AS INTEGER),
+                        CAST(SUM(total_duration_ms) / MAX(SUM(call_count), 1) AS INTEGER),
                         CAST(MAX(p95_duration_ms) AS INTEGER)
                  FROM tool_stats_daily
                  WHERE day >= ?1
@@ -1050,7 +1050,7 @@ impl Storage {
                 "SELECT tool_name, success, duration_ms, output_size, error_message, session_id, created_at
                  FROM tool_call_log
                  WHERE tool_name = ?1
-                 ORDER BY created_at DESC
+                 ORDER BY created_at DESC, id DESC
                  LIMIT ?2",
                 turso::params![name, i64::from(limit)],
             ).await?
@@ -1058,7 +1058,7 @@ impl Storage {
             conn.query(
                 "SELECT tool_name, success, duration_ms, output_size, error_message, session_id, created_at
                  FROM tool_call_log
-                 ORDER BY created_at DESC
+                 ORDER BY created_at DESC, id DESC
                  LIMIT ?1",
                 turso::params![i64::from(limit)],
             ).await?

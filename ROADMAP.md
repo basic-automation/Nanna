@@ -9287,6 +9287,19 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       — every comment is written at 0.5, exactly `PEAK_FLOOR` — so a flat run of 40 comments made
       all 40 mandatory, the overflow branch kept the earliest ~22 and elided the rest. A peak must
       now rise above at least one neighbour. Test `a_flat_run_is_decimated_evenly_not_truncated`.
+- [x] *(found 2026-10-09, same audit)* **Tool-stats time series: an unweighted average, a "P95"
+      that is the maximum, and no order within a second.** The all-tools rows averaged each tool's
+      average (`AVG(avg_duration_ms)`: one 1 s call of one tool beside 99 × 10 ms of another read
+      505 ms instead of ~20 ms) — now `SUM(total)/SUM(calls)`, hourly and daily (test
+      `the_all_tools_average_is_weighted_by_calls`). The buckets' `p95_duration_ms` column is
+      maintained as `MAX(...)`, so the daily tooltip now says "Slowest" rather than "P95" (the
+      table's P95 comes from the live tracker and is a real percentile). The tool-call log sorted
+      on one-second `created_at` alone; it now breaks ties on `id`.
+      **Filed from the same audit, not fixed this run:** `sessions.updated_at` is written as RFC
+      3339 by some paths and as `datetime('now')` by others and sorted as text (a rename can make
+      the wrong session the default after a restart); `update_content` NULLs `memories.embedding`
+      without the zero-then-checkpoint the other vector-clearing paths do; the usage/daily windows
+      cover `days + 1` calendar days.
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
