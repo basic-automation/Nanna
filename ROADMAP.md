@@ -9678,8 +9678,11 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `Nanna.workdir()` when none is given.
       **Filed from the same audit, not fixed this run:** a given python workdir is applied with
       `os.chdir`, which RustPython applies to the whole daemon process (every tool's relative
-      paths move with it, concurrently); GUI user tools execute
-      with no workspace, services or session (`user_tools.rs` passes `None, None`).
+      paths move with it, concurrently); GUI user tools get no skill services (the control plane
+      holds no service map). *(same run)* GUI user tools ran with no workspace or session, so
+      their relative paths resolved against the daemon's own directory; `UserToolManager` now
+      keeps the registry it registers with and each run reads the active workspace's directory
+      and the session from it, as bundled skills do (test `a_user_tool_runs_in_the_active_workspace`).
       *(same run)* **`web_fetch` threw on a network error and buffered any body whole.** A refused
       host, DNS failure or timeout became a thrown script error instead of a result; it now
       answers "Error: could not fetch …". And `Nanna.fetch` read the body with `Response::text`
