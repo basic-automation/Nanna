@@ -300,14 +300,47 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # A published release body is not in version control. RELEASE_NOTES.md is
+  # overwritten each release and `gh release create --notes-file` copies it into
+  # GitHub, where nothing rewrites it again. So when this repo moved to
+  # basic-automation, the repo-wide link fix could not reach the 13 bodies that
+  # had already been published with the old owner — every one had to be edited
+  # by hand afterwards. This job stops the next release from joining them.
+  #
+  # It cannot require every github.com link to match this repository's owner:
+  # release bodies legitimately link elsewhere (rust-lang/rust, for one). It
+  # checks the narrower invariant that actually broke — a link to a repository
+  # NAMED Nanna must be under this repository's owner.
+  #
+  # It declares no `needs`, so it runs beside the builds and fails in seconds
+  # rather than after a 65-minute Windows build.
+  check-release-notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Reject notes linking to another owner's Nanna
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY%%/*}"
+          stray=$(grep -oE 'github\.com/[A-Za-z0-9_.-]+/Nanna\b' RELEASE_NOTES.md \
+                    | grep -vE "^github\.com/${owner}/Nanna\b" | sort -u || true)
+          if [ -n "$stray" ]; then
+            echo "::error file=RELEASE_NOTES.md::These links name a Nanna outside ${owner} and would be frozen into the published release body:"
+            printf '%s\n' "$stray" | while IFS= read -r u; do echo "::error::  $u"; done
+            echo "::error::Canonical footer wording lives in docs/RELEASE_NOTES_FOOTER.md."
+            exit 1
+          fi
+          echo "release notes OK: every Nanna link is under ${owner}"
+
   # ── Publish ──────────────────────────────────────────────────────────────
   publish-release:
-    needs: [build-windows, build-macos, build-linux]
+    needs: [check-release-notes, build-windows, build-macos, build-linux]
     # `needs` on a skipped job makes the dependent skip too, so the opt-in
     # platforms must be tolerated explicitly. Windows must still have SUCCEEDED
     # — `!failure() && !cancelled()` alone would publish an empty release if it
     # were skipped.
-    if: ${{ always() && needs.build-windows.result == 'success' }}
+    if: ${{ always() && needs.build-windows.result == 'success' && needs.check-release-notes.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -398,5 +431,12 @@ jobs:
           exe_file=$(ls *-setup.exe 2>/dev/null | head -1 || true)
           if [ -z "$sig_file" ]; then echo "No signature found; skipping."; exit 0; fi
           echo "::notice::Commit this into .updater/latest.json, then push to master:"
-          printf '"windows-x86_64": {\n  "signature": "%s",\n  "url": "https://github.com/basic-automation/Nanna/releases/download/%s/%s"\n}\n' \
-            "$(cat "$sig_file")" "$TAG" "$exe_file"
+          # The owner used to be hardcoded here, so every manifest this step
+          # printed named the pre-rename owner — including the live
+          # .updater/latest.json. Those URLs still resolved only because GitHub
+          # redirects a renamed repository, which put auto-update for every
+          # install one redirect away from breaking. GITHUB_REPOSITORY is
+          # already how the tag guard above names the repo; use it here too so
+          # the next rename cannot strand clients.
+          printf '"windows-x86_64": {\n  "signature": "%s",\n  "url": "https://github.com/%s/releases/download/%s/%s"\n}\n' \
+            "$(cat "$sig_file")" "$GITHUB_REPOSITORY" "$TAG" "$exe_file"
