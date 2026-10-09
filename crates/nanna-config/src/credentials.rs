@@ -615,7 +615,15 @@ impl SecureStore {
             std::fs::create_dir_all(parent)?;
         }
         let bytes = encrypt_credentials(creds, &self.file_encryption_key()?)?;
-        let tmp = path.with_extension("enc.tmp");
+        // Unique per writer: a fixed name let two writers interleave into one
+        // temp file and rename a corrupt envelope into place. (Writers that
+        // modify the map also hold `with_file_lock`; the plaintext migration
+        // on a read does not.)
+        let tmp = path.with_extension(format!(
+            "enc.tmp.{}.{}",
+            std::process::id(),
+            TMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         {
             // 0600 from the first byte, like the key file: the temp copy is
             // the store's full contents until the rename.
@@ -739,23 +747,61 @@ impl SecureStore {
     }
 
     fn set_to_file(&self, key: &str, value: &str) -> Result<(), CredentialError> {
-        let mut creds = self.load_file_credentials()?;
-        creds.insert(key.to_string(), value.to_string());
-        self.save_file_credentials(&creds)?;
+        self.with_file_lock(|| {
+            let mut creds = self.load_file_credentials()?;
+            creds.insert(key.to_string(), value.to_string());
+            self.save_file_credentials(&creds)
+        })?;
         info!("Stored credential '{}' in file fallback", key);
         Ok(())
     }
 
     fn delete_from_file(&self, key: &str) -> Result<(), CredentialError> {
-        let mut creds = self.load_file_credentials()?;
-        if creds.remove(key).is_some() {
-            self.save_file_credentials(&creds)?;
-            Ok(())
-        } else {
-            Err(CredentialError::NotFound)
+        self.with_file_lock(|| {
+            let mut creds = self.load_file_credentials()?;
+            if creds.remove(key).is_some() {
+                self.save_file_credentials(&creds)
+            } else {
+                Err(CredentialError::NotFound)
+            }
+        })
+    }
+
+    /// Run a read-modify-write of `credentials.enc` under an exclusive lock on
+    /// `credentials.enc.lock` beside it.
+    ///
+    /// The daemon and a CLI (`nanna mcp secret set`, `nanna auth`) are separate
+    /// processes on the same file. Unlocked, each read the whole map, changed
+    /// one key and wrote the whole map back, so the slower writer erased the
+    /// other's key. The lock is an OS advisory lock (`flock`/`LockFileEx`),
+    /// released when the handle drops — including when the holder dies. Never
+    /// nested: a second lock from this process on another handle would wait
+    /// on itself.
+    fn with_file_lock<T>(
+        &self,
+        modify: impl FnOnce() -> Result<T, CredentialError>,
+    ) -> Result<T, CredentialError> {
+        let path = self.credentials_file_path()?.with_extension("enc.lock");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)?;
+        lock.lock()?;
+        let result = modify();
+        // Released explicitly so the order is visible: the write (and its
+        // rename) finished before the next writer may read.
+        drop(lock);
+        result
     }
 }
+
+/// Numbers each `credentials.enc` temp file this process writes, so no two
+/// writers share one.
+static TMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // =============================================================================
 // Claude CLI OAuth Credentials (Read-Only)
@@ -1596,6 +1642,42 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Two stores on one file — the daemon and a CLI — each setting their own
+    /// keys concurrently keep every key. Unlocked, each read-modify-write
+    /// erased the other's latest key.
+    #[test]
+    fn concurrent_writers_on_one_file_lose_no_key() {
+        const KEYS_PER_WRITER: usize = 25;
+        let dir = TempDir::new().expect("tempdir");
+        // The key file is created once up front, as a store in use has it.
+        SecureStore::file_only_at(dir.path().to_path_buf())
+            .set("seed", "0")
+            .expect("seed");
+        let writers: Vec<_> = ["daemon", "cli"]
+            .into_iter()
+            .map(|who| {
+                let store = SecureStore::file_only_at(dir.path().to_path_buf());
+                std::thread::spawn(move || {
+                    for n in 0..KEYS_PER_WRITER {
+                        store.set(&format!("{who}-{n}"), "v").expect("set");
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().expect("writer");
+        }
+        let store = SecureStore::file_only_at(dir.path().to_path_buf());
+        let held = store.load_file_credentials().expect("load");
+        assert_eq!(held.len(), 2 * KEYS_PER_WRITER + 1, "{:?}", held.keys());
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("list")
+                .all(|e| !e.expect("entry").file_name().to_string_lossy().contains(".tmp")),
+            "no temp file is left behind"
+        );
+    }
 
     /// The key-source flip: a store written under one key must keep being
     /// opened by that key whichever place holds it, and a store no key opens is

@@ -9682,10 +9682,14 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       back to SSE could name `https://attacker.example/x` (or `//attacker.example/x`) and receive
       the stored credential. `same_origin_endpoint` now refuses an endpoint on another origin, as
       the TypeScript SDK does. Test `a_message_endpoint_must_stay_on_the_connections_origin`.
-      **Filed from the same audit, not fixed this run:** the encrypted-credentials file fallback has no cross-process lock
-      (a CLI `mcp secret set` racing the daemon can lose a key or corrupt the envelope via the fixed
-      `credentials.enc.tmp`); a 404 on a legacy Streamable-HTTP session never re-initializes; and a
-      dropped legacy SSE GET stream leaves every later request waiting its full 60 s.
+      *(same run)* The encrypted-credentials file had no cross-process lock: a CLI `mcp secret
+      set` racing the daemon lost a key (each wrote back the whole map it read) or renamed an
+      interleaved, corrupt envelope from the shared `credentials.enc.tmp`. Set/delete now hold an
+      OS advisory lock on `credentials.enc.lock`, and every temp file is unique (test
+      `concurrent_writers_on_one_file_lose_no_key` — fails 3/3 with the lock removed).
+      **Filed from the same audit, not fixed this run:** a 404 on a legacy Streamable-HTTP session
+      never re-initializes; and a dropped legacy SSE GET stream leaves every later request waiting
+      its full 60 s.
       *(same run)* **Streamable HTTP's 16 MiB cap bounded nothing.** `read_answer` buffered the
       whole body (`Response::bytes`) before comparing it to `HTTP_BODY_BYTES_MAX`, and the
       `notify` and legacy-SSE error paths read error bodies with `Response::text`, unbounded. Now
