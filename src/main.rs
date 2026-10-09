@@ -155,6 +155,11 @@ enum Commands {
         /// file name. Prints to stdout when omitted.
         #[arg(short, long)]
         output: Option<std::path::PathBuf>,
+
+        /// The daemon's IPC address (default: the local daemon on the default
+        /// port) — for a daemon started with `daemon start --port`
+        #[arg(long)]
+        daemon: Option<String>,
     },
 
     /// Run a single prompt and exit
@@ -306,6 +311,23 @@ enum DaemonAction {
         #[arg(short, long, default_value_t = DEFAULT_IPC_PORT)]
         port: u16,
     },
+}
+
+/// `nanna export`, out of `main`'s match.
+async fn run_export(command: Commands) -> anyhow::Result<()> {
+    let Commands::Export {
+        session,
+        memories,
+        scope,
+        format,
+        output,
+        daemon,
+    } = command
+    else {
+        anyhow::bail!("not the export command");
+    };
+    let target = commands::export::ExportTarget::from_cli(session, memories, scope)?;
+    commands::export::export(target, format, output, daemon).await
 }
 
 /// Parse the `--log-level` string into a level, defaulting to INFO for an
@@ -470,17 +492,7 @@ async fn main() -> anyhow::Result<()> {
             let config = interactive_config(config)?;
             run_cli(&config, session, model, stream).await?;
         }
-        Some(Commands::Export {
-            session,
-            memories,
-            scope,
-            format,
-            output,
-        }) => {
-            let target = commands::export::ExportTarget::from_cli(session, memories, scope)?;
-            commands::export::export(target, format, output).await?;
-            return Ok(());
-        }
+        Some(export @ Commands::Export { .. }) => return run_export(export).await,
         Some(Commands::Sessions { limit }) => {
             list_sessions(&config, limit).await?;
         }
@@ -580,6 +592,25 @@ mod tests {
         assert_eq!(parse(&[]), (LOOPBACK_HOST.to_string(), DEFAULT_IPC_PORT));
         assert_eq!(parse(&["--port", "6001"]).1, 6001);
         assert_eq!(parse(&["-H", "127.0.0.2"]).0, "127.0.0.2");
+    }
+
+    /// `export` reaches a daemon started on another port: it always dialled
+    /// the default.
+    #[test]
+    fn export_takes_the_daemon_address() {
+        let daemon_of = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["nanna", "export", "--memories"].iter().chain(args))
+                .expect("`nanna export --memories` parses");
+            match cli.command {
+                Some(Commands::Export { daemon, .. }) => daemon,
+                _ => panic!("expected export"),
+            }
+        };
+        assert_eq!(daemon_of(&[]), None, "the default is resolved at run time");
+        assert_eq!(
+            daemon_of(&["--daemon", "ws://127.0.0.1:6001"]).as_deref(),
+            Some("ws://127.0.0.1:6001")
+        );
     }
 
     /// A daemon is never given its config file as `--config`, which only part
