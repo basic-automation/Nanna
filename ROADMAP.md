@@ -8733,6 +8733,17 @@ as its turn (`TurnAdmission`, scope default `session`).
             breaking decision 7. `apply_decision` already re-reads the card after the call; it now
             treats `in_progress` there as worked (park only). Test
             `a_card_picked_up_while_the_router_thought_can_only_be_parked`.
+      - [x] *(found 2026-10-09, same audit)* **`TaskRepository::update` and `delete` could undo a
+            concurrent write.** Both read the row(s) *before* taking the connection guard and then
+            rewrote every column from that copy — the code's own "the mutex is the transaction"
+            held only from the checks on. With the IPC handlers, the router and the run worker
+            writing at once, a board reorder (`sort_order` patch) read a card `in_progress`, a run's
+            `complete` marked it done, and the reorder's write put it back to `in_progress` with
+            `completed_at` cleared; `delete` likewise rewrote dependents' `depends_on` from a stale
+            copy, and a child created in the gap survived its deleted parent. The read (and
+            `update`'s blocking snapshot) now happens under the same guard as the write
+            (`get_raw_with`). No deterministic test: the window is between two awaits with no hook,
+            so the fix is by construction; the storage suites stay green.
 - [ ] Delete: session table + `SessionManager`, `ChatAction::*`, `chat_harness.rs` continuation
       loop, empty-bubble gating, per-session pinned model, GUI chat pages and commands, channel
       adapters + `channel_secrets` + per-channel pinned models, `scheduler.target_channel/
