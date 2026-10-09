@@ -9808,9 +9808,11 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       that a bad check is dropped from the task, not the task. `canonicalize` now ends in
       `nanna_storage::admit_acceptance`. Test
       `a_check_the_store_would_refuse_is_dropped_and_the_task_kept`.
-      **Filed from the same audit, not fixed this run:** an acceptance `command`'s output is
-      buffered whole (`wait_with_output`) before the 4 MiB cut, for up to its 600 s ceiling; Stop
-      does not interrupt an acceptance check already running; primary-model failures never reach
+      *(same run)* An acceptance `command`'s output was buffered whole (`wait_with_output`)
+      before the 4 MiB cut, for up to its 600 s ceiling — a check spamming logs could hold
+      gigabytes in the daemon. `run_shell` now drains both pipes keeping at most
+      `ACCEPTANCE_READ_MAX_BYTES` of each (`read_pipe_capped`, 1 test).
+      **Filed from the same audit, not fixed this run:** Stop does not interrupt an acceptance check already running; primary-model failures never reach
       `ModelStatsTracker` while a cancelled call is recorded as a 0-token success; and salvaged
       prose tool calls can be stored without a paired `tool_result` on the cancel/budget and
       wrap-up paths (no observed 400 yet — every path rebuilds its context).

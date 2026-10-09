@@ -978,19 +978,31 @@ async fn run_shell(
         // path a pgid to kill.
         cmd.process_group(0);
     }
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| ShellRunError::Other(e.to_string()))?;
-    // Capture the pid before the wait future consumes the child, so a timeout
+    // Capture the pid before the wait future borrows the child, so a timeout
     // can kill the whole tree rooted here (not just the shell).
     let pid = child.id();
     // Windows: contain the whole subtree in its own kill-on-close Job Object
     // (see exec_with_timeout in nanna-scripting bridge.rs for the full
     // rationale). Unix relies on the process group above.
     let mut job = nanna_proc::ChildJob::assign(&child);
-    let wait = child.wait_with_output();
+    // Read both pipes keeping at most the cap of each, draining the rest so
+    // the child never blocks on a full pipe. `wait_with_output` buffered
+    // everything first: a check spamming logs for its whole timeout (up to
+    // 600 s) could hold gigabytes before the cut below ran.
+    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    let wait = async {
+        let (stdout, stderr, status) = tokio::join!(
+            read_pipe_capped(stdout, ACCEPTANCE_READ_MAX_BYTES),
+            read_pipe_capped(stderr, ACCEPTANCE_READ_MAX_BYTES),
+            child.wait(),
+        );
+        status.map(|status| (status, stdout, stderr))
+    };
     tokio::pin!(wait);
-    let output = tokio::select! {
+    let (status, stdout, stderr) = tokio::select! {
         res = &mut wait => {
             let output = res.map_err(|e| ShellRunError::Other(e.to_string()))?;
             // Completed: spare deliberate background survivors (the
@@ -1012,8 +1024,8 @@ async fn run_shell(
             return Err(ShellRunError::Timeout { secs: timeout.as_secs() });
         }
     };
-    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    let mut combined = String::from_utf8_lossy(&stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&stderr));
     if combined.len() > ACCEPTANCE_READ_MAX_BYTES {
         // Cut on a char boundary: String::truncate panics mid-char.
         let mut cut = ACCEPTANCE_READ_MAX_BYTES;
@@ -1022,7 +1034,31 @@ async fn run_shell(
         }
         combined.truncate(cut);
     }
-    Ok((output.status.code(), combined))
+    Ok((status.code(), combined))
+}
+
+/// Everything `pipe` yields, keeping at most `cap` bytes and discarding the
+/// rest (still read, so the writer is never blocked on a full pipe).
+async fn read_pipe_capped<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>, cap: usize) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let Some(mut pipe) = pipe else {
+        return Vec::new();
+    };
+    let mut kept = Vec::new();
+    // On the heap: two of these live in `run_shell`'s future, and a stack
+    // array made every future that awaits it 16 KiB larger.
+    let mut chunk = vec![0_u8; 8192];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let room = cap.saturating_sub(kept.len());
+                kept.extend_from_slice(&chunk[..read.min(room)]);
+            }
+        }
+    }
+    debug_assert!(kept.len() <= cap, "never more than the cap is kept");
+    kept
 }
 
 /// Locate Git-for-Windows `bash.exe`, cached. Mirrors the exec tool's routing
@@ -4525,6 +4561,14 @@ mod tests {
             timeout_secs: None,
         };
         assert!(!fail.run(dir.path()).await.passed);
+    }
+
+    #[tokio::test]
+    async fn a_pipe_is_drained_but_only_the_cap_is_kept() {
+        let source = vec![b'x'; 100_000];
+        let kept = read_pipe_capped(Some(source.as_slice()), 1024).await;
+        assert_eq!(kept.len(), 1024);
+        assert_eq!(read_pipe_capped::<&[u8]>(None, 1024).await.len(), 0);
     }
 
     #[tokio::test]
