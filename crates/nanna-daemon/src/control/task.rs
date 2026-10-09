@@ -323,6 +323,11 @@ impl ControlPlane {
             due_at, deadline_at, recurrence, depends_on, acceptance, project, assignee,
             workspace_id,
         } = request;
+        let recurrence = match recurrence.as_deref().map(crate::tasks::admit_recurrence) {
+            None => None,
+            Some(Ok(admitted)) => admitted,
+            Some(Err(message)) => return json!({"error": "bad_recurrence", "message": message}),
+        };
         // A subtask always lives in its parent's scope and inherits
         // its ladder position; a new root task appends after
         // everything (sort_order 0 would jump the whole queue).
@@ -432,6 +437,16 @@ impl ControlPlane {
             }
             None => None,
         };
+        // An empty string clears it, like the dates; anything else must parse.
+        let recurrence = match patch
+            .get("recurrence")
+            .and_then(Value::as_str)
+            .map(crate::tasks::admit_recurrence)
+        {
+            None => None,
+            Some(Ok(admitted)) => Some(admitted),
+            Some(Err(message)) => return json!({"error": "bad_recurrence", "message": message}),
+        };
         let task_patch = TaskPatch {
             title: patch
                 .get("title")
@@ -462,10 +477,7 @@ impl ControlPlane {
                 .get("deadline_at")
                 .and_then(Value::as_str)
                 .map(clearable),
-            recurrence: patch
-                .get("recurrence")
-                .and_then(Value::as_str)
-                .map(|s| Some(s.to_string())),
+            recurrence,
             depends_on: patch.get("depends_on").filter(|v| v.is_array()).map(|v| {
                 v.as_array()
                     .map(|arr| arr.iter().filter_map(Value::as_i64).collect())

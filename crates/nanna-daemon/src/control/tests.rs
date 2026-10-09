@@ -2707,6 +2707,54 @@ async fn a_card_run_is_claimed_only_for_an_agent_on_an_open_board_card() {
 /// A client shows its own board: a `workspace_id` on `task.list` /
 /// `task.quick_add` names that board whichever workspace the daemon has
 /// active, and an unregistered one is refused rather than guessed.
+/// A recurrence is a cron expression or nothing: `"daily"` is refused instead
+/// of stored-and-never-run, and `""` clears one (it used to store `""`, which
+/// no write could ever remove).
+#[tokio::test]
+async fn a_recurrence_is_checked_on_write_and_can_be_cleared() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let refused = ask(serde_json::json!({
+        "type": "task", "action": "create", "title": "Water plants", "scope": "global",
+        "recurrence": "daily",
+    }))
+    .await;
+    assert_eq!(refused["error"], "bad_recurrence", "{refused}");
+
+    let created = ask(serde_json::json!({
+        "type": "task", "action": "create", "title": "Water plants", "scope": "global",
+        "recurrence": " 0 9 * * 1 ",
+    }))
+    .await;
+    let id = created["task"]["id"].as_i64().expect("created");
+    assert_eq!(
+        created["task"]["recurrence"], "0 9 * * 1",
+        "stored trimmed: {created}"
+    );
+
+    let bad_patch = ask(serde_json::json!({
+        "type": "task", "action": "update", "id": id, "patch": {"recurrence": "weekly"},
+    }))
+    .await;
+    assert_eq!(bad_patch["error"], "bad_recurrence", "{bad_patch}");
+    let cleared = ask(serde_json::json!({
+        "type": "task", "action": "update", "id": id, "patch": {"recurrence": ""},
+    }))
+    .await;
+    assert!(cleared.get("error").is_none(), "{cleared}");
+    let task = storage.tasks().get(id).await.expect("task");
+    assert_eq!(task.recurrence, None, "an empty string clears it");
+}
+
 /// `task.done` judges a board card in its OWN board's workspace, not whichever
 /// workspace happens to be active — as a card run already did.
 #[tokio::test]

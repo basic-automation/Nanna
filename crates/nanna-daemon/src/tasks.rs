@@ -395,6 +395,37 @@ fn opt_string_vec(params: &Value, key: &str) -> ParamResult<Vec<String>> {
         .map(Some)
 }
 
+/// A card's recurrence as given to a write: blank clears it (`None`), anything
+/// else must parse as the cron expression the recurrence sweep will run.
+///
+/// Stored unchecked, `"daily"` was accepted, never recurred, and logged a
+/// warning every sweep; and `""` (how a client clears a field) was stored as
+/// `""`, which is `NOT NULL` — so no write could remove a recurrence.
+///
+/// # Errors
+/// A message naming the expression and the parser's reason.
+pub(crate) fn admit_recurrence(raw: &str) -> Result<Option<String>, String> {
+    let expr = raw.trim();
+    if expr.is_empty() {
+        return Ok(None);
+    }
+    nanna_core::CronExpr::parse(expr).map_err(|e| {
+        format!(
+            "recurrence '{expr}' is not a cron expression (minute hour day month weekday, \
+             e.g. `0 9 * * 1`, or @daily / @weekly / @monthly): {e}"
+        )
+    })?;
+    Ok(Some(expr.to_string()))
+}
+
+/// The `recurrence` param of a create, admitted (see [`admit_recurrence`]).
+fn opt_recurrence(params: &Value) -> Result<Option<String>, String> {
+    opt_string(params, "recurrence")
+        .map(|raw| admit_recurrence(&raw))
+        .transpose()
+        .map(Option::flatten)
+}
+
 fn opt_string(params: &Value, key: &str) -> Option<String> {
     params
         .get(key)
@@ -730,7 +761,7 @@ fn task_add_service(
                 tool_scope: opt_string_vec(&params, "tools")?.unwrap_or_default(),
                 due_at: opt_string(&params, "due_at"),
                 deadline_at: opt_string(&params, "deadline_at"),
-                recurrence: opt_string(&params, "recurrence"),
+                recurrence: opt_recurrence(&params)?,
                 depends_on: opt_i64_vec(&params, "depends_on")?.unwrap_or_default(),
                 // Acceptance inheritance: a subtask that declares no
                 // check of its own answers to its parent's — the same
@@ -875,7 +906,8 @@ fn task_update_service(storage: &Arc<Storage>) -> ServiceFn {
                 recurrence: params
                     .get("recurrence")
                     .and_then(Value::as_str)
-                    .map(|s| Some(s.to_string())),
+                    .map(admit_recurrence)
+                    .transpose()?,
                 depends_on: opt_i64_vec(&params, "depends_on")?,
                 acceptance: canonical_acceptance(&params)?.map(Some),
                 assignee: params

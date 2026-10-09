@@ -9189,6 +9189,14 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       bare day or timestamp; never backwards). Tests `a_rounds_dates_move_to_its_occurrence`,
       `a_reopened_round_is_not_announced_overdue_on_last_rounds_deadline` (1 due, 0 overdue; was
       overdue on the old reopen).
+- [x] *(found 2026-10-09, same audit)* **A card's recurrence was never checked and could not be
+      removed.** Every write stored the string as given; `CronExpr` parsed it only inside the
+      sweep — so `recurrence: "daily"` was accepted, never recurred, and logged a warning every
+      five minutes — and recurrence was not `clearable` like the dates, so `""` was stored as
+      `""` (still `NOT NULL`) and no write could remove it. New `admit_recurrence` (blank clears,
+      anything else must parse; stored trimmed) on all four ingress points: `tasks.add`,
+      `tasks.update`, IPC `task.create`, `task.update` (`bad_recurrence`). Test
+      `a_recurrence_is_checked_on_write_and_can_be_cleared`.
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
