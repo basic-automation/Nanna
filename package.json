@@ -1,6 +1,6 @@
 {
 	"devDependencies": {
-		"vitest": "1.2.0",
+		"vitest": "4.1.11",
 		"vue-test-utils": "1.0.0-beta.11"
 	}
 }
