@@ -4680,6 +4680,14 @@ impl DaemonServer {
                     debug!("Webhook event from {}: {:?}", event.source, event.message);
 
                     if let Some(ref msg) = event.message {
+                        let allowed = control_for_webhooks.telegram_allowed_users().await;
+                        if !webhook_chat_allowed(&event.source, &msg.chat_id, allowed.as_deref()) {
+                            debug!(
+                                "Ignoring {} webhook message from non-allowed chat {}",
+                                event.source, msg.chat_id
+                            );
+                            continue;
+                        }
                         // Convert WebhookMessage → IncomingMessage
                         let incoming = IncomingMessage {
                             id: msg
@@ -6647,6 +6655,43 @@ impl Default for DaemonBuilder {
 /// Fields that exist in `nanna_config` but not in the daemon-local type are
 /// silently dropped — the local type only covers what `ChannelManager` actually
 /// needs at runtime.
+/// Whether a webhook message from `chat_id` on `source` may start a turn.
+///
+/// Telegram's `allowed_users` reached only the polling listener's chat
+/// filter; with a `webhook_url` set the listener is off and the webhook path
+/// had no filter, so any Telegram user who found the bot got a full agent
+/// turn with tools (the webhook secret proves the POST came from Telegram,
+/// not who wrote it). The same rule as the listener: an empty or absent list
+/// admits every chat, otherwise the chat id must be listed. Other providers
+/// have no allowlist here.
+fn webhook_chat_allowed(source: &str, chat_id: &str, telegram_allowed: Option<&[i64]>) -> bool {
+    if source != "telegram" {
+        return true;
+    }
+    match telegram_allowed {
+        None | Some([]) => true,
+        Some(allowed) => chat_id
+            .trim()
+            .parse::<i64>()
+            .is_ok_and(|id| allowed.contains(&id)),
+    }
+}
+
+#[cfg(test)]
+mod webhook_allowlist_tests {
+    use super::webhook_chat_allowed;
+
+    #[test]
+    fn telegram_webhook_messages_honour_allowed_users() {
+        assert!(webhook_chat_allowed("telegram", "42", Some(&[42])));
+        assert!(!webhook_chat_allowed("telegram", "7", Some(&[42])), "a stranger is refused");
+        assert!(!webhook_chat_allowed("telegram", "not-a-number", Some(&[42])));
+        assert!(webhook_chat_allowed("telegram", "7", None), "no list admits everyone");
+        assert!(webhook_chat_allowed("telegram", "7", Some(&[])));
+        assert!(webhook_chat_allowed("slack", "C1", Some(&[42])), "Telegram's list only");
+    }
+}
+
 fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsConfig {
     use crate::channels::{
         DiscordConfig as DaemonDiscord, SlackConfig as DaemonSlack,

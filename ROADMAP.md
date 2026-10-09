@@ -9325,6 +9325,21 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `days + 1` calendar days (eight bars for "7 days"). Both now start at `window_first_day`,
       today and the `days - 1` before it (tests `a_window_of_n_days_spans_n_calendar_days`,
       `a_one_day_usage_window_excludes_yesterday`).
+- [x] *(found 2026-10-09, audit of channels and webhooks)* **Telegram's `allowed_users` did not
+      apply in webhook mode.** It reached only the polling listener's chat filter; with a
+      `webhook_url` the listener is off and the daemon's webhook processor ran every message, so
+      any Telegram user who found the bot got a full agent turn with tools (the webhook secret
+      proves the POST came from Telegram, not who wrote it). The processor now applies the same
+      rule from the live config (`webhook_chat_allowed`, test
+      `telegram_webhook_messages_honour_allowed_users`).
+      **Filed from the same audit, not fixed this run:** Telegram replies go out as legacy
+      `Markdown` with no fallback, so an unmatched `_` makes Telegram reject the whole reply (and a
+      split reply stops at the first rejected part); an edited Telegram message starts a second
+      turn (`message.or(edited_message)` in the listener and both webhook handlers); the daemon's
+      Discord interaction webhook passes the command name instead of its options and never
+      completes the deferred response; `nanna serve`'s Slack and Discord handlers return the
+      reply in the HTTP body (Slack ignores it and retries the event up to 3 times; Discord needs
+      an answer within 3 s).
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).

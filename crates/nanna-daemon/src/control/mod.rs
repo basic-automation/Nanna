@@ -229,6 +229,17 @@ impl ControlPlane {
         self.status_manager = Some(status_manager);
     }
 
+    /// The live Telegram `allowed_users` list (`None`: not configured).
+    pub(crate) async fn telegram_allowed_users(&self) -> Option<Vec<i64>> {
+        self.config
+            .read()
+            .await
+            .channels
+            .telegram
+            .as_ref()
+            .and_then(|tg| tg.allowed_users.clone())
+    }
+
     /// Shared channel status manager, if attached.
     #[must_use]
     pub fn status_manager(&self) -> Option<Arc<StatusManager>> {
