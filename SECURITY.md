@@ -4,12 +4,13 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.2.x   | ✅ |
-| < 0.2   | ❌ |
+| Latest `0.3.x` beta | ✅ |
+| Older betas | ❌ |
 
-The public beta (`0.2.x`) is the only actively supported line. Security fixes
-land on `master` and ship in the next beta/patch release; we do not back-port
-to archive tags.
+Nanna is in public beta and ships from `master`. Only the latest beta release
+is supported: security fixes land on `master` and ship in the next beta, which
+installed copies pick up through the built-in updater. We do not back-port to
+older tags.
 
 ## Reporting a vulnerability
 

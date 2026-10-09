@@ -4,12 +4,12 @@
   "pub_date": "2026-10-09T16:17:55.458Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWtXeW5Yby9QelBMOTQ4b1VZSHVLbEkwdWxYS1lGTzFwcE9TQXlZY2FVT1ZqMzUxL0NXVGh1TkJnaVo5V1BzZzZySk5DVFdqb3BrY2xpNldnOFJFZHdjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxNTYyNjEyCWZpbGU6TmFubmFfMC4zLjQwX3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuNDAKRWFPcHJ0WjRKMFVlRHNnSEEwYy9XNzIxU1pra0VkUVpvS25nQ1kybUpzR0FQM2pFcFRhNEtQYWRzeE9PdklRTHBRN2MyYXBmdnY4WE4vREh0ZDVkQ0E9PQo=",
-      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.40-beta.49/Nanna_0.3.40_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXI3d0dDbGYxbE9zV2F2Qk85TGdENzV6c29BVnpIc3VMa1RQZnJETXNRaTJNUTFoV0lUbnFzM2lDcGlMckdvVzRpaVZmcjdoWk9BUkRiaklucTJWK1FrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMjc5MTY5CWZpbGU6TmFubmFfMC4zLjMwX3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMzAKQzlXUXl2andpclgxRzJTeVZEdnhOOEhaL1VWcFR6dU83MTY3ZzkzTXBoMFBEMUx4Q3pUVlhQcHl4VkY2NDloV2xQKytEdGY5OVorOGNGRXZieUtIQnc9PQo=",
+      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.30-beta.39/Nanna_0.3.30_x64-setup.exe"
     },
     "linux-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWs3Qm8yL2hGcE5iZHF6VkxRMFNpWG5zK0hDR1BvSTBWdjZuc1pncjNKWWdLdVBQOCszck1OMVpvRVF4Ui8vUkVKejlralc4YWV3cEJyUm5EZUM5c2djPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxNTYxNjcyCWZpbGU6TmFubmFfMC4zLjQwX2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjQwCnowK3BYY2V0Z3BnL0tVRm1wRFRRcVhnY09wYmtPTWdFYzNnc2NySWhSeFNMNHd1aTV3V3Vod3JERDlBRlRYOGh5Z3huczBRK21oci9CYUdZblVHMENRPT0K",
-      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.40-beta.49/Nanna_0.3.40_amd64.AppImage"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXFRTEJ2T0hSZnA2WTFjbFJFZE9iU3EveVoxaFMvdU9MSEZZNXhDZ3crWkVLOTNlUURIVnFlY1ZGY2dkR20zV2M3TWlUTWtNQ0hUdGNpLzdNa240VUFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMjc3NDk0CWZpbGU6TmFubmFfMC4zLjMwX2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjMwCnlLOCtGekZHQTBGOEo1NndUR1I4cVMzL3FvQ1VNR1NINkNCZ3NMZExuTjJ6VitWU3J3NUYxRWNSSzdvNEU0MmI5Zkg0U1pKS1Q0MmZZcGY0SklLL0JBPT0K",
+      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.30-beta.39/Nanna_0.3.30_amd64.AppImage"
     }
   }
 }

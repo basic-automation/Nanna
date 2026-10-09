@@ -73,7 +73,7 @@ jobs:
             <key>CFBundleName</key>
             <string>Nanna</string>
             <key>CFBundleIdentifier</key>
-            <string>com.physics515.nanna</string>
+            <string>com.nanna.app</string>
             <key>CFBundleVersion</key>
             <string>${{ env.VERSION }}</string>
             <key>CFBundleShortVersionString</key>
@@ -89,7 +89,7 @@ jobs:
       - name: Sign app with Developer ID
         run: |
           # Sign the binary
-          codesign --force --deep --sign "Developer ID Application: physics515 (YOUR_TEAM_ID)" \
+          codesign --force --deep --sign "Developer ID Application: Basic Automation (YOUR_TEAM_ID)" \
             --options runtime \
             build/Nanna.app/Contents/MacOS/nanna
 

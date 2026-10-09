@@ -4,10 +4,12 @@
 
 **A personal AI presence that runs entirely on your machine.** Nanna is a calm, capable assistant written in Rust — not a chatbot, but a *presence*. It runs as a headless daemon on your own hardware, thinks with a small open model on a single consumer GPU, remembers across sessions, and reaches you on any channel.
 
-[![Download for Windows](https://img.shields.io/badge/Download-Windows%20x64-blue?style=for-the-badge&logo=windows)](https://github.com/basic-automation/Nanna/releases/latest)
-[![Build from Source](https://img.shields.io/badge/Build-from%20Source-green?style=for-the-badge&logo=rust)](https://github.com/basic-automation/Nanna#building-from-source)
+[![Download](https://img.shields.io/github/v/release/basic-automation/Nanna?include_prereleases&style=for-the-badge&label=Download&logo=github)](https://github.com/basic-automation/Nanna/releases)
+[![Build from Source](https://img.shields.io/badge/Build-from%20Source-green?style=for-the-badge&logo=rust)](#building-from-source)
+[![Tests](https://img.shields.io/github/actions/workflow/status/basic-automation/Nanna/test-compile.yml?branch=master&style=for-the-badge&label=build)](https://github.com/basic-automation/Nanna/actions/workflows/test-compile.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
 
-**Status:** 🧪 Public Beta · v0.2.1 · Windows x64 (macOS/Linux build from source)
+**Status:** 🧪 Public Beta (0.3.x) · Windows x64 and Linux x64 installers · macOS builds from source
 
 ---
 
@@ -20,8 +22,10 @@ ollama pull qwen3.5:9b
 ```
 
 ### 2. Download Nanna
-Get the latest installer from [Releases](https://github.com/basic-automation/Nanna/releases):
-- **Windows:** `Nanna_x.y.z_x64-setup.exe` or `.msi`
+Get the latest installer from [Releases](https://github.com/basic-automation/Nanna/releases)
+(every release is currently marked *Pre-release* — take the newest one):
+- **Windows:** `Nanna_x.y.z_x64-setup.exe`
+- **Linux:** `Nanna_x.y.z_amd64.AppImage` or `Nanna_x.y.z_amd64.deb`
 
 ### 3. Run It
 Launch Nanna. On first run, it seeds its default tools into the user data directory —
@@ -44,13 +48,13 @@ A fully local run needs none.
 
 | Component | Minimum | Recommended |
 |-----------|---------|-------------|
-| **OS** | Windows 10 x64 | Windows 11 x64 |
+| **OS** | Windows 10 x64 / Linux x64 | Windows 11 x64 / recent Linux x64 |
 | **RAM** | 8 GB | 16 GB |
 | **GPU** | — | 8+ GB VRAM (for local inference) |
 | **Disk** | 500 MB | 2 GB (with models) |
 | **Runtime** | [Ollama](https://ollama.com) | Ollama + GPU drivers |
 
-**Other platforms:** macOS and Linux build from source (see [Building from Source](#building-from-source)).
+**macOS:** build from source (see [Building from Source](#building-from-source)).
 
 ---
 
@@ -71,7 +75,7 @@ A fully local run needs none.
 
 | Feature | Status | Requires |
 |---------|--------|----------|
-| **Desktop GUI** | ✅ Stable | Windows x64 (macOS/Linux: build from source) |
+| **Desktop GUI** | ✅ Stable | Windows x64, Linux x64 (macOS: build from source) |
 | **CLI Chat** | ✅ Stable | Terminal |
 | **Fully Local Inference** | 🚧 In Development | GPU with 8+ GB VRAM (P12 milestone) |
 | **Ollama Backend** | ✅ Stable | [Ollama](https://ollama.com) installed |
@@ -203,7 +207,7 @@ chmod +x Nanna_x.y.z_amd64.AppImage
 
 **Debian/Ubuntu:**
 ```bash
-sudo dpkg -i nanna_x.y.z_amd64.deb
+sudo apt install ./Nanna_x.y.z_amd64.deb
 ```
 
 **Uninstall:**
@@ -427,15 +431,14 @@ pnpm run tauri:build    # Production
 ```
 
 **Requirements:**
-- Rust 1.85+ (2024 edition)
-- Node.js 18+
-- pnpm
+- Rust via [rustup](https://rustup.rs) — the pinned nightly toolchain in `rust-toolchain.toml`
+  is installed automatically on the first `cargo` command
+- Node.js 22+ and pnpm (for the GUI)
 
-**Linux:** the workspace builds and its test suite passes on Linux as of 2026-09-07 — before that it
-did not compile there at all (a Windows-only `exec` code path was compiled on every platform, and
-`libc >= 0.2.187` breaks the vendored Python runtime; both are fixed/pinned). The **Tauri GUI on
-Linux is not yet verified** — `cargo build` and `cargo test` are. Building the GUI additionally needs
-WebKitGTK (`webkit2gtk-4.1`) and its development headers.
+**Linux:** building the GUI additionally needs WebKitGTK (`webkit2gtk-4.1`) and its development
+headers — see [Linux WebKitGTK Missing](#linux-webkitgtk-missing). `libc` is pinned below 0.2.187
+because newer versions break the vendored Python runtime; leave that pin in place when updating
+dependencies.
 
 ---
 
@@ -462,9 +465,12 @@ for the complete stored session) and `nanna export --memories` — the daemon mu
 
 ---
 
-## Contributing
+## Contributing & Community
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+- **Questions and ideas** → [Discussions](https://github.com/basic-automation/Nanna/discussions)
+- **Bugs and feature requests** → [Issues](https://github.com/basic-automation/Nanna/issues/new/choose)
+- **Security reports** → privately, per [SECURITY.md](SECURITY.md) — never in a public issue
+- **Code** → see [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ---
 
@@ -473,7 +479,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 <details>
 <summary>Click to expand technical details</summary>
 
-17 workspace crates + Tauri app, layered by dependency:
+21 workspace crates + Tauri app, layered by dependency:
 
 ```
 nanna/
@@ -495,7 +501,11 @@ nanna/
 │   ├── nanna-client/        # Daemon client library
 │   ├── nanna-server/        # HTTP server + webhooks
 │   ├── nanna-config/        # TOML config + credentials
-│   └── nanna-core/          # Orchestration, scheduler, registry
+│   ├── nanna-core/          # Orchestration, scheduler, registry
+│   ├── nanna-numeric/       # Lossless numeric conversions (no `as` casts)
+│   ├── nanna-proc/          # Child-process containment (tree kills, Job Objects)
+│   ├── nanna-timeline/      # Episodic event timeline for memory
+│   └── nanna-bench/         # Criterion benchmark harness
 └── gui/                     # Tauri 2 + Nuxt 4 frontend
 ```
 

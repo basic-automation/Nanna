@@ -11,7 +11,7 @@ By participating in this project, you agree to abide by our [Code of Conduct](CO
 ### Reporting Bugs
 
 1. **Check existing issues** — search [GitHub Issues](https://github.com/basic-automation/Nanna/issues) to see if the bug has already been reported.
-2. **Create a new issue** with:
+2. **Open a [bug report](https://github.com/basic-automation/Nanna/issues/new/choose)** with:
    - A clear, descriptive title
    - Steps to reproduce the problem
    - Expected vs actual behavior
@@ -20,8 +20,8 @@ By participating in this project, you agree to abide by our [Code of Conduct](CO
 
 ### Suggesting Features
 
-1. **Check existing issues** — someone may have already suggested it.
-2. **Open a feature request** describing:
+1. **Check existing issues and [Discussions](https://github.com/basic-automation/Nanna/discussions)** — someone may have already suggested it.
+2. **Open a [feature request](https://github.com/basic-automation/Nanna/issues/new/choose)** describing:
    - The problem you're trying to solve
    - Your proposed solution
    - Alternatives you've considered
@@ -33,17 +33,22 @@ By participating in this project, you agree to abide by our [Code of Conduct](CO
 3. **Add tests** for any new functionality.
 4. **Run the test suite** to ensure nothing is broken:
    ```bash
-   cargo test --workspace
-   cargo clippy --all-targets
+   cargo test -p <crate-you-changed>
+   cargo clippy --workspace --all-targets
    ```
+   Clippy runs with `all + pedantic + nursery` on every target (tests, benches and build
+   scripts included), and the project does not use `#[allow]` / `#[expect]` to silence it —
+   fix the lint instead. Lossy numeric casts go through the `nanna-numeric` crate, not `as`.
 5. **Submit a pull request** with a clear description of your changes.
 
 ## Development Setup
 
 ### Prerequisites
 
-- **Rust 1.85+** (2024 edition)
-- **Node.js 20+** and **pnpm** (for the GUI)
+- **Rust** via [rustup](https://rustup.rs) — `rust-toolchain.toml` pins a nightly toolchain, which
+  rustup installs on the first `cargo` command
+- **Node.js 22+** and **pnpm** (for the GUI)
+- **Linux:** WebKitGTK 4.1 development headers for the GUI (`libwebkit2gtk-4.1-dev` on Debian/Ubuntu)
 - **Ollama** (optional, for local model testing)
 
 ### Building from Source
@@ -68,7 +73,8 @@ pnpm run tauri:build
 
 ### Rust Code
 
-- Follow standard Rust conventions (`rustfmt`, `clippy`)
+- Follow standard Rust conventions (`rustfmt`, `clippy`); format the files you changed rather than
+  running `cargo fmt` across the whole workspace, so unrelated files stay out of your diff
 - All crates enable `clippy::all + pedantic + nursery` lints
 - Use `thiserror` for library errors, `anyhow` for application errors
 - Async code uses Tokio
@@ -83,7 +89,7 @@ pnpm run tauri:build
 ### Documentation
 
 - Public APIs require doc comments
-- Update README.md and ROADMAP.md for user-facing changes
+- Update README.md for user-facing changes
 - Keep commit messages clear and descriptive
 
 ## Architecture Overview
@@ -108,6 +114,7 @@ By contributing, you agree that your contributions will be licensed under the MI
 
 ## Questions?
 
+- Ask in [Discussions](https://github.com/basic-automation/Nanna/discussions)
 - Open an issue for bugs or feature requests
 - See [ROADMAP.md](ROADMAP.md) for the project direction
 - Check [SECURITY.md](SECURITY.md) for security-related concerns

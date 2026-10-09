@@ -59,8 +59,11 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement at
-**conduct@nanna.bot**.
+reported privately to the community leaders responsible for enforcement by
+opening a [private report](https://github.com/basic-automation/Nanna/security/advisories/new)
+titled "Code of Conduct" — it is visible only to the maintainers. Behavior in a
+specific comment, issue or discussion can also be flagged with GitHub's
+*Report content* option on it.
 
 All complaints will be reviewed and investigated promptly and fairly.
 

@@ -4,7 +4,7 @@
 [installer]
 name = "Nanna"
 version = "0.2.1"
-publisher = "physics515"
+publisher = "Basic Automation"
 description = "Personal AI presence — local-first, always-on"
 display_name = "Nanna Personal AI"
 

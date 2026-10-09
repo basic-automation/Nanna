@@ -398,5 +398,5 @@ jobs:
           exe_file=$(ls *-setup.exe 2>/dev/null | head -1 || true)
           if [ -z "$sig_file" ]; then echo "No signature found; skipping."; exit 0; fi
           echo "::notice::Commit this into .updater/latest.json, then push to master:"
-          printf '"windows-x86_64": {\n  "signature": "%s",\n  "url": "https://github.com/physics515/Nanna/releases/download/%s/%s"\n}\n' \
+          printf '"windows-x86_64": {\n  "signature": "%s",\n  "url": "https://github.com/basic-automation/Nanna/releases/download/%s/%s"\n}\n' \
             "$(cat "$sig_file")" "$TAG" "$exe_file"
