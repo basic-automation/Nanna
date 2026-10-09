@@ -9348,6 +9348,23 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       Telegram's MarkdownV2/HTML (it arrives unformatted when refused); `nanna serve`'s Slack and Discord handlers return the
       reply in the HTTP body (Slack ignores it and retries the event up to 3 times; Discord needs
       an answer within 3 s).
+- [x] *(found 2026-10-09, audit of browser tools)* **Every browser call leaked a tab.**
+      `BrowserManager::get_page` opened a fresh tab per call and cached it over the last one,
+      and nothing ever closed one (dropping a chromiumoxide `Page` closes nothing), so a long
+      session held one live tab per call until Chromium ran out of memory. Each call now closes
+      its own page when it is done, failed calls included; the unused page cache is gone; a
+      `wait` action is held to the browser's operation deadline (it slept whatever `wait_ms` the
+      model asked). Test `every_call_closes_the_tab_it_opened` (fake browser counting tabs).
+      *(same run)* The four browser skills returned every failure as a SUCCESSFUL plain string
+      blaming the service ("Browser service not available") whatever went wrong; they now
+      return `{content, success: false}` with the real error. `browser_action` read
+      `result.message` (the service answers `result`), and `browser_screenshot` claimed a base64
+      PNG it never returned instead of the saved file's path; both fixed.
+      **Filed from the same audit, not fixed this run:** a crashed Chromium is never relaunched
+      (`ensure_launched` only checks the slot); `browser_action` cannot act on the page a
+      previous call opened (each call is a fresh tab, so type-then-click loses the text); the
+      screenshot's `width`/`height`/`selector`/`quality` are accepted and ignored by the CDP
+      backend; the extract selector script escapes only `'`.
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
