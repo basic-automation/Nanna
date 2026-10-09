@@ -9560,9 +9560,15 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       (`stream_options.include_usage`) nor parsed, so those turns record 0/0 tokens; the
       rate-limit wait from headers survives only in `LlmError::RateLimit.retry_after`, while the
       chat path and card cooldown re-parse the *display* text (and read "try again in 452ms" as
-      452 s); `parse_reset_secs` ignores an HTTP-date `Retry-After`; and `model_health` judges
-      `Unhealthy` on lifetime error rate with no expiry, so a model that recovers after a 5-failure
-      outage (5/6 errors) is skipped for good.
+      452 s); and `parse_reset_secs` ignores an HTTP-date `Retry-After`.
+- [x] *(found 2026-10-09, same audit)* **A poor lifetime record retired a model for good.**
+      `model_health` answered `Unhealthy` (never usable, no expiry) for a lifetime error rate above
+      50 % over 5+ requests; `health_sorted_models` then never called the model, so the rate could
+      never fall — five failures and one recovery (5/6), or 2 successes and 3 failures, removed it
+      until restart. The same "deadline never arrives" class the 09-26 cooldown fix closed. Now a
+      model whose last call succeeded is `Degraded` (tried after the healthy ones) and one whose
+      last call failed is held `COOLDOWN_BACKOFF_MAX_MS` (10 min, the cooldown's own cap) from that
+      failure, then tried again. Test `a_poor_record_is_held_for_a_while_never_for_good`.
 
 **Stage 4 — the board client and what it must not port:**
 - [x] The Tauri layer's lock discipline: never hold `AppState` across a daemon round trip
