@@ -9592,9 +9592,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `stat_returns_the_resolved_permitted_path`.
       **Filed from the same audit, not fixed this run:** the `python` tool's default workdir is
       the daemon's cwd (and a given one `os.chdir`s the whole process); GUI user tools execute
-      with no workspace, services or session (`user_tools.rs` passes `None, None`); `web_fetch`
-      throws on network errors instead of returning `{content, success:false}`, and the bridge
-      reads a response body whole before `max_chars` applies.
+      with no workspace, services or session (`user_tools.rs` passes `None, None`).
+      *(same run)* **`web_fetch` threw on a network error and buffered any body whole.** A refused
+      host, DNS failure or timeout became a thrown script error instead of a result; it now
+      answers "Error: could not fetch …". And `Nanna.fetch` read the body with `Response::text`
+      before `max_chars` applied, so a fast link could feed gigabytes within the 30 s timeout; it
+      now reads chunk by chunk and refuses past `READ_FILE_BYTES_MAX` (64 MiB, `readFile`'s cap),
+      declared or not. Test `a_fetched_body_is_read_only_up_to_the_cap` (loopback server).
 - [x] Tool authoring: `tools.update` refuses bundled names and runs `check_syntax`; GUI
       `update_skill` validates the name (`tool_authoring.rs:99,236`, `gui/.../tools.rs:458`). Both
       move with the `default-skills` → tools rename.
