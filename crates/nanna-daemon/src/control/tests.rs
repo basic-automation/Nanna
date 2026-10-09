@@ -2623,6 +2623,57 @@ async fn a_card_run_is_claimed_only_for_an_agent_on_an_open_board_card() {
 /// A client shows its own board: a `workspace_id` on `task.list` /
 /// `task.quick_add` names that board whichever workspace the daemon has
 /// active, and an unregistered one is refused rather than guessed.
+/// `task.done` judges a board card in its OWN board's workspace, not whichever
+/// workspace happens to be active — as a card run already did.
+#[tokio::test]
+async fn a_cards_acceptance_is_judged_in_its_own_boards_workspace() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let (dir_a, dir_b) = (
+        tempfile::tempdir().expect("a"),
+        tempfile::tempdir().expect("b"),
+    );
+    std::fs::write(dir_b.path().join("report.md"), "done").expect("B's artifact");
+    let mut ids = Vec::new();
+    for dir in [&dir_a, &dir_b] {
+        let opened = ask(serde_json::json!({
+            "type": "workspace", "action": "open", "path": dir.path().display().to_string(),
+        }))
+        .await;
+        ids.push(opened["id"].as_str().expect("an id").to_string());
+    }
+    let on_b = ask(serde_json::json!({
+        "type": "task", "action": "quick_add", "text": "Write the report", "workspace_id": ids[1],
+    }))
+    .await;
+    let card_id = on_b["task"]["id"].as_i64().expect("a card");
+    let patched = ask(serde_json::json!({
+        "type": "task", "action": "update", "id": card_id,
+        "patch": {"acceptance": {"kind": "file_exists", "path": "report.md"}},
+    }))
+    .await;
+    assert!(patched.get("error").is_none(), "{patched}");
+    // A, which lacks the file, is the active workspace.
+    let active =
+        ask(serde_json::json!({"type": "workspace", "action": "set_active", "id": ids[0]})).await;
+    assert!(active.get("error").is_none(), "{active}");
+
+    let done = ask(serde_json::json!({"type": "task", "action": "done", "id": card_id})).await;
+    assert_eq!(
+        done["done"], true,
+        "judged in B, where the report is: {done}"
+    );
+}
+
 #[tokio::test]
 async fn a_board_named_by_workspace_id_is_used_whatever_is_active() {
     let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));

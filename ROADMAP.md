@@ -8744,6 +8744,12 @@ as its turn (`TurnAdmission`, scope default `session`).
             `update`'s blocking snapshot) now happens under the same guard as the write
             (`get_raw_with`). No deterministic test: the window is between two awaits with no hook,
             so the fix is by construction; the storage suites stay green.
+      - [x] *(found 2026-10-09, audit of the control plane)* **`task.done` judged a card in the
+            wrong project.** It ran the acceptance check in the *active* workspace (or the daemon's
+            `.`), while `start_card_run` in the same file already used the card's own board: done
+            on a card from board B while A was open computed the verdict against A's files. Both now
+            share `card_workspace_root` (explicit > the card's board > active). Control-plane test
+            `a_cards_acceptance_is_judged_in_its_own_boards_workspace`.
 - [ ] Delete: session table + `SessionManager`, `ChatAction::*`, `chat_harness.rs` continuation
       loop, empty-bubble gating, per-session pinned model, GUI chat pages and commands, channel
       adapters + `channel_secrets` + per-channel pinned models, `scheduler.target_channel/
