@@ -888,13 +888,15 @@ impl MemoryService {
             let action = IngestAction::from_similarity(*similarity);
             
             match action {
-                IngestAction::Reinforce => {
+                // Same rule as `remember_with_importance`: only a neighbour that
+                // already holds this text verbatim may absorb it unwritten.
+                IngestAction::Reinforce if existing.content.trim().contains(content.trim()) => {
                     // Just strengthen existing memory
                     self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
                     info!("Reinforced: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
                     return Ok((existing.id.clone(), action));
                 }
-                IngestAction::Update => {
+                IngestAction::Reinforce | IngestAction::Update => {
                     // Related-but-distinct: fold new information into the existing
                     // memory (dedup) rather than accreting a near-duplicate.
                     let folded = self
@@ -914,7 +916,9 @@ impl MemoryService {
                             );
                             return Ok((existing.id.clone(), IngestAction::Update));
                         }
-                        FoldResult::Subset => {
+                        // `Subset` is also the byte bound declining the append,
+                        // so it discards only what is provably already there.
+                        FoldResult::Subset if existing.content.trim().contains(content.trim()) => {
                             info!(
                                 "Update no-op (subset): {} (sim: {:.3})",
                                 truncate(&existing.content, 30),
@@ -922,9 +926,10 @@ impl MemoryService {
                             );
                             return Ok((existing.id.clone(), IngestAction::Update));
                         }
-                        // The neighbour changed under the fold; the content
-                        // landed nowhere, so it must still become a row.
-                        FoldResult::Contended => {
+                        // The neighbour changed under the fold, or the bound
+                        // declined it: the content landed nowhere, so it must
+                        // still become a row.
+                        FoldResult::Subset | FoldResult::Contended => {
                             debug!(
                                 "Fold contended (memory changed mid-merge); \
                                  storing separately (sim: {:.3})",
@@ -1148,7 +1153,14 @@ impl MemoryService {
                 || existing.content.contains("Command failed");
 
             match action {
-                IngestAction::Reinforce if !skip_reinforce => {
+                // A near-duplicate that already holds this text verbatim: only
+                // strengthen it. Without the containment check, any new detail
+                // in the top similarity band ("…, allergic to chicken") was
+                // dropped and logged as a reinforcement — the invariant
+                // `remember_scoped` keeps: discard only what is provably present.
+                IngestAction::Reinforce
+                    if !skip_reinforce && existing.content.trim().contains(content.trim()) =>
+                {
                     // Just strengthen existing memory (testing effect)
                     self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
                     // Also boost importance if new fact has higher importance
@@ -1163,7 +1175,7 @@ impl MemoryService {
                     info!("Reinforced: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
                     return Ok((existing.id.clone(), action));
                 }
-                IngestAction::Update if !skip_reinforce => {
+                IngestAction::Reinforce | IngestAction::Update if !skip_reinforce => {
                     // Related-but-distinct: fold new information in (dedup) and reinforce.
                     let folded = self
                         .fold_into_memory(embed_fn, &existing.id, &existing.content, content)
@@ -3535,6 +3547,53 @@ mod tests {
         let public_row = fresh.store.get(&public).await.expect("public row");
         assert_eq!(public_row.workspace_id, None);
         assert_eq!(public_row.content, "a public note");
+    }
+
+    /// The top similarity band is "probably the same fact", not "provably the
+    /// same text": a new detail there must land somewhere — folded into the
+    /// neighbour or as its own row — never be dropped as a reinforcement.
+    #[tokio::test]
+    async fn a_new_detail_in_the_reinforce_band_is_kept() {
+        use std::sync::Arc;
+
+        for path in ["smart_ingest", "remember_with_importance"] {
+            let service = MemoryService::new(MemoryServiceConfig {
+                dimension: 3,
+                ..Default::default()
+            })
+            .with_embed_fn(Arc::new(|_text: &str| {
+                Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0]) })
+            }));
+            let ingest = |text: &'static str| {
+                let service = &service;
+                async move {
+                    if path == "smart_ingest" {
+                        service.smart_ingest(text, HashMap::new()).await
+                    } else {
+                        service
+                            .remember_with_importance(text, HashMap::new(), 3.0)
+                            .await
+                    }
+                }
+            };
+            ingest("dog Rex is a beagle").await.expect("first write");
+            // Identical embeddings: cosine 1.0, the Reinforce band.
+            ingest("dog Rex is a beagle, allergic to chicken")
+                .await
+                .expect("second write");
+            let kept = service
+                .store
+                .all_entries()
+                .await
+                .iter()
+                .any(|entry| entry.content.contains("allergic to chicken"));
+            assert!(kept, "{path}: the new detail was dropped");
+
+            // A true restatement is still only a reinforcement.
+            let before = service.store.all_entries().await.len();
+            ingest("dog Rex is a beagle").await.expect("restatement");
+            assert_eq!(service.store.all_entries().await.len(), before, "{path}");
+        }
     }
 
     #[test]

@@ -9121,6 +9121,15 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `VectorStore::search_owned_by(emb, k, owner)` returns only neighbours owned exactly like the
       write; all three paths use it. Test `an_ingest_never_folds_across_a_workspace_boundary`
       (fails on the old neighbour search).
+- [x] *(found 2026-10-09, same audit)* **The two global ingest paths dropped a new detail in the
+      top similarity band.** `remember_with_importance` and `smart_ingest` returned at once on
+      `Reinforce` (cosine > 0.92) — "dog Rex is a beagle, allergic to chicken" next to "dog Rex is a
+      beagle" was logged as a reinforcement and written nowhere — and `smart_ingest` also returned
+      on `FoldResult::Subset`, which is the byte bound declining the append as often as a true
+      subset. `remember_scoped` already kept the invariant "discard only what is provably present".
+      Both paths now reinforce-and-return only when the neighbour contains the text verbatim, fold
+      otherwise, and fall through to a row of its own when the fold lands nothing. Test
+      `a_new_detail_in_the_reinforce_band_is_kept` (both paths; fails with the old `Reinforce` arm).
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
