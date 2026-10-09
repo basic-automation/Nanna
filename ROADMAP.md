@@ -400,6 +400,20 @@ Remaining: capture real screenshots to replace the README placeholders.
        time. Each test's wall-clock then tracks its solo cost (~2.4 s, well under the smallest 10 s guard)
        regardless of `--test-threads`. Verified: 13/13 green in 31.2 s, clippy clean (no new warnings), and it is
        test-only — production `python.exec` sets its own per-call timeout and is untouched.
+- [x] *(2026-10-09)* **Every declared dependency is used, and CI checks it.** `cargo shear` found 16
+       unused dependencies and one misplaced one across 8 manifests: `anyhow` (agent, core, daemon),
+       `flume` (core), `half` (gpu, memory), `criterion` (gpu — its four benches have custom mains, so
+       the dev-dep was dead and its "0.8 → 0.7" downgrade row in every sweep was noise from a crate
+       nothing used; `nanna-bench` keeps the real one), `serde` + `async-trait` (client), `thiserror` +
+       `reqwest` + a non-dev `tower` (server — the test's `tower` with `util` stays in dev-deps), and in
+       the GUI a whole PKCE stack (`base64`, `sha2`, `rand`, `urlencoding`) plus `directories`, left
+       behind when OAuth moved to the daemon. Each verified by grep, not taken on the tool's word; its
+       `--fix` was **not** used as-is: it rewrote `nanna-core/Cargo.toml` from CRLF to LF and replaced
+       the server's commented `tower = { …, features = ["util"] }` dev-dep with a bare one (the test
+       needs `util`), so both were edited by hand. Lockfile: 16 dependency edges gone, no version moved.
+       New `dependency-hygiene.yml` runs `cargo shear` (metadata + source scan, no build, ~1 min) on
+       every PR; a real false positive goes in the crate's `[package.metadata.cargo-shear] ignored`
+       with a reason. Verified: workspace clippy clean, GUI crate clippy clean + 103/103.
 
 ### P1 — Core Infrastructure
 SIMD vector ops (AVX/AVX2), GPU compute (wgpu), Turso persistence (embedded, SQLite-compatible),

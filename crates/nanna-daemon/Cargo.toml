@@ -45,7 +45,6 @@ serde_json = { workspace = true, features = ["raw_value"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
-anyhow.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 uuid.workspace = true

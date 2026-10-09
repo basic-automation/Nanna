@@ -4918,7 +4918,6 @@ dependencies = [
 name = "nanna-agent"
 version = "0.3.39"
 dependencies = [
- "anyhow",
  "async-trait",
  "base64 0.23.1",
  "chrono",
@@ -4997,10 +4996,8 @@ dependencies = [
 name = "nanna-client"
 version = "0.3.39"
 dependencies = [
- "async-trait",
  "futures-util",
  "nanna-daemon",
- "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
@@ -5034,9 +5031,7 @@ dependencies = [
 name = "nanna-core"
 version = "0.3.39"
 dependencies = [
- "anyhow",
  "chrono",
- "flume",
  "nanna-channels",
  "nanna-gpu",
  "nanna-llm",
@@ -5058,7 +5053,6 @@ dependencies = [
 name = "nanna-daemon"
 version = "0.3.39"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "chrono",
@@ -5107,9 +5101,7 @@ name = "nanna-gpu"
 version = "0.3.39"
 dependencies = [
  "bytemuck",
- "criterion",
  "futures",
- "half",
  "nanna-numeric",
  "nanna-simd",
  "thiserror 2.0.21",
@@ -5122,20 +5114,16 @@ dependencies = [
 name = "nanna-gui"
 version = "0.3.39"
 dependencies = [
- "base64 0.23.1",
  "chrono",
- "directories",
  "futures-util",
  "nanna-config",
  "nanna-core",
  "nanna-numeric",
  "nanna-proc",
- "rand 0.10.3",
  "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
- "sha2 0.11.0",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -5150,7 +5138,6 @@ dependencies = [
  "toml 1.1.8+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
- "urlencoding",
  "uuid",
 ]
 
@@ -5195,7 +5182,6 @@ name = "nanna-memory"
 version = "0.3.39"
 dependencies = [
  "async-trait",
- "half",
  "nanna-gpu",
  "nanna-numeric",
  "nanna-simd",
@@ -5261,13 +5247,11 @@ dependencies = [
  "nanna-llm",
  "nanna-storage",
  "nanna-tools",
- "reqwest",
  "serde",
  "serde_json",
  "serde_urlencoded",
  "sha2 0.11.0",
  "subtle",
- "thiserror 2.0.21",
  "tokio",
  "tower",
  "tower-http 0.7.1",

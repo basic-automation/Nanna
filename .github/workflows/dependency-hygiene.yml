@@ -1,0 +1,49 @@
+# Every declared dependency is used.
+#
+# Found 2026-10-09: 16 dependencies across 8 manifests were declared and never
+# named by their crate's code — `flume` in nanna-core, `half` in nanna-gpu and
+# nanna-memory, a whole PKCE stack (`base64`, `sha2`, `rand`, `urlencoding`) in
+# the GUI left behind by an OAuth flow that moved to the daemon, `criterion` in
+# nanna-gpu, whose benches have custom mains. Each one costs compile time and
+# lockfile churn, and some of them (`criterion`) showed up in every freshness
+# sweep as a "bump" to evaluate. Nothing noticed, because an unused dependency
+# compiles fine.
+#
+# `cargo shear` reads `cargo metadata` and scans the source for each crate's
+# imports — no build — so this job takes about a minute. If it reports a false
+# positive (a dependency needed only for feature unification or a macro that
+# names it indirectly), list it under `[package.metadata.cargo-shear] ignored`
+# in that crate's manifest with a comment saying why, rather than deleting this
+# gate.
+name: dependency-hygiene
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: dependency-hygiene-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unused-dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # `cargo metadata` honours rust-toolchain.toml; keep this in lockstep with
+      # the pin there (see the note in test-compile.yml).
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-03
+
+      - name: Install cargo-shear
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-shear
+
+      - name: No unused or misplaced dependencies
+        run: cargo shear
