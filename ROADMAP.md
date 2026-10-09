@@ -9336,9 +9336,11 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       handlers — so fixing a typo ran the agent again (a duplicate reply, tool side effects
       again). Edits are now acknowledged and ignored, and the listener no longer subscribes to
       them (test `an_edited_message_does_not_start_a_turn`).
-      **Filed from the same audit, not fixed this run:** Telegram replies go out as legacy
-      `Markdown` with no fallback, so an unmatched `_` makes Telegram reject the whole reply (and a
-      split reply stops at the first rejected part); the daemon's
+      *(same run)* Telegram replies went out as legacy `Markdown` with no fallback, so an
+      unmatched `_` (a file name) made Telegram refuse the whole reply; a refused parse is now
+      resent once as plain text (test `a_reply_telegram_cannot_parse_is_resent_as_plain_text`).
+      **Filed from the same audit, not fixed this run:** model text is not converted to
+      Telegram's MarkdownV2/HTML (it arrives unformatted when refused); the daemon's
       Discord interaction webhook passes the command name instead of its options and never
       completes the deferred response; `nanna serve`'s Slack and Discord handlers return the
       reply in the HTTP body (Slack ignores it and retries the event up to 3 times; Discord needs
