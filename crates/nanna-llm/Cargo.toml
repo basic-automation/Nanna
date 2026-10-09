@@ -21,6 +21,8 @@ thiserror.workspace = true
 futures = "0.3"
 async-stream = "0.3"
 directories = "6"
+# `Retry-After` as an HTTP-date (RFC 9110 allows it); already in the graph via hyper.
+httpdate = "1"
 
 # Optional: for OAuth auto-refresh
 nanna-config = { path = "../nanna-config", optional = true }

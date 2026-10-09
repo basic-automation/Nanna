@@ -9575,8 +9575,10 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       call open as a 502; a text-only reply with no terminator still ends as before, with a warning
       (some compatible servers omit both). 2 tests.
       **Filed, not fixed this run:** usage on streamed OpenAI-compatible turns is never requested
-      (`stream_options.include_usage`) nor parsed, so those turns record 0/0 tokens; and
-      `parse_reset_secs` ignores an HTTP-date `Retry-After`.
+      (`stream_options.include_usage`) nor parsed, so those turns record 0/0 tokens.
+      *(same run)* `Retry-After` as an HTTP-date (RFC 9110) is now read (`httpdate`, already in
+      the graph via hyper), a unit-less decimal (`"1.5"`) is seconds, and an empty header is no
+      value — it used to read as `0` and win over the `x-ratelimit-reset-*` headers.
 - [x] *(found 2026-10-09, same audit)* **A provider's published wait never reached the chat or the
       card run.** `from_response` put the header's wait in `LlmError::RateLimit.retry_after`, but
       the display was `Rate limit exceeded: {message}`, and the chat path

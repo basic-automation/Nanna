@@ -6635,7 +6635,9 @@ fn ollama_separates_thinking(model: &str) -> bool {
 /// nothing about this refusal.
 fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    if let Some(wait) = header("retry-after").and_then(parse_reset_secs) {
+    if let Some(wait) = header("retry-after")
+        .and_then(|value| parse_reset_secs(value).or_else(|| http_date_wait_secs(value)))
+    {
         return Some(wait);
     }
     ["requests", "tokens"]
@@ -6649,13 +6651,32 @@ fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<u64>
         .max()
 }
 
-/// Whole seconds (rounded up) in a reset value: plain seconds (`"20"`), or a
-/// Go-style duration as `OpenAI` sends it (`"6m0s"`, `"1.5s"`, `"250ms"`).
-/// These used to be parsed as bare integers, so every duration form was `None`.
+/// Seconds from now until an HTTP-date `Retry-After`
+/// (`Wed, 09 Oct 2026 07:28:00 GMT`), rounded up; a date already past is 0.
+fn http_date_wait_secs(value: &str) -> Option<u64> {
+    let at = httpdate::parse_http_date(value.trim()).ok()?;
+    let wait = at
+        .duration_since(std::time::SystemTime::now())
+        .unwrap_or(std::time::Duration::ZERO);
+    Some(wait.as_secs() + u64::from(wait.subsec_nanos() > 0))
+}
+
+/// Whole seconds (rounded up) in a reset value: plain seconds (`"20"`, or a
+/// decimal `"1.5"`), or a Go-style duration as `OpenAI` sends it (`"6m0s"`,
+/// `"1.5s"`, `"250ms"`). These used to be parsed as bare integers, so every
+/// duration form was `None`. An empty value is no value: it used to read as
+/// `0` and win over the `x-ratelimit-reset-*` headers.
 fn parse_reset_secs(value: &str) -> Option<u64> {
     let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
     if let Ok(secs) = value.parse::<u64>() {
         return Some(secs);
+    }
+    if value.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        // A unit-less decimal is seconds, like the integer form.
+        return parse_reset_secs(&format!("{value}s"));
     }
     let mut millis: u64 = 0;
     let mut rest = value;
@@ -7464,6 +7485,24 @@ mod tests {
         assert_eq!(parse_reset_secs("0s"), Some(0));
         assert_eq!(parse_reset_secs("soon"), None);
         assert_eq!(parse_reset_secs("5x"), None);
+        assert_eq!(
+            parse_reset_secs("1.5"),
+            Some(2),
+            "unit-less decimal seconds"
+        );
+        assert_eq!(parse_reset_secs(""), None, "an empty header is no wait");
+        assert_eq!(parse_reset_secs("  "), None);
+        assert_eq!(
+            http_date_wait_secs("Wed, 21 Oct 2015 07:28:00 GMT"),
+            Some(0),
+            "past"
+        );
+        let soon = httpdate::fmt_http_date(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(120),
+        );
+        let wait = http_date_wait_secs(&soon).expect("an HTTP-date parses");
+        assert!((118..=121).contains(&wait), "{wait}");
+        assert_eq!(http_date_wait_secs("soon"), None);
     }
 
     /// `retry-after` wins; otherwise only an exhausted bucket's reset counts.
