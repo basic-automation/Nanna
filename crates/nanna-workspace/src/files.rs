@@ -22,11 +22,50 @@ pub struct WorkspaceFile {
     pub modified: Option<i64>,
 }
 
+/// The most of one context file that is read.
+///
+/// These files are injected into a system prompt, where the agent keeps only
+/// a slice of the window for the whole workspace block; 256 KiB is already
+/// several times any window this serves, so reading further only spends
+/// memory. It used to be unbounded: a cloned repo whose `README.md` was a
+/// symlink to `/dev/zero` grew the process until it died.
+pub const WORKSPACE_FILE_BYTES_MAX: u64 = 256 * 1024;
+
+/// `path`, if it resolves to a regular file inside `root`.
+///
+/// A symlinked context file is fine (`AGENTS.md -> CLAUDE.md` is common) as
+/// long as it stays in the project: one pointing at `~/.ssh/id_rsa` would be
+/// pasted into the prompt and sent to the model provider.
+async fn contained_file(root: &Path, path: &Path) -> Option<PathBuf> {
+    let root = fs::canonicalize(root).await.ok()?;
+    let target = fs::canonicalize(path).await.ok()?;
+    let metadata = fs::metadata(&target).await.ok()?;
+    (metadata.is_file() && target.starts_with(&root)).then_some(target)
+}
+
+/// At most [`WORKSPACE_FILE_BYTES_MAX`] bytes of `path`, as text.
+async fn read_capped(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt;
+    let file = fs::File::open(path).await?;
+    let mut bytes = Vec::new();
+    file.take(WORKSPACE_FILE_BYTES_MAX)
+        .read_to_end(&mut bytes)
+        .await?;
+    debug_assert!(u64::try_from(bytes.len()).is_ok_and(|n| n <= WORKSPACE_FILE_BYTES_MAX));
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 impl WorkspaceFile {
-    /// Load a workspace file from disk
+    /// Load a workspace file from disk: a regular file inside `root` (through
+    /// symlinks that stay inside it), read up to [`WORKSPACE_FILE_BYTES_MAX`].
+    /// Anything else loads as absent.
     pub async fn load(root: &Path, name: &str) -> Self {
         let path = root.join(name);
-        match fs::read_to_string(&path).await {
+        let read = match contained_file(root, &path).await {
+            Some(target) => read_capped(&target).await,
+            None => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        };
+        match read {
             Ok(content) => {
                 let modified = fs::metadata(&path)
                     .await
@@ -228,6 +267,33 @@ impl WorkspaceFiles {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_context_file_is_read_only_inside_the_project_and_only_so_far() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "private key").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), root.path().join("README.md"))
+            .unwrap();
+        let escaped = super::WorkspaceFile::load(root.path(), "README.md").await;
+        assert!(
+            !escaped.exists,
+            "a symlink out of the project is not followed"
+        );
+        assert_eq!(escaped.content, "");
+
+        std::fs::write(root.path().join("CLAUDE.md"), "be careful").unwrap();
+        std::os::unix::fs::symlink(root.path().join("CLAUDE.md"), root.path().join("AGENTS.md"))
+            .unwrap();
+        let inside = super::WorkspaceFile::load(root.path(), "AGENTS.md").await;
+        assert_eq!(inside.content, "be careful", "a symlink inside it is fine");
+
+        let cap = usize::try_from(super::WORKSPACE_FILE_BYTES_MAX).unwrap();
+        std::fs::write(root.path().join("ROADMAP.md"), "x".repeat(cap + 10)).unwrap();
+        let big = super::WorkspaceFile::load(root.path(), "ROADMAP.md").await;
+        assert_eq!(big.content.len(), cap, "read up to the cap");
+    }
+
     use super::*;
     use std::fs::write;
     use tempfile::tempdir;

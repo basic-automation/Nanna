@@ -233,8 +233,8 @@ enum McpSecretAction {
 enum WorkspaceAction {
     /// Initialize a new workspace in the current directory
     Init {
-        /// Template to use (minimal, standard, project, assistant, research)
-        #[arg(short, long, default_value = "standard")]
+        /// Template to use (minimal, project)
+        #[arg(short, long, default_value = "project")]
         template: String,
 
         /// Path to initialize (defaults to current directory)

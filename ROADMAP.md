@@ -9901,6 +9901,24 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       turn's question and reply usually share it) on `id`, so "oldest first" is no longer the
       engine's choice within a second. 2 storage tests (`session_messages.rs`); no caller of the
       old read wanted the opening.
+- [x] *(found 2026-10-09, audit of the CLI and workspace crate)* **Workspace context files and
+      `workspace init` were careless with the user's files.** `WorkspaceFile::load` read
+      `README.md`/`AGENTS.md`/… whole and through any symlink: a cloned repo whose `README.md` points
+      at `/dev/zero` grew the process until it died, and one pointing at `~/.ssh/id_rsa` was pasted
+      into `nanna chat`'s system prompt and sent to the provider. It now reads only a regular file
+      that resolves inside the project (a symlink within it, like `AGENTS.md -> CLAUDE.md`, still
+      works), up to `WORKSPACE_FILE_BYTES_MAX` (256 KiB). `create_from_template` overwrote existing
+      files (the only guard was "no `AGENTS.md` yet"), replacing a repo's own `ROADMAP.md`; it now
+      creates only missing files. And a bare `nanna workspace init` always failed: its default
+      template `standard` does not exist (only `minimal` and `project` do) — the default is
+      `project`. Tests `a_context_file_is_read_only_inside_the_project_and_only_so_far`,
+      `an_existing_file_is_kept_not_replaced`.
+      **Filed from the same audit, not fixed this run:** `nanna doctor` checks the defaults (and
+      says all passed) when `config.toml` does not parse; `nanna daemon restart` can end with no
+      daemon (500 ms wait vs a multi-second drain) and exit 0; `daemon status` / export probe the
+      default port whatever `--port` started; `nanna mcp serve` fails tool calls over 30 s and
+      never reconnects; `nanna-daemon install` ignores `systemctl`/`launchctl` failures and drops
+      `--data-dir`/`--port`/`NANNA_CONFIG_PATH` from the unit.
 - [x] `nanna-simd` NEON arm has a trailing semicolon and does not compile on aarch64
       (`lib.rs:174,204`); `nanna-gpu` `search` must check buffer limits, `append` dirty index
       off-by-one; `nanna-bench` fixture divides by 24 576 instead of 2^24; `src/installer/windows/
