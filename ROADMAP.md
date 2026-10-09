@@ -9546,6 +9546,24 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       the openers seen (innermost first), and a dangling `\` at the cut no longer escapes the
       closing quote. 2 tests.
 
+- [x] *(found 2026-10-09, same audit)* **An OpenAI-compatible stream cut inside a tool call was
+      run as a finished call.** Both OpenAI-compatible stream paths (OpenAI/OpenRouter/GitHub and
+      the role-checked one) closed every open block and emitted `MessageStop{end_turn}` when the
+      body ended without `[DONE]` or a `finish_reason`, and dropped a last line that lacked its
+      `\n`. A proxy hanging up inside `"content":"def f(` therefore handed the agent half an
+      argument object, which the healer closed and a write tool ran. The Ollama path already
+      reported this as a retryable 502. New `OpenAiStreamState::finish_unterminated` translates
+      the unterminated last line first (it may be the terminator), then ends a cut with a tool
+      call open as a 502; a text-only reply with no terminator still ends as before, with a warning
+      (some compatible servers omit both). 2 tests.
+      **Filed, not fixed this run:** usage on streamed OpenAI-compatible turns is never requested
+      (`stream_options.include_usage`) nor parsed, so those turns record 0/0 tokens; the
+      rate-limit wait from headers survives only in `LlmError::RateLimit.retry_after`, while the
+      chat path and card cooldown re-parse the *display* text (and read "try again in 452ms" as
+      452 s); `parse_reset_secs` ignores an HTTP-date `Retry-After`; and `model_health` judges
+      `Unhealthy` on lifetime error rate with no expiry, so a model that recovers after a 5-failure
+      outage (5/6 errors) is skipped for good.
+
 **Stage 4 — the board client and what it must not port:**
 - [x] The Tauri layer's lock discipline: never hold `AppState` across a daemon round trip
       (`scheduler.rs:28`, `settings.rs:454,519,550` and siblings); no `unsafe set_var` from

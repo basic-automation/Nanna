@@ -5522,11 +5522,10 @@ impl LlmClient {
                 }
             }
 
-            // Emit close events if stream ended without finish_reason
-            for event in state.close_blocks() {
-                yield Ok(event);
+            // The body closed without `[DONE]` or a `finish_reason`.
+            for item in state.finish_unterminated::<OpenAiChunkDelta>(&buffer) {
+                yield item;
             }
-            yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
         }
     }
 
@@ -5787,11 +5786,10 @@ impl LlmClient {
                 }
             }
 
-            // If we got here without MessageStop, emit it
-            for event in state.close_blocks() {
-                yield Ok(event);
+            // The body closed without `[DONE]` or a `finish_reason`.
+            for item in state.finish_unterminated::<OpenAiRoleCheckedDelta>(&buffer) {
+                yield item;
             }
-            yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
         }
     }
 
@@ -6749,6 +6747,62 @@ impl OpenAiStreamState {
         events
     }
 
+    /// The items that end a stream whose body closed without `[DONE]` or a
+    /// `finish_reason`.
+    ///
+    /// A last `data:` line that arrived without its trailing newline is
+    /// translated first — it may be the terminator itself. Past that, a cut
+    /// that leaves a TOOL CALL open is an aborted generation, reported as a
+    /// retryable 502 like the Ollama path's (`finish`): closing it as a normal
+    /// `end_turn` handed the agent a half-written argument object, which the
+    /// JSON healer then "repaired" — a proxy hanging up inside
+    /// `"content":"def f(` ran a write tool with half its content. A text-only
+    /// reply still ends as before (logged): some OpenAI-compatible servers
+    /// omit both terminators, and a cut text reply harms nothing it touches.
+    fn finish_unterminated<D>(&mut self, buffer: &str) -> Vec<Result<StreamEvent, LlmError>>
+    where
+        D: serde::de::DeserializeOwned + Into<OpenAiChunkDelta>,
+    {
+        let mut items = Vec::new();
+        let residue = buffer.trim();
+        if !residue.is_empty() {
+            match self.on_line::<D>(residue) {
+                Ok((events, finished)) => {
+                    items.extend(events.into_iter().map(Ok));
+                    if finished {
+                        return items;
+                    }
+                }
+                Err(e) => {
+                    items.push(Err(e));
+                    return items;
+                }
+            }
+        }
+        if self.tool_calls_started.is_empty() {
+            tracing::warn!(
+                "OpenAI-compatible stream closed without [DONE] or finish_reason; \
+                 ending the text reply as complete"
+            );
+            items.extend(self.close_blocks().into_iter().map(Ok));
+            items.push(Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() }));
+            return items;
+        }
+        let open_tools = self.tool_calls_started.len();
+        items.push(Err(LlmError::from_api_response(
+            502,
+            format!(
+                "OpenAI-compatible stream ended without [DONE] or a finish_reason while \
+                 {open_tools} tool call(s) were open — their arguments may be cut off"
+            ),
+        )));
+        debug_assert!(
+            items.last().is_some_and(Result::is_err),
+            "a cut tool call ends in an error"
+        );
+        items
+    }
+
     /// Translate one SSE line into the events to yield, in order, and whether
     /// the message ended (`[DONE]` or a `finish_reason`). Lines that are not
     /// `data:` lines, and chunks that do not decode as `D`, yield nothing.
@@ -7474,6 +7528,57 @@ mod tests {
             r#"{"error":"input length 9000 exceeds maximum context length 8192"}"#
         ));
         assert!(!legacy_embed_may_answer(500, "internal error"));
+    }
+
+    /// A body that closes with a tool call open, and no `[DONE]` or
+    /// `finish_reason`, is an aborted generation — never a finished call whose
+    /// half-written arguments the healer would then "repair" and run.
+    #[test]
+    fn a_stream_cut_inside_a_tool_call_is_an_error_not_a_finish() {
+        let mut state = OpenAiStreamState::default();
+        let (events, finished) = state
+            .on_line::<OpenAiChunkDelta>(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":"{\"path\":\"a.py\",\"content\":\"def f("}}]}}]}"#,
+            )
+            .expect("a chunk");
+        assert!(!finished);
+        assert!(!events.is_empty());
+        let end = state.finish_unterminated::<OpenAiChunkDelta>("");
+        assert!(
+            matches!(end.last(), Some(Err(LlmError::Api { status: 502, .. }))),
+            "{end:?}"
+        );
+        assert!(
+            !end.iter().any(|item| matches!(item, Ok(StreamEvent::MessageStop { .. }))),
+            "a cut call is not stopped as complete"
+        );
+    }
+
+    /// The terminator itself may be the line that lost its trailing newline;
+    /// and a text-only reply with no terminator still ends as it did.
+    #[test]
+    fn an_unterminated_stream_honours_its_last_line_and_keeps_text_replies() {
+        let mut state = OpenAiStreamState::default();
+        state
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"ls","arguments":"{}"}}]}}]}"#)
+            .expect("a chunk");
+        let end = state.finish_unterminated::<OpenAiChunkDelta>(
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        );
+        assert!(
+            matches!(end.last(), Some(Ok(StreamEvent::MessageStop { stop_reason })) if stop_reason == "tool_use"),
+            "{end:?}"
+        );
+
+        let mut text_only = OpenAiStreamState::default();
+        text_only
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#)
+            .expect("a chunk");
+        let end = text_only.finish_unterminated::<OpenAiChunkDelta>("");
+        assert!(
+            matches!(end.last(), Some(Ok(StreamEvent::MessageStop { stop_reason })) if stop_reason == "end_turn"),
+            "{end:?}"
+        );
     }
 
     /// A mid-stream error envelope is the error it names — classified, so a
