@@ -8717,6 +8717,14 @@ as its turn (`TurnAdmission`, scope default `session`).
             "Deferred until …". A bare date now arrives at 00:00 UTC of its day, the same day the
             store's `due` announcement (the run worker's wake) uses. 2 cases added to
             `only_an_open_unblocked_agent_card_whose_date_has_come_starts`.
+      - [x] *(found 2026-10-09, same audit)* **A split naming one stranger left the others behind.**
+            `validate` refused only router assignees; `apply_split` then created children one at a
+            time, so `{"subtasks":[{…"agent:coder"},{…"agent:typo"}]}` wrote child 1, failed on
+            child 2's `ensure_member_exists`, and returned — child 1 stayed on the board with no post
+            naming it (the post comes last), already starting coder's run, under a card that was
+            never routed. Every named assignee is now checked against the roster before the first
+            write; a refusal names the sub-task and creates nothing. Test
+            `a_split_naming_a_stranger_creates_nothing`.
 - [ ] Delete: session table + `SessionManager`, `ChatAction::*`, `chat_harness.rs` continuation
       loop, empty-bubble gating, per-session pinned model, GUI chat pages and commands, channel
       adapters + `channel_secrets` + per-channel pinned models, `scheduler.target_channel/

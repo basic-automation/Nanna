@@ -331,7 +331,7 @@ pub async fn apply_decision(
             apply_assign(tasks, members, router_id, &task, member, reason, &fill).await?
         }
         RouterDecision::Split { subtasks, reason } => {
-            apply_split(tasks, router_id, &task, subtasks, reason).await?
+            apply_split(tasks, members, router_id, &task, subtasks, reason).await?
         }
         RouterDecision::Clarify { question, reason } => {
             apply_clarify(tasks, router_id, &task, question, reason).await?
@@ -420,11 +420,29 @@ async fn apply_assign(
 
 async fn apply_split(
     tasks: &TaskRepository,
+    members: &MemberRepository,
     router_id: &str,
     task: &Task,
     subtasks: &[SubtaskSpec],
     reason: &str,
 ) -> Result<AppliedDecision, StorageError> {
+    // Every named assignee is checked BEFORE the first child is written. The
+    // children are created one at a time, so a typo in sub-task 2 used to
+    // leave sub-task 1 on the board — unannounced (the post comes last) and,
+    // with an agent assignee, already starting a run — under a card that was
+    // never routed.
+    for (index, sub) in subtasks.iter().enumerate() {
+        let Some(assignee) = sub.assignee.as_deref() else {
+            continue;
+        };
+        members.get(assignee).await.map_err(|e| match e {
+            StorageError::NotFound(_) => StorageError::Invalid(format!(
+                "sub-task {} names '{assignee}', who is not a board member; nothing was split",
+                index + 1
+            )),
+            other => other,
+        })?;
+    }
     let mut created = Vec::with_capacity(subtasks.len());
     let mut lines = String::new();
     for sub in subtasks {
@@ -871,6 +889,43 @@ mod tests {
             post.contains(&format!("#{} → unassigned: client", applied.created[1])),
             "{post}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_split_naming_a_stranger_creates_nothing() {
+        let (_s, tasks, members) = board().await;
+        let task = card(&tasks, "ship the board").await;
+        let decision = RouterDecision::Split {
+            reason: "two halves".to_string(),
+            subtasks: vec![
+                SubtaskSpec {
+                    title: "store".to_string(),
+                    description: None,
+                    assignee: Some("agent:coder".to_string()),
+                },
+                SubtaskSpec {
+                    title: "client".to_string(),
+                    description: None,
+                    assignee: Some("agent:typo".to_string()),
+                },
+            ],
+        };
+        let refused = apply_decision(&tasks, &members, ROUTER, task.id, &decision, false)
+            .await
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("sub-task 2 names 'agent:typo'"),
+            "{refused}"
+        );
+        let board = tasks.list("global", None, true).await.unwrap();
+        assert_eq!(
+            board.iter().map(|t| t.id).collect::<Vec<_>>(),
+            [task.id],
+            "no child of a refused split is left behind"
+        );
+        assert!(tasks.notes(task.id, 10).await.unwrap().is_empty());
     }
 
     /// Decision 6: the clarification is a card for the human, and the work
