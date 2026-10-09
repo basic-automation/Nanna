@@ -168,6 +168,12 @@ impl AcceptanceVerdict {
         }
     }
 
+    /// A check Stop interrupted: unknown, like a hang — it never answered —
+    /// and never a failure of the work.
+    fn interrupted(command: &str) -> Self {
+        Self::timeout(format!("`{command}` was interrupted by Stop before it answered"))
+    }
+
     /// Attach the head of the command's own output.
     fn with_output_head(mut self, combined: &str) -> Self {
         let head = text_head(combined.trim_start(), ACCEPTANCE_OUTPUT_EXCERPT_CHARS).trim();
@@ -438,6 +444,21 @@ impl AcceptanceCheck {
         workdir: &Path,
         cap: Option<Duration>,
     ) -> AcceptanceVerdict {
+        self.run_interruptible(workdir, cap, None).await
+    }
+
+    /// [`Self::run_with_timeout_cap`], ended early when `cancel` fires: the
+    /// command's whole process tree is killed and the verdict is unknown.
+    ///
+    /// Stop used to wait out a running check — up to its 600 s ceiling —
+    /// because nothing between the run's token and the check's child process
+    /// listened for it.
+    pub async fn run_interruptible(
+        &self,
+        workdir: &Path,
+        cap: Option<Duration>,
+        cancel: Option<&CancelToken>,
+    ) -> AcceptanceVerdict {
         let capped_timeout = |configured: Duration| -> (Duration, bool) {
             cap.map_or((configured, false), |cap| {
                 let floored = cap.max(Duration::from_secs(1));
@@ -450,7 +471,7 @@ impl AcceptanceCheck {
                 timeout_secs,
             } => {
                 let (timeout, capped) = capped_timeout(Self::effective_timeout(*timeout_secs));
-                run_command_check(command, workdir, timeout, capped).await
+                run_command_check(command, workdir, timeout, capped, cancel).await
             }
             Self::FileExists { path } => {
                 let resolved = resolve_in_workdir(workdir, path);
@@ -486,13 +507,16 @@ impl AcceptanceCheck {
                 } else if let Some(command) = command {
                     let (timeout, capped) =
                         capped_timeout(Self::effective_timeout(*timeout_secs));
-                    let output = run_shell(command, workdir, timeout).await;
+                    let output = run_shell(command, workdir, timeout, cancel).await;
                     match output {
                         Ok((_, combined)) => combined,
                         Err(ShellRunError::Timeout { secs }) => {
                             return AcceptanceVerdict::timeout(timeout_detail(
                                 command, secs, capped,
                             ));
+                        }
+                        Err(ShellRunError::Cancelled) => {
+                            return AcceptanceVerdict::interrupted(command);
                         }
                         Err(ShellRunError::Other(e)) => {
                             return AcceptanceVerdict::fail(format!("command failed: {e}"));
@@ -892,8 +916,9 @@ async fn run_command_check(
     workdir: &Path,
     timeout: Duration,
     capped: bool,
+    cancel: Option<&CancelToken>,
 ) -> AcceptanceVerdict {
-    match run_shell(command, workdir, timeout).await {
+    match run_shell(command, workdir, timeout, cancel).await {
         Ok((code, combined)) => {
             let passed = code == Some(0);
             let tail: String = combined
@@ -918,6 +943,7 @@ async fn run_command_check(
         Err(ShellRunError::Timeout { secs }) => {
             AcceptanceVerdict::timeout(timeout_detail(command, secs, capped))
         }
+        Err(ShellRunError::Cancelled) => AcceptanceVerdict::interrupted(command),
         Err(ShellRunError::Other(e)) => {
             AcceptanceVerdict::fail(format!("`{command}` failed to run: {e}"))
         }
@@ -931,6 +957,8 @@ async fn run_command_check(
 /// accounting downstream must never confuse the two.
 enum ShellRunError {
     Timeout { secs: u64 },
+    /// The run was stopped; the check's tree was killed.
+    Cancelled,
     Other(String),
 }
 
@@ -938,6 +966,7 @@ impl std::fmt::Display for ShellRunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Timeout { secs } => write!(f, "timed out after {secs}s"),
+            Self::Cancelled => write!(f, "interrupted by Stop"),
             Self::Other(message) => write!(f, "{message}"),
         }
     }
@@ -958,6 +987,7 @@ async fn run_shell(
     command: &str,
     workdir: &Path,
     timeout: Duration,
+    cancel: Option<&CancelToken>,
 ) -> Result<(Option<i32>, String), ShellRunError> {
     let mut cmd = shell_command(command);
     cmd.current_dir(workdir)
@@ -1013,15 +1043,12 @@ async fn run_shell(
             output
         },
         () = tokio::time::sleep(timeout) => {
-            // Walk the live tree first, then terminate the job to sweep
-            // descendants the walk can't see (detached grandchildren).
-            if let Some(pid) = pid {
-                nanna_proc::kill_process_tree(pid).await;
-            }
-            if let Some(job) = job.take() {
-                job.terminate();
-            }
+            kill_check_tree(pid, job.take()).await;
             return Err(ShellRunError::Timeout { secs: timeout.as_secs() });
+        }
+        () = until_cancelled(cancel) => {
+            kill_check_tree(pid, job.take()).await;
+            return Err(ShellRunError::Cancelled);
         }
     };
     let mut combined = String::from_utf8_lossy(&stdout).into_owned();
@@ -1035,6 +1062,25 @@ async fn run_shell(
         combined.truncate(cut);
     }
     Ok((status.code(), combined))
+}
+
+/// Kill a check's whole tree: walk the live tree first, then terminate the
+/// job to sweep descendants the walk can't see (detached grandchildren).
+async fn kill_check_tree(pid: Option<u32>, job: Option<nanna_proc::ChildJob>) {
+    if let Some(pid) = pid {
+        nanna_proc::kill_process_tree(pid).await;
+    }
+    if let Some(job) = job {
+        job.terminate();
+    }
+}
+
+/// Resolves when `cancel` fires; never, without one.
+async fn until_cancelled(cancel: Option<&CancelToken>) {
+    match cancel {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Everything `pipe` yields, keeping at most `cap` bytes and discarding the
@@ -2306,7 +2352,7 @@ impl<'a> HarnessRun<'a> {
             // Re-hash BEFORE the run: the fingerprint has to
             // describe the inputs this run is about to read.
             let drift = self.evidence_guard.observe(&check, self.workdir);
-            let mut verdict = check.run_with_timeout_cap(self.workdir, hang_cap).await;
+            let mut verdict = check.run_interruptible(self.workdir, hang_cap, self.cancel.as_ref()).await;
             if let Some(sentence) = &drift {
                 verdict = verdict.with_evidence_drift(sentence);
             }
@@ -2379,7 +2425,7 @@ impl<'a> HarnessRun<'a> {
                 .contains(&check_identity(&check))
                 .then(|| self.longest_step.max(self.longest_decided_check));
             let drift = self.evidence_guard.observe(&check, self.workdir);
-            let mut verdict = check.run_with_timeout_cap(self.workdir, hang_cap).await;
+            let mut verdict = check.run_interruptible(self.workdir, hang_cap, self.cancel.as_ref()).await;
             if let Some(sentence) = &drift {
                 verdict = verdict.with_evidence_drift(sentence);
             }
@@ -2546,7 +2592,7 @@ impl<'a> HarnessRun<'a> {
                 .contains(&check_identity(check))
                 .then(|| self.longest_step.max(self.longest_decided_check));
             let drift = self.evidence_guard.observe(check, self.workdir);
-            let mut verdict = check.run_with_timeout_cap(self.workdir, hang_cap).await;
+            let mut verdict = check.run_interruptible(self.workdir, hang_cap, self.cancel.as_ref()).await;
             if let Some(sentence) = &drift {
                 verdict = verdict.with_evidence_drift(sentence);
             }
@@ -3043,7 +3089,7 @@ impl<'a> HarnessRun<'a> {
         // the verdict, so a step that edited what the check reads
         // cannot close the item in the same breath.
         let drift = self.evidence_guard.observe(check, self.workdir);
-        let mut verdict = check.run_with_timeout_cap(self.workdir, hang_cap).await;
+        let mut verdict = check.run_interruptible(self.workdir, hang_cap, self.cancel.as_ref()).await;
         if let Some(sentence) = &drift {
             verdict = verdict.with_evidence_drift(sentence);
         }
@@ -3546,7 +3592,7 @@ impl<'a> HarnessRun<'a> {
                 .contains(&check_identity(&check))
                 .then(|| self.longest_step.max(self.longest_decided_check));
             let drift = self.evidence_guard.observe(&check, self.workdir);
-            let mut verdict = check.run_with_timeout_cap(self.workdir, hang_cap).await;
+            let mut verdict = check.run_interruptible(self.workdir, hang_cap, self.cancel.as_ref()).await;
             if let Some(sentence) = &drift {
                 verdict = verdict.with_evidence_drift(sentence);
             }
@@ -3650,7 +3696,7 @@ impl<'a> HarnessRun<'a> {
                 .contains(&check_identity(&check))
                 .then(|| self.longest_step.max(self.longest_decided_check));
             let drift = self.evidence_guard.observe(&check, self.workdir);
-            let mut verdict = check.run_with_timeout_cap(self.workdir, hang_cap).await;
+            let mut verdict = check.run_interruptible(self.workdir, hang_cap, self.cancel.as_ref()).await;
             if let Some(sentence) = &drift {
                 verdict = verdict.with_evidence_drift(sentence);
             }
@@ -4581,7 +4627,7 @@ mod tests {
         let command = "sleep 30";
 
         let started = std::time::Instant::now();
-        let result = run_shell(command, dir.path(), Duration::from_secs(1)).await;
+        let result = run_shell(command, dir.path(), Duration::from_secs(1), None).await;
         let err = result.expect_err("a 30s sleeper must time out at 1s");
         assert!(err.to_string().contains("timed out"), "unexpected error: {err}");
         // Bound: 1s timeout + tree-kill (taskkill subprocess on Windows).
@@ -4615,7 +4661,7 @@ mod tests {
         let command =
             format!("ping -n 60 127.0.0.1 & cat /proc/$!/winpid > '{pid_path}'; exit 0");
 
-        let result = run_shell(&command, dir.path(), Duration::from_secs(2)).await;
+        let result = run_shell(&command, dir.path(), Duration::from_secs(2), None).await;
         let err = result.expect_err("held pipes must force the timeout");
         assert!(err.to_string().contains("timed out"), "unexpected error: {err}");
 
@@ -7318,6 +7364,34 @@ TASK COMPLETE"))]);
             "must die of script exhaustion, never of fruitlessness: {reasons:?}"
         );
         drop(reasons);
+    }
+
+    /// Stop interrupts a check already running: the check's tree is killed
+    /// and the verdict is unknown, not a failure. It used to run on to its
+    /// timeout (up to 600 s) after the run was stopped.
+    #[tokio::test]
+    async fn stop_interrupts_a_running_check() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let hang = "ping -n 60 127.0.0.1";
+        #[cfg(not(windows))]
+        let hang = "sleep 60";
+        let check = AcceptanceCheck::Command {
+            command: hang.to_string(),
+            timeout_secs: Some(60),
+        };
+        let cancel = CancelToken::new();
+        let stopper = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stopper.cancel();
+        });
+        let started = std::time::Instant::now();
+        let verdict = check.run_interruptible(dir.path(), None, Some(&cancel)).await;
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+        assert!(verdict.is_unknown(), "{verdict:?}");
+        assert!(!verdict.passed);
+        assert!(verdict.detail.contains("interrupted by Stop"), "{}", verdict.detail);
     }
 
     /// Once a check has consumed its ENTIRE ceiling without answering,

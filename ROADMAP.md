@@ -9886,7 +9886,12 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `record_llm_failure` records every non-cancelled failure, and a cancelled call
       (`LlmCallMeta::cancelled`) records nothing. With the 10-09 health fix above, a failing
       model is now actually held back — and released again.
-      **Filed from the same audit, not fixed this run:** Stop does not interrupt an acceptance check already running; and salvaged
+      *(same run)* Stop did not interrupt an acceptance check already running — it ran on to its
+      timeout (up to 600 s). The harness now runs checks through `run_interruptible` with the
+      run's token; `run_shell` kills the check's tree on cancel (the timeout path's
+      `kill_check_tree`) and the verdict is unknown, never a failure (test
+      `stop_interrupts_a_running_check`).
+      **Filed from the same audit, not fixed this run:** salvaged
       prose tool calls can be stored without a paired `tool_result` on the cancel/budget and
       wrap-up paths (no observed 400 yet — every path rebuilds its context).
 
