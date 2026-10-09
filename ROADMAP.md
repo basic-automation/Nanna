@@ -1330,8 +1330,8 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       real GUI over WebDriver** (isolated daemon): `set_tool_enabled web_fetch false` →
       `set_agent_name Verifier` → `config.toml` holds both `name = "Verifier"` and
       `disabled = ["web_fetch"]`. Residual: a setter racing the event by milliseconds; routing
-      setters through `config.set` is the full fix. Also open from this audit:
-      `set_embedding_config` reports success on a failed save and never tells the daemon.
+      setters through `config.set` is the full fix. *(same run)* `set_embedding_config` logged a
+      failed save and still answered "Embedding settings updated"; it now returns the error.
       *(same run)* `init_workspace` re-registered the active workspace as inactive (a fresh
       `Workspace` under the same id); `WorkspaceRegistry::register` now takes the flag from the
       registry's own selection (test `re_registering_the_active_workspace_keeps_it_active`).
