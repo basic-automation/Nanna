@@ -5457,6 +5457,9 @@ impl LlmClient {
                 "messages": messages_json,
                 "max_tokens": request.max_tokens,
                 "stream": true,
+                // Without it a streamed turn carries no usage at all, and
+                // recorded 0/0 tokens (see `OpenAiStreamState::on_usage`).
+                "stream_options": { "include_usage": true },
             });
             if let Some(temp) = request.temperature {
                 body["temperature"] = serde_json::json!(temp);
@@ -6502,6 +6505,8 @@ struct OpenAiStreamRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     stream: bool,
+    /// `{"include_usage": true}`: the usage chunk after the last choice.
+    stream_options: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAiStreamTool>>,
 }
@@ -6546,6 +6551,7 @@ fn openai_stream_body(request: &CompletionRequest) -> OpenAiStreamRequest {
         max_tokens: request.max_tokens,
         temperature: request.temperature,
         stream: true,
+        stream_options: serde_json::json!({ "include_usage": true }),
         tools,
     }
 }
@@ -6553,7 +6559,28 @@ fn openai_stream_body(request: &CompletionRequest) -> OpenAiStreamRequest {
 /// One `data:` chunk of an OpenAI-compatible chat-completions stream.
 #[derive(Deserialize, Debug)]
 struct OpenAiStreamChunk<D> {
+    #[serde(default = "Vec::new")]
     choices: Vec<OpenAiChunkChoice<D>>,
+    /// Sent once, after the last choice, when `include_usage` was asked for.
+    #[serde(default)]
+    usage: Option<OpenAiStreamUsage>,
+}
+
+/// The token counts of a streamed completion.
+#[derive(Deserialize, Debug)]
+struct OpenAiStreamUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -6757,6 +6784,10 @@ struct OpenAiStreamState {
     text_block_started: bool,
     /// Block index -> (id, name) of every tool call started so far.
     tool_calls_started: std::collections::HashMap<usize, (String, String)>,
+    /// The stop reason a `finish_reason` announced. The message ends at
+    /// `[DONE]`, not there: the usage chunk comes between the two, and the
+    /// stream used to be dropped before it was read.
+    finished_with: Option<String>,
 }
 
 impl OpenAiStreamState {
@@ -6807,6 +6838,13 @@ impl OpenAiStreamState {
                 }
             }
         }
+        if let Some(stop_reason) = self.finished_with.take() {
+            // A `finish_reason` arrived; only `[DONE]` (and perhaps the usage
+            // chunk) did not. The message is whole.
+            debug_assert!(self.tool_calls_started.is_empty(), "the finish closed every block");
+            items.push(Ok(StreamEvent::MessageStop { stop_reason }));
+            return items;
+        }
         if self.tool_calls_started.is_empty() {
             tracing::warn!(
                 "OpenAI-compatible stream closed without [DONE] or finish_reason; \
@@ -6853,7 +6891,8 @@ impl OpenAiStreamState {
         if data == "[DONE]" {
             // Close any open blocks
             let mut events = self.close_blocks();
-            events.push(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
+            let stop_reason = self.finished_with.take().unwrap_or_else(|| "end_turn".to_string());
+            events.push(StreamEvent::MessageStop { stop_reason });
             return Ok((events, true));
         }
 
@@ -6868,18 +6907,48 @@ impl OpenAiStreamState {
 
             // Check for stop
             if let Some(reason) = choice.finish_reason {
-                // Close any open blocks
+                // Close any open blocks; the message itself stops at `[DONE]`.
                 events.extend(self.close_blocks());
+                self.text_block_started = false;
+                self.tool_calls_started.clear();
                 let stop_reason = match reason.as_str() {
                     "tool_calls" => "tool_use",
                     "stop" => "end_turn",
                     other => other,
                 };
-                events.push(StreamEvent::MessageStop { stop_reason: stop_reason.to_string() });
-                return Ok((events, true));
+                self.finished_with = Some(stop_reason.to_string());
             }
         }
+        if let Some(usage) = chunk.usage {
+            Self::on_usage(&usage, &mut events);
+        }
         Ok((events, false))
+    }
+
+    /// The usage chunk as the events every provider reports usage with: the
+    /// prompt side on a (late) `MessageStart`, the completion on a
+    /// `MessageDelta` — the order the Ollama path emits them, and the stream
+    /// consumer records both by assignment wherever they appear. Cached
+    /// prompt tokens are part of `prompt_tokens`, so they are split out.
+    fn on_usage(usage: &OpenAiStreamUsage, events: &mut Vec<StreamEvent>) {
+        let cached = usage
+            .prompt_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.cached_tokens)
+            .min(usage.prompt_tokens);
+        debug_assert!(cached <= usage.prompt_tokens);
+        events.push(StreamEvent::MessageStart {
+            id: String::new(),
+            model: String::new(),
+            input_tokens: token_count_u32(usage.prompt_tokens - cached),
+            cache_read_tokens: token_count_u32(cached),
+            cache_creation_tokens: 0,
+            cache_creation_1h_tokens: 0,
+        });
+        events.push(StreamEvent::MessageDelta {
+            stop_reason: None,
+            output_tokens: token_count_u32(usage.completion_tokens),
+        });
     }
 
     /// Append the events for one choice delta: text, then tool-call starts and
@@ -7625,6 +7694,69 @@ mod tests {
             matches!(end.last(), Some(Ok(StreamEvent::MessageStop { stop_reason })) if stop_reason == "end_turn"),
             "{end:?}"
         );
+    }
+
+    /// The usage chunk `OpenAI` sends between the last choice and `[DONE]` is
+    /// read and reported; the message stops at `[DONE]` with the reason the
+    /// `finish_reason` gave. Streamed turns used to record 0/0 tokens: usage
+    /// was never asked for, and the stream was dropped at `finish_reason`.
+    #[test]
+    fn a_streamed_turn_reports_its_usage_before_it_stops() {
+        let mut state = OpenAiStreamState::default();
+        state
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"ls","arguments":"{}"}}]}}]}"#)
+            .expect("a chunk");
+        let (events, finished) = state
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#)
+            .expect("the finish");
+        assert!(!finished, "the usage chunk is still to come");
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { index: 1 })));
+        let (usage, finished) = state
+            .on_line::<OpenAiChunkDelta>(
+                r#"data: {"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":34,"prompt_tokens_details":{"cached_tokens":1000}}}"#,
+            )
+            .expect("the usage");
+        assert!(!finished);
+        assert!(
+            matches!(
+                usage.as_slice(),
+                [
+                    StreamEvent::MessageStart { input_tokens: 200, cache_read_tokens: 1000, .. },
+                    StreamEvent::MessageDelta { output_tokens: 34, .. },
+                ]
+            ),
+            "{usage:?}"
+        );
+        let (done, finished) = state.on_line::<OpenAiChunkDelta>("data: [DONE]").expect("done");
+        assert!(finished);
+        assert!(
+            matches!(done.as_slice(), [StreamEvent::MessageStop { stop_reason }] if stop_reason == "tool_use"),
+            "{done:?}"
+        );
+
+        // A server that closes after the finish without `[DONE]` still ends
+        // the message whole — never as a cut tool call.
+        let mut closed = OpenAiStreamState::default();
+        closed
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"ls","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#)
+            .expect("call and finish in one chunk");
+        let end = closed.finish_unterminated::<OpenAiChunkDelta>("");
+        assert!(
+            matches!(end.as_slice(), [Ok(StreamEvent::MessageStop { stop_reason })] if stop_reason == "tool_use"),
+            "{end:?}"
+        );
+    }
+
+    /// Every streamed OpenAI-compatible body asks for the usage chunk.
+    #[test]
+    fn a_streamed_body_asks_for_usage() {
+        let request = CompletionRequest {
+            model: "gpt-x".to_string(),
+            ..CompletionRequest::default()
+        };
+        let body = serde_json::to_value(openai_stream_body(&request)).expect("serializes");
+        assert_eq!(body["stream_options"]["include_usage"], true, "{body}");
+        assert_eq!(body["stream"], true);
     }
 
     /// A mid-stream error envelope is the error it names — classified, so a

@@ -9828,8 +9828,14 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       the unterminated last line first (it may be the terminator), then ends a cut with a tool
       call open as a 502; a text-only reply with no terminator still ends as before, with a warning
       (some compatible servers omit both). 2 tests.
-      **Filed, not fixed this run:** usage on streamed OpenAI-compatible turns is never requested
-      (`stream_options.include_usage`) nor parsed, so those turns record 0/0 tokens.
+      *(same run)* Usage on streamed OpenAI-compatible turns was never requested nor parsed, and
+      the stream was dropped at `finish_reason` — before the usage chunk OpenAI sends ahead of
+      `[DONE]` — so those turns recorded 0/0 tokens. Both streamed bodies now send
+      `stream_options.include_usage`; the message stops at `[DONE]` (or the body's end) with the
+      `finish_reason`'s stop reason, and the usage chunk becomes the late `MessageStart` /
+      `MessageDelta` pair the Ollama path already emits, cached prompt tokens split out as cache
+      reads (tests `a_streamed_turn_reports_its_usage_before_it_stops`,
+      `a_streamed_body_asks_for_usage`).
       *(same run)* `Retry-After` as an HTTP-date (RFC 9110) is now read (`httpdate`, already in
       the graph via hyper), a unit-less decimal (`"1.5"`) is seconds, and an empty header is no
       value — it used to read as `0` and win over the `x-ratelimit-reset-*` headers.
