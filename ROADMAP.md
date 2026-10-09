@@ -9771,6 +9771,16 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       last call failed is held `COOLDOWN_BACKOFF_MAX_MS` (10 min, the cooldown's own cap) from that
       failure, then tried again. Test `a_poor_record_is_held_for_a_while_never_for_good`.
 
+- [x] *(found 2026-10-09, audit of the agent loop)* **Tool-result dedup wiped results it should
+      have kept — sometimes the newest.** `deduplicate_tool_results` (run after every tool round,
+      before the next model call) recorded a superseded call's *message* and then stubbed EVERY
+      `ToolResult` in it: a re-read of `a.rs` erased the `cargo test` output that shared its batch.
+      And its key was the path alone, so two pages of one file in a single batch
+      (`offset` 0 / 500) "superseded" each other inside the newest message — the model's fresh
+      results were stubbed before it read them. Now only the superseded call's own result is
+      replaced, and the key is the tool plus its whole input. Pure
+      `superseded_tool_results` with test `dedup_supersedes_only_the_repeated_calls_own_result`.
+
 **Stage 4 — the board client and what it must not port:**
 - [x] The Tauri layer's lock discipline: never hold `AppState` across a daemon round trip
       (`scheduler.rs:28`, `settings.rs:454,519,550` and siblings); no `unsafe set_var` from
