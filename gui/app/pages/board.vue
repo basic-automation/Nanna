@@ -426,7 +426,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { renderMarkdown } from '~/lib/markdown'
 import {
-  applyFilters, arrangeColumns, assignable, boardLabel, boardLabels, childCounts, filtering, NO_FILTERS, columnOf, dayOf, eventIsForBoard,
+  applyFilters, arrangeColumns, assignable, boardKey, boardLabel, boardLabels, childCounts, filtering, NO_FILTERS, columnOf, dayOf, eventIsForBoard,
   isDeferred, isOverdue, memberName, postKindLabel, runActionFor, splitAssigned, splitList, todayUtc,
   type BoardCard, type BoardFilters, type BoardMember, type CardPost, type RunAction,
 } from '~/lib/board'
@@ -477,7 +477,16 @@ function refusal(reply: unknown): string | null {
   return r?.error ? (r.message || r.error) : null
 }
 
+// Reads are answered in whatever order the daemon finishes them (each request
+// runs on its own task), so a slow read of the board the page just LEFT can land
+// after the read of the one it shows. Each read takes a ticket; only the
+// newest ticket's reply is applied.
+let cardsTicket = 0
+let rosterTicket = 0
+let cardTicket = 0
+
 async function loadCards() {
+  const ticket = ++cardsTicket
   loading.value = true
   try {
     // The board this page shows, named by id: the daemon's own "active
@@ -486,14 +495,15 @@ async function loadCards() {
       scope: board.value.scope, sessionId: null, includeClosed: true,
       workspaceId: board.value.workspaceId,
     })
+    if (ticket !== cardsTicket) return
     const why = refusal(reply)
     loadError.value = why ?? ''
     if (!why) cards.value = reply.tasks ?? []
     today.value = todayUtc()
   } catch (e) {
-    loadError.value = `Could not load the board: ${e}`
+    if (ticket === cardsTicket) loadError.value = `Could not load the board: ${e}`
   } finally {
-    loading.value = false
+    if (ticket === cardsTicket) loading.value = false
   }
 }
 
@@ -524,11 +534,12 @@ async function loadWorkspaces() {
 }
 
 async function loadRoster() {
+  const ticket = ++rosterTicket
   try {
     const reply = await invoke<{ members?: BoardMember[] }>('list_members', {
       workspaceId: board.value.workspaceId,
     })
-    if (!refusal(reply)) roster.value = reply.members ?? []
+    if (ticket === rosterTicket && !refusal(reply)) roster.value = reply.members ?? []
   } catch (e) {
     console.error('Failed to load the board roster:', e)
   }
@@ -594,9 +605,10 @@ const selected = computed(() => {
 })
 
 async function loadCard(id: number) {
+  const ticket = ++cardTicket
   try {
     const reply = await invoke<{ task?: BoardCard, notes?: CardPost[] }>('get_card', { id })
-    if (refusal(reply) || selectedId.value !== id) return
+    if (ticket !== cardTicket || refusal(reply) || selectedId.value !== id) return
     selectedDetail.value = reply.task ?? null
     posts.value = reply.notes ?? []
     void loadRunState(id)
@@ -765,7 +777,10 @@ async function markDone() {
 
 // ═══ Live refresh: the daemon announces every card change on the bus ═══
 let refreshTimer: ReturnType<typeof setTimeout> | null = null
+let assignedTimer: ReturnType<typeof setTimeout> | null = null
 const unlisteners: UnlistenFn[] = []
+/** Set on unmount: a `listen()` that resolves afterwards is undone at once. */
+let disposed = false
 
 /** Coalesce a burst of events (a router decision writes several) into one read. */
 function scheduleRefresh() {
@@ -781,7 +796,22 @@ function scheduleRefresh() {
   }, 250)
 }
 
-watch(board, () => {
+/** Inbox/Upcoming span every board: another board's change still moves their counts. */
+function scheduleAssignedRefresh() {
+  if (assignedTimer) clearTimeout(assignedTimer)
+  assignedTimer = setTimeout(() => {
+    assignedTimer = null
+    void loadAssigned()
+  }, 250)
+}
+
+/** Keep a listener only while the page is mounted. */
+function keep(unlisten: UnlistenFn) {
+  if (disposed) unlisten()
+  else unlisteners.push(unlisten)
+}
+
+watch(() => boardKey(board.value), () => {
   selectedId.value = null
   Object.assign(filters, NO_FILTERS)
   void loadCards()
@@ -800,19 +830,24 @@ onMounted(async () => {
   void loadRoster()
   void loadAssigned()
   try {
-    unlisteners.push(await listen<{ scope?: string, scope_id?: string | null }>('board-event', (event) => {
-      // Inbox and Upcoming span every board, so any card change may move them.
+    keep(await listen<{ scope?: string, scope_id?: string | null }>('board-event', (event) => {
+      // Inbox and Upcoming span every board, so any card change may move them;
+      // the nav shows their counts on the Board view too.
       if (view.value !== 'board' || eventIsForBoard(event.payload ?? {}, board.value)) scheduleRefresh()
+      else scheduleAssignedRefresh()
     }))
-    unlisteners.push(await listen('members-changed', () => { void loadRoster() }))
+    keep(await listen('members-changed', () => { void loadRoster() }))
   } catch (e) {
     console.error('Failed to subscribe to board events:', e)
   }
 })
 
 onUnmounted(() => {
+  disposed = true
   if (refreshTimer) clearTimeout(refreshTimer)
+  if (assignedTimer) clearTimeout(assignedTimer)
   for (const unlisten of unlisteners) unlisten()
+  unlisteners.length = 0
 })
 </script>
 

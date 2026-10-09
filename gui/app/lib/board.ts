@@ -103,12 +103,19 @@ function compareDone(a: BoardCard, b: BoardCard): number {
 }
 
 /**
- * Arrange cards into the four columns. `nested` hides sub-cards (the board's
- * flat/nested toggle, P25 decision 8) — a sub-card is still counted on its
- * parent via {@link childCounts}.
+ * Arrange cards into the four columns. `nested` hides sub-cards whose parent
+ * is on the board (the board's flat/nested toggle, P25 decision 8) — such a
+ * sub-card is still counted on its parent via {@link childCounts}. A sub-card
+ * whose parent is NOT among `cards` (a filter dropped it, or it lives on
+ * another board) is shown on its own: hiding it inside a parent that is not
+ * there would hide it altogether, so a filter matching only sub-cards showed
+ * "Nothing here".
  */
 export function arrangeColumns(cards: readonly BoardCard[], nested: boolean): BoardColumn[] {
-  const shown = nested ? cards.filter(card => card.parent_id === null) : cards
+  const present = new Set(cards.map(card => card.id))
+  const shown = nested
+    ? cards.filter(card => card.parent_id === null || !present.has(card.parent_id))
+    : cards
   const columns = COLUMNS.map(column => ({ ...column, cards: [] as BoardCard[] }))
   const byId = new Map(columns.map(column => [column.id, column]))
   for (const card of shown) byId.get(columnOf(card))?.cards.push(card)
@@ -182,6 +189,16 @@ export function eventIsForBoard(
 ): boolean {
   if (event.scope !== board.scope) return false
   return board.scope === 'global' || (event.scope_id ?? null) === board.workspaceId
+}
+
+/**
+ * A board's identity as a value: two `board` objects naming the same board
+ * give the same key. Watching the key, not the object, keeps an unrelated
+ * rebuild of the workspace list (every open/close anywhere) from looking like
+ * a board switch that closes the card view and clears the filters.
+ */
+export function boardKey(board: { scope: 'workspace' | 'global', workspaceId: string | null }): string {
+  return board.scope === 'global' ? 'global' : `workspace:${board.workspaceId ?? ''}`
 }
 
 /** The thread's label for a post kind. */

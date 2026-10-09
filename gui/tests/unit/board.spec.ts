@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   arrangeColumns,
+  boardKey,
   boardLabel,
   splitAssigned,
   splitList,
@@ -104,6 +105,19 @@ describe('arrangeColumns', () => {
     expect(count(false)).toBe(2)
   })
 
+  it('nested shows a sub-card on its own when its parent is not on the board', () => {
+    // An assignee filter matched only the router's sub-card: hiding it inside
+    // a parent the filter dropped left the board saying "Nothing here".
+    const parent = card({ id: 110, assignee: 'human' })
+    const child = card({ id: 111, parent_id: 110, assignee: 'agent:builder' })
+    const shown = (cards: BoardCard[]) => arrangeColumns(cards, true).flatMap(column => column.cards.map(c => c.id))
+    const filtered = applyFilters([parent, child], { ...NO_FILTERS, assignee: 'agent:builder' }, '2026-10-09')
+    expect(filtered.map(c => c.id)).toEqual([111])
+    expect(shown(filtered)).toEqual([111])
+    // With its parent present it stays inside it, as before.
+    expect(shown([parent, child])).toEqual([110])
+  })
+
   it('always returns the four columns in board order', () => {
     expect(arrangeColumns([], true).map(c => c.id)).toEqual(['todo', 'blocked', 'in_progress', 'done'])
   })
@@ -172,6 +186,16 @@ describe('eventIsForBoard', () => {
     expect(eventIsForBoard({ scope: 'global' }, ws)).toBe(false)
     expect(eventIsForBoard({ scope: 'global', scope_id: null }, global)).toBe(true)
     expect(eventIsForBoard({ scope: 'session', scope_id: 's' }, global)).toBe(false)
+  })
+})
+
+describe('boardKey', () => {
+  it('is equal for two objects naming the same board and differs across boards', () => {
+    const a = { scope: 'workspace' as const, workspaceId: 'ws-1' }
+    expect(boardKey(a)).toBe(boardKey({ ...a }))
+    expect(boardKey(a)).not.toBe(boardKey({ scope: 'workspace', workspaceId: 'ws-2' }))
+    expect(boardKey({ scope: 'global', workspaceId: null })).toBe('global')
+    expect(boardKey(a)).not.toBe(boardKey({ scope: 'global', workspaceId: null }))
   })
 })
 

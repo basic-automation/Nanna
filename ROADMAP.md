@@ -8692,6 +8692,23 @@ as its turn (`TurnAdmission`, scope default `session`).
             workspace A active, `quick_add_card {workspaceId: B}` put the card on B, each
             `list_tasks` returned only its own board's card, an unknown id was refused, and the
             Board page showed A's card and not B's.
+      - [x] *(found 2026-10-09, audit of the board client)* **Five ways the board showed the wrong
+            thing.** (1) **Opening or closing any workspace, from any client, closed the card view
+            and cleared the filters**: `watch(board)` watched a computed that builds a new object
+            whenever the layout re-reads the workspace list, so a same-board rebuild looked like a
+            switch — it now watches `boardKey(board)`. (2) **A slow read of the board just left
+            could land after the new board's** (the daemon answers each request on its own task):
+            `loadCards`, `loadRoster` and `loadCard` take a ticket and apply only the newest
+            reply. (3) **Nested view + a filter that matched only sub-cards showed "Nothing
+            here"**: `arrangeColumns` hid every sub-card, including ones whose parent the filter
+            had dropped; a sub-card whose parent is not on the board is now shown on its own.
+            (4) Inbox/Upcoming counts in the nav went stale on the Board view (other boards'
+            events were dropped) — they now refresh on their own coalesced timer. (5) A `listen()`
+            resolving after unmount was never undone; it is now unlistened at once. 2 vitest
+            (`boardKey`, the orphaned sub-card). **Not changed — owner call:** the board's dates
+            are store (UTC) days while the date picker means a local day, so in UTC−5 after 19:00
+            a deadline set "today" already reads overdue and `friday` typed on Thursday evening
+            resolves a week out. Which clock a board's "today" is belongs with decision 10.
 - [ ] Delete: session table + `SessionManager`, `ChatAction::*`, `chat_harness.rs` continuation
       loop, empty-bubble gating, per-session pinned model, GUI chat pages and commands, channel
       adapters + `channel_secrets` + per-channel pinned models, `scheduler.target_channel/
