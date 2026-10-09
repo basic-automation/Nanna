@@ -9127,9 +9127,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       beagle" was logged as a reinforcement and written nowhere — and `smart_ingest` also returned
       on `FoldResult::Subset`, which is the byte bound declining the append as often as a true
       subset. `remember_scoped` already kept the invariant "discard only what is provably present".
-      Both paths now reinforce-and-return only when the neighbour contains the text verbatim, fold
-      otherwise, and fall through to a row of its own when the fold lands nothing. Test
-      `a_new_detail_in_the_reinforce_band_is_kept` (both paths; fails with the old `Reinforce` arm).
+      Both paths now reinforce-and-return only when the neighbour contains the text verbatim;
+      otherwise a `Reinforce`-band text gets a row of its own (its embedding is already in hand —
+      a fold would re-embed the merged text, a second round-trip the write-path baseline
+      `write_path_round_trips_baseline` caught: 15 calls for 8 facts) and dreaming folds the pair
+      later; the `Update` band folds as before, and falls through to a row when the fold lands
+      nothing. Test `a_new_detail_in_the_reinforce_band_is_kept` (both paths; fails with the old
+      `Reinforce` arm).
 - [x] *(found 2026-10-09, same audit)* **A huge `Retry-After` could abort the daemon.**
       `embedding_router::demote` computed `Instant::now() + cooldown` with the cooldown taken
       straight from a provider's published retry (no upstream cap); `Instant + Duration` panics on

@@ -897,7 +897,15 @@ impl MemoryService {
                     info!("Reinforced: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
                     return Ok((existing.id.clone(), action));
                 }
-                IngestAction::Reinforce | IngestAction::Update => {
+                // Near-identical but not contained: rate the neighbour, keep the
+                // text as its own row (no second embed; dreaming folds later).
+                IngestAction::Reinforce => {
+                    self.pending_updates
+                        .write()
+                        .await
+                        .push((existing.id.clone(), Rating::Good));
+                }
+                IngestAction::Update => {
                     // Related-but-distinct: fold new information into the existing
                     // memory (dedup) rather than accreting a near-duplicate.
                     let folded = self
@@ -1176,7 +1184,18 @@ impl MemoryService {
                     info!("Reinforced: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
                     return Ok((existing.id.clone(), action));
                 }
-                IngestAction::Reinforce | IngestAction::Update if !skip_reinforce => {
+                // Near-identical but NOT contained: the neighbour is rated, and
+                // the text gets a row of its own. Its embedding is already in
+                // hand, so this costs the write path no second round-trip (a
+                // fold would re-embed the merged text); squeezing the pair is
+                // dreaming's job, with the whole corpus in view.
+                IngestAction::Reinforce if !skip_reinforce => {
+                    self.pending_updates
+                        .write()
+                        .await
+                        .push((existing.id.clone(), Rating::Good));
+                }
+                IngestAction::Update if !skip_reinforce => {
                     // Related-but-distinct: fold new information in (dedup) and reinforce.
                     let folded = self
                         .fold_into_memory(embed_fn, &existing.id, &existing.content, content)
