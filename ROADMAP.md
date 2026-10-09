@@ -1330,8 +1330,11 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       real GUI over WebDriver** (isolated daemon): `set_tool_enabled web_fetch false` →
       `set_agent_name Verifier` → `config.toml` holds both `name = "Verifier"` and
       `disabled = ["web_fetch"]`. Residual: a setter racing the event by milliseconds; routing
-      setters through `config.set` is the full fix. Also open from this audit: `init_workspace` re-registers the active workspace as inactive;
+      setters through `config.set` is the full fix. Also open from this audit:
       `set_embedding_config` reports success on a failed save and never tells the daemon.
+      *(same run)* `init_workspace` re-registered the active workspace as inactive (a fresh
+      `Workspace` under the same id); `WorkspaceRegistry::register` now takes the flag from the
+      registry's own selection (test `re_registering_the_active_workspace_keeps_it_active`).
       *(same run)* Two fixed: the Memory page's Workspace tab with no workspace open forwarded the
       literal `"workspace"` (listed the globals under that label; Clear matched nothing and said
       "cleared") — `resolve_memory_scope` now refuses it with a reason (1 test); and clearing an
