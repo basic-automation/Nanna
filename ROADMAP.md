@@ -9953,8 +9953,11 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `restart_fails_when_the_old_daemon_never_exits`).
       **Filed from the same audit, not fixed this run:** `daemon status` / export probe the
       default port whatever `--port` started; `nanna mcp serve` fails tool calls over 30 s and
-      never reconnects; `nanna-daemon install` ignores `systemctl`/`launchctl` failures and drops
-      `--data-dir`/`--port`/`NANNA_CONFIG_PATH` from the unit.
+      never reconnects; `nanna-daemon install` drops `--data-dir`/`--port`/`NANNA_CONFIG_PATH` from
+      the unit. *(same run)* `systemctl`/`launchctl` exit statuses are now checked: a refused
+      `systemctl --user enable` (bad unit, no user bus) used to print its error while `install`
+      reported success; `run_checked` fails with the status and stderr (test
+      `a_service_command_that_exits_non_zero_fails`), and the unit/plist path `unwrap`s are gone.
 - [x] `nanna-simd` NEON arm has a trailing semicolon and does not compile on aarch64
       (`lib.rs:174,204`); `nanna-gpu` `search` must check buffer limits, `append` dirty index
       off-by-one; `nanna-bench` fixture divides by 24 576 instead of 2^24; `src/installer/windows/

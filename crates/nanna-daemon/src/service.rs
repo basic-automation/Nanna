@@ -58,6 +58,32 @@ pub struct ServiceManager {
     config: ServiceConfig,
 }
 
+/// Run a service-manager command and fail unless it exits zero.
+///
+/// `status()` only reported whether the program could be spawned: a `systemctl
+/// --user enable` refused for a bad unit (or with no user session bus) printed
+/// its error and `install` still reported success, so the operator learned the
+/// daemon would not start at login only at the next login. The error carries
+/// the command, its exit status and its stderr.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn run_checked(command: &mut std::process::Command) -> Result<(), String> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let output = command
+        .output()
+        .map_err(|e| format!("could not run {program}: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    debug_assert!(!output.status.success());
+    Err(if stderr.is_empty() {
+        format!("{program} failed ({})", output.status)
+    } else {
+        format!("{program} failed ({}): {stderr}", output.status)
+    })
+}
+
 impl ServiceManager {
     #[must_use]
     pub const fn new(config: ServiceConfig) -> Self {
@@ -70,8 +96,9 @@ impl ServiceManager {
     ///
     /// Returns an error when the platform has no service backend, or the
     /// backend step fails: on Linux, creating or writing the systemd user unit
-    /// or spawning `systemctl`; on macOS, writing the launchd plist or spawning
-    /// `launchctl`; on Windows, connecting to the service manager or creating
+    /// or running `systemctl`; on macOS, writing the launchd plist or running
+    /// `launchctl` (a non-zero exit is a failure); on Windows, connecting to
+    /// the service manager or creating
     /// the service.
     pub fn install(&self) -> Result<(), String> {
         #[cfg(windows)]
@@ -117,8 +144,7 @@ impl ServiceManager {
     /// Returns an error when the platform has no service backend, or the
     /// service command could not be issued: spawning `systemctl` (Linux) or
     /// `launchctl` (macOS) failed, or the Windows service manager could not be
-    /// reached or refused the start. A spawned command's non-zero exit status is
-    /// not checked.
+    /// reached or refused the start, or the command exited non-zero.
     pub fn start(&self) -> Result<(), String> {
         #[cfg(windows)]
         return self.start_windows();
@@ -140,8 +166,7 @@ impl ServiceManager {
     /// Returns an error when the platform has no service backend, or the
     /// service command could not be issued: spawning `systemctl` (Linux) or
     /// `launchctl` (macOS) failed, or the Windows service manager could not be
-    /// reached or refused the stop. A spawned command's non-zero exit status is
-    /// not checked.
+    /// reached or refused the stop, or the command exited non-zero.
     pub fn stop(&self) -> Result<(), String> {
         #[cfg(windows)]
         return self.stop_windows();
@@ -217,18 +242,14 @@ impl ServiceManager {
         let plist_path = self.launchd_plist_path();
         let plist_content = self.generate_launchd_plist();
         
-        std::fs::create_dir_all(plist_path.parent().unwrap())
-            .map_err(|e| e.to_string())?;
+        if let Some(parent) = plist_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
         std::fs::write(&plist_path, plist_content)
             .map_err(|e| e.to_string())?;
         
         // Load the service
-        std::process::Command::new("launchctl")
-            .args(["load", plist_path.to_str().unwrap()])
-            .status()
-            .map_err(|e| e.to_string())?;
-        
-        Ok(())
+        run_checked(std::process::Command::new("launchctl").arg("load").arg(&plist_path))
     }
     
     #[cfg(target_os = "macos")]
@@ -237,7 +258,8 @@ impl ServiceManager {
         
         // Unload first
         let _ = std::process::Command::new("launchctl")
-            .args(["unload", plist_path.to_str().unwrap()])
+            .arg("unload")
+            .arg(&plist_path)
             .status();
         
         // Remove plist
@@ -250,20 +272,18 @@ impl ServiceManager {
     
     #[cfg(target_os = "macos")]
     fn start_macos(&self) -> Result<(), String> {
-        std::process::Command::new("launchctl")
-            .args(["start", &format!("com.nanna.{}", self.config.name)])
-            .status()
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        run_checked(
+            std::process::Command::new("launchctl")
+                .args(["start", &format!("com.nanna.{}", self.config.name)]),
+        )
     }
     
     #[cfg(target_os = "macos")]
     fn stop_macos(&self) -> Result<(), String> {
-        std::process::Command::new("launchctl")
-            .args(["stop", &format!("com.nanna.{}", self.config.name)])
-            .status()
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        run_checked(
+            std::process::Command::new("launchctl")
+                .args(["stop", &format!("com.nanna.{}", self.config.name)]),
+        )
     }
     
     #[cfg(target_os = "macos")]
@@ -333,24 +353,19 @@ impl ServiceManager {
         let unit_path = self.systemd_unit_path();
         let unit_content = self.generate_systemd_unit();
         
-        std::fs::create_dir_all(unit_path.parent().unwrap())
-            .map_err(|e| e.to_string())?;
+        if let Some(parent) = unit_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
         std::fs::write(&unit_path, unit_content)
             .map_err(|e| e.to_string())?;
         
         // Reload systemd
-        std::process::Command::new("systemctl")
-            .args(["--user", "daemon-reload"])
-            .status()
-            .map_err(|e| e.to_string())?;
+        run_checked(std::process::Command::new("systemctl").args(["--user", "daemon-reload"]))?;
         
         // Enable the service
-        std::process::Command::new("systemctl")
-            .args(["--user", "enable", &self.config.name])
-            .status()
-            .map_err(|e| e.to_string())?;
-        
-        Ok(())
+        run_checked(
+            std::process::Command::new("systemctl").args(["--user", "enable", &self.config.name]),
+        )
     }
     
     #[cfg(target_os = "linux")]
@@ -367,30 +382,21 @@ impl ServiceManager {
         }
         
         // Reload systemd
-        std::process::Command::new("systemctl")
-            .args(["--user", "daemon-reload"])
-            .status()
-            .map_err(|e| e.to_string())?;
-        
-        Ok(())
+        run_checked(std::process::Command::new("systemctl").args(["--user", "daemon-reload"]))
     }
     
     #[cfg(target_os = "linux")]
     fn start_linux(&self) -> Result<(), String> {
-        std::process::Command::new("systemctl")
-            .args(["--user", "start", &self.config.name])
-            .status()
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        run_checked(
+            std::process::Command::new("systemctl").args(["--user", "start", &self.config.name]),
+        )
     }
     
     #[cfg(target_os = "linux")]
     fn stop_linux(&self) -> Result<(), String> {
-        std::process::Command::new("systemctl")
-            .args(["--user", "stop", &self.config.name])
-            .status()
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        run_checked(
+            std::process::Command::new("systemctl").args(["--user", "stop", &self.config.name]),
+        )
     }
     
     #[cfg(target_os = "linux")]
@@ -497,6 +503,23 @@ fn xml_escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A service command that runs but refuses is a failure, with its stderr.
+    #[cfg(unix)]
+    #[test]
+    fn a_service_command_that_exits_non_zero_fails() {
+        let refused = run_checked(
+            std::process::Command::new("sh").args(["-c", "echo 'Unit not found.' >&2; exit 5"]),
+        );
+        let message = refused.expect_err("exit 5 is a failure");
+        assert!(message.contains("Unit not found."), "{message}");
+        assert!(message.starts_with("sh failed"), "{message}");
+        assert_eq!(run_checked(std::process::Command::new("sh").args(["-c", "exit 0"])), Ok(()));
+        assert!(
+            run_checked(&mut std::process::Command::new("/nonexistent/systemctl"))
+                .is_err_and(|e| e.starts_with("could not run"))
+        );
+    }
 
     #[test]
     fn exec_start_words_survive_spaces_quotes_and_specifiers() {
