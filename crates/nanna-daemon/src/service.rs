@@ -28,6 +28,11 @@ pub struct ServiceConfig {
     /// `executable`. **Platform-dependent** — see `Default`.
     pub arguments: Vec<String>,
     pub working_directory: Option<PathBuf>,
+    /// Variables the supervisor sets for the daemon (systemd `Environment=`,
+    /// launchd `EnvironmentVariables`) — `NANNA_CONFIG_PATH` when the install
+    /// ran with one, so the service reads the config file the operator chose.
+    /// Not applied on Windows, whose SCM has no per-service environment.
+    pub environment: Vec<(String, String)>,
 }
 
 /// The subcommand a service supervisor must invoke to start the daemon.
@@ -49,6 +54,7 @@ impl Default for ServiceConfig {
             executable: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nanna-daemon")),
             arguments: vec![DEFAULT_SERVICE_ARGUMENT.to_string()],
             working_directory: None,
+            environment: Vec::new(),
         }
     }
 }
@@ -320,6 +326,21 @@ impl ServiceManager {
             .map(|a| format!("        <string>{}</string>", xml_escape(a)))
             .collect::<Vec<_>>()
             .join("\n");
+        let environment = if self.config.environment.is_empty() {
+            String::new()
+        } else {
+            let pairs = self.config.environment.iter().fold(String::new(), |mut out, (k, v)| {
+                use std::fmt::Write as _;
+                let _ = writeln!(
+                    out,
+                    "        <key>{}</key>\n        <string>{}</string>",
+                    xml_escape(k),
+                    xml_escape(v)
+                );
+                out
+            });
+            format!("    <key>EnvironmentVariables</key>\n    <dict>\n{pairs}    </dict>\n")
+        };
         
         format!(r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -336,7 +357,7 @@ impl ServiceManager {
     <true/>
     <key>KeepAlive</key>
     <true/>
-    <key>StandardOutPath</key>
+{environment}    <key>StandardOutPath</key>
     <string>/tmp/nanna-daemon.log</string>
     <key>StandardErrorPath</key>
     <string>/tmp/nanna-daemon.err</string>
@@ -441,6 +462,12 @@ impl ServiceManager {
             .map(|arg| systemd_quote(arg))
             .collect::<Vec<_>>()
             .join(" ");
+        // One quoted `Environment="K=V"` line each, quoted like ExecStart.
+        let environment = self.config.environment.iter().fold(String::new(), |mut out, (k, v)| {
+            use std::fmt::Write as _;
+            let _ = writeln!(out, "Environment={}", systemd_quote(&format!("{k}={v}")));
+            out
+        });
         
         format!(r"[Unit]
 Description={}
@@ -448,7 +475,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart={} {}
+{environment}ExecStart={} {}
 Restart=on-failure
 RestartSec=5
 
@@ -534,6 +561,28 @@ mod tests {
         );
         assert_eq!(systemd_quote(r#"a"b\c"#), r#""a\"b\\c""#);
         assert_eq!(systemd_quote("100%"), "\"100%%\"", "no specifier expansion");
+    }
+
+    /// The unit and the plist carry the service's environment, quoted for
+    /// each format.
+    #[test]
+    fn the_service_environment_reaches_the_unit_and_the_plist() {
+        let manager = ServiceManager::new(ServiceConfig {
+            environment: vec![("NANNA_CONFIG_PATH".to_string(), "/home/a b/c&d.toml".to_string())],
+            ..ServiceConfig::default()
+        });
+        let plist = manager.generate_launchd_plist();
+        assert!(plist.contains("<key>EnvironmentVariables</key>"), "{plist}");
+        assert!(plist.contains("<key>NANNA_CONFIG_PATH</key>"));
+        assert!(plist.contains("<string>/home/a b/c&amp;d.toml</string>"));
+        #[cfg(target_os = "linux")]
+        {
+            let unit = manager.generate_systemd_unit();
+            assert!(
+                unit.contains("Environment=\"NANNA_CONFIG_PATH=/home/a b/c&d.toml\"\n"),
+                "{unit}"
+            );
+        }
     }
 
     #[test]

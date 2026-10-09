@@ -9999,8 +9999,12 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `ToolsApi::execute_until_answered` — no client-side deadline, the tool's own timeout bounds
       the call, and a dropped connection still ends the wait (test
       `a_tool_call_waits_for_the_daemons_answer`, slow mock daemon).
-      **Filed from the same audit, not fixed this run:** `nanna mcp serve` never reconnects; `nanna-daemon install` drops `--data-dir`/`--port`/`NANNA_CONFIG_PATH` from
-      the unit. *(same run)* `systemctl`/`launchctl` exit statuses are now checked: a refused
+      **Filed from the same audit, not fixed this run:** `nanna mcp serve` never reconnects. *(same run)* `nanna-daemon install` wrote the defaults whatever it was
+      given; the unit/plist/SCM arguments now carry its `--host`/`--port`/`--health-port`/
+      `--data-dir` (absolute), and a set `NANNA_CONFIG_PATH` becomes the unit's `Environment=` /
+      the plist's `EnvironmentVariables` (tests
+      `the_installed_service_runs_the_daemon_install_was_given`,
+      `the_service_environment_reaches_the_unit_and_the_plist`). *(same run)* `systemctl`/`launchctl` exit statuses are now checked: a refused
       `systemctl --user enable` (bad unit, no user bus) used to print its error while `install`
       reported success; `run_checked` fails with the status and stderr (test
       `a_service_command_that_exits_non_zero_fails`), and the unit/plist path `unwrap`s are gone.
