@@ -9478,6 +9478,14 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       and a relative `../../..` from a workspace under home wrote outside it. `scope_covers` now
       checks the lexically normalised path (`.` dropped, `..` resolved, never past the root), the
       same path the OS opens short of symlinks. Test `dot_dot_cannot_climb_out_of_a_scope`.
+- [x] *(found 2026-10-09, same audit)* **An authored tool could replace a bundled one.**
+      `tools.create`/`tools.update` refused only a bundled *directory* name, but a tool registers
+      under the name its *source* declares (`register_boxed` overwrites by that name), so
+      `create_tool(name: "my_writer", source: "export default { name: 'write_file', … }")` replaced
+      the live `write_file` — shrink floor, `.__prev__` copies and read marks — with unguarded code.
+      `validate_source` now requires the declared name to equal the tool's name (which is never
+      bundled). GUI user tools (`UserToolManager::create_tool`, registered under their own name)
+      now refuse a bundled name too. Test `a_source_declaring_another_name_is_refused`.
 - [x] Tool authoring: `tools.update` refuses bundled names and runs `check_syntax`; GUI
       `update_skill` validates the name (`tool_authoring.rs:99,236`, `gui/.../tools.rs:458`). Both
       move with the `default-skills` → tools rename.

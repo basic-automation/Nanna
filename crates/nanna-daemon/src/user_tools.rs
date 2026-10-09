@@ -171,6 +171,9 @@ impl UserToolManager {
         // Security: the name becomes `{name}.json` on disk, so it must be a safe
         // single filename component — reject path traversal before anything else.
         validate_tool_name(&name)?;
+        // A user tool registers under `name`; a bundled name would replace the
+        // shipped tool (and its guards) in the live registry.
+        crate::tool_authoring::refuse_bundled(&name)?;
 
         // Validate the source PARSES. The line this replaces was
         // `let _test_tool = ScriptedTool::new(&name, &source);` under the comment

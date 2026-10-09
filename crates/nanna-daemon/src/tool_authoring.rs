@@ -96,7 +96,7 @@ fn replace_exactly_once(current: &str, old: &str, new: &str) -> Result<String, S
 /// A tool whose source has no default export is written, registered and
 /// advertised, and the first anyone hears of it is a failed call — the same
 /// failure `UserToolManager::create_tool` was hardened against.
-fn validate_source(source: &str) -> Result<(), String> {
+fn validate_source(source: &str, name: &str) -> Result<(), String> {
     if source.trim().is_empty() {
         return Err("source is empty".to_string());
     }
@@ -107,10 +107,21 @@ fn validate_source(source: &str) -> Result<(), String> {
             source.len()
         ));
     }
-    if extract_manifest(source).is_none() {
+    let Some(manifest) = extract_manifest(source) else {
         return Err(
             "source must `export default` an object with `name` and `description`".to_string(),
         );
+    };
+    // The tool registers under the name its SOURCE declares, not the
+    // directory's: checking only `name` let `create_tool(name: "my_writer",
+    // source: "export default { name: 'write_file', … }")` replace the bundled
+    // `write_file` — and its shrink floor, `.__prev__` copies and read marks —
+    // with unguarded code. One name for both, and it is never a bundled one.
+    if manifest.name != name {
+        return Err(format!(
+            "the source declares the name '{}' but the tool is '{name}'; they must match",
+            manifest.name
+        ));
     }
     // The same parse `UserToolManager::create_tool` runs. Without it an edit
     // that broke the syntax was written, re-registered and advertised, and
@@ -133,7 +144,7 @@ fn is_bundled(name: &str) -> bool {
 }
 
 /// The refusal for a bundled `name`, addressed to the model.
-fn refuse_bundled(name: &str) -> Result<(), String> {
+pub(crate) fn refuse_bundled(name: &str) -> Result<(), String> {
     if is_bundled(name) {
         return Err(format!(
             "'{name}' ships with Nanna and cannot be changed by tool authoring. \
@@ -223,7 +234,7 @@ pub fn build_tool_authoring_services(
                 // same name would shadow it.
                 refuse_bundled(&name)?;
                 let source = string_arg(&params, "source")?;
-                validate_source(&source)?;
+                validate_source(&source, &name)?;
 
                 let dir = resolve_tool_dir(&tools_dir, &name)?;
                 if dir.join("tool.ts").exists() || dir.join("tool.js").exists() {
@@ -288,7 +299,7 @@ pub fn build_tool_authoring_services(
                             .map_err(|e| format!("cannot read {}: {e}", source_path.display()))?;
                         (replace_exactly_once(&current, &old, &new)?, 1)
                     };
-                validate_source(&updated)?;
+                validate_source(&updated, &name)?;
 
                 std::fs::write(&source_path, &updated)
                     .map_err(|e| format!("cannot write {}: {e}", source_path.display()))?;
@@ -504,20 +515,38 @@ mod tests {
 
     #[test]
     fn a_source_without_a_default_export_is_refused_before_disk() {
-        let err = validate_source("const x = 1;").unwrap_err();
+        let err = validate_source("const x = 1;", "probe").unwrap_err();
         assert!(err.contains("export default"), "unhelpful refusal: {err}");
     }
 
     #[test]
     fn an_oversized_source_is_refused_with_the_engines_own_ceiling() {
         let huge = format!("{VALID_SOURCE}//{}", "x".repeat(TOOL_SOURCE_BYTES_MAX));
-        let err = validate_source(&huge).unwrap_err();
+        let err = validate_source(&huge, "probe").unwrap_err();
         assert!(err.contains(&TOOL_SOURCE_BYTES_MAX.to_string()));
     }
 
     #[test]
     fn a_valid_source_passes() {
-        assert!(validate_source(VALID_SOURCE).is_ok());
+        assert!(validate_source(VALID_SOURCE, "probe").is_ok());
+    }
+
+    /// A tool registers under the name its source declares, so a source that
+    /// declares a bundled name under an innocent directory name would have
+    /// replaced the bundled tool.
+    #[test]
+    fn a_source_declaring_another_name_is_refused() {
+        let impostor = VALID_SOURCE.replace("\"probe\"", "\"write_file\"");
+        let err = validate_source(&impostor, "probe").unwrap_err();
+        assert!(err.contains("'write_file'"), "{err}");
+        assert!(
+            validate_source(&impostor, "write_file").is_ok(),
+            "the name check alone"
+        );
+        assert!(
+            refuse_bundled("write_file").is_err(),
+            "and that name is refused upstream"
+        );
     }
 
     // --- writing ----------------------------------------------------------
