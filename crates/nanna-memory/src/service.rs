@@ -880,8 +880,9 @@ impl MemoryService {
             }
         };
 
-        // Check for similar existing memories
-        let results = self.store.search(&embedding, 1).await;
+        // Check for similar existing GLOBAL memories: this path writes a
+        // global row, so a workspace's private row is never its neighbour.
+        let results = self.store.search_owned_by(&embedding, 1, None).await;
         
         if let Some((existing, similarity)) = results.first() {
             let action = IngestAction::from_similarity(*similarity);
@@ -1134,8 +1135,10 @@ impl MemoryService {
             }
         };
 
-        // Check for similar existing memories (duplicate detection)
-        let results = self.store.search(&embedding, 1).await;
+        // Check for similar existing GLOBAL memories (duplicate detection):
+        // this path writes a global row, so a workspace's private row is never
+        // its neighbour.
+        let results = self.store.search_owned_by(&embedding, 1, None).await;
         
         if let Some((existing, similarity)) = results.first() {
             let action = IngestAction::from_similarity(*similarity);
@@ -1303,8 +1306,8 @@ impl MemoryService {
             }
         };
 
-        // Check for similar existing memories (within same scope)
-        let results = self.store.search_scoped(&embedding, 1, workspace_id.as_deref()).await;
+        let owner = workspace_id.as_deref(); // same-scope neighbours only
+        let results = self.store.search_owned_by(&embedding, 1, owner).await;
         
         if let Some((existing, similarity)) = results.first() {
             let action = IngestAction::from_similarity(*similarity);
@@ -3466,6 +3469,72 @@ mod tests {
             "every byte handed in is a byte stored"
         );
         assert!(stored.content.ends_with("TAIL"), "the tail survived");
+    }
+
+    /// A write folds into, reinforces, or is discarded against only a memory
+    /// owned like the one it writes. The neighbour search used to be the READ
+    /// scope (a workspace's rows plus the global ones, or everything), so a
+    /// workspace's private detail was folded into a global row every other
+    /// workspace recalls, and a global fact was swallowed by one workspace's
+    /// private row.
+    #[tokio::test]
+    async fn an_ingest_never_folds_across_a_workspace_boundary() {
+        use std::sync::Arc;
+
+        // Every text embeds identically: each neighbour is in the Reinforce band.
+        let embed: EmbedFn =
+            Arc::new(|_text: &str| Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0]) }));
+        let config = MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        };
+        let service = MemoryService::new(config).with_embed_fn(embed);
+
+        let (global, _) = service
+            .remember_with_importance("deploy uses port 5149", HashMap::new(), 3.0)
+            .await
+            .expect("global write");
+        let (private, action) = service
+            .remember_scoped(
+                "deploy uses port 5149 behind the A-only VPN",
+                HashMap::new(),
+                3.0,
+                Some("ws-a".into()),
+            )
+            .await
+            .expect("workspace write");
+        assert_ne!(private, global, "the private detail got its own row");
+        assert_eq!(action, IngestAction::Create);
+        let global_row = service.store.get(&global).await.expect("global row");
+        assert_eq!(
+            global_row.content, "deploy uses port 5149",
+            "the global row is untouched"
+        );
+        assert_eq!(global_row.workspace_id, None);
+        let private_row = service.store.get(&private).await.expect("private row");
+        assert_eq!(private_row.workspace_id.as_deref(), Some("ws-a"));
+
+        // And the other way: with only a private neighbour, a global fact is a
+        // global row of its own, not a "reinforcement" of ws-a's memory.
+        let fresh = MemoryService::new(MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        })
+        .with_embed_fn(Arc::new(|_text: &str| {
+            Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0]) })
+        }));
+        let (private, _) = fresh
+            .remember_scoped("a private note", HashMap::new(), 3.0, Some("ws-a".into()))
+            .await
+            .expect("workspace write");
+        let (public, _) = fresh
+            .remember_with_importance("a public note", HashMap::new(), 3.0)
+            .await
+            .expect("global write");
+        assert_ne!(public, private);
+        let public_row = fresh.store.get(&public).await.expect("public row");
+        assert_eq!(public_row.workspace_id, None);
+        assert_eq!(public_row.content, "a public note");
     }
 
     #[test]

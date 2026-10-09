@@ -9110,6 +9110,17 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       another. The existing reassembly tests cover the path unchanged.
 
 **Stage 2 — router, scheduler, IPC, config:**
+- [x] *(found 2026-10-09, audit of the memory write path)* **Ingest folded memories across a
+      workspace boundary.** The write paths picked their dedup neighbour with the READ scope:
+      `remember_scoped` used `search_scoped` (the workspace's rows plus the global ones), and
+      `smart_ingest` / `remember_with_importance` — which write global rows — searched everything.
+      So a workspace's private detail at cosine > 0.75 to a global fact was folded INTO the global
+      row (now recalled by every other workspace), and a global fact near one workspace's private
+      row was folded into it or "reinforced" away (hidden from every other workspace). Dreaming
+      already refused such pairs (`consolidation::same_scope`). New
+      `VectorStore::search_owned_by(emb, k, owner)` returns only neighbours owned exactly like the
+      write; all three paths use it. Test `an_ingest_never_folds_across_a_workspace_boundary`
+      (fails on the old neighbour search).
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).

@@ -1178,6 +1178,41 @@ impl VectorStore {
             .0
     }
 
+    /// The nearest memories OWNED by exactly `owner` (`None` = global ones):
+    /// the neighbours a write may fold into, reinforce, or call a duplicate.
+    ///
+    /// Not [`Self::search_scoped`], which is what a workspace may READ — its
+    /// own memories plus the global ones. The write paths used that (or the
+    /// unscoped [`Self::search`]) to pick their neighbour, so a workspace's
+    /// private text could be folded into a global row (visible to every other
+    /// workspace) and a global fact folded into, or discarded as a duplicate
+    /// of, one workspace's private row (hidden from all the others). Dreaming
+    /// already refuses such pairs (`consolidation::same_scope`); the write path
+    /// now keeps the same rule.
+    pub async fn search_owned_by(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        owner: Option<&str>,
+    ) -> Vec<(MemoryEntry, f32)> {
+        let scope = owner.map_or(RecallScope::GlobalOnly, RecallScope::Workspace);
+        let (hits, _) = self
+            .search_in_scope_with_coverage(query_embedding, top_k, scope)
+            .await;
+        let neighbours: Vec<(MemoryEntry, f32)> = hits
+            .into_iter()
+            .filter(|(entry, _)| entry.workspace_id.as_deref() == owner)
+            .collect();
+        debug_assert!(neighbours.len() <= top_k, "never more than asked for");
+        debug_assert!(
+            neighbours
+                .iter()
+                .all(|(entry, _)| entry.workspace_id.as_deref() == owner),
+            "every neighbour shares the write's scope"
+        );
+        neighbours
+    }
+
     /// [`search_scoped`](Self::search_scoped), plus what the scan could compare.
     ///
     /// The coverage describes the SCAN, which is unscoped — a memory the
