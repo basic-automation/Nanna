@@ -103,7 +103,11 @@ impl Check {
 fn config_file_check(config_path: &Path) -> Check {
     let parsed = std::fs::read_to_string(config_path)
         .map_err(|e| e.to_string())
-        .and_then(|text| toml::from_str::<Config>(&text).map(drop).map_err(|e| e.to_string()));
+        .and_then(|text| {
+            toml::from_str::<Config>(&text)
+                .map(drop)
+                .map_err(|e| e.to_string())
+        });
     match parsed {
         Ok(()) => Check::ok("config.file", format!("{}", config_path.display())),
         Err(why) => Check::fail(

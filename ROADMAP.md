@@ -9951,8 +9951,11 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `RESTART_STOP_DEADLINE`, 30 s) and fails, not succeeds, when it is still alive or another
       daemon won the role (tests `restart_waits_out_a_slow_drain`,
       `restart_fails_when_the_old_daemon_never_exits`).
-      **Filed from the same audit, not fixed this run:** `daemon status` / export probe the
-      default port whatever `--port` started; `nanna mcp serve` fails tool calls over 30 s and
+      *(same run)* `daemon status` took no address and probed the default port whatever `--port`
+      started; it now takes `--host`/`--port` with `start`'s defaults (test
+      `daemon_status_takes_the_port_start_was_given`).
+      **Filed from the same audit, not fixed this run:** export probes the default port;
+      `nanna mcp serve` fails tool calls over 30 s and
       never reconnects; `nanna-daemon install` drops `--data-dir`/`--port`/`NANNA_CONFIG_PATH` from
       the unit. *(same run)* `systemctl`/`launchctl` exit statuses are now checked: a refused
       `systemctl --user enable` (bad unit, no user bus) used to print its error while `install`

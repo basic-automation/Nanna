@@ -286,7 +286,15 @@ enum DaemonAction {
     Stop,
 
     /// Check daemon status
-    Status,
+    Status {
+        /// Host the daemon was started on
+        #[arg(short = 'H', long, default_value = LOOPBACK_HOST)]
+        host: String,
+
+        /// Port the daemon was started on (`daemon start --port`)
+        #[arg(short, long, default_value_t = DEFAULT_IPC_PORT)]
+        port: u16,
+    },
 
     /// Restart the daemon
     Restart {
@@ -552,6 +560,26 @@ mod tests {
         assert_eq!(cli.config, None);
         assert_eq!(cli.host, "127.0.0.2");
         assert_eq!(cli.port, 6001);
+    }
+
+    /// `daemon status` probes the port the daemon was started on: a daemon
+    /// started with `--port` used to be reported "Not responding" because
+    /// status always probed the default.
+    #[test]
+    fn daemon_status_takes_the_port_start_was_given() {
+        let parse = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["nanna", "daemon", "status"].iter().chain(args))
+                .expect("`nanna daemon status` parses");
+            match cli.command {
+                Some(Commands::Daemon {
+                    action: DaemonAction::Status { host, port },
+                }) => (host, port),
+                _ => panic!("expected daemon status"),
+            }
+        };
+        assert_eq!(parse(&[]), (LOOPBACK_HOST.to_string(), DEFAULT_IPC_PORT));
+        assert_eq!(parse(&["--port", "6001"]).1, 6001);
+        assert_eq!(parse(&["-H", "127.0.0.2"]).0, "127.0.0.2");
     }
 
     /// A daemon is never given its config file as `--config`, which only part

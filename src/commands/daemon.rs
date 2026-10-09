@@ -10,8 +10,6 @@
 
 use crate::DaemonAction;
 use nanna_config::Config;
-use nanna_config::bind::LOOPBACK_HOST;
-use nanna_daemon::DEFAULT_IPC_PORT;
 use nanna_daemon::health::{DAEMON_MODE_FLAG, PidFile, PidFileState, ProcessProbe};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -63,8 +61,8 @@ pub async fn handle_daemon_command(
             println!("🌙 Stopping Nanna daemon...\n");
             stop_daemon_process(&pid_file)?;
         }
-        DaemonAction::Status => {
-            print_daemon_status(&pid_file).await?;
+        DaemonAction::Status { host, port } => {
+            print_daemon_status(&pid_file, &host, port).await?;
         }
         DaemonAction::Restart { host, port } => {
             println!("🌙 Restarting Nanna daemon...\n");
@@ -271,7 +269,10 @@ fn stop_daemon_process(pid_file: &PidFile) -> anyhow::Result<()> {
 }
 
 /// Print daemon status information.
-async fn print_daemon_status(pid_file: &PidFile) -> anyhow::Result<()> {
+///
+/// The connection is probed at `host:port`, the address `daemon start` was
+/// given (its defaults are the same).
+async fn print_daemon_status(pid_file: &PidFile, host: &str, port: u16) -> anyhow::Result<()> {
     use nanna_client::{Client, ClientConfig};
 
     println!("🌙 Nanna Daemon Status\n");
@@ -292,9 +293,11 @@ async fn print_daemon_status(pid_file: &PidFile) -> anyhow::Result<()> {
         println!("   (alive, but its program could not be identified — treated as the daemon)");
     }
 
-    // Same constant `daemon start` binds, so status can never probe a different port
-    // than the one the daemon was launched on — which is exactly what used to happen.
-    let address = format!("ws://{LOOPBACK_HOST}:{DEFAULT_IPC_PORT}");
+    // The address `daemon start` was given, with the same defaults. The
+    // daemon does not record its port, and status used to probe the default
+    // whatever `--port` had started — reporting a healthy daemon "Not
+    // responding".
+    let address = format!("ws://{host}:{port}");
     let client_config = ClientConfig::new(&address);
     if let Ok(Ok(_)) = tokio::time::timeout(
         std::time::Duration::from_secs(2),
