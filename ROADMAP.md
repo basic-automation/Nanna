@@ -9820,8 +9820,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       before the 4 MiB cut, for up to its 600 s ceiling — a check spamming logs could hold
       gigabytes in the daemon. `run_shell` now drains both pipes keeping at most
       `ACCEPTANCE_READ_MAX_BYTES` of each (`read_pipe_capped`, 1 test).
-      **Filed from the same audit, not fixed this run:** Stop does not interrupt an acceptance check already running; primary-model failures never reach
-      `ModelStatsTracker` while a cancelled call is recorded as a 0-token success; and salvaged
+      *(same run)* Failed model calls never reached `ModelStatsTracker` (only a routed model's
+      pre-escalation failure did), so a model failing on every call kept a 100% success rate; and
+      a call ended by Stop was recorded as a 0-token *success*, resetting the failure streak. Now
+      `record_llm_failure` records every non-cancelled failure, and a cancelled call
+      (`LlmCallMeta::cancelled`) records nothing. With the 10-09 health fix above, a failing
+      model is now actually held back — and released again.
+      **Filed from the same audit, not fixed this run:** Stop does not interrupt an acceptance check already running; and salvaged
       prose tool calls can be stored without a paired `tool_result` on the cancel/budget and
       wrap-up paths (no observed 400 yet — every path rebuilds its context).
 

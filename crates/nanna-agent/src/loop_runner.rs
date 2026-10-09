@@ -4109,6 +4109,10 @@ struct LlmCallMeta {
     escalated: bool,
     /// The complexity routing classified, when routed.
     complexity: Option<TaskComplexity>,
+    /// Whether Stop ended the call. Its empty result is neither outcome:
+    /// recorded as a success it reset the model's failure streak and added a
+    /// 0 t/s sample; it carries no tokens, so skipping it loses nothing.
+    cancelled: bool,
 }
 
 /// What the prose tool-call dialect pass salvaged from a zero-tool-call reply.
@@ -4644,20 +4648,21 @@ impl Agent {
                 complexity,
             )
             .await;
+        let meta = LlmCallMeta {
+            latency: llm_latency,
+            routed: routed_model.is_some(),
+            escalated,
+            complexity,
+            cancelled: options
+                .cancel
+                .as_ref()
+                .is_some_and(CancelToken::is_cancelled),
+        };
+        self.record_llm_failure(&request.model, &meta, &result)
+            .await;
         let mut result = Self::settle_llm_result(state, result)?;
-        self.record_llm_call(
-            state,
-            options,
-            &request.model,
-            &result,
-            LlmCallMeta {
-                latency: llm_latency,
-                routed: routed_model.is_some(),
-                escalated,
-                complexity,
-            },
-        )
-        .await;
+        self.record_llm_call(state, options, &request.model, &result, meta)
+            .await;
         self.post_hoc_spiral_nudge(state, &result).await?;
 
         let salvage = self.salvage_prose_calls(state, &mut result).await;
@@ -5743,6 +5748,38 @@ impl Agent {
         }
     }
 
+    /// Record a failed call in the tracker, so its health judgement sees the
+    /// failures and not only the successes.
+    ///
+    /// The tracker used to hear only successes, so a model failing on every
+    /// call kept a 100% success rate and was never deprioritized.
+    async fn record_llm_failure(
+        &self,
+        model: &str,
+        meta: &LlmCallMeta,
+        result: &Result<LlmResult, AgentError>,
+    ) {
+        let (Err(error), Some(tracker), false) = (result, self.stats.as_ref(), meta.cancelled)
+        else {
+            return;
+        };
+        debug!(model, %error, "recording a failed model call");
+        tracker
+            .record(crate::model_stats::RequestObservation {
+                model: model.to_string(),
+                success: false,
+                latency: meta.latency,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_creation_1h_tokens: 0,
+                tier: meta.complexity,
+                escalated: meta.escalated,
+            })
+            .await;
+    }
+
     /// Record the call in the run's and the tracker's model statistics and
     /// in the run's token totals.
     async fn record_llm_call(
@@ -5758,7 +5795,11 @@ impl Agent {
             routed,
             escalated,
             complexity,
+            cancelled,
         } = meta;
+        if cancelled {
+            return;
+        }
         // Record model statistics
         let actual_model = model.to_string();
         let was_routed = routed && !escalated;
