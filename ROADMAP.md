@@ -9159,6 +9159,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `search_in_scope_with_coverage` takes the global top `3·k` before filtering, so a small
       workspace's matches can be crowded out while coverage reports complete; and the card fold
       (`memory_write_through`) reads only a card's oldest 1 000 episodes and never re-folds past it.
+- [x] *(found 2026-10-09, audit of scheduling)* **Cron matched day-of-month AND day-of-week.**
+      `CronExpr::matches` required both, while standard (Vixie) cron fires on EITHER when both are
+      restricted — so `0 9 1,15 * 1` ran only on a Monday that was the 1st or 15th, and
+      `0 0 29 2 1` (Feb 29 or any Monday) could fall outside `next`'s four-year search and never
+      run. Same parser for scheduler jobs and card recurrences. Now OR when neither field starts
+      with `*` (so `*/2` counts as starred, like Vixie), AND otherwise. Test
+      `restricted_day_and_weekday_fire_on_either`.
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
