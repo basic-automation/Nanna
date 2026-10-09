@@ -9693,8 +9693,10 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       replays it without the old id, sends `initialized`, and retries the request once (test
       `a_lost_legacy_session_is_renewed_and_the_request_retried`, scripted loopback server; fails
       with the renewal disabled).
-      **Filed from the same audit, not fixed this run:** a dropped legacy SSE GET stream leaves
-      every later request waiting its full 60 s.
+      *(same run)* A dropped legacy SSE GET stream failed the requests already waiting, but every
+      later one was posted and then waited the full 60 s for an answer the dead stream could never
+      carry. The pending map now closes with the stream, and a later request fails at once with
+      `ConnectionClosed` (test `a_request_after_the_stream_ended_fails_at_once`).
       *(same run)* **Streamable HTTP's 16 MiB cap bounded nothing.** `read_answer` buffered the
       whole body (`Response::bytes`) before comparing it to `HTTP_BODY_BYTES_MAX`, and the
       `notify` and legacy-SSE error paths read error bodies with `Response::text`, unbounded. Now

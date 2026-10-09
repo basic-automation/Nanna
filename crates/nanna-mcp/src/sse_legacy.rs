@@ -35,7 +35,10 @@ const ENDPOINT_TIMEOUT: Duration = Duration::from_secs(10);
 /// per tool call; the bound only stops a leak from growing without limit.
 const PENDING_MAX: usize = 256;
 
-type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<JsonRpcResponse>>>>;
+/// Requests awaiting their answer on the stream, by id; `None` once the
+/// stream has ended, so a later request fails at once instead of waiting
+/// [`HTTP_REQUEST_TIMEOUT`] for an answer nothing can deliver.
+type Pending = Arc<Mutex<Option<HashMap<String, oneshot::Sender<JsonRpcResponse>>>>>;
 
 /// The 2024-11-05 HTTP+SSE transport.
 pub struct LegacySseTransport {
@@ -114,7 +117,7 @@ impl LegacySseTransport {
             .timeout(HTTP_REQUEST_TIMEOUT)
             .build()
             .map_err(|e| McpError::Transport(e.to_string()))?;
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
         let list_changed = Arc::new(ListChangedFlags::default());
         let (stop, stop_rx) = tokio::sync::watch::channel(false);
         let reader = Reader {
@@ -133,6 +136,13 @@ impl LegacySseTransport {
             list_changed,
             stop,
         })
+    }
+
+    /// Stop waiting for `id`'s answer.
+    async fn forget(&self, id: &str) {
+        if let Some(waiting) = self.pending.lock().await.as_mut() {
+            waiting.remove(id);
+        }
     }
 
     async fn post(&self, body: String) -> Result<()> {
@@ -211,8 +221,10 @@ impl Reader {
                 self.route(&event.data).await;
             }
         }
-        // Nothing will answer the requests still waiting: fail them now.
-        self.pending.lock().await.clear();
+        // Nothing will answer the requests still waiting, or any later one:
+        // fail them now, and refuse the rest (dropping the senders ends
+        // every waiter with `ConnectionClosed`).
+        *self.pending.lock().await = None;
     }
 
     async fn route(&self, data: &str) {
@@ -248,7 +260,12 @@ impl Reader {
             }
             (None, _) => {
                 if let Ok(response) = serde_json::from_value::<JsonRpcResponse>(message)
-                    && let Some(waiter) = self.pending.lock().await.remove(&response.id.to_string())
+                    && let Some(waiter) = self
+                        .pending
+                        .lock()
+                        .await
+                        .as_mut()
+                        .and_then(|waiting| waiting.remove(&response.id.to_string()))
                 {
                     let _ = waiter.send(response);
                 }
@@ -262,24 +279,26 @@ impl Transport for LegacySseTransport {
     async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
         let id = request.id.to_string();
         let (tx, rx) = oneshot::channel();
-        {
-            let mut pending = self.pending.lock().await;
-            if pending.len() >= PENDING_MAX {
-                return Err(McpError::Protocol(format!(
-                    "{PENDING_MAX} MCP requests already await an answer"
-                )));
-            }
-            pending.insert(id.clone(), tx);
+        let mut guard = self.pending.lock().await;
+        let Some(waiting) = guard.as_mut() else {
+            return Err(McpError::ConnectionClosed);
+        };
+        if waiting.len() >= PENDING_MAX {
+            return Err(McpError::Protocol(format!(
+                "{PENDING_MAX} MCP requests already await an answer"
+            )));
         }
+        waiting.insert(id.clone(), tx);
+        drop(guard);
         if let Err(e) = self.post(serde_json::to_string(&request)?).await {
-            self.pending.lock().await.remove(&id);
+            self.forget(&id).await;
             return Err(e);
         }
         match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, rx).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => Err(McpError::ConnectionClosed),
             Err(_) => {
-                self.pending.lock().await.remove(&id);
+                self.forget(&id).await;
                 Err(McpError::Timeout)
             }
         }
@@ -346,5 +365,52 @@ mod origin_tests {
                 "{elsewhere}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_end_tests {
+    use super::LegacySseTransport;
+    use crate::transport::Transport as _;
+    use crate::{JsonRpcRequest, McpError};
+
+    /// Once the server's event stream has ended, a request fails at once:
+    /// it used to be posted and then wait the full 60 s for an answer the
+    /// dead stream could never deliver.
+    #[tokio::test]
+    async fn a_request_after_the_stream_ended_fails_at_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0_u8; 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                          Connection: close\r\n\r\nevent: endpoint\ndata: /messages\n\n",
+                    )
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        let transport = LegacySseTransport::connect(&format!("http://{addr}/sse"), None)
+            .await
+            .expect("the endpoint event arrives before the stream ends");
+        // Let the reader see the end of the stream.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while transport.pending.lock().await.is_some() {
+            assert!(tokio::time::Instant::now() < deadline, "the reader never saw the end");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let started = tokio::time::Instant::now();
+        let refused = transport
+            .request(JsonRpcRequest::new(1_i64, "tools/list", None))
+            .await;
+        assert!(matches!(refused, Err(McpError::ConnectionClosed)), "{refused:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }
