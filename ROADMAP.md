@@ -8885,6 +8885,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `DescribeImageTool`, `ReadPdfTool` — the daemon calls the `create_*_fn` closures and the
       pdf/ocr functions, never the structs); the CLI path's 16 tools (an owner call: is the
       `nanna` CLI/`serve` path still wanted beside the daemon?).
+      *(2026-10-09 — the test-only structs.)* `AnalyzeImageTool` and the audio structs had already
+      gone with the 10-08 cut. Deleted now: `ReadPdfTool` (with `PdfVisionFn`, its only user, and
+      the two markdown-appending passes behind it) and `DescribeImageTool` — **~440 lines**, built
+      by nothing but their own definition tests. `pdf.read` keeps running exactly as before:
+      `read_pdf_text` → `ocr_empty_pages` with the `OcrFn` bound in `vision_service`. The module
+      docs no longer claim the daemon wires an `OcrTool` pipeline into PDFs (it never did).
+      **Still open:** `OcrTool` alone, which is the OCR owner call below.
       *(2026-10-08, same run — the Deno path.)* `nanna-scripting`'s `deno` feature was enabled by
       no crate (only its own unused `full`), so the V8 engine was never compiled into anything we
       ship and every script already ran on Boa: with `deno` off, both engine orders resolved to
