@@ -283,7 +283,14 @@ impl AcceptanceCheck {
         // Round-tripping through the typed check is what makes the result
         // canonical rather than merely object-shaped: unknown keys are gone,
         // absent options are absent, and `timeout_secs` is an integer.
-        serde_json::to_value(&check)
+        let canonical = serde_json::to_value(&check)
+            .map_err(|e| format!("invalid acceptance check: {e}. {ACCEPTANCE_SHAPES}"))?;
+        // And the store's own admission, so the reader never accepts what the
+        // writer refuses: a check that parses but is empty (`file_exists` with
+        // no path, `command` with no command, `regex` with nothing to match)
+        // passed here and was then refused by `create` — which dropped the
+        // whole planned task, not just its check.
+        nanna_storage::admit_acceptance(&canonical)
             .map_err(|e| format!("invalid acceptance check: {e}. {ACCEPTANCE_SHAPES}"))
     }
 

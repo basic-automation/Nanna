@@ -9781,6 +9781,22 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       replaced, and the key is the tool plus its whole input. Pure
       `superseded_tool_results` with test `dedup_supersedes_only_the_repeated_calls_own_result`.
 
+- [x] *(found 2026-10-09, same audit)* **A planned task with a check the store refuses was dropped
+      whole.** `AcceptanceCheck::canonicalize` (the planner's and `tasks.add`'s gate) round-tripped
+      the typed check but never ran the store's `validate_acceptance`, so `file_exists` with an
+      empty path, `command` with an empty command or a `regex` with nothing to match passed the
+      planner and was then refused by `create` — and `seed_plan` dropped the entire task ("no
+      planned task could be created" for a one-task plan), contradicting the planner's own rule
+      that a bad check is dropped from the task, not the task. `canonicalize` now ends in
+      `nanna_storage::admit_acceptance`. Test
+      `a_check_the_store_would_refuse_is_dropped_and_the_task_kept`.
+      **Filed from the same audit, not fixed this run:** an acceptance `command`'s output is
+      buffered whole (`wait_with_output`) before the 4 MiB cut, for up to its 600 s ceiling; Stop
+      does not interrupt an acceptance check already running; primary-model failures never reach
+      `ModelStatsTracker` while a cancelled call is recorded as a 0-token success; and salvaged
+      prose tool calls can be stored without a paired `tool_result` on the cancel/budget and
+      wrap-up paths (no observed 400 yet — every path rebuilds its context).
+
 **Stage 4 — the board client and what it must not port:**
 - [x] The Tauri layer's lock discipline: never hold `AppState` across a daemon round trip
       (`scheduler.rs:28`, `settings.rs:454,519,550` and siblings); no `unsafe set_var` from
