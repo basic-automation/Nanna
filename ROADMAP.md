@@ -9360,8 +9360,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       return `{content, success: false}` with the real error. `browser_action` read
       `result.message` (the service answers `result`), and `browser_screenshot` claimed a base64
       PNG it never returned instead of the saved file's path; both fixed.
-      **Filed from the same audit, not fixed this run:** a crashed Chromium is never relaunched
-      (`ensure_launched` only checks the slot); `browser_action` cannot act on the page a
+      *(same run)* A crashed Chromium was never relaunched: `ensure_launched` only checked the
+      slot, and the event handler kept polling a dead connection (chromiumoxide yields its error
+      on every poll rather than ending). A per-launch liveness flag is cleared when the
+      connection errors; the next call drops the dead browser and launches anew (test
+      `a_browser_that_died_is_relaunched`, ignored by default — it launches Chromium; run here:
+      the kill seen and the relaunch done in 0.6 s).
+      **Filed from the same audit, not fixed this run:** `browser_action` cannot act on the page a
       previous call opened (each call is a fresh tab, so type-then-click loses the text); the
       screenshot's `width`/`height`/`selector`/`quality` are accepted and ignored by the CDP
       backend. *(same run)* The extract selector script escaped only `'` (a backslash in a
