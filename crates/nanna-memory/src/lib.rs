@@ -877,7 +877,10 @@ impl VectorStore {
     /// # Errors
     ///
     /// Returns `MemoryError::DimensionMismatch` if a non-empty embedding has
-    /// the wrong dimension.
+    /// the wrong dimension, or the backend's error if the write-through fails —
+    /// in which case nothing is added. An entry kept only in RAM is handed out
+    /// as an id that a restart silently takes back; `remove` is "durable or
+    /// refused", and `add` is now the same.
     pub async fn add(&self, mut entry: MemoryEntry) -> Result<(), MemoryError> {
         if !entry.embedding.is_empty() && entry.embedding.len() != self.config.get_dimension() {
             return Err(MemoryError::DimensionMismatch {
@@ -891,10 +894,11 @@ impl VectorStore {
 
         // Write-through to persistence backend before updating in-memory cache
         if let Some(ref db) = self.db
-            && let Err(e) = db.save_entry(&entry).await {
-                warn!("Failed to persist memory entry {}: {}", entry.id, e);
-                // Non-fatal: continue with in-memory add
-            }
+            && let Err(e) = db.save_entry(&entry).await
+        {
+            warn!("Failed to persist memory entry {}: {}", entry.id, e);
+            return Err(e);
+        }
 
         // Chunks follow the content, on EVERY path that writes content — not
         // just `remember`. The consolidation and dream paths mutate entries
@@ -2819,6 +2823,46 @@ mod tests {
             fsrs: FsrsState::default(),
             workspace_id: None,
         }
+    }
+
+    /// A backend whose every save fails.
+    struct UnwritableDb;
+    #[async_trait]
+    impl MemoryPersistence for UnwritableDb {
+        async fn save_entry(&self, _e: &MemoryEntry) -> Result<(), MemoryError> {
+            Err(MemoryError::Persistence("disk full".to_string()))
+        }
+        async fn remove_entry(&self, _id: &str) -> Result<(), MemoryError> {
+            Ok(())
+        }
+        async fn update_entry_fsrs(&self, _id: &str, _f: &FsrsState) -> Result<(), MemoryError> {
+            Ok(())
+        }
+        async fn update_entry_content(&self, _id: &str, _c: &str) -> Result<(), MemoryError> {
+            Ok(())
+        }
+        async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
+            Ok(vec![])
+        }
+    }
+
+    /// An add the backend refused is refused, not kept in RAM under an id a
+    /// restart takes back.
+    #[tokio::test]
+    async fn an_add_that_could_not_be_saved_is_refused_and_not_kept() {
+        let config = VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        };
+        let store = VectorStore::new(config).with_persistence(Arc::new(UnwritableDb));
+        let refused = store.add(entry_dim8("lost")).await;
+        assert!(
+            matches!(refused, Err(MemoryError::Persistence(_))),
+            "{refused:?}"
+        );
+        assert!(store.get("lost").await.is_none(), "nothing was kept in RAM");
+        assert!(store.all_entries().await.is_empty());
     }
 
     /// A backend that refuses to delete one named row, and whose batch delete

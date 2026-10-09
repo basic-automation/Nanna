@@ -9137,6 +9137,21 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       rate-limit `learn` (`reset_in` from a header epoch). Now `bench_until` uses `checked_add`
       and treats an unrepresentable horizon as none (the standard `DEMOTION_SECS`); `learn` keeps
       its last window. 1 test.
+- [x] *(found 2026-10-09, same audit)* **`VectorStore::add` reported success for a memory it
+      had not saved.** A failed write-through was logged and the entry kept in RAM, so the caller
+      handed out an id a restart silently took back — the exact shape `save_entry`'s own comment
+      calls a bug, and the one asymmetric path left after `remove` became "durable or refused".
+      `add` now returns the backend's error and keeps nothing; every caller already propagates
+      it (consolidation adds before it removes, so a refused add leaves the sources). Test
+      `an_add_that_could_not_be_saved_is_refused_and_not_kept`.
+      **Filed from the same audit, not fixed this run:** `backfill_embeddings` installs a vector
+      embedded from a content snapshot with no content compare-and-swap, so an edit landing
+      mid-embed gets the OLD text's vector permanently (the bucket then exists, so the row is never
+      re-queued); `set_embedding_for_model` / `update_content_and_embedding_if` clone under the
+      lock and `save_entry` after it, so a delete in that gap is resurrected by the upsert;
+      `search_in_scope_with_coverage` takes the global top `3·k` before filtering, so a small
+      workspace's matches can be crowded out while coverage reports complete; and the card fold
+      (`memory_write_through`) reads only a card's oldest 1 000 episodes and never re-folds past it.
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
