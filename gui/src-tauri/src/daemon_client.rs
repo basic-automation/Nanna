@@ -2259,6 +2259,40 @@ mod tests {
         .expect("the loop ends at once, not after RETRY_INTERVAL");
     }
 
+    /// After the daemon drops the connection, a request is refused at once
+    /// as "Not connected" and leaves nothing pending. The dead connection's
+    /// sender used to stay installed: every request registered itself, then
+    /// failed "channel closed" and stayed in the pending map.
+    #[tokio::test]
+    async fn a_request_after_the_daemon_dropped_is_refused_and_leaves_nothing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // One connection, closed straight after the handshake; then nothing listens.
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await
+                && let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await
+            {
+                let _ = ws.close(None).await;
+            }
+        });
+        let client = quick_client(port);
+        client.connect().await.expect("the first connection is accepted");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.is_connected().await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the drop is seen");
+
+        let refused = client
+            .request_with_timeout(serde_json::json!({"type": "system", "action": "status"}), Duration::from_secs(5))
+            .await;
+        assert_eq!(refused.unwrap_err(), "Not connected to daemon");
+        assert!(client.pending.read().await.is_empty(), "nothing left pending");
+        client.disconnect();
+    }
+
     /// `init` can run more than once. A second `connect` on a live client must
     /// not open a second connection: two message pumps would forward every
     /// daemon event twice.

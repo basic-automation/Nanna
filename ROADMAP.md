@@ -9399,7 +9399,8 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       failed with "channel closed" and stayed in the pending map; one sent just before the
       message task exited was buffered, dropped and waited out its whole timeout (5 min). The
       sender is now cleared first (requests answer "Not connected to daemon" at once) and a
-      failed send removes its own entry.
+      failed send removes its own entry (test
+      `a_request_after_the_daemon_dropped_is_refused_and_leaves_nothing`; fails without it).
       **Filed from the same audit, not fixed this run:** `relay_output` reads sidecar output
       with no line-length cap (an MCP server's `\r` progress bar grows one line for a whole
       download before `fit_line` trims it).
