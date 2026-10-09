@@ -294,6 +294,9 @@ pub struct Scheduler {
     /// this is the authority for the three live settings — `config` keeps the
     /// boot-time values and is updated alongside by [`Self::apply_settings`].
     runtime: Arc<SchedulerRuntime>,
+    /// Ids with a run in progress, shared by the loop and [`Self::run_now`]
+    /// so a manual run and a scheduled one never overlap.
+    in_flight: InFlight,
 }
 
 impl Scheduler {
@@ -308,6 +311,7 @@ impl Scheduler {
             storage: None,
             history: Arc::new(RwLock::new(HashMap::new())),
             runtime,
+            in_flight: InFlight::default(),
         }
     }
 
@@ -682,11 +686,6 @@ impl Scheduler {
             .map_or_default(|runs| runs.iter().rev().take(limit).cloned().collect())
     }
 
-    /// Record a job run
-    async fn record_run(&self, result: &TaskResult) {
-        record_run_in(&self.history, &result.task_id, result).await;
-    }
-
     /// How often the loop looks for due work — the resolution of every
     /// non-heartbeat schedule, reminders included.
     #[must_use]
@@ -694,38 +693,36 @@ impl Scheduler {
         self.config.check_interval
     }
 
-    /// Run a task immediately (bypass schedule)
+    /// Run a task immediately (bypass schedule), settled exactly like a
+    /// scheduled run: a delivered one-shot (a reminder) is removed and the
+    /// outcome persisted. `None` when there is no such task, no executor, or a
+    /// run of it is already in progress.
+    ///
+    /// It used to bump `run_count` in memory only and skip the in-flight claim:
+    /// a "Run now" reminder stayed listed but never fired at its time (count
+    /// 1), came back at 0 after a restart and was delivered a second time, and
+    /// could run concurrently with the loop's own run of it.
     pub async fn run_now(&self, task_id: &str) -> Option<TaskResult> {
         let executor = self.executor.as_ref()?;
+        let Some(claim) = InFlightClaim::take(&self.in_flight, task_id) else {
+            info!("Task {task_id} is already running; run-now skipped");
+            return None;
+        };
         let task = {
             let tasks = self.tasks.read().await;
             tasks.get(task_id).cloned()?
         };
-
+        let one_shot = task.task_type.is_one_shot();
         let result = executor(task).await;
-
-        // Record the run
-        self.record_run(&result).await;
-
-        // Update last_run
-        {
-            let mut tasks = self.tasks.write().await;
-            if let Some(t) = tasks.get_mut(task_id) {
-                t.last_run = Some(result.finished_at);
-                t.run_count += 1;
-
-                // Update next_run for cron tasks
-                if let TaskType::Cron {
-                    parsed: Some(ref p),
-                    ref mut next_run,
-                    ..
-                } = t.task_type
-                {
-                    *next_run = p.next_from_now();
-                }
-            }
-        }
-
+        settle_run(
+            &self.tasks,
+            self.storage.as_ref(),
+            &self.history,
+            one_shot,
+            &result,
+        )
+        .await;
+        drop(claim);
         Some(result)
     }
 
@@ -746,7 +743,7 @@ impl Scheduler {
         let storage = self.storage.clone();
         let history = self.history.clone();
         let runtime = self.runtime.clone();
-        let in_flight = InFlight::default();
+        let in_flight = Arc::clone(&self.in_flight);
 
         // Spawn the scheduler loop
         tokio::spawn(async move {
@@ -909,12 +906,34 @@ async fn run_due_task(
         result.task_id, task_id,
         "executor must answer for the task it ran"
     );
+    settle_run(&tasks, storage.as_ref(), &history, one_shot, &result).await;
+    // Released only now: the in-memory state settled above is what the next
+    // tick reads.
+    drop(claim);
+
+    if result.success {
+        info!("Task {} completed in {}ms", task_id, result.duration_ms);
+    } else {
+        error!("Task {} failed: {:?}", task_id, result.error);
+    }
+}
+
+/// Settle a finished run, scheduled or manual: record it, remove a delivered
+/// one-shot (or disable a failed one), advance a cron's next run, and persist.
+async fn settle_run(
+    tasks: &Arc<RwLock<HashMap<String, ScheduledTask>>>,
+    storage: Option<&Arc<Storage>>,
+    history: &Arc<RwLock<HashMap<String, Vec<JobRun>>>>,
+    one_shot: bool,
+    result: &TaskResult,
+) {
+    let task_id = result.task_id.clone();
     debug_assert!(
         result.finished_at >= result.started_at,
         "a run cannot finish before it starts"
     );
 
-    record_run_in(&history, &result.task_id, &result).await;
+    record_run_in(history, &result.task_id, result).await;
 
     let next_run = {
         let mut tasks_guard = tasks.write().await;
@@ -942,15 +961,7 @@ async fn run_due_task(
     };
 
     if let Some(storage) = storage {
-        settle_in_storage(&storage, &task_id, one_shot, &result, next_run.as_deref()).await;
-    }
-    // Released only now: the in-memory state above is what the next tick reads.
-    drop(claim);
-
-    if result.success {
-        info!("Task {} completed in {}ms", task_id, result.duration_ms);
-    } else {
-        error!("Task {} failed: {:?}", task_id, result.error);
+        settle_in_storage(storage, &task_id, one_shot, result, next_run.as_deref()).await;
     }
 }
 
@@ -1428,6 +1439,44 @@ mod tests {
         );
         assert_eq!(job.payload, "new prompt");
         assert!(!job.enabled);
+    }
+
+    #[tokio::test]
+    async fn run_now_delivers_a_reminder_once_and_for_good() {
+        let storage = Arc::new(Storage::in_memory().await.expect("in-memory storage"));
+        let executor: TaskExecutor = Arc::new(|task: ScheduledTask| {
+            Box::pin(async move {
+                TaskResult {
+                    task_id: task.id.clone(),
+                    task_name: task.name.clone(),
+                    success: true,
+                    output: None,
+                    error: None,
+                    duration_ms: 1,
+                    started_at: Utc::now(),
+                    finished_at: Utc::now(),
+                }
+            })
+        });
+        let scheduler = Scheduler::new(SchedulerConfig::default())
+            .with_storage(storage.clone())
+            .with_executor(executor);
+        let later = at_task("reminder", Utc::now() + chrono::Duration::hours(1), "x");
+        let id = later.id.clone();
+        scheduler.add_task(later).await;
+
+        assert!(scheduler.run_now(&id).await.is_some_and(|r| r.success));
+        assert!(
+            scheduler.get_task(&id).await.is_none(),
+            "a delivered reminder is gone, not left pending with run_count 1"
+        );
+        // And after a restart it is not delivered again.
+        let reloaded = Scheduler::new(SchedulerConfig::default()).with_storage(storage);
+        reloaded.load_jobs().await.expect("load");
+        assert!(
+            reloaded.get_task(&id).await.is_none(),
+            "not re-armed by a reload"
+        );
     }
 
     #[tokio::test]

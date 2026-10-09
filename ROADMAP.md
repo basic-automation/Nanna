@@ -9204,6 +9204,17 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       anything else must parse; stored trimmed) on all four ingress points: `tasks.add`,
       `tasks.update`, IPC `task.create`, `task.update` (`bad_recurrence`). Test
       `a_recurrence_is_checked_on_write_and_can_be_cleared`.
+- [x] *(found 2026-10-09, audit of scheduling)* **"Run now" on a reminder delivered it twice.**
+      `Scheduler::run_now` bumped `run_count` in memory only: the delivered reminder stayed listed
+      but never fired at its time (`run_count` 1), came back at 0 after a restart and was delivered
+      again; it also skipped the in-flight claim, so it could overlap the loop's own run.
+      `run_now` now takes the shared claim and settles through the same `settle_run` as a
+      scheduled run (one-shot removed on success, disabled on failure, persisted). Test
+      `run_now_delivers_a_reminder_once_and_for_good`.
+      **Filed, not fixed:** a cron job whose time passed while the daemon was down is skipped
+      silently (`job_to_task` recomputes `next_run` from now and ignores the stored one), while
+      one-shots and intervals catch up — "missed-job handling on startup" is a backlog feature,
+      so the catch-up policy (once? never?) is an owner call.
 - [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
