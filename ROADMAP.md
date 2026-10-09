@@ -9144,10 +9144,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `add` now returns the backend's error and keeps nothing; every caller already propagates
       it (consolidation adds before it removes, so a refused add leaves the sources). Test
       `an_add_that_could_not_be_saved_is_refused_and_not_kept`.
-      **Filed from the same audit, not fixed this run:** `backfill_embeddings` installs a vector
-      embedded from a content snapshot with no content compare-and-swap, so an edit landing
-      mid-embed gets the OLD text's vector permanently (the bucket then exists, so the row is never
-      re-queued); `set_embedding_for_model` / `update_content_and_embedding_if` clone under the
+      *(same run)* **`backfill_embeddings` installed an old text's vector on edited content.** It
+      embeds a content snapshot and installed the vector with no compare-and-swap, so an edit
+      landing mid-embed got the OLD text's vector permanently (the bucket then existed, so the row
+      was never re-queued) — findable by words it no longer contains. New
+      `VectorStore::set_embedding_if_content` compares the content under the same write guard that
+      installs; a changed row stays queued. Test `a_vector_of_edited_text_is_not_installed`.
+      **Filed from the same audit, not fixed this run:** `set_embedding_for_model` / `update_content_and_embedding_if` clone under the
       lock and `save_entry` after it, so a delete in that gap is resurrected by the upsert;
       `search_in_scope_with_coverage` takes the global top `3·k` before filtering, so a small
       workspace's matches can be crowded out while coverage reports complete; and the card fold

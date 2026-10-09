@@ -423,14 +423,15 @@ impl MemoryService {
                         debug!("Backfill for '{model}' abandoned — provider changed underneath it");
                         break;
                     }
-                    if let Err(e) = self
+                    match self
                         .store
-                        .set_embedding_for_model(&id, model, embedding, true)
+                        .set_embedding_if_content(&id, model, embedding, &content)
                         .await
                     {
-                        debug!("Backfill could not store embedding for {id}: {e}");
-                    } else {
-                        filled += 1;
+                        Ok(true) => filled += 1,
+                        // Edited mid-embed: this vector is of the old text.
+                        Ok(false) => debug!("Backfill skipped {id}: its content changed"),
+                        Err(e) => debug!("Backfill could not store embedding for {id}: {e}"),
                     }
                 }
                 Err(e) => {

@@ -1878,6 +1878,44 @@ impl VectorStore {
         embedding: Vec<f32>,
         activate: bool,
     ) -> Result<(), MemoryError> {
+        self.install_embedding(id, model, embedding, activate, None)
+            .await
+            .map(|installed| debug_assert!(installed, "an unguarded install always lands"))
+    }
+
+    /// [`Self::set_embedding_for_model`], only if the memory still holds
+    /// `embedded_from` — the text the vector was computed from. Returns
+    /// whether it was installed.
+    ///
+    /// The backfill embeds a content snapshot and installs the vector after
+    /// the (slow) embed call. An edit landing in between (`update_content`
+    /// clears the vectors and re-queues the row) used to get the OLD text's
+    /// vector installed on the NEW text — and since the model's bucket then
+    /// existed, the row was never queued again, so the memory stayed findable
+    /// by words it no longer contains. A changed row is left for the next pass.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_embedding_for_model`].
+    pub async fn set_embedding_if_content(
+        &self,
+        id: &str,
+        model: &str,
+        embedding: Vec<f32>,
+        embedded_from: &str,
+    ) -> Result<bool, MemoryError> {
+        self.install_embedding(id, model, embedding, true, Some(embedded_from))
+            .await
+    }
+
+    async fn install_embedding(
+        &self,
+        id: &str,
+        model: &str,
+        embedding: Vec<f32>,
+        activate: bool,
+        embedded_from: Option<&str>,
+    ) -> Result<bool, MemoryError> {
         if activate && embedding.len() != self.config.get_dimension() {
             return Err(MemoryError::DimensionMismatch {
                 expected: self.config.get_dimension(),
@@ -1888,6 +1926,11 @@ impl VectorStore {
         let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
             return Err(MemoryError::NotFound(id.to_string()));
         };
+        // Compared under the same write guard that installs: the check and the
+        // install are one step.
+        if embedded_from.is_some_and(|text| text != entry.content) {
+            return Ok(false);
+        }
         // A memory's FIRST vector ever is the moment it becomes findable by
         // similarity search. A re-embed after a provider switch keeps its old
         // buckets, so it is not a wait — counting it would read a days-old
@@ -1921,7 +1964,8 @@ impl VectorStore {
         {
             warn!("Failed to persist backfilled embedding for {}: {}", snapshot.id, e);
         }
-        Ok(())
+        debug_assert!(snapshot.embeddings.contains_key(model), "the bucket was written");
+        Ok(true)
     }
 
     /// Get the current configured dimension
@@ -2413,6 +2457,38 @@ mod tests {
             fsrs: FsrsState::default(),
             workspace_id: None,
         }
+    }
+
+    /// A vector computed from text the memory no longer holds is not
+    /// installed: the backfill embeds a snapshot, and an edit can land while
+    /// the embed is in flight.
+    #[tokio::test]
+    async fn a_vector_of_edited_text_is_not_installed() {
+        let store = store_of_width(3);
+        store.add(unembedded("m", 0)).await.expect("stored");
+        let stale = store
+            .set_embedding_if_content("m", "prov:a", vec![1.0, 0.0, 0.0], "an older text")
+            .await
+            .expect("no error");
+        assert!(!stale, "the edited row is left for the next pass");
+        let row = store.get("m").await.expect("row");
+        assert!(row.embedding.is_empty() && row.embeddings.is_empty());
+        assert_eq!(
+            store.entries_missing_model("prov:a", 8).await.len(),
+            1,
+            "still queued"
+        );
+
+        let fresh = store
+            .set_embedding_if_content("m", "prov:a", vec![1.0, 0.0, 0.0], "memory m")
+            .await
+            .expect("no error");
+        assert!(fresh);
+        assert_eq!(
+            store.entries_missing_model("prov:a", 8).await,
+            Vec::<(String, String)>::new(),
+            "filled"
+        );
     }
 
     /// P13 staleness: a memory written without a vector records how long it
