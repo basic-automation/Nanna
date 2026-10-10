@@ -10707,8 +10707,11 @@ keep the phases readable; promote individual items into a phase when they become
 - [ ] Quick setup (`nanna chat` with no key) saves the env-overridden runtime config: `PORT`, a
       channel section built from `TELEGRAM_BOT_TOKEN`, env API keys over stored ones. Save a
       freshly loaded file plus the entered key.
-- [ ] `--config` is ignored by `credentials` (it edits the default file) and mislabelled by
+- [x] `--config` is ignored by `credentials` (it edits the default file) and mislabelled by
       `init` and `status`.
+      *(2026-10-10, same run)* `credentials` loads from and saves to the `--config` file;
+      `init` and `status` name it. Verified on the built CLI: `status` and `config` label the
+      `--config` file, and `config` printed no secret line against this host's keyring.
 
 ### Context assembly that could lose or reject a turn (found 2026-10-10, audit of context management)
 

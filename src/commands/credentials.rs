@@ -2,6 +2,7 @@
 
 use crate::CredentialsAction;
 use nanna_config::Config;
+use std::path::Path;
 use tracing::warn;
 
 /// Print credentials status
@@ -76,8 +77,14 @@ fn print_credentials_status(
 /// TOML typo loaded as the DEFAULTS, and the save then wrote them over the
 /// user's file — provider, models, channels, MCP servers and `data_dir` gone,
 /// to set one OAuth field.
-fn loaded_config_to_edit() -> Option<Config> {
-    config_to_edit(Config::load())
+fn loaded_config_to_edit(config_path: &Path) -> Option<Config> {
+    // The file this command was pointed at (`--config`), not always the
+    // default: `nanna --config alt.toml credentials import` used to switch the
+    // DEFAULT file to OAuth while the daemon ran on `alt.toml`.
+    if !config_path.exists() {
+        return Some(Config::default());
+    }
+    config_to_edit(Config::load_from(&config_path.to_path_buf()))
 }
 
 fn config_to_edit<E: std::fmt::Display>(loaded: Result<Config, E>) -> Option<Config> {
@@ -91,20 +98,23 @@ fn config_to_edit<E: std::fmt::Display>(loaded: Result<Config, E>) -> Option<Con
     }
 }
 
-fn persist_oauth_credential(credential: &nanna_config::OAuthCredential) -> anyhow::Result<()> {
+fn persist_oauth_credential(
+    credential: &nanna_config::OAuthCredential,
+    config_path: &Path,
+) -> anyhow::Result<()> {
     // The secure store is where the token lives across restarts; a failed
     // save there is a failed login, not a warning followed by "✅".
     nanna_config::SecureStore::new()
         .save_anthropic_oauth(credential)
         .map_err(|e| anyhow::anyhow!("could not save the token to the secure store: {e}"))?;
 
-    let Some(mut config) = loaded_config_to_edit() else {
+    let Some(mut config) = loaded_config_to_edit(config_path) else {
         anyhow::bail!("the token is saved, but config.toml could not be read to switch it on");
     };
     config.llm.anthropic_oauth_token = Some(credential.access_token.clone());
     config.llm.anthropic_use_oauth = true;
     config
-        .save()
+        .save_to(config_path)
         .map_err(|e| anyhow::anyhow!("the token is saved, but config.toml was not: {e}"))?;
     println!("   Config updated to use OAuth");
     Ok(())
@@ -113,6 +123,7 @@ fn persist_oauth_credential(credential: &nanna_config::OAuthCredential) -> anyho
 /// Import Claude CLI credentials into Nanna config
 async fn import_credentials(
     manager: &nanna_config::ClaudeCredentialManager,
+    config_path: &Path,
 ) -> anyhow::Result<()> {
     use nanna_config::CredentialSource;
 
@@ -163,7 +174,7 @@ async fn import_credentials(
                 loaded.credential
             };
 
-            persist_oauth_credential(&credential)?;
+            persist_oauth_credential(&credential, config_path)?;
         }
         Err(e) => {
             println!("   Run 'claude login' first, or use 'nanna credentials setup'");
@@ -177,6 +188,7 @@ async fn import_credentials(
 /// Run interactive Claude CLI setup and import credentials
 fn setup_credentials(
     manager: &nanna_config::ClaudeCredentialManager,
+    config_path: &Path,
 ) -> anyhow::Result<()> {
     use nanna_config::ClaudeCredentialManager;
 
@@ -199,7 +211,7 @@ fn setup_credentials(
     // leaves something for `load()` to find — and it may be stale.
     match manager.load() {
         Ok(loaded) if !loaded.credential.is_expired() => {
-            persist_oauth_credential(&loaded.credential)?;
+            persist_oauth_credential(&loaded.credential, config_path)?;
 
             println!("\n✅ Authentication complete!");
             if let Some(ref sub) = loaded.credential.subscription_type {
@@ -224,6 +236,7 @@ fn setup_credentials(
 /// Refresh an existing OAuth token
 async fn refresh_credentials(
     manager: &nanna_config::ClaudeCredentialManager,
+    config_path: &Path,
 ) -> anyhow::Result<()> {
     println!("🔄 Refreshing OAuth Token...\n");
 
@@ -240,7 +253,7 @@ async fn refresh_credentials(
                         warn!("Failed to save to original source: {}", e);
                     }
 
-                    persist_oauth_credential(&new_cred)?;
+                    persist_oauth_credential(&new_cred, config_path)?;
 
                     println!("✅ Token refreshed!");
                     if let Some(secs) = new_cred.seconds_until_expiry() {
@@ -261,7 +274,7 @@ async fn refresh_credentials(
 }
 
 /// Clear stored OAuth credentials
-fn clear_credentials() -> anyhow::Result<()> {
+fn clear_credentials(config_path: &Path) -> anyhow::Result<()> {
     println!("🗑 Clearing OAuth Credentials...\n");
 
     // The SecureStore is the durable home — clearing only the config would
@@ -271,12 +284,14 @@ fn clear_credentials() -> anyhow::Result<()> {
         .delete_anthropic_oauth()
         .map_err(|e| anyhow::anyhow!("could not remove the token from the secure store: {e}"))?;
 
-    let Some(mut config) = loaded_config_to_edit() else {
+    let Some(mut config) = loaded_config_to_edit(config_path) else {
         anyhow::bail!("config.toml could not be read to switch OAuth off");
     };
     config.llm.anthropic_oauth_token = None;
     config.llm.anthropic_use_oauth = false;
-    config.save().map_err(|e| anyhow::anyhow!("config.toml was not saved: {e}"))?;
+    config
+        .save_to(config_path)
+        .map_err(|e| anyhow::anyhow!("config.toml was not saved: {e}"))?;
     println!("✅ Cleared OAuth token from Nanna config");
 
     println!("\n   Note: Claude CLI credentials in ~/.claude/.credentials.json are not modified.");
@@ -285,17 +300,20 @@ fn clear_credentials() -> anyhow::Result<()> {
 }
 
 /// Handle credentials subcommands
-pub async fn handle_credentials_command(action: CredentialsAction) -> anyhow::Result<()> {
+pub async fn handle_credentials_command(
+    action: CredentialsAction,
+    config_path: &Path,
+) -> anyhow::Result<()> {
     use nanna_config::ClaudeCredentialManager;
 
     let manager = ClaudeCredentialManager::new();
 
     match action {
         CredentialsAction::Status => print_credentials_status(&manager),
-        CredentialsAction::Import => import_credentials(&manager).await?,
-        CredentialsAction::Setup => setup_credentials(&manager)?,
-        CredentialsAction::Refresh => refresh_credentials(&manager).await?,
-        CredentialsAction::Clear => clear_credentials()?,
+        CredentialsAction::Import => import_credentials(&manager, config_path).await?,
+        CredentialsAction::Setup => setup_credentials(&manager, config_path)?,
+        CredentialsAction::Refresh => refresh_credentials(&manager, config_path).await?,
+        CredentialsAction::Clear => clear_credentials(config_path)?,
     }
 
     Ok(())

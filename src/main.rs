@@ -465,7 +465,7 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some(Commands::Status) => {
-            onboarding::show_status(&config)?;
+            onboarding::show_status(&config, &doctor_config_path(cli.config.as_ref())?);
             return Ok(());
         }
         Some(Commands::Doctor { online }) => {
@@ -499,7 +499,7 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some(Commands::Credentials { action }) => {
-            handle_credentials_command(action).await?;
+            handle_credentials_command(action, &doctor_config_path(cli.config.as_ref())?).await?;
             return Ok(());
         }
         Some(Commands::Daemon { action }) => {

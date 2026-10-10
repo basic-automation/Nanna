@@ -385,7 +385,7 @@ pub fn run_onboarding(config_path: &std::path::Path) -> anyhow::Result<Config> {
         );
     }
 
-    let config_path = Config::default_config_path()?;
+    // The file just written (`--config`), not always the default path.
     println!(
         "  {CHECK}Configuration saved to {}",
         style(config_path.display()).green()
@@ -438,12 +438,11 @@ pub fn quick_setup(config: &mut Config, config_path: &std::path::Path) -> anyhow
 }
 
 /// Show setup status.
-pub fn show_status(config: &Config) -> anyhow::Result<()> {
+pub fn show_status(config: &Config, config_path: &std::path::Path) {
     println!("{}", style("Nanna Configuration Status").bold());
     println!("{}", "─".repeat(40));
 
-    // Config path
-    let config_path = Config::default_config_path()?;
+    // The file the config came from (`--config`), not always the default.
     println!(
         "Config: {}",
         if config_path.exists() {
@@ -510,8 +509,6 @@ pub fn show_status(config: &Config) -> anyhow::Result<()> {
     } else {
         println!("  Path: (current directory)");
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
