@@ -110,7 +110,7 @@ async fn resolve_scope(
             Ok(("session".to_string(), Some(session_id.to_string())))
         }
         "workspace" => {
-            let ws = workspace_id.read().await.clone();
+            let ws = crate::run_workspace::resolve(workspace_id).await;
             let ws =
                 ws.ok_or_else(|| "workspace scope requires an active workspace".to_string())?;
             Ok(("workspace".to_string(), Some(ws)))
@@ -1441,6 +1441,22 @@ pub const CARD_RUN_SESSION_PREFIX: &str = "card:";
 #[must_use]
 pub fn card_run_session_id(card_id: i64) -> String {
     format!("{CARD_RUN_SESSION_PREFIX}{card_id}")
+}
+
+/// Bind a background run's memory and `tasks.*` workspace scope to its own
+/// board — never the shared slot the last chat turn wrote — and return the
+/// run session to release when the run ends. A run over a session's plan is
+/// that chat session, whose own turn binds it: `None`, nothing to release.
+fn bind_run_workspace(source: &TursoTaskSource, run_session: &str) -> Option<String> {
+    if source.scope == "session" {
+        return None;
+    }
+    let workspace = (source.scope == "workspace")
+        .then(|| source.scope_id.clone())
+        .flatten();
+    debug_assert!(source.scope != "workspace" || workspace.is_some());
+    crate::run_workspace::bind(run_session, workspace);
+    Some(run_session.to_string())
 }
 
 /// The tool session a background run's tools see — never the shared slot.
@@ -8791,6 +8807,7 @@ impl TaskRunManager {
 
         let manager = self.clone();
         let run_session = background_run_session(&source);
+        let bound_session = bind_run_workspace(&source, &run_session);
         let run = async move {
             // Bounded auto-resume (standard for every model): the task store
             // IS the checkpoint, so a run stopped by a provider incident is
@@ -8873,8 +8890,9 @@ impl TaskRunManager {
                 report: serde_json::to_value(&report).unwrap_or(Value::Null),
             });
             set_member_status(&source.storage, busy_member.as_deref(), MemberStatus::Idle).await;
-            manager.runs.write().await.remove(&key);
-            manager.reports.write().await.insert(key, (report, resumes));
+            manager
+                .free_slot(key, (report, resumes), bound_session.as_deref())
+                .await;
             // After the slot is free, or the member's next card would be
             // refused as "already working" — and the card's next member's
             // start refused as "already being worked".
@@ -8887,6 +8905,22 @@ impl TaskRunManager {
             run,
         ));
         Ok(())
+    }
+
+    /// Close a finished run's books: free its slot, keep its report, and drop
+    /// the run's workspace binding (`run_workspace`), if it bound one.
+    async fn free_slot(
+        &self,
+        key: String,
+        report: (LongHorizonReport, usize),
+        bound_session: Option<&str>,
+    ) {
+        let removed = self.runs.write().await.remove(&key);
+        debug_assert!(removed.is_some(), "a run frees the slot it claimed");
+        self.reports.write().await.insert(key, report);
+        if let Some(session) = bound_session {
+            crate::run_workspace::release(session);
+        }
     }
 
     /// Hand a freed member, and the card its run held, to the card-run

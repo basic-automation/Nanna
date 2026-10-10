@@ -833,7 +833,7 @@ fn memory_write_services(
                 // every `remember` call passes through — both this service
                 // and its `memory.embed` alias.
                 let tags = tags_with_provenance(tags, &params);
-                let workspace = ws.read().await.clone();
+                let workspace = crate::run_workspace::resolve(&ws).await;
                 match mem
                     .remember_scoped(&content, tags, importance, workspace)
                     .await
@@ -880,7 +880,7 @@ fn memory_write_services(
                 // every `remember` call passes through — both this service
                 // and its `memory.embed` alias.
                 let tags = tags_with_provenance(tags, &params);
-                let workspace = ws.read().await.clone();
+                let workspace = crate::run_workspace::resolve(&ws).await;
                 match mem
                     .remember_scoped(&content, tags, importance, workspace)
                     .await
@@ -932,7 +932,7 @@ fn memory_search_services(
                 let page_chars = opt_count(&params, "page_chars")?
                     .unwrap_or(nanna_memory::MEMORY_CHUNK_TARGET_CHARS);
                 let offset = opt_count(&params, "offset")?.unwrap_or(0);
-                let workspace = ws.read().await;
+                let workspace = crate::run_workspace::resolve(&ws).await;
                 match mem
                     .recall_scoped_with_coverage_shown(&query, workspace.as_deref(), limit)
                     .await

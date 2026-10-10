@@ -10537,13 +10537,23 @@ keep the phases readable; promote individual items into a phase when they become
       returns; the tool, `recall_memories` and `recall_memories_scoped` use it. Test
       `recall_reviews_only_what_it_shows`. **Still open:** chat injection's later filter (a
       memory already in the last 4 messages is dropped) happens after the review.
-- [ ] **Memory tools read ONE process-wide workspace slot.** `workspace_id_for_services` is
+- [x] **Memory tools read ONE process-wide workspace slot.** `workspace_id_for_services` is
       overwritten by every chat turn's prep and never reset, and `memory.store` / `memory.search`
       / the turn's auto-extraction read it live — so a card run on workspace B's board recalls
       and writes A's memories after a chat in A (or everything, if no chat has run), and two
       concurrent sessions in different workspaces cross. Same class as the tool-cwd slot fixed
       by `bind_session_workdir`: resolve the workspace per run session, and register each card
       run's card workspace there (decision 13).
+      *(2026-10-10, same run)* `run_workspace`: a map from run session to workspace (bounded
+      at 4096, entries live exactly as long as their run). A chat turn binds its session in
+      `prepare_chat_turn` and releases it at teardown (beside `clear_session_workdir`); a
+      background card/scope run binds `card:<id>` / `run:<scope>:<id>` to its board's workspace
+      at launch and releases it with its slot. `memory.store`/`.embed`/`.search`, the `tasks.*`
+      workspace scope and the harness's auto-extraction resolve through the caller's run session
+      first, the shared slot only when unbound. Test
+      `a_run_resolves_its_own_workspace_not_the_shared_slot`. Still the documented rule, not
+      changed: a run with no workspace (a global-board card, a chat with none) recalls
+      `Everything`.
 - [ ] **A stated fact folded into an observed neighbour loses its pin.** The live write path's
       fold keeps the survivor's metadata (`update_content_and_embedding_if` rewrites content and
       vector only), so a user assertion becomes `observed` and the next dream may paraphrase it
