@@ -232,7 +232,7 @@ pub async fn create_cron_job(
     })
 }
 
-/// Update a cron job's schedule.
+/// Update a cron job's schedule and, when given, its prompt.
 ///
 /// # Errors
 ///
@@ -244,10 +244,11 @@ pub async fn update_cron_job(
     state: State<'_, Arc<RwLock<AppState>>>,
     job_id: String,
     schedule: String,
+    payload: Option<String>,
 ) -> Result<bool, String> {
     let result = backend_handle(&state)
         .await
-        .scheduler_update(&job_id, Some(&schedule), None, None)
+        .scheduler_update(&job_id, Some(&schedule), payload.as_deref(), None)
         .await?;
     match result.get("error").and_then(|v| v.as_str()) {
         None => Ok(true),

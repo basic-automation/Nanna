@@ -10658,6 +10658,31 @@ keep the phases readable; promote individual items into a phase when they become
       file says the replaced content was saved when it was not; `file_history list` caps at 100
       of up to 500; `web_fetch` ignores the declared charset.
 
+### GUI settings that did not do what they showed (found 2026-10-10, audit of the GUI outside the board)
+
+- [x] **Editing a scheduled job dropped the new prompt.** The edit sent only the schedule
+      (`update_cron_job {jobId, schedule}`, the Rust side passing `None` for the payload) and found
+      the job by name; the modal closed as saved. It sends the prompt and keeps the edited job's
+      id.
+- [x] **"Remember my choice" on close was forgotten every launch** (`set_close_mode` lives in the
+      GUI process only). The choice is kept in the webview's storage and pushed back on load.
+      Test `a remembered close choice survives a restart`.
+- [x] **Two board notices from one agent within 2 s: the second was dropped** — the de-dup key
+      was type/source/title, and the card's name is only in the summary. The summary is part of
+      the key now.
+- [x] **Three memory setters awaited the daemon while holding the AppState write lock**
+      (`set_auto_remember_messages`, `set_max_compression_ratio`, `set_min_remaining_memories`)
+      — the class closed elsewhere; the backend handle is cloned and the guard dropped first.
+- [ ] **The custom system prompt and the agent name are saved and never used**: nothing outside
+      `nanna-config` reads `[agent].system_prompt`/`name` (the daemon builds
+      `default_system_prompt()`, and `ControlPlane::set_system_prompt` has no caller), nor
+      `streaming_enabled`. Apply them on config load/reload, or remove the editors (the
+      dead-fields class).
+- [ ] **A daemon-side save can undo a GUI setting made a moment earlier**: save-only setters wait
+      for the 2 s watcher while `config_set` setters make the daemon save its whole (older) copy
+      — reorder embeddings, then chat models within ~2.5 s, and the first change is lost. After a
+      GUI save, ask the daemon to `config_reload` instead of `config_set`ting one key.
+
 ### The test suite stranded its scratch databases in tmpfs (found 2026-10-10)
 
 - [x] **Every `cargo test --workspace` left 44 directories in `/tmp`, and `/tmp` is RAM here.**

@@ -45,11 +45,13 @@ pub async fn set_auto_remember_messages(
     let mut state_guard = state.write().await;
     state_guard.config.memory.auto_remember_messages = enabled;
     state_guard.config.save().map_err(|e| format!("Failed to save config: {e}"))?;
-    let _ = state_guard
-        .backend
+    // Never hold AppState across a daemon round trip: it can wait the full
+    // request timeout, and every other command queues behind this lock.
+    let backend = Arc::clone(&state_guard.backend);
+    drop(state_guard);
+    let _ = backend
         .config_set("memory.auto_remember_messages", serde_json::json!(enabled))
         .await;
-    drop(state_guard);
     info!("Auto-remember messages set: {enabled}");
     Ok(())
 }
@@ -72,11 +74,13 @@ pub async fn set_max_compression_ratio(
     let clamped = ratio.clamp(0.1, 0.9);
     state_guard.config.memory.max_compression_ratio = clamped;
     state_guard.config.save().map_err(|e| format!("Failed to save config: {e}"))?;
-    let _ = state_guard
-        .backend
+    // Never hold AppState across a daemon round trip: it can wait the full
+    // request timeout, and every other command queues behind this lock.
+    let backend = Arc::clone(&state_guard.backend);
+    drop(state_guard);
+    let _ = backend
         .config_set("memory.max_compression_ratio", serde_json::json!(clamped))
         .await;
-    drop(state_guard);
     info!("Max compression ratio set: {clamped}");
     Ok(())
 }
@@ -99,11 +103,13 @@ pub async fn set_min_remaining_memories(
     let clamped = count.max(5);
     state_guard.config.memory.min_remaining_memories = clamped;
     state_guard.config.save().map_err(|e| format!("Failed to save config: {e}"))?;
-    let _ = state_guard
-        .backend
+    // Never hold AppState across a daemon round trip: it can wait the full
+    // request timeout, and every other command queues behind this lock.
+    let backend = Arc::clone(&state_guard.backend);
+    drop(state_guard);
+    let _ = backend
         .config_set("memory.min_remaining_memories", serde_json::json!(clamped))
         .await;
-    drop(state_guard);
     info!("Min remaining memories set: {clamped}");
     Ok(())
 }

@@ -5,6 +5,24 @@ import { readonly, ref } from 'vue'
 
 export type CloseMode = 'ask' | 'minimize_to_tray' | 'quit_completely'
 
+/**
+ * Where a remembered close choice survives a restart. The daemon-side value
+ * (`set_close_mode`) lives in the GUI process only and starts as "ask" every
+ * launch, so "Remember my choice" was forgotten at the next start (and a
+ * remembered "quit" died with the process at once). The browser store keeps
+ * it and is pushed back on load. Reads and writes are best-effort.
+ */
+const CLOSE_MODE_KEY = 'nanna.closeMode'
+
+function storedCloseMode(): CloseMode | null {
+  try {
+    const value = localStorage.getItem(CLOSE_MODE_KEY)
+    return value === 'minimize_to_tray' || value === 'quit_completely' ? value : null
+  } catch {
+    return null
+  }
+}
+
 const showCloseDialog = ref(false)
 const closeMode = ref<CloseMode>('ask')
 const rememberChoice = ref(false)
@@ -16,6 +34,12 @@ export function useCloseHandler() {
   async function loadCloseMode(): Promise<CloseMode> {
     try {
       const mode = await invoke<string>('get_close_mode')
+      const remembered = storedCloseMode()
+      if (mode === 'ask' && remembered) {
+        await invoke('set_close_mode', { mode: remembered })
+        closeMode.value = remembered
+        return remembered
+      }
       closeMode.value = mode as CloseMode
       return mode as CloseMode
     } catch (e) {
@@ -31,6 +55,11 @@ export function useCloseHandler() {
     try {
       await invoke('set_close_mode', { mode })
       closeMode.value = mode
+      try {
+        localStorage.setItem(CLOSE_MODE_KEY, mode)
+      } catch {
+        // Not persisted; this session still uses it.
+      }
     } catch (e) {
       console.error('Failed to set close mode:', e)
     }

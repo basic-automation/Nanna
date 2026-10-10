@@ -284,6 +284,8 @@ const schedulerEnabled = ref(true)
 
 const showModal = ref(false)
 const editing = ref(false)
+/** The job being edited, by id: two jobs may share a name. */
+const editingId = ref<string | null>(null)
 const form = ref({
   name: '',
   schedule: '',
@@ -381,6 +383,7 @@ function openCreateModal() {
 
 function editJob(job: CronJob) {
   editing.value = true
+  editingId.value = job.id
   form.value = {
     name: job.name,
     schedule: job.schedule,
@@ -415,12 +418,13 @@ async function validateSchedule() {
 async function saveJob() {
   try {
     if (editing.value) {
-      // Find the job ID by name (since we can't change name)
-      const existingJob = jobs.value.find(j => j.name === form.value.name)
-      if (existingJob) {
+      // The prompt is part of the edit: only the schedule used to be sent,
+      // so a changed prompt was dropped while the modal closed as if saved.
+      if (editingId.value) {
         await invoke('update_cron_job', {
-          jobId: existingJob.id,
+          jobId: editingId.value,
           schedule: form.value.schedule,
+          payload: form.value.payload,
         })
       }
     } else {
