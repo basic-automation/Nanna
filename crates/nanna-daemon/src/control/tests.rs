@@ -2543,6 +2543,54 @@ async fn task_verdicts_answers_the_rollup_over_ipc() {
     assert_eq!(refused["error"], "bad_window", "{refused}");
 }
 
+/// Deleting a member releases its open cards (no dangling assignee for a
+/// later same-named member to inherit), and a client can unassign a card
+/// with `"assignee": ""`.
+#[tokio::test]
+async fn deleting_a_member_releases_its_cards_and_an_empty_assignee_clears() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let created =
+        ask(serde_json::json!({ "type": "member", "action": "create", "name": "Ada" })).await;
+    let ada = created["member"]["id"].as_str().expect("id").to_string();
+    let tasks = storage.tasks();
+    let new_card = |title: &str| nanna_storage::NewTask {
+        scope: "global".to_string(),
+        title: title.to_string(),
+        priority: 3,
+        assignee: Some(ada.clone()),
+        created_by: Some("gui".to_string()),
+        ..nanna_storage::NewTask::default()
+    };
+    let held = tasks.create(new_card("Held")).await.expect("card");
+    let other = tasks.create(new_card("Other")).await.expect("card");
+
+    let cleared = ask(serde_json::json!({
+        "type": "task", "action": "update", "id": other.id, "patch": { "assignee": "" },
+    }))
+    .await;
+    assert!(
+        cleared["task"]["assignee"].is_null(),
+        "\"\" unassigns: {cleared}"
+    );
+
+    let deleted = ask(serde_json::json!({ "type": "member", "action": "delete", "id": ada })).await;
+    assert_eq!(deleted["removed"], true, "{deleted}");
+    assert_eq!(deleted["cards_released"], 1, "{deleted}");
+    let after = tasks.get(held.id).await.expect("card");
+    assert_eq!(after.assignee, None, "no dangling id");
+    assert_eq!(after.status, "pending");
+}
+
 #[tokio::test]
 async fn the_board_roster_is_managed_over_ipc() {
     let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));

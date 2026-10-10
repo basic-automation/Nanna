@@ -8466,6 +8466,20 @@ as its turn (`TurnAdmission`, scope default `session`).
       unchanged); the card view offers its own board's roster, and instead of sub-cards and
       dependencies it could not see (shown as "not on this board") says which board it is on.
       Tests `useFieldDraft.spec.ts` (4), `a_card_is_assigned_only_to_a_member_of_its_own_board`.
+- [x] *(found 2026-10-10, audit of the task and member IPC)* **Deleting a member checked
+      nothing.** A member mid-run was deleted under its run: every post the run made (its
+      question to the human included) was refused as "not a board member" while it kept
+      spending. And its open cards kept the dead id — assigned to nobody who exists, never
+      routed — until a member created later under the same name, on any board, inherited them
+      and its next free slot started another board's card. `member.delete` now refuses a member
+      that is working, and releases its open cards first (unassigned, back to `pending`, through
+      the task store). Also: a `task.update` with `"assignee": ""` was refused (the empty id is
+      no member) — there was no way to unassign a card; `""` now clears `assignee` and
+      `project`, as it already did dates. Test
+      `deleting_a_member_releases_its_cards_and_an_empty_assignee_clears`. **Still open:** the
+      released cards are not routed (no wake reason covers a deleted member's cards), and a
+      field edit or a card delete emits no task event, so other views refresh only on the next
+      unrelated one.
 - [x] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
       *(2026-09-28)* `RouterDecision::Assign` gained optional `labels` and `acceptance`. Labels

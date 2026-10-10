@@ -484,15 +484,13 @@ impl ControlPlane {
                     .unwrap_or_default()
             }),
             acceptance,
-            assignee: patch
-                .get("assignee")
-                .and_then(Value::as_str)
-                .map(|s| Some(s.to_string())),
+            // "" clears, as for dates and description: an assignee could
+            // not be removed at all (the empty id was refused as no member).
+            assignee: patch.get("assignee").and_then(Value::as_str).map(clearable),
             parent_id: patch.get("parent_id").and_then(Value::as_i64).map(Some),
-            project: patch
-                .get("project")
-                .and_then(Value::as_str)
-                .map(|s| Some(s.to_string())),
+            // "" clears, as for dates and description: an assignee could
+            // not be removed at all (the empty id was refused as no member).
+            project: patch.get("project").and_then(Value::as_str).map(clearable),
             sort_order: patch.get("sort_order").and_then(Value::as_i64),
         };
         match repo.update(id, task_patch, Some("gui")).await {
