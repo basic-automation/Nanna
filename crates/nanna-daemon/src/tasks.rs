@@ -895,14 +895,16 @@ fn task_update_service(storage: &Arc<Storage>) -> ServiceFn {
                 priority: opt_i64(&params, "priority")?.map(|p| p.max(2)),
                 labels: opt_string_vec(&params, "labels")?,
                 tool_scope: opt_string_vec(&params, "tools")?,
+                // An empty string clears the date, as the GUI's does.
                 due_at: params
                     .get("due_at")
                     .and_then(Value::as_str)
-                    .map(|s| Some(s.to_string())),
+                    .map(|s| Some(s.trim()).filter(|s| !s.is_empty()).map(str::to_string)),
+                // An empty string clears the date, as the GUI's does.
                 deadline_at: params
                     .get("deadline_at")
                     .and_then(Value::as_str)
-                    .map(|s| Some(s.to_string())),
+                    .map(|s| Some(s.trim()).filter(|s| !s.is_empty()).map(str::to_string)),
                 recurrence: params
                     .get("recurrence")
                     .and_then(Value::as_str)
@@ -5487,12 +5489,17 @@ fn next_round_dates(
                 (day_of(stored)? + shift).format("%Y-%m-%d").to_string(),
             ));
         }
+        if stored.contains('T') {
+            // In the offset it was written in: re-rendered in UTC, an evening
+            // `-07:00` time moved to the next day's prefix, and every reader
+            // compares that prefix — the card fell due a day late each round.
+            let at = chrono::DateTime::parse_from_rfc3339(stored).ok()? + shift;
+            let moved = at.to_rfc3339();
+            debug_assert_eq!(moved.get(..10), Some(at.date_naive().to_string().as_str()));
+            return Some(Some(moved));
+        }
         let at = parse_db_time(stored)? + shift;
-        Some(Some(if stored.contains('T') {
-            at.to_rfc3339()
-        } else {
-            at.format("%Y-%m-%d %H:%M:%S").to_string()
-        }))
+        Some(Some(at.format("%Y-%m-%d %H:%M:%S").to_string()))
     };
     let dates = (moved(due_at)?, moved(deadline_at)?);
     debug_assert!(
@@ -5937,6 +5944,16 @@ mod tests {
                 at("2026-10-12T09:00:00Z")
             ),
             Some((None, Some("2026-10-12 17:00:00".to_string())))
+        );
+        // An offset timestamp stays in its offset: in UTC this evening time
+        // would read as the next day, and the round would fall due a day late.
+        assert_eq!(
+            next_round_dates(
+                Some("2026-10-05T20:00:00-07:00"),
+                None,
+                at("2026-10-12T09:00:00Z")
+            ),
+            Some((Some("2026-10-12T20:00:00-07:00".to_string()), None))
         );
         // No dates, a date not behind the occurrence, or an unreadable one: unchanged.
         assert_eq!(

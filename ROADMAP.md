@@ -8410,6 +8410,30 @@ as its turn (`TurnAdmission`, scope default `session`).
       `an_answer_to_a_members_own_question_is_not_the_routers`,
       `edits_between_hand_backs_do_not_hide_one` (300 edits), and the extended
       `a_finished_card_run_announces_its_member_free`; daemon 715, e2e 56 green.
+- [x] *(found 2026-10-10, audit of the task store)* **Six store defects, fixed.** (1) **A
+      deadlock the cycle check could not see:** it followed only `depends_on`, never the
+      parent-waits-on-its-sub-tasks edge, so with A the parent of T and T depending on D,
+      `update(D, depends_on: [A])` was admitted (D has no ancestors, so the ancestor check
+      passed) and D → A → T → D could never finish. `check_dependency_cycle` now walks both
+      edges. (2) **Cards closed by a parent's cancellation were never announced:** the cascade
+      wrote each child `cancelled` with no `StatusChanged`, so their memory copies and timeline
+      never recorded the close (decision 14). Each now gets its event, with `cascade_from`.
+      (3) **`due_at`/`deadline_at` were never checked for form** though every reader compares
+      their first ten characters as text: `10/15/2026` fell due at once (`'1' < '2'`), `Friday`
+      never, and a recurring card kept last round's dates. Refused now unless `YYYY-MM-DD`, RFC
+      3339 or `YYYY-MM-DD HH:MM:SS` — on create, and on a patch that sets the date, so a legacy
+      row stays editable; `tasks.update` with `""` now clears, as the GUI's does. (4)
+      **Reopening through `update` kept the due/overdue markers** `reopen` clears (migration
+      020), so a late card done and reopened was never announced late again. (5) `create` and
+      `reopen` answered `blocked: false` for a card waiting on an open one. (6) **A recurring
+      card's offset timestamp was moved in UTC**: `2026-10-05T20:00:00-07:00` became
+      `…-10-13T03:00:00+00:00`, a day late every round by the text compare; it keeps its offset.
+      Tests: `a_dependency_that_closes_a_loop_through_a_parent_is_rejected`,
+      `cancelling_a_parent_announces_each_child_it_closes`, `a_date_that_is_not_iso_is_refused`,
+      `a_card_reopened_by_update_is_announced_overdue_again`,
+      `a_card_created_waiting_on_an_open_one_says_it_is_blocked`, and an offset case in
+      `a_rounds_dates_move_to_its_occurrence`; (1) and (4) mutation-checked (red without the
+      fix). Storage + daemon 1003 green.
 - [x] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
       *(2026-09-28)* `RouterDecision::Assign` gained optional `labels` and `acceptance`. Labels

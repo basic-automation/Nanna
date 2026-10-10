@@ -451,6 +451,67 @@ async fn cancelling_a_dependency_also_unblocks() {
     assert_eq!(unblocked[0].task_id, b);
 }
 
+/// A sub-task closed by its parent's cancellation is announced like one
+/// cancelled by hand: the memory copy and the timeline learn of a close only
+/// through this event, and before it the cascade closed children silently.
+#[tokio::test]
+async fn cancelling_a_parent_announces_each_child_it_closes() {
+    let (storage, recorder) = storage_with_recorder().await;
+    let repo = storage.tasks();
+    let parent = repo.create(card("plan")).await.expect("parent");
+    let child = repo
+        .create(NewTask {
+            parent_id: Some(parent.id),
+            ..card("step")
+        })
+        .await
+        .expect("child");
+    let grandchild = repo
+        .create(NewTask {
+            parent_id: Some(child.id),
+            ..card("sub-step")
+        })
+        .await
+        .expect("grandchild");
+    recorder.clear();
+
+    repo.update(
+        parent.id,
+        TaskPatch {
+            status: Some("cancelled".to_string()),
+            ..TaskPatch::default()
+        },
+        Some("gui"),
+    )
+    .await
+    .expect("cancelled");
+
+    let closed: Vec<i64> = recorder
+        .of_kind(TaskEventKind::StatusChanged)
+        .iter()
+        .filter(|e| e.detail.get("status").and_then(|s| s.as_str()) == Some("cancelled"))
+        .map(|e| e.task_id)
+        .collect();
+    assert_eq!(closed, vec![parent.id, child.id, grandchild.id]);
+}
+
+/// What `create` answers is what a read answers: the derived flag included.
+#[tokio::test]
+async fn a_card_created_waiting_on_an_open_one_says_it_is_blocked() {
+    let (storage, _recorder) = storage_with_recorder().await;
+    let repo = storage.tasks();
+    let first = repo.create(card("first")).await.expect("first");
+    let waiting = repo
+        .create(NewTask {
+            depends_on: vec![first.id],
+            ..card("second")
+        })
+        .await
+        .expect("second");
+    assert!(waiting.blocked, "the create's own answer");
+    assert!(repo.get(waiting.id).await.expect("read").blocked);
+}
+
 #[tokio::test]
 async fn reopening_a_dependency_blocks_its_dependent_again() {
     let (storage, recorder) = storage_with_recorder().await;
@@ -673,6 +734,41 @@ async fn a_repeated_sweep_announces_nothing_twice() {
         Vec::<TaskEventKind>::new(),
         "a 5-minute sweep must not re-announce the same card forever"
     );
+}
+
+/// Reopening through `update` must re-arm the announcements like `reopen`
+/// does: a late card that was done and is now open again is late again.
+#[tokio::test]
+async fn a_card_reopened_by_update_is_announced_overdue_again() {
+    let (storage, recorder) = storage_with_recorder().await;
+    let repo = storage.tasks();
+    let task = repo
+        .create(dated("late", None, Some("2026-07-10")))
+        .await
+        .expect("created");
+    assert_eq!(
+        repo.announce_due("2026-07-20").await.expect("swept"),
+        (0, 1)
+    );
+    repo.complete(task.id, None, None).await.expect("done");
+    repo.update(
+        task.id,
+        nanna_storage::TaskPatch {
+            status: Some("pending".to_string()),
+            ..nanna_storage::TaskPatch::default()
+        },
+        None,
+    )
+    .await
+    .expect("reopened");
+    recorder.clear();
+
+    assert_eq!(
+        repo.announce_due("2026-07-20").await.expect("swept"),
+        (0, 1),
+        "the reopened card is still late"
+    );
+    assert_eq!(recorder.of_kind(TaskEventKind::Overdue).len(), 1);
 }
 
 #[tokio::test]
