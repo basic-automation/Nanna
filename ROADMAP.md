@@ -10657,8 +10657,9 @@ keep the phases readable; promote individual items into a phase when they become
 - [x] *(same run)* **`file_history restore` over an 8 MiB+ file destroyed it unsaved** while
       saying the replaced content was saved; it is refused now. Test
       `a_restore_over_an_unkeepable_file_is_refused`.
-- [ ] Still open from the same audit: `file_history list` caps at 100 of up to 500;
-      `web_fetch` ignores the declared charset.
+- [x] *(same run)* `file_history list` capped at 100 of the up-to-500 a session holds, so the
+      oldest baselines were unreachable; the cap is now recent + baseline (500).
+- [ ] Still open from the same audit: `web_fetch` ignores the declared charset.
 
 ### GUI settings that did not do what they showed (found 2026-10-10, audit of the GUI outside the board)
 

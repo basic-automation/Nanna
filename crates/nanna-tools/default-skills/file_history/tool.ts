@@ -1,7 +1,7 @@
 export default {
   name: "file_history",
   requires: ["files.history", "files.restore"],
-  version: "0.1.0",
+  version: "0.1.1",
   description: "Undo file writes made in this conversation. Before write_file, edit_file or file_buffer changes a file, its previous content is saved as a numbered checkpoint. action=\"list\" shows checkpoints (newest first; pass path to see one file's); action=\"restore\" with checkpoint=<number> puts that file back exactly as the checkpoint found it (a file the write created is removed). A restore saves the current content first, so it can be undone too. Changes made through exec are not tracked.",
   parameters: {
     type: "object",
@@ -9,7 +9,7 @@ export default {
       action: { type: "string", enum: ["list", "restore"], description: "list or restore" },
       path: { type: "string", description: "For list: only this file's checkpoints" },
       checkpoint: { type: "integer", description: "For restore: the checkpoint number from list" },
-      limit: { type: "integer", description: "For list: how many to show (default 20, max 100)" }
+      limit: { type: "integer", description: "For list: how many to show (default 20, max 500)" }
     },
     required: ["action"]
   },
