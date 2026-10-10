@@ -71,6 +71,9 @@ rules. Both are fixed, and the agent can no longer erase the records its safety 
   restoring over a file too large for history to keep is refused instead of losing it.
 - Web pages in other character sets (Latin-1, Shift-JIS and others) are fetched with their text
   intact.
+- The browser tools keep working after their first use. Before, every browser call after the
+  first failed until Nanna was restarted.
+- An MCP server that sends an enormous message can no longer use up Nanna's memory.
 
 ## Conversations with the model
 
@@ -116,3 +119,5 @@ rules. Both are fixed, and the agent can no longer erase the records its safety 
   keyring. Channels are due to be removed.
 - `nanna daemon stop` on macOS and Windows cannot yet confirm that the recorded process is the
   daemon before stopping it.
+- MCP: a question a server asks you times out after about a minute, and one slow server delays
+  the tools of the others while Nanna starts.
