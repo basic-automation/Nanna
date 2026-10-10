@@ -257,21 +257,7 @@ impl TaskRepository {
         let by_id: HashMap<i64, &Task> = scope_tasks.iter().map(|t| (t.id, t)).collect();
 
         if let Some(parent_id) = new.parent_id {
-            let parent = by_id.get(&parent_id).ok_or_else(|| {
-                StorageError::Invalid(format!("parent task #{parent_id} not found in scope"))
-            })?;
-            if is_closed_status(&parent.status) {
-                return Err(StorageError::Invalid(format!(
-                    "cannot add a child to {} task #{parent_id}",
-                    parent.status
-                )));
-            }
-            let depth = parent_depth(&by_id, parent_id)?;
-            if depth + 1 >= TASK_DEPTH_MAX {
-                return Err(StorageError::Invalid(format!(
-                    "hierarchy depth limit {TASK_DEPTH_MAX} reached"
-                )));
-            }
+            check_new_parent(&by_id, parent_id)?;
         }
         check_dependencies_in_scope(&by_id, &new.depends_on)?;
         // A pure depends_on cycle is impossible for a new task (nothing
@@ -292,7 +278,14 @@ impl TaskRepository {
             .map(std::string::ToString::to_string);
 
         let conn = self.conn.lock().await;
-        if let Err(err) = ensure_member_exists(&conn, new.assignee.as_deref(), "assignee").await {
+        if let Err(err) = ensure_assignee_on_board(
+            &conn,
+            new.assignee.as_deref(),
+            &new.scope,
+            new.scope_id.as_deref(),
+        )
+        .await
+        {
             drop(conn);
             return Err(err);
         }
@@ -555,8 +548,13 @@ impl TaskRepository {
                 None
             };
             if changed.contains(&"assignee")
-                && let Err(err) =
-                    ensure_member_exists(&conn, task.assignee.as_deref(), "assignee").await
+                && let Err(err) = ensure_assignee_on_board(
+                    &conn,
+                    task.assignee.as_deref(),
+                    &task.scope,
+                    task.scope_id.as_deref(),
+                )
+                .await
             {
                 drop(conn);
                 return Err(err);
@@ -3309,6 +3307,28 @@ fn is_closed_status(status: &str) -> bool {
     matches!(status, "done" | "cancelled")
 }
 
+/// A new card may go under `parent_id` only if that card is in scope, open,
+/// and shallow enough to take a child within the depth bound.
+fn check_new_parent(by_id: &HashMap<i64, &Task>, parent_id: i64) -> Result<(), StorageError> {
+    let parent = by_id.get(&parent_id).ok_or_else(|| {
+        StorageError::Invalid(format!("parent task #{parent_id} not found in scope"))
+    })?;
+    if is_closed_status(&parent.status) {
+        return Err(StorageError::Invalid(format!(
+            "cannot add a child to {} task #{parent_id}",
+            parent.status
+        )));
+    }
+    let depth = parent_depth(by_id, parent_id)?;
+    if depth + 1 >= TASK_DEPTH_MAX {
+        return Err(StorageError::Invalid(format!(
+            "hierarchy depth limit {TASK_DEPTH_MAX} reached"
+        )));
+    }
+    debug_assert!(depth + 1 < TASK_DEPTH_MAX);
+    Ok(())
+}
+
 /// Every id in `depends_on` names a card in the same scope.
 fn check_dependencies_in_scope(
     by_id: &HashMap<i64, &Task>,
@@ -3566,6 +3586,62 @@ fn validate_dates(due_at: Option<&str>, deadline_at: Option<&str>) -> Result<(),
         )));
     }
     Ok(())
+}
+
+/// An assignee must be a member of the card's own board: owned by the card's
+/// workspace (the global board's are those with no owner), or owned by the
+/// human — the human and their personal agents, who travel between
+/// workspaces. The same rule as `MemberRepository::list_for_workspace`.
+///
+/// Existence alone was checked, so a card opened from the Inbox (which spans
+/// every board) could be given to another workspace's agent from the shown
+/// board's roster — an agent that cannot see the card's folders or memory.
+/// Session-scoped cards (the chat harness's) are on no board: existence only.
+async fn ensure_assignee_on_board(
+    conn: &Connection,
+    assignee: Option<&str>,
+    scope: &str,
+    scope_id: Option<&str>,
+) -> Result<(), StorageError> {
+    let Some(member_id) = assignee else {
+        return Ok(());
+    };
+    ensure_member_exists(conn, Some(member_id), "assignee").await?;
+    if scope == "session" {
+        return Ok(());
+    }
+    let board = if scope == "workspace" { scope_id } else { None };
+    debug_assert!(
+        scope != "workspace" || board.is_some(),
+        "a workspace card names its board"
+    );
+    let mut rows = conn
+        .query(
+            "SELECT owner_kind, owner_id FROM members WHERE id = ?1",
+            turso::params![member_id.to_string()],
+        )
+        .await?;
+    let owner = match rows.next().await? {
+        Some(row) => Some((row.get::<String>(0)?, row.get::<Option<String>>(1)?)),
+        None => None,
+    };
+    // Drop the open cursor before the caller's write: an unfinished Rows on
+    // the shared turso connection silently swallows later writes.
+    drop(rows);
+    let Some((owner_kind, owner_id)) = owner else {
+        return Err(StorageError::NotFound(format!("member '{member_id}'")));
+    };
+    if owner_kind == "human" || (owner_kind == "workspace" && owner_id.as_deref() == board) {
+        return Ok(());
+    }
+    Err(StorageError::Invalid(format!(
+        "assignee '{member_id}' is not on this card's board ({}); assign a member of {}",
+        board.unwrap_or("global"),
+        board.map_or_else(
+            || "the global board".to_string(),
+            |b| format!("workspace {b}")
+        )
+    )))
 }
 
 /// `tasks.assignee` holds a `members.id` (P25 Stage 1). SQLite cannot add a

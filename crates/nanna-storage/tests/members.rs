@@ -782,3 +782,80 @@ async fn a_card_whose_newest_run_marker_is_a_start_was_interrupted() {
         .expect("scan");
     assert_eq!(unended, vec![ids[2], ids[1]], "newest first, each once");
 }
+
+/// A card's assignee comes from the card's own board: the Inbox spans every
+/// board, and a card from workspace B opened there offered workspace A's
+/// roster — whose agents the store then accepted onto B's card.
+#[tokio::test]
+async fn a_card_is_assigned_only_to_a_member_of_its_own_board() {
+    let storage = storage().await;
+    let members = storage.members();
+    for (id, owner) in [("agent:a-builder", "ws-a"), ("agent:b-builder", "ws-b")] {
+        members
+            .create(NewMember {
+                owner_id: Some(owner.to_string()),
+                ..agent(id)
+            })
+            .await
+            .expect("member");
+    }
+    members.create(agent("agent:global")).await.expect("member");
+    members
+        .create(NewMember {
+            owner_kind: MemberOwner::Human,
+            owner_id: Some(HUMAN_MEMBER_ID.to_string()),
+            ..agent("agent:personal")
+        })
+        .await
+        .expect("member");
+
+    let tasks = storage.tasks();
+    let card = tasks
+        .create(nanna_storage::NewTask {
+            scope: "workspace".to_string(),
+            scope_id: Some("ws-b".to_string()),
+            title: "B's card".to_string(),
+            priority: 3,
+            ..nanna_storage::NewTask::default()
+        })
+        .await
+        .expect("card");
+    let assign = |who: &'static str| {
+        let tasks = storage.tasks();
+        async move {
+            tasks
+                .update(
+                    card.id,
+                    nanna_storage::TaskPatch {
+                        assignee: Some(Some(who.to_string())),
+                        ..nanna_storage::TaskPatch::default()
+                    },
+                    None,
+                )
+                .await
+        }
+    };
+    for refused in ["agent:a-builder", "agent:global"] {
+        let err = assign(refused).await;
+        assert!(
+            matches!(&err, Err(StorageError::Invalid(m)) if m.contains("not on this card's board")),
+            "{refused}: {err:?}"
+        );
+    }
+    for admitted in ["agent:b-builder", "agent:personal", HUMAN_MEMBER_ID] {
+        assert!(assign(admitted).await.is_ok(), "{admitted} is on B's board");
+    }
+    let global_card = tasks
+        .create(nanna_storage::NewTask {
+            scope: "global".to_string(),
+            title: "Global card".to_string(),
+            priority: 3,
+            assignee: Some("agent:b-builder".to_string()),
+            ..nanna_storage::NewTask::default()
+        })
+        .await;
+    assert!(
+        global_card.is_err(),
+        "a workspace agent is not on the global board"
+    );
+}

@@ -8449,6 +8449,23 @@ as its turn (`TurnAdmission`, scope default `session`).
       `a_long_card_folds_from_both_ends_and_refolds_when_it_grows`. **Not changed:** a fold
       clustered with its own card's post copy keeps `source_task_id` but not `board_event`, so
       the card is folded again beside the summary — the story stored twice, nothing lost.
+- [x] *(found 2026-10-10, audit of the board client)* **Two board-client defects, fixed.** (1)
+      **A half-typed description or label list was wiped by any board event.** Both fields were
+      bound one way (`:value`, saved on `change`); Vue re-applies `value` on every re-render, and
+      the board reloads ~250 ms after every card event (an agent's post, a chat run's task
+      write), so the text snapped back — and the field then equalled its start, so `change`
+      never fired and the edit was lost silently. Now `v-model` drafts (`useFieldDraft`) that
+      follow the stored value except while the field is being edited, and always on opening
+      another card. **Verified in the real app over WebDriver:** typed into a card's
+      description, created another card over IPC (the board reloaded and showed it), the text
+      stayed; the save then persisted it through the daemon. (2) **A card opened from the Inbox
+      or Upcoming could be given to another workspace's agent:** the assignee list was the
+      *shown* board's roster and the store checked only that the member existed. The store now
+      refuses an assignee not on the card's own board (`ensure_assignee_on_board`, the
+      `list_for_workspace` rule: owned by the card's workspace, or human-owned; session cards
+      unchanged); the card view offers its own board's roster, and instead of sub-cards and
+      dependencies it could not see (shown as "not on this board") says which board it is on.
+      Tests `useFieldDraft.spec.ts` (4), `a_card_is_assigned_only_to_a_member_of_its_own_board`.
 - [x] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
       *(2026-09-28)* `RouterDecision::Assign` gained optional `labels` and `acceptance`. Labels

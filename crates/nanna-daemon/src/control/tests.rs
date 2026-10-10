@@ -2449,7 +2449,7 @@ async fn task_verdicts_answers_the_rollup_over_ipc() {
             avatar: None,
             kind: nanna_storage::MemberKind::Agent,
             owner_kind: nanna_storage::MemberOwner::Workspace,
-            owner_id: None,
+            owner_id: Some("ws1".to_string()),
             status: nanna_storage::MemberStatus::Idle,
             profile: serde_json::json!({}),
         })
