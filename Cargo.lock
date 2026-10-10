@@ -5217,6 +5217,7 @@ dependencies = [
  "boa_engine",
  "chrono",
  "directories",
+ "encoding_rs",
  "nanna-proc",
  "reqwest",
  "rustpython-pylib",

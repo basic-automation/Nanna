@@ -10659,7 +10659,10 @@ keep the phases readable; promote individual items into a phase when they become
       `a_restore_over_an_unkeepable_file_is_refused`.
 - [x] *(same run)* `file_history list` capped at 100 of the up-to-500 a session holds, so the
       oldest baselines were unreachable; the cap is now recent + baseline (500).
-- [ ] Still open from the same audit: `web_fetch` ignores the declared charset.
+- [x] *(same run)* `web_fetch` (every `Nanna.fetch`) decoded bodies as UTF-8 whatever the
+      `Content-Type` declared; a Latin-1 or Shift-JIS page came back as U+FFFD. Bodies are decoded
+      in the declared charset (`encoding_rs`, already in the graph). Test
+      `a_declared_charset_decodes_the_body`.
 
 ### GUI settings that did not do what they showed (found 2026-10-10, audit of the GUI outside the board)
 

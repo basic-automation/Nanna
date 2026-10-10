@@ -1716,6 +1716,16 @@ pub const READ_FILE_BYTES_MAX: u64 = 64 * 1024 * 1024;
 /// lossily (an invalid byte becomes U+FFFD rather than failing the call).
 async fn read_body_capped(mut response: reqwest::Response, cap: u64) -> Result<String> {
     let cap_bytes = usize::try_from(cap).unwrap_or(usize::MAX);
+    // The body's declared charset, read before the body consumes the response:
+    // a `charset=windows-1252` / `iso-8859-1` / `shift_jis` page decoded as
+    // UTF-8 came back as replacement characters, silently.
+    let encoding = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(charset_of)
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
     if response
         .content_length()
         .is_some_and(|declared| declared > cap)
@@ -1738,7 +1748,19 @@ async fn read_body_capped(mut response: reqwest::Response, cap: u64) -> Result<S
         bytes.extend_from_slice(&chunk);
     }
     debug_assert!(bytes.len() <= cap_bytes, "never more than the cap is held");
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    let (text, _, _) = encoding.decode(&bytes);
+    Ok(text.into_owned())
+}
+
+/// The `charset` parameter of a `Content-Type` value, if it names one.
+fn charset_of(content_type: &str) -> Option<&str> {
+    content_type.split(';').skip(1).find_map(|param| {
+        let (name, value) = param.split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("charset")
+            .then(|| value.trim().trim_matches('"'))
+            .filter(|label| !label.is_empty())
+    })
 }
 
 /// Read `path` as UTF-8, refusing once more than `max_bytes` have arrived.
@@ -1853,6 +1875,25 @@ fn strip_ansi_escapes(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fetched body is decoded in the charset its `Content-Type` declares;
+    /// read as UTF-8, a Latin-1 page's accents came back as U+FFFD.
+    #[test]
+    fn a_declared_charset_decodes_the_body() {
+        assert_eq!(
+            charset_of("text/html; charset=ISO-8859-1"),
+            Some("ISO-8859-1")
+        );
+        assert_eq!(
+            charset_of("text/html;charset=\"windows-1252\""),
+            Some("windows-1252")
+        );
+        assert_eq!(charset_of("text/html"), None);
+        assert_eq!(charset_of("text/html; charset="), None);
+        let encoding = encoding_rs::Encoding::for_label(b"iso-8859-1").expect("known label");
+        let (text, _, _) = encoding.decode(b"caf\xe9");
+        assert_eq!(text, "caf\u{e9}");
+    }
 
     /// The invariant: a path the SHELL prints must name the same file when it
     /// is handed back to a file tool. Git Bash prints `/d/...`, and that used
