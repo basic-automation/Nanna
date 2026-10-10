@@ -10892,6 +10892,17 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `frontend-windows` judge it; check the windows `buildDir`/manifest path handling first
            (the roadmap's 2026-07 "manifest-race mitigation" pinned `buildDir` for a related
            Windows-only failure).
+           *(research 2026-10-10)* **Nuxt 4.6.1 (2026-10-09) carries the likely fix.** Commit
+           [`21657c6`](https://github.com/nuxt/nuxt/commit/21657c6fc) "inline nuxt runtime when
+           resolved to windows paths": nitro's inline list matched the literal `'nuxt/dist'`,
+           which a backslash module id on Windows never contains, so the Nuxt runtime was
+           externalized and loaded as a second instance without the build manifest — exactly
+           "Either manifest or precomputed data must be provided". It is now `isNuxtDistId`
+           (a regex over the `pathe`-normalized id). Re-try `nuxt 4.6.1` as its own PR and let
+           `frontend-windows` judge it ([v4.6.1](https://github.com/nuxt/nuxt/releases/tag/v4.6.1)).
+           *(same run)* Taken as its own commit in the 2026-10-10 nightly (`^4.6.1`, with `vite
+           8.3.4`); Linux: vitest 442/442, typecheck 0, `pnpm generate` prerenders 4 routes. Its
+           `frontend-windows` check is the verdict — reverted before merge if red.
    - *(2026-09-27 sweep)* `cargo update` → the Tauri plugin minors (`dialog 2.8.0`, `fs 2.6.0`,
      `notification 2.5.0`, `process 2.4.0`, `shell 2.4.0`, `updater 2.13.0`,
      `tauri-winrt-notification 0.8.1`) plus `notify-rust 4.18.1`; the JS halves bumped in
