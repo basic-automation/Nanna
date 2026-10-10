@@ -10594,11 +10594,15 @@ keep the phases readable; promote individual items into a phase when they become
       half-written file. The temp name is now per-writer, synced before the rename, removed if
       the rename fails, and the directory is synced after it (Unix). Test
       `a_save_round_trips_and_leaves_no_temp_file`.
-- [ ] **The GUI files environment-supplied secrets into the keyring.** `store_secrets()` /
+- [~] **The GUI files environment-supplied secrets into the keyring.** `store_secrets()` /
       `migrate_secrets_to_keyring()` on a Settings save store every non-blank secret the cached
       config holds — including ones that came from `OPENAI_API_KEY`, `TELEGRAM_BOT_TOKEN`, … —
       so after the variable is unset the stale key keeps being used. Save only the field the
       user entered, or reuse the daemon's `file_secrets_brought_in` rule.
+      *(2026-10-10, same run — the provider half.)* `set_provider_api_key` files only the key
+      entered (`SecureStore::set` under its own name) instead of `store_secrets()`. **Still
+      open:** the channel wizard's `store_and_save` (`migrate_secrets_to_keyring`) — channels
+      go with P25 decision 18, and `channel_secrets` has no per-channel filer.
 - [ ] **Non-secret environment overrides are written into `config.toml`** (`PORT`,
       `TELEGRAM_WEBHOOK_URL`, `DISCORD_*`, a whole channel section from a token), and a `set` of
       an overridden path answers `updated` and then silently reverts on the watcher's reload.

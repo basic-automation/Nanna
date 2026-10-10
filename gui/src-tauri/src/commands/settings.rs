@@ -497,11 +497,22 @@ pub async fn set_provider_api_key(
     }
 
     // Durable storage is the OS keyring; config.toml never receives secrets.
-    // (claude-proxy is a URL, not a secret — strip_secrets leaves it alone.)
-    // store_secrets() refills what it stores, so in-memory state (and the OAuth
-    // badge) keeps the session's credentials.
-    if provider != "claude-proxy"
-        && let Err(e) = state_guard.config.store_secrets()
+    // (claude-proxy is a URL, not a secret.) Only the key entered HERE is
+    // filed: `store_secrets()` filed every secret the cached config held —
+    // including ones that came from the environment (`OPENAI_API_KEY`, …) —
+    // so after the variable was unset the stale key kept being used, from a
+    // place the user never put it.
+    let store_key = match provider.as_str() {
+        "anthropic" => Some(nanna_config::credentials::keys::ANTHROPIC_API_KEY),
+        "openai" => Some(nanna_config::credentials::keys::OPENAI_API_KEY),
+        "brave" => Some(nanna_config::credentials::keys::BRAVE_API_KEY),
+        "openrouter" => Some(nanna_config::credentials::keys::OPENROUTER_API_KEY),
+        "github" => Some(nanna_config::credentials::keys::GITHUB_TOKEN),
+        _ => None,
+    };
+    debug_assert_eq!(store_key.is_none(), provider == "claude-proxy");
+    if let Some(key) = store_key
+        && let Err(e) = nanna_config::credentials::SecureStore::new().set(key, &api_key)
     {
         error!("Failed to store API key in keyring: {e}");
         return Err(format!("failed to store API key securely: {e}"));
