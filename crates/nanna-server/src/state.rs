@@ -745,6 +745,7 @@ impl AppState {
                                     duration_ms: elapsed_ms(start),
                                     started_at,
                                     finished_at,
+                                    skipped: false,
                                 }
                             }
                             Err(e) => {
@@ -759,6 +760,7 @@ impl AppState {
                                     duration_ms: elapsed_ms(start),
                                     started_at,
                                     finished_at,
+                                    skipped: false,
                                 }
                             }
                         }
@@ -775,6 +777,7 @@ impl AppState {
                             duration_ms: elapsed_ms(start),
                             started_at,
                             finished_at,
+                            skipped: false,
                         }
                     }
                 })

@@ -141,6 +141,12 @@ pub struct TaskResult {
     pub duration_ms: u64,
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
+    /// The run did not start (another run held the model, a resume was
+    /// already parked). A skipped cron occurrence stays due, so the next tick
+    /// retries it; settling it as a run moved `next_run` to the following
+    /// occurrence, and a daily 09:00 job that met a chat turn did not run
+    /// that day at all.
+    pub skipped: bool,
 }
 
 /// Job run history entry
@@ -581,8 +587,27 @@ impl Scheduler {
 
     /// Enable/disable a task (persisted). `false` when no task has `task_id`.
     pub async fn set_task_enabled(&self, task_id: &str, enabled: bool) -> bool {
-        self.modify_task(task_id, |task| task.enabled = enabled)
-            .await
+        self.modify_task(task_id, |task| {
+            let enabling = enabled && !task.enabled;
+            task.enabled = enabled;
+            // A disabled cron job's `next_run` stays where it was when it was
+            // switched off, so re-enabling it days later found that stale
+            // occurrence due and fired at once, off schedule. It resumes at
+            // its next occurrence from now — as a restart already did.
+            if enabling
+                && let TaskType::Cron {
+                    parsed: Some(ref p),
+                    ref mut next_run,
+                    ..
+                } = task.task_type
+            {
+                *next_run = p.next_from_now();
+                debug_assert!(
+                    next_run.is_none_or(|next| next > Utc::now() - chrono::Duration::seconds(1))
+                );
+            }
+        })
+        .await
     }
 
     /// Replace a task's payload (persisted). `false` when no task has
@@ -932,6 +957,18 @@ async fn settle_run(
         result.finished_at >= result.started_at,
         "a run cannot finish before it starts"
     );
+
+    if result.skipped {
+        // Not a run: nothing to record, and a cron job keeps its `next_run`
+        // so the next tick retries it. Interval and one-shot jobs re-arm as
+        // before (their next tick IS the retry).
+        let mut tasks_guard = tasks.write().await;
+        if let Some(t) = tasks_guard.get_mut(&task_id)
+            && matches!(t.task_type, TaskType::Cron { .. })
+        {
+            return;
+        }
+    }
 
     record_run_in(history, &result.task_id, result).await;
 
@@ -1310,6 +1347,7 @@ mod tests {
                     duration_ms: 100,
                     started_at: Utc::now(),
                     finished_at: Utc::now(),
+                    skipped: false,
                 }
             })
         });
@@ -1361,6 +1399,7 @@ mod tests {
                     duration_ms: 0,
                     started_at: Utc::now(),
                     finished_at: Utc::now(),
+                    skipped: false,
                 }
             })
         });
@@ -1392,6 +1431,87 @@ mod tests {
         assert!(
             after > before,
             "due tasks keep running beside a stuck heartbeat ({before} → {after})"
+        );
+    }
+
+    /// A cron occurrence whose run did not start stays due: the next tick
+    /// retries it. Settled as a run, a daily job that met a chat turn at its
+    /// minute moved to tomorrow and did not run that day.
+    #[tokio::test]
+    async fn a_skipped_cron_occurrence_stays_due() {
+        let scheduler = Scheduler::new(SchedulerConfig::default());
+        let task = Scheduler::cron_task("digest", "0 9 * * *", "prompt").expect("cron");
+        let id = task.id.clone();
+        scheduler.add_task(task).await;
+        let due_at = Utc::now() - chrono::Duration::minutes(1);
+        if let Some(TaskType::Cron { next_run, .. }) = scheduler
+            .tasks
+            .write()
+            .await
+            .get_mut(&id)
+            .map(|t| &mut t.task_type)
+        {
+            *next_run = Some(due_at);
+        }
+        let now = Utc::now();
+        let skipped = TaskResult {
+            task_id: id.clone(),
+            task_name: "digest".to_string(),
+            success: true,
+            output: Some("Skipped (a run is in flight)".to_string()),
+            error: None,
+            duration_ms: 0,
+            started_at: now,
+            finished_at: now,
+            skipped: true,
+        };
+        settle_run(&scheduler.tasks, None, &scheduler.history, false, &skipped).await;
+        let job = scheduler.get_task(&id).await.expect("job");
+        assert_eq!(job.task_type.next_run(), Some(due_at), "still due");
+        assert_eq!(job.run_count, 0, "a skip is not a run");
+        assert!(job.last_run.is_none());
+
+        let ran = TaskResult {
+            skipped: false,
+            ..skipped
+        };
+        settle_run(&scheduler.tasks, None, &scheduler.history, false, &ran).await;
+        let job = scheduler.get_task(&id).await.expect("job");
+        assert!(
+            job.task_type.next_run().is_some_and(|next| next > now),
+            "a real run moves on"
+        );
+        assert_eq!(job.run_count, 1);
+    }
+
+    /// Re-enabling a cron job resumes it at its next occurrence from now, not
+    /// at the stale one it was switched off at — which fired it at once.
+    #[tokio::test]
+    async fn a_re_enabled_cron_job_waits_for_its_next_occurrence() {
+        let scheduler = Scheduler::new(SchedulerConfig::default());
+        let task = Scheduler::cron_task("digest", "0 9 * * *", "prompt").expect("cron");
+        let id = task.id.clone();
+        scheduler.add_task(task).await;
+        assert!(scheduler.set_task_enabled(&id, false).await);
+        let stale = Utc::now() - chrono::Duration::days(3);
+        if let Some(TaskType::Cron { next_run, .. }) = scheduler
+            .tasks
+            .write()
+            .await
+            .get_mut(&id)
+            .map(|t| &mut t.task_type)
+        {
+            *next_run = Some(stale);
+        }
+        assert!(scheduler.set_task_enabled(&id, true).await);
+        let job = scheduler.get_task(&id).await.expect("job");
+        assert!(job.enabled);
+        assert!(
+            job.task_type
+                .next_run()
+                .is_some_and(|next| next > Utc::now()),
+            "not due at once: {:?}",
+            job.task_type.next_run()
         );
     }
 
@@ -1455,6 +1575,7 @@ mod tests {
                     duration_ms: 1,
                     started_at: Utc::now(),
                     finished_at: Utc::now(),
+                    skipped: false,
                 }
             })
         });
@@ -1505,6 +1626,7 @@ mod tests {
                     duration_ms: 150,
                     started_at: Utc::now(),
                     finished_at: Utc::now(),
+                    skipped: false,
                 }
             })
         });

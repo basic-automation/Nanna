@@ -10495,6 +10495,33 @@ keep the phases readable; promote individual items into a phase when they become
       names — those files start a fresh high-water (fail-open, once). Test
       `the_ledger_keeps_a_files_case_where_the_filesystem_does`.
 
+### Scheduled work that fired off time or not at all (found 2026-10-10, audit of the scheduler)
+
+- [x] **A cron occurrence whose run did not start was lost.** A scheduled prompt that met a
+      live run answers "Skipped (a run is in flight)" (or yields when a resume is already
+      parked), and `settle_run` settled that as a run: `next_run` moved to the next occurrence,
+      so a daily 09:00 job that met a heartbeat or a chat turn did not run that day. The comment
+      said "the next tick picks up whatever was due" — true for intervals, not for cron.
+      `TaskResult::skipped` now marks it, and a skipped cron job stays due (no history row, no
+      `next_run` move) so the next tick retries. Test `a_skipped_cron_occurrence_stays_due`.
+- [x] **Re-enabling a cron job fired it at once, off schedule.** A disabled job's `next_run` stays
+      at the occurrence it was switched off at; enabling only flipped the flag, so Thursday's
+      re-enable of a Monday-09:00 job found Monday due and ran at 14:00 (a restart in the same
+      state did not — it recomputes). `set_task_enabled` recomputes from now on the off→on edge.
+      Test `a_re_enabled_cron_job_waits_for_its_next_occurrence`. **Not done:** the scheduler's
+      master switch has the same edge for every cron job.
+- [ ] **A recurring card finished before its next occurrence reopens the same round** (completed
+      08:00, cron 09:00 the same day: reopened with the same `due_at`, announced due again), and
+      **after downtime it reopens on the oldest missed round**, overdue at once. Search the next
+      occurrence from the later of `completed_at` and the end of the anchor day, then step to the
+      latest occurrence `<= now` (`sweep_recurrences`, `crates/nanna-daemon/src/tasks.rs`).
+- [ ] **A deadline with a non-UTC offset is announced overdue before it passes**: the sweep
+      compares the stored local-day prefix with a UTC "today". Compare instants for timestamp
+      values; keep day granularity for bare `YYYY-MM-DD` (`announce_due`).
+- [ ] **"Run now" holds the scheduler's read lock for the whole run** (`control/scheduler.rs`),
+      so a settings save or a `remind` call — and then every reader behind that writer — waits
+      minutes. Hand out an owned run handle and drop the guard before awaiting.
+
 ### The test suite stranded its scratch databases in tmpfs (found 2026-10-10)
 
 - [x] **Every `cargo test --workspace` left 44 directories in `/tmp`, and `/tmp` is RAM here.**
