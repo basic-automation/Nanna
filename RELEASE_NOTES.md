@@ -31,8 +31,9 @@ rules. Both are fixed, and the agent can no longer erase the records its safety 
 - The limit on retries before Nanna asks you now holds, however busy the card is.
 - Text you are typing in a card's description or labels is no longer wiped when the board refreshes.
 - A card opened from your Inbox can only be given to someone on that card's own board.
-- Deleting an agent releases its open cards instead of leaving them pointing at an agent that is
-  gone, and you can now unassign a card.
+- Deleting an agent releases its open cards back to the router instead of leaving them pointing at
+  an agent that is gone, and you can now unassign a card.
+- Renaming, re-dating or deleting a card now updates every open view right away.
 - Recurring cards open on the right day: not again on the day you finished them, and on the current
   round after the computer was off.
 - Deadlines written with a time zone are no longer marked overdue before they pass.
@@ -66,13 +67,16 @@ rules. Both are fixed, and the agent can no longer erase the records its safety 
   permissions yourself.
 - Paths with `~` or an apostrophe no longer break the syntax checks, and `.env.local` beside `.env`
   is no longer refused as a copy.
-- File history no longer fills up with temporary drafts, and restoring over a file too large for
-  history to keep is refused instead of losing it.
+- File history no longer fills up with temporary drafts, every saved checkpoint can be listed, and
+  restoring over a file too large for history to keep is refused instead of losing it.
+- Web pages in other character sets (Latin-1, Shift-JIS and others) are fetched with their text
+  intact.
 
 ## Conversations with the model
 
-- Requests sized for a small local model now count the project context and the tool list too, so
-  a request that looked small enough no longer overflows the model's window.
+- Requests sized for a small local model now count the project context, the tool list and the real
+  size of attached images, so a request that looked small enough no longer overflows the model's
+  window.
 - A file the agent re-read to edit is no longer swapped for a "seen before" note on the next step.
 - Empty-looking messages that Anthropic rejects are no longer sent, so a session that stored one no
   longer fails on every later turn.
@@ -87,6 +91,8 @@ rules. Both are fixed, and the agent can no longer erase the records its safety 
 - "Remember my choice" in the close dialog is remembered after a restart.
 - Saving one API key no longer copies keys from environment variables into your keyring.
 - Changing two settings in quick succession no longer undoes the first.
+- The Tools and Memory pages no longer show stale results after a quick switch, the scheduler switch
+  shows its real state when a change is refused, and a failed settings import now says so.
 
 ## Command line
 
@@ -106,8 +112,7 @@ rules. Both are fixed, and the agent can no longer erase the records its safety 
 
 ## Still open
 
-- Cards released when their agent is deleted are not yet re-routed automatically; assign them from
-  the board.
-- Editing or deleting a card does not yet refresh other open views right away.
 - Channel setup (Telegram, Discord and others) still copies environment-variable secrets into the
   keyring. Channels are due to be removed.
+- `nanna daemon stop` on macOS and Windows cannot yet confirm that the recorded process is the
+  daemon before stopping it.
