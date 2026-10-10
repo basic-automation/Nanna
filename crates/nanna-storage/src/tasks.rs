@@ -1794,17 +1794,27 @@ impl TaskRepository {
         now: &str,
     ) -> Result<(usize, usize), StorageError> {
         let today = day_of(now);
-        let pending = self.list_time_announcable(&today).await?;
+        // The SQL prefilter compares stored prefixes, and an offset
+        // timestamp's prefix is its LOCAL day, up to a day off its UTC day
+        // either way: widen by one day there and judge exactly below.
+        let horizon = chrono::NaiveDate::parse_from_str(&today, "%Y-%m-%d")
+            .ok()
+            .and_then(|day| day.succ_opt())
+            .map_or_else(|| today.clone(), |day| day.to_string());
+        let pending = self.list_time_announcable(&horizon).await?;
         let mut due_count = 0usize;
         let mut overdue_count = 0usize;
         for task in pending {
             let due_crossed = task.due_announced_at.is_none()
-                && task.due_at.as_deref().is_some_and(|at| day_of(at) <= today);
+                && task
+                    .due_at
+                    .as_deref()
+                    .is_some_and(|at| utc_day_of(at) <= today);
             let overdue_crossed = task.overdue_announced_at.is_none()
                 && task
                     .deadline_at
                     .as_deref()
-                    .is_some_and(|at| day_of(at) < today);
+                    .is_some_and(|at| utc_day_of(at) < today);
             if due_crossed {
                 self.mark_announced(task.id, "due_announced_at", now).await?;
                 self.emit(
@@ -1830,11 +1840,13 @@ impl TaskRepository {
         Ok((due_count, overdue_count))
     }
 
-    /// Open cards with an un-announced date or deadline that `now` has reached.
+    /// Open cards with an un-announced date or deadline whose stored day is
+    /// at most `horizon` — a superset of what is due, which `announce_due`
+    /// then judges exactly.
     ///
     /// The filtering is done in SQL so a board with thousands of settled cards
     /// does not decode all of them every five minutes.
-    async fn list_time_announcable(&self, today: &str) -> Result<Vec<Task>, StorageError> {
+    async fn list_time_announcable(&self, horizon: &str) -> Result<Vec<Task>, StorageError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
@@ -1844,9 +1856,9 @@ impl TaskRepository {
                        (due_announced_at IS NULL AND due_at IS NOT NULL \
                         AND substr(due_at, 1, 10) <= ?1) \
                        OR (overdue_announced_at IS NULL AND deadline_at IS NOT NULL \
-                           AND substr(deadline_at, 1, 10) < ?1))"
+                           AND substr(deadline_at, 1, 10) <= ?1))"
                 ),
-                turso::params![today],
+                turso::params![horizon],
             )
             .await?;
         let mut tasks = Vec::new();
@@ -3247,6 +3259,18 @@ fn blocked_ids(tasks: &[Task]) -> HashSet<i64> {
 /// bare `2026-07-20` and a full `2026-07-20T14:03:00Z` both yield `2026-07-20`.
 fn day_of(at: &str) -> String {
     at.chars().take(10).collect()
+}
+
+/// The UTC day of a stored date, for comparing against the sweep's UTC
+/// "today". A bare day and the store's own `YYYY-MM-DD HH:MM:SS` are already
+/// that; an RFC 3339 timestamp with an offset is converted, because its prefix
+/// is its LOCAL day — `2026-10-09T20:00:00-07:00` is 10-10 in UTC, and read
+/// as 10-09 it was announced overdue at 00:30 UTC, hours before it passed.
+fn utc_day_of(at: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(at).map_or_else(
+        |_| day_of(at),
+        |instant| instant.with_timezone(&chrono::Utc).date_naive().to_string(),
+    )
 }
 
 /// Whether a status means the task is closed.

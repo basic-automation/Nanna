@@ -10510,14 +10510,23 @@ keep the phases readable; promote individual items into a phase when they become
       state did not — it recomputes). `set_task_enabled` recomputes from now on the off→on edge.
       Test `a_re_enabled_cron_job_waits_for_its_next_occurrence`. **Not done:** the scheduler's
       master switch has the same edge for every cron job.
-- [ ] **A recurring card finished before its next occurrence reopens the same round** (completed
+- [x] **A recurring card finished before its next occurrence reopens the same round** (completed
       08:00, cron 09:00 the same day: reopened with the same `due_at`, announced due again), and
       **after downtime it reopens on the oldest missed round**, overdue at once. Search the next
       occurrence from the later of `completed_at` and the end of the anchor day, then step to the
       latest occurrence `<= now` (`sweep_recurrences`, `crates/nanna-daemon/src/tasks.rs`).
-- [ ] **A deadline with a non-UTC offset is announced overdue before it passes**: the sweep
+      *(2026-10-10, same run)* `round_occurrence`: the search starts after the end of the card's
+      own day (its date, else its deadline) or its completion, whichever is later, then steps to
+      the latest occurrence `<= now` (`RECURRENCE_CATCH_UP_STEPS_MAX` = 1024). Test
+      `a_round_opens_after_its_own_day_and_on_the_latest_occurrence`.
+- [x] **A deadline with a non-UTC offset is announced overdue before it passes**: the sweep
       compares the stored local-day prefix with a UTC "today". Compare instants for timestamp
       values; keep day granularity for bare `YYYY-MM-DD` (`announce_due`).
+      *(2026-10-10, same run)* Instants would contradict the pinned day granularity (a
+      `…T00:01Z` deadline has its whole day), so an RFC 3339 value is judged on its **UTC** day
+      (`utc_day_of`), matching the sweep's UTC today; the SQL prefilter widens one day so a
+      positive offset (local day ahead of UTC) is not missed. Test
+      `an_offset_deadline_is_judged_on_its_utc_day`.
 - [ ] **"Run now" holds the scheduler's read lock for the whole run** (`control/scheduler.rs`),
       so a settings save or a `remind` call — and then every reader behind that writer — waits
       minutes. Hand out an owned run handle and drop the guard before awaiting.

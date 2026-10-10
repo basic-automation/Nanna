@@ -771,6 +771,44 @@ async fn a_card_reopened_by_update_is_announced_overdue_again() {
     assert_eq!(recorder.of_kind(TaskEventKind::Overdue).len(), 1);
 }
 
+/// An offset timestamp is judged on its UTC day, like the sweep's "today":
+/// its prefix is its local day, and read as that a US-evening deadline was
+/// announced overdue hours before it passed — and an Asian-morning one was
+/// not considered until a day late.
+#[tokio::test]
+async fn an_offset_deadline_is_judged_on_its_utc_day() {
+    let (storage, _recorder) = storage_with_recorder().await;
+    let repo = storage.tasks();
+    repo.create(dated("west", None, Some("2026-10-09T20:00:00-07:00")))
+        .await
+        .expect("created");
+    let (_, overdue) = repo
+        .announce_due("2026-10-10T00:30:00Z")
+        .await
+        .expect("swept");
+    assert_eq!(
+        overdue, 0,
+        "10-10 03:00 UTC has not passed, nor has its day"
+    );
+    let (_, overdue) = repo
+        .announce_due("2026-10-11T00:30:00Z")
+        .await
+        .expect("swept");
+    assert_eq!(overdue, 1, "late the next UTC day");
+
+    repo.create(dated("east", None, Some("2026-10-10T08:00:00+09:00")))
+        .await
+        .expect("created");
+    let (_, overdue) = repo
+        .announce_due("2026-10-10T12:00:00Z")
+        .await
+        .expect("swept");
+    assert_eq!(
+        overdue, 1,
+        "10-09 23:00 UTC: late on 10-10, though its prefix says 10-10"
+    );
+}
+
 #[tokio::test]
 async fn a_deadline_is_not_overdue_on_the_day_it_falls() {
     // Dates are compared at day granularity throughout the store, so a card due
