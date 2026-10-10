@@ -10508,8 +10508,7 @@ keep the phases readable; promote individual items into a phase when they become
       at the occurrence it was switched off at; enabling only flipped the flag, so Thursday's
       re-enable of a Monday-09:00 job found Monday due and ran at 14:00 (a restart in the same
       state did not — it recomputes). `set_task_enabled` recomputes from now on the off→on edge.
-      Test `a_re_enabled_cron_job_waits_for_its_next_occurrence`. **Not done:** the scheduler's
-      master switch has the same edge for every cron job.
+      Test `a_re_enabled_cron_job_waits_for_its_next_occurrence`; the master switch's edge too (below).
 - [x] **A recurring card finished before its next occurrence reopens the same round** (completed
       08:00, cron 09:00 the same day: reopened with the same `due_at`, announced due again), and
       **after downtime it reopens on the oldest missed round**, overdue at once. Search the next
@@ -10527,9 +10526,14 @@ keep the phases readable; promote individual items into a phase when they become
       (`utc_day_of`), matching the sweep's UTC today; the SQL prefilter widens one day so a
       positive offset (local day ahead of UTC) is not missed. Test
       `an_offset_deadline_is_judged_on_its_utc_day`.
-- [ ] **"Run now" holds the scheduler's read lock for the whole run** (`control/scheduler.rs`),
+- [x] **"Run now" holds the scheduler's read lock for the whole run** (`control/scheduler.rs`),
       so a settings save or a `remind` call — and then every reader behind that writer — waits
       minutes. Hand out an owned run handle and drop the guard before awaiting.
+      *(2026-10-10, same run)* `Scheduler::run_now_handle` hands out the run's pieces as owned
+      `Arc`s (`RunNowHandle`); the control plane drops the guard before awaiting it. Test
+      `a_manual_run_does_not_hold_the_scheduler_lock`. The master-switch variant of the
+      re-enable bug is fixed the same run: switching the scheduler back on re-arms stale cron
+      occurrences (`rearm_stale_cron`, test `re_enabling_the_scheduler_does_not_fire_stale_cron_jobs`).
 
 ### Memory writes and reviews that went wrong quietly (found 2026-10-10, audit of recall and ingest)
 

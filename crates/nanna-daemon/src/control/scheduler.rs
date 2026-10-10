@@ -51,8 +51,15 @@ impl ControlPlane {
                 }
             }
             SchedulerAction::RunNow { id } => {
-                let scheduler = scheduler.read().await;
-                match scheduler.run_now(&id).await {
+                // The guard is dropped before the run is awaited: held, it
+                // stalled every scheduler write (and the readers queued
+                // behind it) for the whole run.
+                let handle = scheduler.read().await.run_now_handle();
+                let result = match handle {
+                    Some(handle) => handle.run(&id).await,
+                    None => None,
+                };
+                match result {
                     Some(result) => {
                         json!({
                             "status": if result.success { "success" } else { "failed" },
