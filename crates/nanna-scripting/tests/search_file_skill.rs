@@ -175,7 +175,35 @@ async fn end_anchored_patterns_match_in_a_crlf_file() {
     .await;
     assert!(found.contains("Found 1 match"), "got: {found}");
     assert!(found.contains(" > 1 | fn main() {"), "got: {found}");
-    assert!(!found.contains('\r'), "no carriage return is rendered: {found:?}");
+    assert!(
+        !found.contains('\r'),
+        "no carriage return is rendered: {found:?}"
+    );
+}
+
+/// A match that falls inside an earlier match's context is still marked.
+#[tokio::test]
+async fn a_match_inside_another_matchs_context_is_marked() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let body: String = (1..=20).map(|n| format!("row {n}\n")).collect::<String>();
+    let f = seed(
+        dir.path(),
+        "a.txt",
+        &body
+            .replace("row 10\n", "hit 10\n")
+            .replace("row 12\n", "hit 12\n"),
+    );
+
+    let found = run_search_ok(
+        json!({ "file_path": f.to_string_lossy(), "pattern": "^hit", "context_lines": 3 }),
+        dir.path(),
+    )
+    .await;
+    assert!(found.contains(" > 10 | hit 10"), "got: {found}");
+    assert!(found.contains(" > 12 | hit 12"), "got: {found}");
 }
 
 #[tokio::test]

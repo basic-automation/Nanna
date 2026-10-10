@@ -10636,8 +10636,11 @@ keep the phases readable; promote individual items into a phase when they become
       conventional variants** (`.env.local` beside `.env`, `Dockerfile.dev` beside `Dockerfile`):
       dotfile stems and variant suffixes are exempt in `write_file` and `edit_file`; `minidb.sh`
       is still refused. Test `conventional_variants_are_not_forks`.
-- [ ] Still open from the same audit: a match inside an earlier match's context loses its `>`
-      marker (and in `code_search` its trailing context); `file_history restore` over an 8 MiB+
+- [x] *(same run)* **A match inside an earlier match's context lost its `>` marker** (and in
+      `code_search` its whole trailing context): markers come from the set of all matches, and
+      `code_search` renders the unshown part of each window, joined to the section it continues.
+      Test `a_match_inside_another_matchs_context_is_marked`.
+- [ ] Still open from the same audit: `file_history restore` over an 8 MiB+
       file says the replaced content was saved when it was not; `file_history list` caps at 100
       of up to 500; `web_fetch` ignores the declared charset.
 

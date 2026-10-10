@@ -1,6 +1,6 @@
 export default {
   name: "search_file",
-  version: "0.2.1",
+  version: "0.2.2",
   output: "memory",
   description: "Search within a single file for a pattern and return matching lines with surrounding context. Useful for finding specific functions, variables, or text in large files without reading the entire file. Returns line numbers so you can follow up with read_file for a broader view.",
   parameters: {
@@ -367,6 +367,8 @@ export default {
     var renderedChars = 0;
     var outputCapped = false;
 
+    var matchSet = {};
+    for (var ms = 0; ms < matchIndices.length; ms++) matchSet[matchIndices[ms]] = true;
     for (var mi = 0; mi < matchIndices.length; mi++) {
       var matchIdx = matchIndices[mi];
       var start = Math.max(0, matchIdx - ctx);
@@ -379,7 +381,9 @@ export default {
 
       var rendered = [];
       for (var i = start; i <= stop; i++) {
-        var marker = i === matchIdx ? " >" : "  ";
+        // Every match line is marked — including one that falls inside an
+        // earlier match's context, which used to render as plain context.
+        var marker = matchSet[i] ? " >" : "  ";
         var lineNum = String(i + 1);
         while (lineNum.length < padLen) lineNum = " " + lineNum;
         rendered.push(marker + " " + lineNum + " | " + lines[i]);

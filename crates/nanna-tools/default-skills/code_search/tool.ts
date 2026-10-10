@@ -1,6 +1,6 @@
 export default {
   name: "code_search",
-  version: "0.3.2",
+  version: "0.3.3",
   output: "memory",
   description: "Search for a pattern across files in a directory tree. Returns matching lines with context. Supports regex patterns, a filename glob filter, and a depth bound.",
   parameters: {
@@ -606,6 +606,11 @@ function hasBinaryExt(name, exts) {
 }
 
 function formatFileMatches(filepath, lines, matchIndices, ctx) {
+  // Every match line is marked, and a match inside an earlier match's window
+  // still gets its own trailing context: skipping a match already shown as
+  // context dropped its `>` and every line after the first window.
+  var isMatch = {};
+  for (var k = 0; k < matchIndices.length; k++) isMatch[matchIndices[k]] = true;
   var sections = [];
   var shown = {};
 
@@ -614,18 +619,25 @@ function formatFileMatches(filepath, lines, matchIndices, ctx) {
     var start = Math.max(0, matchIdx - ctx);
     var end = Math.min(lines.length - 1, matchIdx + ctx);
 
-    if (shown[matchIdx]) continue;
-
     var section = [];
+    var firstNew = -1;
     for (var i = start; i <= end; i++) {
       if (shown[i]) continue;
       shown[i] = true;
-      var marker = i === matchIdx ? ">" : " ";
+      if (firstNew < 0) firstNew = i;
+      var marker = isMatch[i] ? ">" : " ";
       var lineNum = String(i + 1);
       while (lineNum.length < 4) lineNum = " " + lineNum;
       section.push(marker + lineNum + ": " + lines[i]);
     }
-    sections.push(section.join("\n"));
+    if (section.length === 0) continue;
+    // Contiguous with what is already shown: continue that section rather
+    // than start a new one behind a "..." separator.
+    if (sections.length > 0 && shown[firstNew - 1]) {
+      sections[sections.length - 1] += "\n" + section.join("\n");
+    } else {
+      sections.push(section.join("\n"));
+    }
   }
 
   return "=== " + filepath + " (" + matchIndices.length + " match" + (matchIndices.length > 1 ? "es" : "") + ") ===\n" + sections.join("\n  ...\n");
