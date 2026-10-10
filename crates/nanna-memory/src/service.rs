@@ -886,7 +886,7 @@ impl MemoryService {
         let results = self.store.search_owned_by(&embedding, 1, None).await;
         
         if let Some((existing, similarity)) = results.first() {
-            let action = IngestAction::from_similarity(*similarity);
+            let action = ingest_action(*similarity, &metadata, &existing.metadata);
             
             match action {
                 // Same rule as `remember_with_importance`: only a neighbour that
@@ -1166,7 +1166,7 @@ impl MemoryService {
         let results = self.store.search_owned_by(&embedding, 1, None).await;
         
         if let Some((existing, similarity)) = results.first() {
-            let action = IngestAction::from_similarity(*similarity);
+            let action = ingest_action(*similarity, &metadata, &existing.metadata);
             
             // Don't reinforce error memories — let them die
             let skip_reinforce = existing.content.contains("Error:")
@@ -1353,7 +1353,7 @@ impl MemoryService {
         let results = self.store.search_owned_by(&embedding, 1, owner).await;
         
         if let Some((existing, similarity)) = results.first() {
-            let action = IngestAction::from_similarity(*similarity);
+            let action = ingest_action(*similarity, &metadata, &existing.metadata);
             
             // A near neighbour is a reason to STRENGTHEN it, never on its own a
             // reason to throw the new observation away.
@@ -3240,6 +3240,31 @@ pub const MEMORY_CHUNK_MAX_CHARS: usize = MEMORY_CHUNK_TARGET_CHARS;
 /// SIMD cosine is exact here; a dimension mismatch or empty vector yields no
 /// match rather than a panic.
 #[must_use]
+/// What a live write does with its nearest neighbour.
+///
+/// Similarity decides, unless the two differ in verbatim pin (a user's stated
+/// fact vs an observation): absorbing keeps the SURVIVOR's metadata, so a
+/// stated fact folded into an observed row — or discarded as already
+/// contained in one — came back marked `observed`, and the next dream could
+/// paraphrase the user's words. The dream path partitions on the pin first
+/// (`partition_verbatim_pinned`); the live path now keeps them apart too, by
+/// writing the incoming fact as its own row.
+fn ingest_action<S1, S2>(
+    similarity: f32,
+    incoming: &HashMap<String, String, S1>,
+    existing: &HashMap<String, String, S2>,
+) -> IngestAction
+where
+    S1: std::hash::BuildHasher,
+    S2: std::hash::BuildHasher,
+{
+    if is_verbatim_pinned(incoming) == is_verbatim_pinned(existing) {
+        IngestAction::from_similarity(similarity)
+    } else {
+        IngestAction::Create
+    }
+}
+
 fn find_duplicate_target(survivors: &[MemoryEntry], candidate: &MemoryEntry) -> Option<usize> {
     if candidate.embedding.is_empty() {
         return None;
@@ -3582,6 +3607,54 @@ mod tests {
             service.pending_update_count().await - before,
             1,
             "one result shown, one review queued"
+        );
+    }
+
+    /// A user's stated fact is never absorbed into an observed neighbour: the
+    /// survivor's metadata wins an absorb, so the fact came back `observed`
+    /// and lost its verbatim pin.
+    #[tokio::test]
+    async fn a_stated_fact_is_not_folded_into_an_observation() {
+        use std::sync::Arc;
+
+        let embed: EmbedFn = Arc::new(|text: &str| {
+            let text = text.to_string();
+            Box::pin(async move {
+                if text.contains("Never") {
+                    Ok(vec![0.85_f32, 0.526_8, 0.0])
+                } else {
+                    Ok(vec![1.0_f32, 0.0, 0.0])
+                }
+            })
+        });
+        let config = MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        };
+        let service = MemoryService::new(config).with_embed_fn(embed);
+        let fact = |kind: &str| {
+            HashMap::from([(crate::FACT_TYPE_METADATA_KEY.to_string(), kind.to_string())])
+        };
+        service
+            .remember("deploys were frozen last Friday", fact("observed"))
+            .await
+            .expect("observation");
+        service
+            .remember("Never deploy on Fridays", fact("stated"))
+            .await
+            .expect("stated fact");
+
+        let all = service.list_all().await;
+        assert_eq!(
+            all.len(),
+            2,
+            "kept apart: {:?}",
+            all.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+        assert!(
+            all.iter().any(|m| m.content == "Never deploy on Fridays"
+                && crate::is_verbatim_pinned(&m.metadata)),
+            "the user's words stand as their own pinned row"
         );
     }
 

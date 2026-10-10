@@ -10567,11 +10567,15 @@ keep the phases readable; promote individual items into a phase when they become
       `a_run_resolves_its_own_workspace_not_the_shared_slot`. Still the documented rule, not
       changed: a run with no workspace (a global-board card, a chat with none) recalls
       `Everything`.
-- [ ] **A stated fact folded into an observed neighbour loses its pin.** The live write path's
+- [x] **A stated fact folded into an observed neighbour loses its pin.** The live write path's
       fold keeps the survivor's metadata (`update_content_and_embedding_if` rewrites content and
       vector only), so a user assertion becomes `observed` and the next dream may paraphrase it
       — the laundering the dream path's `partition_verbatim_pinned` prevents. Fold only within
       equal pin status, or upgrade the survivor to `stated` in the same write.
+      *(2026-10-10, same run)* `ingest_action`: a neighbour that differs in verbatim pin is never
+      absorbed — the incoming fact becomes its own row — in all three live ingest paths (the
+      contained-discard included). Test `a_stated_fact_is_not_folded_into_an_observation` (red
+      without the fix).
 
 ### The test suite stranded its scratch databases in tmpfs (found 2026-10-10)
 
