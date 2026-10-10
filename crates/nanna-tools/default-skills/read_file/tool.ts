@@ -76,7 +76,10 @@ export default {
       var READMARK_STATE = ".nanna/read_marks.json";
       var READMARK_MAX_ENTRIES = 200;
       var normKey = function(path) {
-        var k = path.split("\\").join("/").toLowerCase();
+        var k = path.split("\\").join("/");
+        // Case folds only where the filesystem does: on Linux `README.md` and
+        // `readme.md` are two files, and one key let a read of either count for both.
+        if (Nanna.platform === "win32" || Nanna.platform === "darwin") k = k.toLowerCase();
         while (k.indexOf("./") === 0) k = k.substring(2);
         while (k.indexOf("//") !== -1) k = k.split("//").join("/");
         return k;

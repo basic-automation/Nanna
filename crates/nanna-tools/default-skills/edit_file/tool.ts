@@ -30,6 +30,20 @@ export default {
       try { Nanna.log("info", msg); } catch (e) { /* logging is optional */ }
     }
 
+    // A path as one shell word for Nanna.exec's `sh -c`: single-quoted with
+    // embedded quotes escaped, and a leading `~/` left to the shell as
+    // "$HOME". The bridge expands `~` when it writes; quoted literally, the
+    // shell looked for a file named `~/x.py` (a valid file then "does NOT
+    // parse"), and an apostrophe re-split the words — `Bob's and Ann's
+    // notes.md` made a cleanup run `rm -f Bobs and …`.
+    function shq(path) {
+      var p = String(path);
+      var home = "";
+      if (p === "~" || p.indexOf("~/") === 0) { home = "\"$HOME\""; p = p.substring(1); }
+      if (p === "") return home;
+      return home + "'" + p.split("'").join("'\\''") + "'";
+    }
+
     // Repeat-refusal escalation, shared with write_file — see the long note
     // there. Same state file and the same "fork:" key prefix, so attempts
     // alternating between the two tools accumulate on ONE counter instead of
@@ -99,7 +113,10 @@ export default {
     var HIWATER_STATE = ".nanna/write_hiwater.json";
     var HIWATER_MAX_ENTRIES = 200;
     function hiwaterNormKey(path) {
-      var k = path.split("\\").join("/").toLowerCase();
+      var k = path.split("\\").join("/");
+      // Case folds only where the filesystem does: on Linux `README.md` and
+      // `readme.md` are two files, and one key let a read of either count for both.
+      if (Nanna.platform === "win32" || Nanna.platform === "darwin") k = k.toLowerCase();
       while (k.indexOf("./") === 0) k = k.substring(2);
       while (k.indexOf("//") !== -1) k = k.split("//").join("/");
       return k;
@@ -612,7 +629,7 @@ export default {
           "    print('NEW_OK')\n" +
           "except SyntaxError as e:\n" +
           "    print('NEW_BAD line ' + str(e.lineno) + ': ' + str(e.msg))\n");
-        var cmd = "python '" + chk + "' '" + newTmp + "'; rc=$?; rm -f '" + chk + "' '" + newTmp + "'; exit $rc";
+        var cmd = "python " + shq(chk) + " " + shq(newTmp) + "; rc=$?; rm -f " + shq(chk) + " " + shq(newTmp) + "; exit $rc";
         var result = Nanna.exec(cmd, null, 30);
         var out = result && result.stdout ? result.stdout : "";
         var bad = out.indexOf("NEW_BAD");
@@ -678,10 +695,10 @@ export default {
       if (path.indexOf("'") !== -1) return null;
       var cmd = null;
       var toolName = null;
-      if (kind === "sh") { cmd = "sh -n '" + path + "'"; toolName = "sh -n"; }
-      else if (kind === "bash") { cmd = "bash -n '" + path + "'"; toolName = "bash -n"; }
-      else if (kind === "node") { cmd = "node --check '" + path + "'"; toolName = "node --check"; }
-      else if (kind === "py") { cmd = "python -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding=\"utf-8\").read())' '" + path + "'"; toolName = "python ast"; }
+      if (kind === "sh") { cmd = "sh -n " + shq(path); toolName = "sh -n"; }
+      else if (kind === "bash") { cmd = "bash -n " + shq(path); toolName = "bash -n"; }
+      else if (kind === "node") { cmd = "node --check " + shq(path); toolName = "node --check"; }
+      else if (kind === "py") { cmd = "python -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding=\"utf-8\").read())' " + shq(path); toolName = "python ast"; }
       if (!cmd) return null;
       try {
         var r = Nanna.exec(cmd, null, 15);

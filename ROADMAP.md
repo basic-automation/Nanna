@@ -10475,15 +10475,23 @@ keep the phases readable; promote individual items into a phase when they become
       DNS/timeout failure raised past unguarded bridge calls and reached the model as stacked
       "Execution failed:" errors. Both return now. Test `a_binary_file_is_answered_not_thrown`
       (red on read_file 0.1.3).
-- [ ] **Paths reach `sh -c` unquoted and unexpanded** (`write_file` py gate/structural check/
+- [x] **Paths reach `sh -c` unquoted and unexpanded** (`write_file` py gate/structural check/
       sweep, `edit_file`, `file_buffer`, exec's post-redirect check): `~/x.py` is checked as a
       literal `'~/x.py'` (the gate is skipped, a valid file is reported "does NOT parse"), and a
       name with an apostrophe re-tokenizes — `Bob's and Ann's notes.md` made the sweep run
       `rm -f Bobs and …`. Pass `Nanna.stat(p).path` through one quoting helper
       (`'` → `'\''`).
-- [ ] **Ledger and read-mark keys are lowercased on every OS** (`hiwaterNormKey`, five copies):
+      *(2026-10-10, same run)* `shq()` in all four skills: single-quoted with `'` escaped and a
+      leading `~/` left to the shell as `"$HOME"`; the "unquotable — no verdict" bail-outs are gone.
+      Test `an_apostrophe_in_the_path_does_not_switch_the_checks_off` (invalid code in `it's.py`
+      is now refused by the gate; it was written before, red on write_file 0.1.17).
+- [x] **Ledger and read-mark keys are lowercased on every OS** (`hiwaterNormKey`, five copies):
       on Linux `readme.md` and `README.md` share one entry, so reading one satisfies the
       blind-rewrite hold for the other. Lowercase only when `Nanna.platform === "win32"`.
+      *(2026-10-10, same run)* Folded on `win32` and `darwin` only (both filesystems fold case by
+      default). Entries an older skill wrote lowercased on Linux no longer match mixed-case
+      names — those files start a fresh high-water (fail-open, once). Test
+      `the_ledger_keeps_a_files_case_where_the_filesystem_does`.
 
 ### The test suite stranded its scratch databases in tmpfs (found 2026-10-10)
 
