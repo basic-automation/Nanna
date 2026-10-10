@@ -140,6 +140,13 @@ pub mod stdio {
     use tokio::sync::{mpsc, oneshot};
     use tracing::{debug, error, trace, warn};
 
+    /// Largest stdio message read from a server.
+    ///
+    /// Bound justification: the same 16 MiB the HTTP transports allow one
+    /// message (`streamable_http::HTTP_BODY_BYTES_MAX`) — far past any real
+    /// tool result, small enough that a runaway server cannot exhaust memory.
+    const STDIO_LINE_BYTES_MAX: usize = 16 * 1024 * 1024;
+
     /// Server → client notification categories from the MCP spec that we recognize.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ServerNotification {
@@ -426,6 +433,53 @@ pub mod stdio {
             })
         }
 
+        /// Read one `\n`-terminated line, refusing past [`STDIO_LINE_BYTES_MAX`].
+        ///
+        /// `lines()` grew one `String` without bound: a server that wrote a
+        /// multi-gigabyte result, or bytes with no newline, used the daemon's
+        /// memory until it was killed. The HTTP transports already cap a
+        /// message at the same size. Cancel-safe: progress is kept in
+        /// `partial`, which outlives the call.
+        async fn next_line_capped<R: tokio::io::AsyncBufRead + Unpin>(
+            reader: &mut R,
+            partial: &mut Vec<u8>,
+        ) -> std::io::Result<Option<String>> {
+            loop {
+                let available = reader.fill_buf().await?;
+                if available.is_empty() {
+                    if partial.is_empty() {
+                        return Ok(None);
+                    }
+                    let line = std::mem::take(partial);
+                    return String::from_utf8(line)
+                        .map(Some)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+                }
+                let (taken, done) = available
+                    .iter()
+                    .position(|b| *b == b'\n')
+                    .map_or((available.len(), false), |at| (at, true));
+                partial.extend_from_slice(&available[..taken]);
+                reader.consume(if done { taken + 1 } else { taken });
+                if partial.len() > STDIO_LINE_BYTES_MAX {
+                    partial.clear();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("an MCP message exceeded {STDIO_LINE_BYTES_MAX} bytes"),
+                    ));
+                }
+                if done {
+                    if partial.last() == Some(&b'\r') {
+                        partial.pop();
+                    }
+                    let line = std::mem::take(partial);
+                    return String::from_utf8(line)
+                        .map(Some)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+                }
+            }
+        }
+
         /// Background task that reads the server's stdout: responses go to the
         /// waiting caller, notifications to the router, and server requests are
         /// answered on stdin.
@@ -436,7 +490,10 @@ pub mod stdio {
             mut shutdown_rx: mpsc::Receiver<()>,
             list_changed: Arc<ListChangedFlags>,
         ) {
-            let mut reader = BufReader::new(stdout).lines();
+            let mut reader = BufReader::new(stdout);
+            // Lives outside the select: a line half-read when shutdown wins
+            // is kept, not lost.
+            let mut partial: Vec<u8> = Vec::new();
 
             loop {
                 tokio::select! {
@@ -444,7 +501,7 @@ pub mod stdio {
                         debug!("Reader task shutting down");
                         break;
                     }
-                    line = reader.next_line() => {
+                    line = Self::next_line_capped(&mut reader, &mut partial) => {
                         match line {
                             Ok(Some(line)) => {
                                 trace!(line, "Received from MCP server");
@@ -618,6 +675,30 @@ pub mod stdio {
             let idle =
                 tokio::time::timeout(std::time::Duration::from_millis(50), flags.changed()).await;
             assert!(idle.is_err(), "no mark, no wake");
+        }
+
+        /// Lines split cleanly (CRLF too, a last unterminated one kept), and a
+        /// message past the cap is refused instead of growing without bound.
+        #[tokio::test]
+        async fn a_stdio_line_is_capped_and_split_on_newlines() {
+            let mut reader = tokio::io::BufReader::new(&b"{\"a\":1}\r\n{\"b\":2}\n{\"c\""[..]);
+            let mut partial = Vec::new();
+            let mut lines = Vec::new();
+            while let Some(line) =
+                super::StdioTransport::next_line_capped(&mut reader, &mut partial)
+                    .await
+                    .unwrap()
+            {
+                lines.push(line);
+            }
+            assert_eq!(lines, ["{\"a\":1}", "{\"b\":2}", "{\"c\""]);
+
+            let huge = vec![b'x'; super::STDIO_LINE_BYTES_MAX + 1];
+            let mut reader = tokio::io::BufReader::new(&huge[..]);
+            let mut partial = Vec::new();
+            let refused = super::StdioTransport::next_line_capped(&mut reader, &mut partial).await;
+            assert!(refused.is_err(), "past the cap: refused");
+            assert!(partial.is_empty(), "the oversized bytes are not kept");
         }
 
         #[cfg(unix)]
