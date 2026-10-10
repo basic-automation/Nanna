@@ -662,6 +662,9 @@ async function setToolEnabled(tool: Tool, enabled: boolean) {
   }
 }
 
+/** The latest selection; an older one's replies are dropped when they land. */
+let selectTicket = 0
+
 async function selectTool(tool: Tool) {
   // `confirm` here is the app's composable, not `window.confirm`: it takes
   // options and returns a Promise. Called with a bare string and un-awaited,
@@ -677,6 +680,9 @@ async function selectTool(tool: Tool) {
     if (!discard) return
   }
 
+  // Switching quickly let a slow earlier reply land last: the previous
+  // tool's source under the new tool's header, ready to be saved over it.
+  const ticket = ++selectTicket
   selectedTool.value = tool
   creating.value = false
   hasChanges.value = false
@@ -686,6 +692,7 @@ async function selectTool(tool: Tool) {
   // Load tool details
   try {
     const result = await invoke<{ tool: ToolDetails }>('get_tool', { name: tool.name })
+    if (ticket !== selectTicket) return
     toolDetails.value = result.tool
 
     editingTool.value = {
@@ -700,6 +707,7 @@ async function selectTool(tool: Tool) {
     // Load source code from tools directory
     try {
       const source = await invoke<{ name: string; source: string; language?: string; path?: string }>('get_tool_source', { name: tool.name })
+      if (ticket !== selectTicket) return
       if (source && source.source) {
         editingTool.value.code = source.source
         editingTool.value.toolType = source.language === 'yaml' ? 'manifest' : 'script'
@@ -710,6 +718,7 @@ async function selectTool(tool: Tool) {
       // Fall back to user tool manager
       try {
         const userTool = await invoke<{ name: string; source: string; language: string } | null>('get_user_tool', { name: tool.name })
+        if (ticket !== selectTicket) return
         if (userTool && userTool.source) {
           editingTool.value.code = userTool.source
           editingTool.value.toolType = userTool.language === 'yaml' ? 'manifest' : 'script'
@@ -721,10 +730,11 @@ async function selectTool(tool: Tool) {
       }
     }
   } catch (e) {
+    if (ticket !== selectTicket) return
     console.error('Failed to load tool details:', e)
     toolDetails.value = null
   } finally {
-    loadingSource.value = false
+    if (ticket === selectTicket) loadingSource.value = false
   }
 }
 

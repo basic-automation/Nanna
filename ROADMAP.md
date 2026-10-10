@@ -10693,6 +10693,11 @@ keep the phases readable; promote individual items into a phase when they become
       save takes effect on the next turn. Test
       `the_agent_prompt_and_name_settings_reach_the_live_prompt`. `streaming_enabled` is still
       unread.
+- [x] *(same run)* **Three GUI races and a silent failure:** switching tools quickly let the
+      previous tool's source land under the new tool's header (ready to be saved over it), and
+      switching memory scopes let a slower list overwrite the newer one — both now keep a request
+      ticket; a refused config import showed nothing (its handler ran after the outer `try` had
+      returned) and now shows the error.
 - [~] **A daemon-side save can undo a GUI setting made a moment earlier**: save-only setters wait
       for the 2 s watcher while `config_set` setters make the daemon save its whole (older) copy
       — reorder embeddings, then chat models within ~2.5 s, and the first change is lost. After a
