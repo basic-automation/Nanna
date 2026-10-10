@@ -317,6 +317,26 @@ async fn adding_an_extension_to_an_existing_file_is_refused() {
     );
 }
 
+/// Conventional variants are siblings, not forks: `.env.local` beside `.env`
+/// and `Dockerfile.dev` beside `Dockerfile` were refused as copies.
+#[tokio::test]
+async fn conventional_variants_are_not_forks() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".env"), "A=1\n").unwrap();
+    std::fs::write(dir.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+    for (name, body) in [(".env.local", "A=2\n"), ("Dockerfile.dev", "FROM alpine\n")] {
+        let path = dir.path().join(name).to_string_lossy().into_owned();
+        let result = run_write(json!({ "file_path": path, "content": body }), dir.path())
+            .await
+            .expect("write returns");
+        assert_ne!(result["success"], Value::Bool(false), "{name}: {result}");
+        assert!(dir.path().join(name).is_file(), "{name} was written");
+    }
+}
+
 /// The refusal must stay narrow: sibling FORMATS are legitimate. Their stems
 /// are not themselves files, which is exactly what distinguishes them from a
 /// copy of an extensionless original.

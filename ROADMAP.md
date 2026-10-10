@@ -10626,13 +10626,16 @@ keep the phases readable; promote individual items into a phase when they become
       `.__chk_new.py` are housekeeping now.
 - [x] **`code_outline` skipped `pub(crate)`/`pub(super)`/`unsafe`/`extern` Rust items** (and
       `impl<T>` lines).
+- [x] *(same run)* **`file_buffer` could re-commit a stale draft**: it cleared the draft with an
+      unchecked `rm -f`, which misses a bridge-repaired path, so the next append landed on content
+      already committed. The draft is blanked through the bridge first. **The fork guard refused
+      conventional variants** (`.env.local` beside `.env`, `Dockerfile.dev` beside `Dockerfile`):
+      dotfile stems and variant suffixes are exempt in `write_file` and `edit_file`; `minidb.sh`
+      is still refused. Test `conventional_variants_are_not_forks`.
 - [ ] Still open from the same audit: a match inside an earlier match's context loses its `>`
-      marker (and in `code_search` its trailing context); `file_buffer` clears its draft with an
-      unchecked `rm -f` that misses a bridge-repaired path, so a stale buffer can be re-committed
-      (use `Nanna.writeFile(bufPath, "")`); `file_history restore` over an 8 MiB+ file says the
-      replaced content was saved when it was not; `edit_file`/`write_file`'s fork guard refuses
-      `.env.local` beside `.env`; `file_history list` caps at 100 of up to 500; `web_fetch` ignores
-      the declared charset.
+      marker (and in `code_search` its trailing context); `file_history restore` over an 8 MiB+
+      file says the replaced content was saved when it was not; `file_history list` caps at 100
+      of up to 500; `web_fetch` ignores the declared charset.
 
 ### The test suite stranded its scratch databases in tmpfs (found 2026-10-10)
 

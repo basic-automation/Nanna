@@ -971,10 +971,16 @@ export default {
         return fail("file_buffer failed writing " + filePath + " — the buffer is KEPT. " +
           writeFailureNote(filePath, String(eC), "Retry the commit."));
       }
+      // Blank the draft through the bridge FIRST — it resolves the path the
+      // read above used — and only then tidy with the shell. The shell sees
+      // the path as written, so for a bridge-repaired path its `rm -f`
+      // removed nothing, "succeeded", and the committed draft stayed: the
+      // next append landed on top of content already written to the file.
+      try { Nanna.writeFile(bufPath, ""); } catch (eZ) { /* the rm below may still clear it */ }
       try {
         Nanna.exec("rm -f " + shq(bufPath) + " " + shq(filePath + ".__cleared__"), null, 15);
       } catch (eRm) {
-        try { Nanna.writeFile(bufPath, ""); } catch (eZ) { /* leftovers are harmless */ }
+        // An empty draft is no draft; leftovers are harmless.
       }
 
       // Structural verdict on what landed (P22): the .py gate above already
@@ -1142,10 +1148,13 @@ export default {
         }
         try { Nanna.writeFile(clearMarker, "1"); } catch (eWk) { /* best effort */ }
       }
+      // Blanked through the bridge first, as on commit: the shell's `rm`
+      // can miss a bridge-repaired path.
+      try { Nanna.writeFile(bufPath, ""); } catch (eZ2) { /* the rm below may still clear it */ }
       try {
         Nanna.exec("rm -f " + shq(bufPath), null, 15);
       } catch (eRm2) {
-        try { Nanna.writeFile(bufPath, ""); } catch (eZ2) { /* best effort */ }
+        // An empty draft is no draft.
       }
       return { content: "Buffer for " + filePath + " discarded. The real file was not touched. NOTE: this file cannot be discarded again — repair the next draft instead of regenerating it.", success: true };
     }

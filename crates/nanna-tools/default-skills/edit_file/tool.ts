@@ -1003,6 +1003,13 @@ export default {
     var forkSlash = forkBase.lastIndexOf("/");
     var forkName = forkSlash >= 0 ? forkBase.substring(forkSlash + 1) : forkBase;
     var forkDot = forkName.lastIndexOf(".");
+    // Conventional variants (`.env.local`, `Dockerfile.dev`) are siblings,
+    // not forks — the same exemption as write_file's guard.
+    var forkVariants = ["local", "dev", "development", "prod", "production", "staging", "test", "example", "sample", "template", "dist", "override", "ci", "debug", "release"];
+    if (forkDot > 0 && (forkName.charAt(0) === "." ||
+        forkVariants.indexOf(forkName.substring(forkDot + 1).toLowerCase()) !== -1)) {
+      forkDot = -1;
+    }
     if (forkDot > 0) {
       var forkStem = forkName.substring(0, forkDot);
       var forkStemPath = forkSlash >= 0

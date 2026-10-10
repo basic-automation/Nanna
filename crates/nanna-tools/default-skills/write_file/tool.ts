@@ -1052,6 +1052,15 @@ export default {
       // their stems are not files: config.json next to config.yaml, tool.ts
       // next to tool.js, index.css next to index.html.
       var lastDot = baseName.lastIndexOf(".");
+      // Conventional variants are siblings, not copies: `.env.local` beside
+      // `.env`, `Dockerfile.dev` beside `Dockerfile` were refused as forks.
+      // A dotfile stem (`.env`, `.gitignore`) and a variant suffix exempt it;
+      // a language extension on an extensionless file (`minidb.sh`) does not.
+      var variantSuffixes = ["local", "dev", "development", "prod", "production", "staging", "test", "example", "sample", "template", "dist", "override", "ci", "debug", "release"];
+      var addedSuffix = lastDot > 0 ? baseName.substring(lastDot + 1).toLowerCase() : "";
+      if (lastDot > 0 && (baseName.charAt(0) === "." || variantSuffixes.indexOf(addedSuffix) !== -1)) {
+        lastDot = -1;
+      }
       if (lastDot > 0) {
         var stem = baseName.substring(0, lastDot);
         var dirPart = filePath.split("\\").join("/");
