@@ -62,6 +62,8 @@ impl ControlPlane {
     /// Called with the config lock released: provider resolution can block on
     /// the keyring or refresh an expired Claude CLI token over the network.
     async fn propagate_committed(&self, config: &Config) {
+        // `[agent].system_prompt` / `name` take effect on the next turn.
+        *self.system_prompt.write().await = super::system_prompt_for(&config.agent);
         self.rebuild_llm_providers(config).await;
         self.apply_scheduler_settings(config).await;
         if let Some(ref live) = self.live_embedding {

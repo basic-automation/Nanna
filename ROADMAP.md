@@ -10673,11 +10673,17 @@ keep the phases readable; promote individual items into a phase when they become
 - [x] **Three memory setters awaited the daemon while holding the AppState write lock**
       (`set_auto_remember_messages`, `set_max_compression_ratio`, `set_min_remaining_memories`)
       — the class closed elsewhere; the backend handle is cloned and the guard dropped first.
-- [ ] **The custom system prompt and the agent name are saved and never used**: nothing outside
+- [x] **The custom system prompt and the agent name are saved and never used**: nothing outside
       `nanna-config` reads `[agent].system_prompt`/`name` (the daemon builds
       `default_system_prompt()`, and `ControlPlane::set_system_prompt` has no caller), nor
       `streaming_enabled`. Apply them on config load/reload, or remove the editors (the
       dead-fields class).
+      *(2026-10-10, same run)* `system_prompt_for`: a non-blank custom prompt replaces the
+      built-in one (the platform section kept), a non-default name is stated ahead of it; applied
+      at startup and on every committed config change (`propagate_committed`), so a Settings
+      save takes effect on the next turn. Test
+      `the_agent_prompt_and_name_settings_reach_the_live_prompt`. `streaming_enabled` is still
+      unread.
 - [ ] **A daemon-side save can undo a GUI setting made a moment earlier**: save-only setters wait
       for the 2 s watcher while `config_set` setters make the daemon save its whole (older) copy
       — reorder embeddings, then chat models within ~2.5 s, and the first change is lost. After a

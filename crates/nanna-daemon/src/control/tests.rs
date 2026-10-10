@@ -255,6 +255,37 @@ async fn a_saved_ollama_token_reaches_the_running_embedder_but_the_model_waits()
 /// address (the agent can send one) used to re-read the store for the new
 /// address, find no record, and hand the old server's token to the new one:
 /// chat, embeddings and the probe would all have sent it there.
+/// `[agent].system_prompt` and `name` reach the prompt a turn uses — set over
+/// IPC, they take effect without a restart; blank, the built-in prompt stands.
+#[tokio::test]
+async fn the_agent_prompt_and_name_settings_reach_the_live_prompt() {
+    let default = super::system_prompt_for(&nanna_config::AgentConfig::default());
+    assert!(default.contains("You are Nanna"), "the built-in prompt");
+    let named = super::system_prompt_for(&nanna_config::AgentConfig {
+        name: "Luna".to_string(),
+        ..nanna_config::AgentConfig::default()
+    });
+    assert!(named.starts_with("Your name is Luna."), "{named}");
+
+    let cp = Arc::new(ControlPlane::new(Arc::new(SessionManager::new())));
+    let reply = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "agent.system_prompt".into(),
+                value: json!("You answer in haiku."),
+            }),
+        )
+        .await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    let live = cp.system_prompt.read().await.clone();
+    assert!(live.starts_with("You answer in haiku."), "{live}");
+    assert!(
+        live.contains("## Platform"),
+        "the tools' platform facts are kept: {live}"
+    );
+}
+
 /// The live config holds the secrets filled in from the secure store; what a
 /// client of the socket reads back must hold none of them.
 #[tokio::test]

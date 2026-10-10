@@ -322,6 +322,7 @@ impl ControlPlane {
         );
 
         let user_tools = Some(Arc::new(UserToolManager::new(data_dir.join("user_tools"))));
+        let system_prompt = system_prompt_for(&config.agent);
 
         Self {
             sessions,
@@ -335,7 +336,7 @@ impl ControlPlane {
             config: Arc::new(RwLock::new(config)),
             config_path,
             data_dir: Some(data_dir),
-            system_prompt: Arc::new(RwLock::new(default_system_prompt())),
+            system_prompt: Arc::new(RwLock::new(system_prompt)),
             log_buffer: None,
             tools_dir: None,
             audit_log_path: None,
@@ -959,9 +960,35 @@ impl ControlPlane {
     }
 }
 
-/// Default system prompt for Nanna
-fn default_system_prompt() -> String {
-    let platform_info = format!(
+/// The system prompt `[agent]` asks for.
+///
+/// Settings → Agent saved a custom prompt and a name to `config.toml` and the
+/// daemon read neither: every chat ran the built-in prompt under the built-in
+/// name while the UI said "saved". A non-blank `system_prompt` now replaces
+/// the built-in one — keeping the platform section the tools rely on — and a
+/// non-default `name` is stated ahead of the built-in prompt.
+pub(crate) fn system_prompt_for(agent: &nanna_config::AgentConfig) -> String {
+    if let Some(custom) = agent
+        .system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        return format!("{custom}{}", platform_section());
+    }
+    let base = default_system_prompt();
+    let name = agent.name.trim();
+    if name.is_empty() || name == "Nanna" {
+        return base;
+    }
+    let named = format!("Your name is {name}.\n\n{base}");
+    debug_assert!(named.ends_with(&platform_section()));
+    named
+}
+
+/// What the agent must know about the host to use its tools.
+fn platform_section() -> String {
+    format!(
         "\n\n## Platform\n- OS: {} ({})\n- Home: {}\n- Shell: {}",
         std::env::consts::OS,
         std::env::consts::ARCH,
@@ -971,7 +998,12 @@ fn default_system_prompt() -> String {
         } else {
             "sh (bash/zsh)"
         },
-    );
+    )
+}
+
+/// Default system prompt for Nanna
+fn default_system_prompt() -> String {
+    let platform_info = platform_section();
 
     format!(
         r"You are Nanna (𒀭𒋀𒆠), the moon god for all.
