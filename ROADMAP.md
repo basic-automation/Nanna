@@ -10729,10 +10729,14 @@ keep the phases readable; promote individual items into a phase when they become
       read in part is never retired: the first chunk tries the next summarizer, a later one ends
       the pass before it. *No dedicated test* — it needs a summarizer with a tiny window, which
       the scripted rig does not model yet.
-- [ ] **The hard-limit check counts only the base system prompt** — not the workspace slice, the
+- [x] **The hard-limit check counts only the base system prompt** — not the workspace slice, the
       workdir note, or the tool definitions — so on a 32k Ollama window a compressed request can
       still exceed it (Ollama then truncates the front; a cloud provider 400s). Charge
       `effective_system_prompt()` and the active tool definitions in the budget.
+      *(2026-10-10, same run)* `estimate_tokens` charges `effective_system_prompt()` and
+      `tool_definition_tokens`, which `build_iteration_request` sets from the request's own tool
+      list each iteration (transient, `#[serde(skip)]`). Test
+      `tool_definitions_count_against_the_hard_limit`; agent/daemon/e2e 1250 green.
 - [x] **Dedup folds the only remaining copy of re-read content** into "already in the summary"
       (chunk hashes from summarized-away blocks match a later re-read), so a file the model
       re-reads to edit disappears again; only fold when another surviving message holds it.

@@ -527,6 +527,11 @@ pub struct AgentContext {
     /// since it's already represented in the `consolidated_summary`.
     #[serde(default)]
     summarized_content_hashes: HashSet<u64>,
+    /// Estimated tokens of the tool definitions the last request carried,
+    /// set by the loop each iteration (see [`Self::set_tool_definition_tokens`]).
+    /// Transient: re-measured on the next request, never persisted.
+    #[serde(skip)]
+    tool_definition_tokens: usize,
     /// Index of the message carrying the LIVE request — the thing the user
     /// actually asked for this turn. Provenance, not a guess: neither index 0
     /// nor `role == "user"` identifies it, because the loop pushes synthetic
@@ -577,6 +582,7 @@ impl AgentContext {
             growth: ContextGrowthTracker::default(),
             pending_loss_notices: Vec::new(),
             summarized_content_hashes: HashSet::new(),
+            tool_definition_tokens: 0,
             pinned_request: None,
         }
     }
@@ -1603,10 +1609,22 @@ impl AgentContext {
     #[must_use]
     pub fn estimate_tokens(&self) -> usize {
         // Family-aware heuristic from nanna-llm (ASCII English/code + CJK density).
-        let system_tokens = estimate_tokens(&self.system_prompt);
+        // The system prompt AS SENT — with the workspace slice and the
+        // working-directory note — and the tool definitions: counting only the
+        // base prompt let a "compressed" request on a 32k local window still
+        // run several thousand tokens over (the server then cut the front of
+        // the prompt, or a cloud provider answered 400).
+        let system_tokens = estimate_tokens(&self.effective_system_prompt());
         let message_tokens: usize = self.messages.iter().map(estimate_message_tokens).sum();
 
-        system_tokens + message_tokens
+        system_tokens + self.tool_definition_tokens + message_tokens
+    }
+
+    /// Record the tool definitions' size for the budget: the loop calls this
+    /// with each iteration's request, so the next check counts what is sent.
+    pub fn set_tool_definition_tokens(&mut self, tokens: usize) {
+        debug_assert!(tokens < 1 << 24, "a tool list is not millions of tokens");
+        self.tool_definition_tokens = tokens;
     }
 
     /// Estimated tokens of the step frame: the pinned message carrying the
@@ -3843,6 +3861,23 @@ mod tests {
             content(&deduped[3]),
             file,
             "the newest result is sent whole"
+        );
+    }
+
+    /// The tool definitions a request carries count against its window: a
+    /// context whose messages fit can still be over once they are added.
+    #[test]
+    fn tool_definitions_count_against_the_hard_limit() {
+        let mut ctx = AgentContext::new("s1");
+        ctx.messages.push(AnthropicMessage::user_text("hello"));
+        let base = ctx.estimate_tokens();
+        assert!(!ctx.exceeds_hard_limit());
+        ctx.set_tool_definition_tokens(1_000);
+        assert_eq!(ctx.estimate_tokens(), base + 1_000);
+        ctx.set_tool_definition_tokens(ctx.message_hard_limit());
+        assert!(
+            ctx.exceeds_hard_limit(),
+            "the definitions alone fill the window"
         );
     }
 

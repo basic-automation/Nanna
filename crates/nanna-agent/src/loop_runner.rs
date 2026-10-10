@@ -5426,6 +5426,14 @@ impl Agent {
         if state.wrap_up.engaged {
             request.tools = None;
         }
+        // The definitions this request carries count against its window.
+        let tool_tokens = request.tools.as_ref().map_or(0, |tools| {
+            nanna_llm::estimate_tokens(&serde_json::to_string(tools).unwrap_or_default())
+        });
+        self.context
+            .write()
+            .await
+            .set_tool_definition_tokens(tool_tokens);
         if let Some(ref routed) = routed_model {
             self.retarget_request_to_routed(&mut request, routed, options).await;
         }
