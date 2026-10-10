@@ -29,6 +29,16 @@ pub struct CdpBrowser {
     /// So a second daemon — or a test running beside one — could not launch a
     /// browser at all.
     profile: RwLock<Option<tempfile::TempDir>>,
+    /// The runtime the browser's connection lives on: the one that built this
+    /// manager (the daemon's), when there is one.
+    ///
+    /// Every `Nanna.service(...)` call runs on a throwaway runtime built for
+    /// that call and dropped after it. A launch on that runtime tied the CDP
+    /// websocket and its event handler to it, so when the first call returned
+    /// the handler was cancelled — not finished, so `alive` never cleared —
+    /// and every later call failed ("receiver is gone") with no relaunch,
+    /// until the daemon restarted.
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl CdpBrowser {
@@ -40,6 +50,7 @@ impl CdpBrowser {
             browser: RwLock::new(None),
             profile: RwLock::new(None),
             alive: std::sync::Mutex::new(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            runtime: tokio::runtime::Handle::try_current().ok(),
         }
     }
 
@@ -131,32 +142,21 @@ impl Browser for CdpBrowser {
             .build()
             .map_err(BrowserError::LaunchFailed)?;
 
-        let (browser, mut handler) = CoBrowser::launch(co_config)
-            .await
-            .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
-
-        // Spawn handler task; its end is the connection's end.
-        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        // Launched on `runtime` (see there), so the connection outlives the
+        // call that opened it. Commands reach it over a channel, from any
+        // runtime.
+        let launched = launch_connected(co_config);
+        let (browser, alive) = match &self.runtime {
+            Some(runtime) => runtime
+                .spawn(launched)
+                .await
+                .map_err(|e| BrowserError::LaunchFailed(format!("launch task: {e}")))??,
+            None => launched.await?,
+        };
         *self
             .alive
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&alive);
-        tokio::spawn(async move {
-            while let Some(event) = handler.next().await {
-                // A dead connection does not end the stream: chromiumoxide
-                // yields its error on every poll. Anything but a malformed
-                // message is the connection gone.
-                if let Err(e) = event {
-                    if matches!(e, chromiumoxide::error::CdpError::InvalidMessage(..)) {
-                        debug!("CDP invalid message: {e}");
-                        continue;
-                    }
-                    tracing::warn!("CDP connection ended: {e}");
-                    break;
-                }
-            }
-            alive.store(false, std::sync::atomic::Ordering::SeqCst);
-        });
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = alive;
 
         *self.profile.write().await = Some(profile);
         *browser_guard = Some(browser);
@@ -225,6 +225,36 @@ impl Browser for CdpBrowser {
     fn config(&self) -> &BrowserConfig {
         &self.config
     }
+}
+
+/// Launch Chromium and drive its connection on the current runtime: the
+/// browser handle, and the flag its event handler clears when the connection
+/// ends (Chromium exited, crashed or was killed).
+async fn launch_connected(
+    config: CoConfig,
+) -> Result<(CoBrowser, Arc<std::sync::atomic::AtomicBool>), BrowserError> {
+    let (browser, mut handler) = CoBrowser::launch(config)
+        .await
+        .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
+    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let connection = Arc::clone(&alive);
+    tokio::spawn(async move {
+        while let Some(event) = handler.next().await {
+            // A dead connection does not end the stream: chromiumoxide
+            // yields its error on every poll. Anything but a malformed
+            // message is the connection gone.
+            if let Err(e) = event {
+                if matches!(e, chromiumoxide::error::CdpError::InvalidMessage(..)) {
+                    debug!("CDP invalid message: {e}");
+                    continue;
+                }
+                tracing::warn!("CDP connection ended: {e}");
+                break;
+            }
+        }
+        connection.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+    Ok((browser, alive))
 }
 
 /// CDP page wrapper

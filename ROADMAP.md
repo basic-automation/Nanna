@@ -10767,6 +10767,62 @@ keep the phases readable; promote individual items into a phase when they become
       after its downscale; an unreadable size or a URL is charged the cap). Test
       `images_are_estimated_from_their_pixel_size`.
 
+### MCP servers that could exhaust or confuse the daemon (found 2026-10-10, audit of the MCP client)
+
+- [x] **A stdio server's message had no size cap.** `BufReader::lines()` grew one `String` until
+      the daemon was OOM-killed when a server wrote a multi-gigabyte result or bytes with no
+      newline; both HTTP transports already cap a message at 16 MiB. The reader now refuses a line
+      past 16 MiB (`STDIO_LINE_BYTES_MAX`), keeps a half-read line across the shutdown `select!`,
+      and ends the session the same way a read error does. Test
+      `a_stdio_line_is_capped_and_split_on_newlines`.
+- [ ] **An MCP question to the user is cut off by the tool's own deadline.** `McpAskUser` waits up
+      to 600 s for the answer, but `McpToolWrapper::timeout_secs()` is 65 s and the registry
+      backstop drops the call at about 75 s, so an answer given later never reaches the server.
+      User think-time should not count against the tool's deadline.
+- [ ] **No server's tools appear until every server has started.** `start_all` starts servers one
+      after another and registers only after the loop, so one slow `npx -y` server (60 s probe +
+      60 s `initialize`) holds back every other server's tools and status. Register each server
+      as its handshake finishes, or start them concurrently.
+- [ ] **A cold start over 60 s fails a modern-only stdio server.** A probe timeout reads as
+      "legacy"; the queued `server/discover` and `initialize` then both arrive, and a modern-only
+      server rejects `initialize` with `-32022`. Re-classify that error and finish the modern
+      handshake.
+- [ ] **Tool names from two servers can collide.** `mcp__{server}__{tool}` is sanitized after the
+      duplicate-name check (`home assistant` vs `home.assistant`, or `__` inside names), the
+      registry's `insert` silently replaces the earlier tool, and `resync_server` can unregister
+      the other server's tool. De-duplicate on the sanitized name and skip a name another server
+      owns.
+- [ ] *(lead)* Under the AppImage, stdio MCP servers inherit the bundle's `LD_LIBRARY_PATH`;
+      `exec` scrubs it (`scrub_appimage_library_path`), `StdioTransport::spawn_with_env` does not.
+
+### Browser tools that broke after one call (found 2026-10-10, audit of the browser services)
+
+- [x] **The browser died with the first call's runtime and was never relaunched.** Every
+      `Nanna.service(...)` runs on a runtime built for that call and dropped after it. The first
+      browser call launched Chromium there, so its CDP connection and event handler were
+      cancelled when the call returned — the handler never ran to its end, so `alive` stayed
+      true — and every later call failed with "send failed because receiver is gone" until the
+      daemon restarted. The integration test called every service on one long-lived runtime, so
+      it never saw it. `CdpBrowser` now keeps the runtime that built it (the daemon's) and
+      launches and drives the connection there (`launch_connected`). Test
+      `the_browser_outlives_the_runtime_of_the_call_that_launched_it` (red before: the second
+      call failed).
+- [ ] **Closed browsers leave `nanna-chromium-*` profiles behind.** `close()` drops the browser
+      (SIGKILL, no wait) and deletes the profile at once; Chromium's NetworkService child
+      outlives the kill and re-creates `Default/Network Persistent State` and its cache index in
+      the deleted directory (reproduced by hand). Nothing calls `BrowserManager::close` either —
+      not the daemon on shutdown, not the integration test. Close over CDP, wait for the process,
+      then delete the profile; call `close` on shutdown and in the test.
+- [ ] **A navigation that times out leaks its tab.** `new_page(url)` only returns the page once it
+      has loaded, so a deadline that fires first leaves a live tab with no handle to close it.
+      Open `about:blank`, then `goto` under the deadline and close the page on any error.
+- [ ] **`browser_evaluate` of an expression with no value fails.** chromiumoxide's `into_value`
+      errors with "No value found" for `undefined`, `NaN`, `Infinity` and `BigInt`, so
+      `localStorage.setItem(...)` reports failure after it ran. Read the remote object's `value`
+      or `unserializableValue` instead.
+- [ ] **A selector that matches nothing is a successful empty extract.** `#hedline` returns
+      "(no content extracted)" as success; report "no element matches" instead.
+
 ### The test suite stranded its scratch databases in tmpfs (found 2026-10-10)
 
 - [x] **Every `cargo test --workspace` left 44 directories in `/tmp`, and `/tmp` is RAM here.**
