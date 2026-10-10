@@ -1,6 +1,6 @@
 export default {
   name: "exec",
-  version: "0.1.6",
+  version: "0.1.7",
   output: "memory",
   // Script-engine deadline (seconds). This is only a backstop for a hung script:
   // the shell bridge owns the real per-command timeout — the `timeout` parameter
@@ -212,6 +212,119 @@ export default {
       return targets;
     }
 
+    // Nanna's own records under .nanna/ — the ratchet ledger, the read
+    // marks, the declared-invariant registry. write_file refuses rewriting the
+    // ledger ("would silently disarm the erosion guard"); exec let
+    // `rm -f .nanna/write_hiwater.json` or `echo {} > …` through, resetting
+    // every file's high-water, and `rm .nanna/declared_invariants.json`
+    // dropped every rule the user had declared.
+    function isNannaState(raw) {
+      var k = hiwaterKey(raw);
+      while (k.length > 1 && k.charAt(k.length - 1) === "/") k = k.substring(0, k.length - 1);
+      return k === ".nanna" || k.indexOf(".nanna/") === 0 || k.indexOf("/.nanna/") !== -1 ||
+        (k.length > 7 && k.lastIndexOf("/.nanna") === k.length - 7);
+    }
+
+    // The user's declared invariants (write_file's registry, same format and
+    // matching): `no_delete` and `read_only` are enforced HERE, where deletion
+    // and shell rewrites happen — write_file says so and leaves them to exec,
+    // and before this exec never read the registry at all. Missing or
+    // malformed registry => no rules (fail open), as in write_file.
+    var INVARIANT_STATE = ".nanna/declared_invariants.json";
+    function invariantsLoad() {
+      try {
+        var raw = Nanna.readFile(INVARIANT_STATE);
+        if (!raw) return [];
+        var parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.invariants)) return [];
+        return parsed.invariants;
+      } catch (e) {
+        return [];
+      }
+    }
+    // Mirrors write_file's invariantMatches exactly, or one rule would match
+    // differently depending on which tool touched the file.
+    function invariantMatches(glob, canonPath, normPath) {
+      try {
+        var g = hiwaterKey(String(glob));
+        while (g.length > 1 && g.charAt(g.length - 1) === "/") g = g.substring(0, g.length - 1);
+        if (g === "") return false;
+        if (g.indexOf("*") === -1 && g.indexOf("?") === -1) {
+          return canonPath === g || normPath === g ||
+            canonPath.indexOf(g + "/") === 0 || normPath.indexOf(g + "/") === 0;
+        }
+        var re = "";
+        for (var i = 0; i < g.length; i++) {
+          var c = g.charAt(i);
+          if (c === "*") {
+            if (g.charAt(i + 1) === "*") {
+              re += "[\\s\\S]*";
+              i++;
+              if (g.charAt(i + 1) === "/") i++;
+            } else {
+              re += "[^/]*";
+            }
+          } else if (c === "?") {
+            re += "[^/]";
+          } else if ("\\^$.|+()[]{}".indexOf(c) !== -1) {
+            re += "\\" + c;
+          } else {
+            re += c;
+          }
+        }
+        var rx = new RegExp("^" + re + "$");
+        return rx.test(canonPath) || rx.test(normPath);
+      } catch (e) {
+        return false;
+      }
+    }
+
+    function stateOrInvariantRefusal(command) {
+      var clobbers = clobberTargets(command);
+      var deletes = destructiveTargets(command);
+      var all = clobbers.concat(deletes);
+      for (var a = 0; a < all.length; a++) {
+        if (all[a].indexOf("$") !== -1) continue;
+        if (isNannaState(all[a])) {
+          glog("exec guard: NOT EXECUTED (Nanna state " + all[a] + "): " + (command.length > 160 ? command.substring(0, 160) + "..." : command));
+          return "NOT EXECUTED — nothing was changed. " + all[a] + " is Nanna's own record (the " +
+            "write ledger, read marks, or the rules you declared), not project output; " +
+            "overwriting, moving or deleting it would silently switch off the safety checks " +
+            "and the user's declared rules. Leave .nanna/ alone and continue with your task.";
+        }
+      }
+      var list = invariantsLoad();
+      if (list.length === 0) return null;
+      for (var t = 0; t < all.length; t++) {
+        var raw = all[t];
+        if (raw.indexOf("$") !== -1 || raw.indexOf("/dev/") === 0) continue;
+        var deleting = t >= clobbers.length;
+        var canon = hiwaterKey(raw);
+        var norm = hiwaterNormKey(raw);
+        for (var i = 0; i < list.length; i++) {
+          var inv = list[i];
+          if (!inv || typeof inv !== "object" || typeof inv.glob !== "string") continue;
+          var kind = typeof inv.kind === "string" ? inv.kind : "";
+          var applies = kind === "read_only" || (kind === "no_delete" && deleting);
+          if (kind === "no_create_under" && !deleting) {
+            var exists = false;
+            try { exists = !!Nanna.stat(raw); } catch (eS) { exists = false; }
+            applies = !exists;
+          }
+          if (!applies || !invariantMatches(inv.glob, canon, norm)) continue;
+          var quoted = typeof inv.source === "string" && inv.source !== "" ? inv.source : "";
+          glog("exec guard: NOT EXECUTED (declared invariant " + kind + " on '" + inv.glob + "') " + raw);
+          return "NOT EXECUTED — nothing was changed. This command would " +
+            (deleting ? "delete or move " : "write ") + raw + ", which is under a path you declared " +
+            "off-limits" + (quoted === "" ? " (" + kind + " on `" + inv.glob + "`)" : ": \"" + quoted + "\"") +
+            ". That is YOUR instruction, not a tool limitation, and it stays in force until you lift " +
+            "it in chat. If you believe it genuinely blocks the goal, call lift_invariant with glob `" +
+            inv.glob + "` — it asks the user — instead of working around it.";
+        }
+      }
+      return null;
+    }
+
     function redirectClobberRefusal(command) {
       var targets = clobberTargets(command);
       var destructive = destructiveTargets(command);
@@ -328,6 +441,10 @@ export default {
     var clobber = redirectClobberRefusal(input.command);
     if (clobber) {
       return { content: clobber, success: false };
+    }
+    var declared = stateOrInvariantRefusal(input.command);
+    if (declared) {
+      return { content: declared, success: false };
     }
 
     // Bridge failures (spawn errors, bad workdir, missing files) must be

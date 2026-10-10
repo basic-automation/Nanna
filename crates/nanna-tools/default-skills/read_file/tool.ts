@@ -1,6 +1,6 @@
 export default {
   name: "read_file",
-  version: "0.1.3",
+  version: "0.1.4",
   output: "memory",
   description: "Read a file from the filesystem. Returns the file contents with line numbers. Supports optional offset and limit for reading portions of large files.",
   parameters: {
@@ -49,7 +49,19 @@ export default {
       return "Error: File is too large (" + (stat.size / 1024 / 1024).toFixed(1) + "MB). Maximum is 10MB. Use offset/limit to read portions.";
     }
 
-    var content = Nanna.readFile(filePath);
+    // Guarded like the stat above: a file that is not UTF-8 text (an image,
+    // a PDF, a binary) makes the bridge raise, and an unguarded raise reaches
+    // the model as a stacked "Execution failed:" script error.
+    var content;
+    try {
+      content = Nanna.readFile(filePath);
+    } catch (e) {
+      return {
+        content: "read_file: '" + filePath + "' could not be read as text (" + e + "). If it " +
+          "is a PDF or an image, use read_pdf, ocr or describe_image. Nothing was read.",
+        success: false
+      };
+    }
 
     // Read-recency mark (P22 Tier 3): record that the session saw this
     // file's content NOW. write_file/file_buffer consult these marks — a

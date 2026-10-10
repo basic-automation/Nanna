@@ -10448,6 +10448,43 @@ keep the phases readable; promote individual items into a phase when they become
 - [ ] **A per-launch token** (written 0600 beside the PID file, required in the first frame)
       would also stop a hostile *local process*, which the `Origin` check does not.
 
+### The tool layer's guards had holes (found 2026-10-10, security audit)
+
+- [x] **`no_delete` was enforced nowhere, and exec could erase the guards' own records.**
+      `write_file` leaves `no_delete` to exec ("enforced where deletions happen") — but exec never
+      read `.nanna/declared_invariants.json`, so under a declared "never delete anything under
+      tests/" `rm tests/test_03.sh` ran, as did `sed -i`/`>` rewrites under `read_only`; and
+      `rm -f .nanna/write_hiwater.json` (or `echo {} >` it) reset every file's high-water — the
+      erosion the ratchet exists to stop. exec 0.1.7 refuses any redirect/`rm`/`mv` onto
+      `.nanna/`, and enforces `no_delete` (rm/mv), `read_only` (any) and `no_create_under`
+      (a redirect creating a file) with `write_file`'s matcher. The registry itself was a
+      writable file too: `write_file`/`edit_file`/`file_buffer` now refuse it even with `force`
+      — only `lift_invariant`, which asks the user, changes it. Tests `exec_skill.rs` (2,
+      red on exec 0.1.6) and `the_declared_rules_cannot_be_rewritten_even_with_force`.
+- [x] **Seven skills could not read the workspace.** `read_pdf`, `ocr`, `analyze_image`,
+      `describe_image`, `transcribe`, `lift_invariant` and `todo` shipped home-only (`~`) scopes,
+      but a workspace is often outside home (here `/mnt/deepmem`, on Windows `D:\`): every file
+      was refused, and `lift_invariant` answered "nothing was lifted" while the rule stood. Now
+      `*`, like `read_file`/`write_file`. Installed `permissions.json` files are never
+      overwritten (the user may have edited them), so a release would have fixed only new
+      installs: `bootstrap_default_skills` now replaces one that is still exactly the scope
+      Nanna shipped (`SUPERSEDED_PERMISSIONS`); any other is kept. Tests
+      `only_an_unedited_superseded_permissions_file_is_replaced`,
+      `every_superseded_scope_is_corrected_in_the_bundle`.
+- [x] **`read_file` and `web_search` threw.** A non-UTF-8 file (an image, a PDF) and a
+      DNS/timeout failure raised past unguarded bridge calls and reached the model as stacked
+      "Execution failed:" errors. Both return now. Test `a_binary_file_is_answered_not_thrown`
+      (red on read_file 0.1.3).
+- [ ] **Paths reach `sh -c` unquoted and unexpanded** (`write_file` py gate/structural check/
+      sweep, `edit_file`, `file_buffer`, exec's post-redirect check): `~/x.py` is checked as a
+      literal `'~/x.py'` (the gate is skipped, a valid file is reported "does NOT parse"), and a
+      name with an apostrophe re-tokenizes — `Bob's and Ann's notes.md` made the sweep run
+      `rm -f Bobs and …`. Pass `Nanna.stat(p).path` through one quoting helper
+      (`'` → `'\''`).
+- [ ] **Ledger and read-mark keys are lowercased on every OS** (`hiwaterNormKey`, five copies):
+      on Linux `readme.md` and `README.md` share one entry, so reading one satisfies the
+      blind-rewrite hold for the other. Lowercase only when `Nanna.platform === "win32"`.
+
 ### The test suite stranded its scratch databases in tmpfs (found 2026-10-10)
 
 - [x] **Every `cargo test --workspace` left 44 directories in `/tmp`, and `/tmp` is RAM here.**

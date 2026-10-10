@@ -1,6 +1,6 @@
 export default {
   name: "write_file",
-  version: "0.1.17",
+  version: "0.1.18",
   output: "memory",
   description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. For files too long to write in one call, use file_buffer (append chunks, then commit) instead. SAFETY: a shrinking rewrite of a file that changed since you last read it returns the file's CURRENT content to merge (not a refusal); a shrinking rewrite that deletes more top-level sections than it keeps is held ONCE with the current content and the removed names — send the same content again to confirm the deletions; blocked if new content is under 30% of the last known-good size (likely truncation), if a .py file would not parse, or if the filename looks like a versioned copy. After each write the cheapest structural check (sh -n / node --check / JSON.parse) runs and its verdict is appended; a full overwrite parks the previous version at <file>.__prev__ for recovery and the richest earlier version at <file>.__best__.",
   parameters: {
@@ -337,6 +337,17 @@ export default {
     // the sentence reads as this tool's refusal, not a generic one.
     function invariantRefusal(path, verb) {
       try {
+        // The registry itself is one of the rules' paths: rewriting it to
+        // "{}" erased every rule the user had declared, with no undo snapshot
+        // (.nanna/ is housekeeping). Only lift_invariant, which asks the
+        // user, changes it.
+        var regKey = hiwaterKey(path);
+        var regTail = "/.nanna/declared_invariants.json";
+        if (regKey === ".nanna/declared_invariants.json" ||
+            (regKey.length > regTail.length && regKey.lastIndexOf(regTail) === regKey.length - regTail.length)) {
+          return verb + " REFUSED — " + path + " holds the rules the user declared; nothing was " +
+            "written. Only lift_invariant (which asks the user) changes it. Continue with your task.";
+        }
         var list = invariantsLoad();
         if (list.length === 0) return "";
         var canon = hiwaterKey(path);

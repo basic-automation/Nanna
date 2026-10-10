@@ -1,6 +1,6 @@
 export default {
   name: "file_buffer",
-  version: "0.1.7",
+  version: "0.1.8",
   output: "memory",
   description: "Write a LARGE file across MULTIPLE tool calls: append chunks of text one call at a time, then commit once to write the real file. Use this instead of write_file when a file is too long to write in one call. Sequence: file_buffer(action=\"append\", file_path, content) repeatedly in order from the top of the file, then file_buffer(action=\"commit\", file_path) to write it. action=\"show\" previews the pending buffer, action=\"clear\" discards it. The real file only changes on commit. Commit carries write_file's safety net: a shrinking commit over a file that changed since you last read it returns the file's current content to merge, a shrinking commit that deletes more top-level sections than it keeps is held ONCE with the removed names (commit the same buffer again to confirm), the previous version is parked at <file>.__prev__ and the richest earlier version at <file>.__best__, and the cheapest structural check runs on the result with its verdict appended.",
   parameters: {
@@ -343,6 +343,17 @@ export default {
     // existence is tooling detail.
     function invariantRefusal(path, verb) {
       try {
+        // The registry itself is one of the rules' paths: rewriting it to
+        // "{}" erased every rule the user had declared, with no undo snapshot
+        // (.nanna/ is housekeeping). Only lift_invariant, which asks the
+        // user, changes it.
+        var regKey = hiwaterKey(path);
+        var regTail = "/.nanna/declared_invariants.json";
+        if (regKey === ".nanna/declared_invariants.json" ||
+            (regKey.length > regTail.length && regKey.lastIndexOf(regTail) === regKey.length - regTail.length)) {
+          return verb + " REFUSED — " + path + " holds the rules the user declared; nothing was " +
+            "written. Only lift_invariant (which asks the user) changes it. Continue with your task.";
+        }
         var list = invariantsLoad();
         if (list.length === 0) return "";
         var canon = hiwaterKey(path);

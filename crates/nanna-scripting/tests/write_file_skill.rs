@@ -354,3 +354,30 @@ async fn a_suffixed_name_with_no_original_is_fine() {
     .expect("a fresh script name must succeed");
     assert!(dir.path().join("build.sh").exists());
 }
+
+/// The rule registry is not a file the model may rewrite: `"{}"` erased every
+/// rule the user had declared, and `force` must not open it either — only
+/// `lift_invariant`, which asks the user, changes it.
+#[tokio::test]
+async fn the_declared_rules_cannot_be_rewritten_even_with_force() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let registry = dir.path().join(".nanna/declared_invariants.json");
+    std::fs::create_dir_all(registry.parent().expect("parent")).expect("mkdir");
+    let rules = r#"{"invariants":[{"kind":"no_delete","glob":"tests"}]}"#;
+    std::fs::write(&registry, rules).expect("seed registry");
+
+    let content = run_fail(
+        json!({ "file_path": ".nanna/declared_invariants.json", "content": "{}", "force": true }),
+        dir.path(),
+    )
+    .await;
+    assert!(content.contains("lift_invariant"), "{content}");
+    assert_eq!(
+        std::fs::read_to_string(&registry).expect("read"),
+        rules,
+        "untouched"
+    );
+}

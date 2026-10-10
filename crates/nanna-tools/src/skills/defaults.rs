@@ -70,6 +70,49 @@ fn extract_version_from_source(source: &str) -> Option<String> {
     None
 }
 
+/// A `permissions.json` Nanna once shipped and has since replaced, per skill.
+///
+/// Installed permission files are never overwritten, because the user may
+/// have edited them — so a scope Nanna got wrong stayed wrong on every
+/// existing install. These skills shipped home-only (`~`) scopes, but they
+/// read the files of the user's workspace, which is often outside home (a
+/// second drive, `/mnt/…`, `D:\…`): every such file was refused, and
+/// `lift_invariant` answered "nothing was lifted" while the rule stood. A file
+/// still byte-for-byte (as parsed JSON) what was shipped was never edited, so
+/// it is replaced; any other is the user's and is kept.
+// Release builds refresh extracted skills; tests cover it everywhere.
+#[cfg(any(not(debug_assertions), test))]
+const SUPERSEDED_PERMISSIONS: &[(&str, &str)] = &[
+    ("analyze_image", HOME_SCOPED_RUN_NET_ENV),
+    ("describe_image", HOME_SCOPED_RUN_NET_ENV),
+    ("lift_invariant", HOME_SCOPED_RUN_NET_ENV),
+    ("ocr", HOME_SCOPED_RUN_NET_ENV),
+    ("read_pdf", HOME_SCOPED_RUN_NET_ENV),
+    ("transcribe", HOME_SCOPED_RUN_NET_ENV),
+    (
+        "todo",
+        r#"{"read":["~"],"write":["~"],"run":false,"net":[],"env":false}"#,
+    ),
+];
+
+#[cfg(any(not(debug_assertions), test))]
+const HOME_SCOPED_RUN_NET_ENV: &str =
+    r#"{"read":["~"],"write":["~"],"run":true,"net":["*"],"env":true}"#;
+
+/// Whether `installed` is a superseded scope of `skill`'s that `embedded`
+/// corrects — never a file the user changed, never a no-op rewrite.
+#[cfg(any(not(debug_assertions), test))]
+fn replaces_superseded_permissions(skill: &str, installed: &str, embedded: &str) -> bool {
+    let parse = |text: &str| serde_json::from_str::<serde_json::Value>(text).ok();
+    let (Some(installed), Some(embedded)) = (parse(installed), parse(embedded)) else {
+        return false;
+    };
+    installed != embedded
+        && SUPERSEDED_PERMISSIONS
+            .iter()
+            .any(|(name, shipped)| *name == skill && parse(shipped).as_ref() == Some(&installed))
+}
+
 /// Directory name, under this crate, holding the bundled JS/TS skills.
 /// Only the debug-build source-tree fallback reads it.
 #[cfg(debug_assertions)]
@@ -275,8 +318,20 @@ pub fn bootstrap_default_skills(tools_dir: &Path) -> usize {
                             continue;
                         }
                     }
+                } else if entry.file_name == "permissions.json"
+                    && std::fs::read_to_string(&target).is_ok_and(|installed| {
+                        replaces_superseded_permissions(entry.skill_name, &installed, entry.content)
+                    })
+                {
+                    tracing::info!(
+                        "Upgrading {}/permissions.json: the installed scope is one Nanna shipped \
+                         and has since corrected",
+                        entry.skill_name
+                    );
+                    // Fall through to write
                 } else {
-                    // Non-tool files (permissions.json etc.) — don't overwrite
+                    // Non-tool files (permissions.json etc.) — don't overwrite:
+                    // the user may have edited them.
                     continue;
                 }
             }
@@ -398,6 +453,52 @@ pub fn load_discover_tools_source(tools_dir: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An installed `permissions.json` equal to a scope Nanna shipped and has
+    /// since corrected is replaced; one the user edited, another skill's, or a
+    /// file already current is left alone.
+    #[test]
+    fn only_an_unedited_superseded_permissions_file_is_replaced() {
+        let current = r#"{"read":["*"],"write":["*"],"run":true,"net":["*"],"env":true}"#;
+        let shipped = "{\n  \"read\": [\"~\"], \"write\": [\"~\"],\n  \"run\": true, \"net\": [\"*\"], \"env\": true\n}";
+        assert!(replaces_superseded_permissions(
+            "read_pdf", shipped, current
+        ));
+        let edited =
+            r#"{"read":["~","/mnt/data"],"write":["~"],"run":true,"net":["*"],"env":true}"#;
+        assert!(
+            !replaces_superseded_permissions("read_pdf", edited, current),
+            "the user's edit stands"
+        );
+        assert!(
+            !replaces_superseded_permissions("recall", shipped, current),
+            "not a corrected skill"
+        );
+        assert!(
+            !replaces_superseded_permissions("read_pdf", current, current),
+            "already current"
+        );
+        assert!(!replaces_superseded_permissions(
+            "read_pdf", "not json", current
+        ));
+    }
+
+    /// Every superseded entry names a bundled skill whose shipped file now
+    /// differs from it — otherwise the table would rewrite a file to itself
+    /// or name a skill that no longer exists.
+    #[test]
+    fn every_superseded_scope_is_corrected_in_the_bundle() {
+        for (skill, shipped) in SUPERSEDED_PERMISSIONS {
+            let embedded = DEFAULT_SKILLS
+                .iter()
+                .find(|e| e.skill_name == *skill && e.file_name == "permissions.json")
+                .unwrap_or_else(|| panic!("{skill} ships no permissions.json"));
+            assert!(
+                replaces_superseded_permissions(skill, shipped, embedded.content),
+                "{skill}: the bundle still ships the superseded scope"
+            );
+        }
+    }
     use tempfile::tempdir;
 
     /// Serializes tests that mutate `NANNA_TOOLS_DIR`.
