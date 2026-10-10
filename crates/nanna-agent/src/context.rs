@@ -72,7 +72,7 @@ fn estimate_message_tokens(msg: &AnthropicMessage) -> usize {
                 estimate_tokens_for_family(&input.to_string(), TokenContentFamily::Code) + 50
             }
             ContentBlock::ToolResult { content, .. } => estimate_tokens(content) + 20,
-            ContentBlock::Image { .. } => 1000, // Images are ~1k tokens
+            ContentBlock::Image { source } => nanna_llm::estimate_image_tokens(source),
             ContentBlock::Thinking { thinking, .. } => estimate_tokens(thinking),
         })
         .sum()
@@ -2790,7 +2790,7 @@ Provide a concise summary (2-4 paragraphs max):"
                     ContentBlock::ToolUse { input, .. } => estimate_token_count(input.to_string().len()),
                     ContentBlock::ToolResult { content, .. } => estimate_token_count(content.len()),
                     ContentBlock::Thinking { thinking, .. } => estimate_token_count(thinking.len()),
-                    ContentBlock::Image { .. } => 1000,
+                    ContentBlock::Image { source } => nanna_llm::estimate_image_tokens(source),
                 })
                 .sum::<usize>()
             )

@@ -10762,7 +10762,10 @@ keep the phases readable; promote individual items into a phase when they become
       *(2026-10-10, same run)* Done: a block folds only when a later surviving message carries the
       same content (the newest copy always survives). Test
       `a_re_read_that_is_the_only_copy_survives_the_next_step`.
-- [ ] Images are estimated at a flat 1000 tokens; estimate from pixel size.
+- [x] Images were estimated at a flat 1000 tokens. *(same run)* `estimate_image_tokens` reads
+      the PNG/GIF/JPEG size from the base64 head (w·h/750, capped at the ~1,600 a provider bills
+      after its downscale; an unreadable size or a URL is charged the cap). Test
+      `images_are_estimated_from_their_pixel_size`.
 
 ### The test suite stranded its scratch databases in tmpfs (found 2026-10-10)
 
