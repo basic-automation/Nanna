@@ -2095,7 +2095,11 @@ pub async fn set_max_tokens(
     state_guard.config.llm.max_tokens = tokens;
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {e}"))?;
+    // Tell the daemon now rather than leave it to the file watcher's poll:
+    // in that window another setter's daemon-side save could undo this one.
+    let backend = state_guard.backend.clone();
     drop(state_guard);
+    let _ = backend.config_reload().await;
     info!("Max tokens set to: {}", tokens);
     Ok(())
 }
@@ -2130,7 +2134,11 @@ pub async fn set_agent_iteration_policy(
     state_guard.config.agent.nudge_interval_iterations = nudge_interval;
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {e}"))?;
+    // Tell the daemon now rather than leave it to the file watcher's poll:
+    // in that window another setter's daemon-side save could undo this one.
+    let backend = state_guard.backend.clone();
     drop(state_guard);
+    let _ = backend.config_reload().await;
     info!(
         "Agent iteration policy set: max={:?}, nudge_after={}, nudge_interval={}",
         max_iterations, nudge_after, nudge_interval
@@ -2347,7 +2355,11 @@ pub async fn set_embedding_model_priority(
 
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {e}"))?;
+    // Tell the daemon now rather than leave it to the file watcher's poll:
+    // in that window another setter's daemon-side save could undo this one.
+    let backend = state_guard.backend.clone();
     drop(state_guard);
+    let _ = backend.config_reload().await;
 
     info!("Embedding model priority set: {:?}", priority);
     Ok(())
@@ -2430,7 +2442,11 @@ pub async fn set_ocr_model_priority(
 
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {e}"))?;
+    // Tell the daemon now rather than leave it to the file watcher's poll:
+    // in that window another setter's daemon-side save could undo this one.
+    let backend = state_guard.backend.clone();
     drop(state_guard);
+    let _ = backend.config_reload().await;
 
     info!("OCR model priority set: {:?}", priority);
     Ok(())
@@ -2466,7 +2482,11 @@ pub async fn set_use_embedded_ocr(
 
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {e}"))?;
+    // Tell the daemon now rather than leave it to the file watcher's poll:
+    // in that window another setter's daemon-side save could undo this one.
+    let backend = state_guard.backend.clone();
     drop(state_guard);
+    let _ = backend.config_reload().await;
 
     info!("Embedded OCR (ocrs) set to: {}", enabled);
     Ok(())
