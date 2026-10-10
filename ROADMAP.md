@@ -10813,6 +10813,24 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `pnpm outdated` reports `4.1.0 → 2.24.3` — the v4 line is published under `next`, so `latest`
            points at the *older* Vue-2 package. **Never let `pnpm update --latest` "upgrade" this one**;
            it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
+   - *(2026-10-10 sweep)* `cargo update` → **`tauri 2.12.3`** (`tauri-build`/`-codegen`/`-macros` 2.7.2)
+     with the plugin minors (`dialog 2.8.2`, `fs 2.7.0`, `notification 2.6.0`, `shell 2.5.0`,
+     `updater 2.13.3` — `minisign-verify 0.3`), `uuid 1.28` (req bumped), `tokio-util 0.7.20`,
+     `serde_json 1.0.152`, `cc 1.7`, `syn 3.0.7`. Taken this time *with* the ~25 Windows-only
+     `windows-sys` edges it re-resolves downward (`rustix`/`tempfile`/`errno`/`winreg`/… onto
+     0.45/0.52/0.59): no new crate version enters the graph — all five `windows-sys` lines were
+     already locked — and this PR's `release-check` Windows job builds that surface. **Pinned
+     back again:** `rustpython-ruff_* 0.16.10 → 0.16.5` (`rustpython-codegen 0.6.0` still E0026/
+     E0308) and a new one, **`pymath 0.2.0`'s `malachite-bigint` re-resolving to 0.13** beside
+     `rustpython-stdlib`'s 0.12 (E0277 `BigInt: From<BigUint>`, 17 errors) — `cargo update -p
+     malachite-bigint@0.13.0 --precise 0.12.0`. Still blocked: `rten 0.27` (`ocrs 0.13.1` wants
+     `^0.26`), the toolchain pin (`turso_core 0.8.3-pre.1` still `branches ^0.4.3`, no 0.4.7).
+     GUI: the Tauri JS halves in lockstep (`api 2.12.3`, `plugin-dialog 2.8.2`, `-notification
+     2.6.0`, `-shell 2.5.0`, `-updater 2.13.3`), `vue-router 5.4.0`, `@lucide/vue 1.55.0`,
+     `@vitejs/plugin-vue 6.0.10`, `vue-tsc 3.3.13`; nuxt stays exactly 4.5.2 (4.6.1 is out — see
+     the item below), TypeScript 7 still blocked. Verified: clippy 0 warnings (workspace and
+     `nanna-gui`), **2918 Rust tests / 94 binaries, 0 failures**, vitest 442/442, typecheck 0
+     errors, `pnpm generate` green, `cargo build --release -p nanna-daemon` green (9m05s).
    - *(2026-10-09 sweep)* `cargo update` offered 15: taken **`toml 1.1.8` / `toml_edit 0.25.17` /
      `toml_parser 1.1.5`** (the lock also re-resolved `cssparser-macros`' `syn` from 3 to 2 — same
      checksum, the registry's dependency metadata changed). **Held back:** `rustpython-ruff_*
