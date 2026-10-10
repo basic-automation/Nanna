@@ -4887,7 +4887,7 @@ dependencies = [
 
 [[package]]
 name = "nanna"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4916,7 +4916,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-agent"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -4944,7 +4944,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-bench"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "criterion",
  "nanna-simd",
@@ -4957,7 +4957,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-browser"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "async-trait",
  "chromiumoxide",
@@ -4973,7 +4973,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-channels"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "async-trait",
  "bitflags 2.13.2",
@@ -4994,7 +4994,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-client"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "futures-util",
  "nanna-daemon",
@@ -5009,7 +5009,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-config"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "aes-gcm 0.11.1",
  "base64 0.23.1",
@@ -5029,7 +5029,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-core"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "chrono",
  "nanna-channels",
@@ -5051,7 +5051,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-daemon"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "async-trait",
  "axum",
@@ -5098,7 +5098,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-gpu"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "bytemuck",
  "futures",
@@ -5112,7 +5112,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-gui"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "chrono",
  "futures-util",
@@ -5143,7 +5143,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-llm"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "async-stream",
  "directories",
@@ -5163,7 +5163,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-mcp"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -5181,7 +5181,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-memory"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "async-trait",
  "nanna-gpu",
@@ -5197,11 +5197,11 @@ dependencies = [
 
 [[package]]
 name = "nanna-numeric"
-version = "0.3.41"
+version = "0.3.42"
 
 [[package]]
 name = "nanna-proc"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "libc",
  "tempfile",
@@ -5212,7 +5212,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-scripting"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "boa_engine",
  "chrono",
@@ -5234,7 +5234,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-server"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "anyhow",
  "axum",
@@ -5263,7 +5263,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-simd"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "half",
  "wide",
@@ -5271,7 +5271,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-storage"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "chrono",
  "nanna-numeric",
@@ -5286,7 +5286,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-timeline"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "nanna-storage",
  "serde",
@@ -5297,7 +5297,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-tools"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "async-trait",
  "base64-simd",
@@ -5330,7 +5330,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-workspace"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "serde",
  "serde_json",

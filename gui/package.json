@@ -1,6 +1,6 @@
 {
   "name": "nanna-gui",
-  "version": "0.3.41",
+  "version": "0.3.42",
   "type": "module",
   "private": true,
   "scripts": {
