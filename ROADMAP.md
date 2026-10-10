@@ -10704,9 +10704,12 @@ keep the phases readable; promote individual items into a phase when they become
 - [ ] `daemon stop` signals a PID it could not identify as the daemon (`Unknown` probe; every live
       PID on macOS, any `nanna.exe` on Windows) — a reused PID gets SIGTERM / `taskkill /T`. Needs
       a real identity probe on those platforms before refusing `Unknown`, or `stop` breaks there.
-- [ ] Quick setup (`nanna chat` with no key) saves the env-overridden runtime config: `PORT`, a
+- [x] Quick setup (`nanna chat` with no key) saves the env-overridden runtime config: `PORT`, a
       channel section built from `TELEGRAM_BOT_TOKEN`, env API keys over stored ones. Save a
       freshly loaded file plus the entered key.
+      *(2026-10-10, same run)* Done: the file is re-read without overrides, stripped of every
+      secret but the entered key, and saved; the running copy gets the key directly. No unit
+      test (an interactive prompt).
 - [x] `--config` is ignored by `credentials` (it edits the default file) and mislabelled by
       `init` and `status`.
       *(2026-10-10, same run)* `credentials` loads from and saves to the `--config` file;
