@@ -20,7 +20,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
-use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
 // =============================================================================
@@ -816,18 +815,17 @@ impl HealthServer {
     }
     
     /// Build the Axum router
+    ///
+    /// No CORS layer: with `Access-Control-Allow-Origin: *` any web page could
+    /// read `/status` (the last provider error's text) and `/metrics`. Probes
+    /// and the GUI are native callers and need none.
     fn router(&self) -> Router {
-        let cors = CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any);
-        
         Router::new()
             .route("/health", get(health))
             .route("/healthz", get(healthz))
             .route("/readyz", get(readyz))
             .route("/status", get(status))
             .route("/metrics", get(metrics))
-            .layer(cors)
             .with_state(self.state.clone())
     }
     

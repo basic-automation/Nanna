@@ -10,8 +10,65 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, watch, RwLock};
-use tokio_tungstenite::{accept_async_with_config, tungstenite::{protocol::WebSocketConfig, Message}};
+use tokio_tungstenite::{
+    accept_hdr_async_with_config,
+    tungstenite::{
+        Message,
+        handshake::server::{
+            Callback, ErrorResponse, Request as HandshakeRequest, Response as HandshakeResponse,
+        },
+        http::{StatusCode, header::ORIGIN},
+        protocol::WebSocketConfig,
+    },
+};
 use tracing::{debug, error, info, warn};
+
+/// How long a connection may take to complete its WebSocket handshake.
+///
+/// Bound justification: a loopback upgrade is one request and one reply,
+/// well under a millisecond; 10 s covers a stalled machine. Without it a peer
+/// that connected and never sent the upgrade held its task and socket forever
+/// — the connection limit counts only handshaken clients, so nothing reaped it.
+const IPC_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Refuse a WebSocket handshake that carries an `Origin` header.
+///
+/// Every legitimate client of this socket (the GUI's Rust client, the CLI,
+/// `nanna-client`) is native tungstenite, which sends no `Origin`. A web
+/// browser always does — and browsers apply no CORS to a `WebSocket` — so before
+/// this any page the user opened could connect to `ws://127.0.0.1:5149` and
+/// call `tool.execute exec`, `config.export` or `system.shutdown`, and read
+/// the replies. A DNS-rebinding page is a browser page too, so it is refused
+/// the same way.
+struct RefuseBrowserOrigins;
+
+impl Callback for RefuseBrowserOrigins {
+    fn on_request(
+        self,
+        request: &HandshakeRequest,
+        response: HandshakeResponse,
+    ) -> Result<HandshakeResponse, ErrorResponse> {
+        if !is_browser_handshake(request) {
+            return Ok(response);
+        }
+        warn!(
+            origin = ?request.headers().get(ORIGIN),
+            "refused a WebSocket handshake from a web page: the daemon's socket is for native clients"
+        );
+        let mut refusal = ErrorResponse::new(Some(
+            "nanna-daemon accepts no browser connections".to_string(),
+        ));
+        *refusal.status_mut() = StatusCode::FORBIDDEN;
+        debug_assert!(refusal.status().is_client_error());
+        Err(refusal)
+    }
+}
+
+/// Whether a handshake came from a web page: browsers always send `Origin`
+/// on a WebSocket upgrade, native clients never do.
+fn is_browser_handshake(request: &HandshakeRequest) -> bool {
+    request.headers().contains_key(ORIGIN)
+}
 
 /// The IPC read limit, shared with every client — see its definition for why
 /// a limit set on one end only ever protected that end.
@@ -519,10 +576,18 @@ impl IpcServer {
         let mut ws_config = WebSocketConfig::default();
         ws_config.max_message_size = Some(IPC_MAX_MESSAGE_BYTES);
         ws_config.max_frame_size = Some(IPC_MAX_MESSAGE_BYTES);
-        let ws_stream = match accept_async_with_config(stream, Some(ws_config)).await {
-            Ok(ws) => ws,
-            Err(e) => {
-                error!("WebSocket handshake failed for {}: {}", addr, e);
+        let handshake = accept_hdr_async_with_config(stream, RefuseBrowserOrigins, Some(ws_config));
+        let ws_stream = match tokio::time::timeout(IPC_HANDSHAKE_TIMEOUT, handshake).await {
+            Ok(Ok(ws)) => ws,
+            Ok(Err(e)) => {
+                warn!("WebSocket handshake refused or failed for {}: {}", addr, e);
+                return;
+            }
+            Err(_) => {
+                warn!(
+                    "WebSocket handshake from {} did not finish within {:?}; dropped",
+                    addr, IPC_HANDSHAKE_TIMEOUT
+                );
                 return;
             }
         };

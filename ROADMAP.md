@@ -10418,6 +10418,36 @@ keep the phases readable; promote individual items into a phase when they become
       `a_bounded_flat_listing_keeps_the_first_names_on_every_filesystem` (alphabetically-first
       entry created last); the `project_structure` suite now passes on btrfs and tmpfs alike.
 
+### Any web page could drive the daemon over loopback (found 2026-10-10, security audit)
+
+- [x] **The IPC WebSocket accepted browser handshakes.** `ipc.rs` used a plain
+      `accept_async_with_config` — no `Origin` check, no token — and browsers apply no CORS to
+      WebSockets, so a page the user opened could connect to `ws://127.0.0.1:5149`, call
+      `tool.execute exec` / `config.export` / `system.shutdown`, and read the replies (a
+      DNS-rebinding page likewise). Every legitimate client (GUI's Rust client, CLI,
+      `nanna-client`) is native tungstenite and sends no `Origin`; a browser always does, so a
+      handshake carrying one is now refused 403 (`RefuseBrowserOrigins`). The handshake also has
+      a 10 s deadline (`IPC_HANDSHAKE_TIMEOUT`): the connection cap counts only handshaken
+      clients, so a peer that never upgraded held a task and a socket forever. e2e
+      `a_web_page_cannot_open_the_daemons_socket` (refused with `Origin`, accepted without).
+- [x] **`config.get` / `config.export` returned every secret in plaintext** — the live config
+      holds the keys filled in from the secure store — though the export was recorded as carrying
+      none (that was true only of the GUI's own export). Both now serialize a copy passed through
+      `strip_secrets_for_disk`; an import of such an export keeps the stored secrets. Test
+      `config_get_and_export_carry_no_secrets`.
+- [x] **`nanna server` (:3000) answered any origin** (`CorsLayer` `allow_origin(Any)`), and
+      `/api/v1/chat` runs the agent with its tools, unauthenticated — so a page could `fetch` it
+      and read the reply. The CORS layer is gone, and `/api` refuses a request with an `Origin`
+      or a non-loopback `Host` (`local_callers_only`; the `Host` check is what stops a
+      DNS-rebinding page, which is same-origin). Webhooks keep their own signature checks. The
+      daemon's health server also dropped `Access-Control-Allow-Origin: *` (`/status` carries the
+      last provider error's text). Test `only_a_local_native_caller_reaches_the_api`.
+- [ ] **Inbound IPC frames may be 128 MiB** (`IPC_MAX_MESSAGE_BYTES` sizes the daemon's own
+      large replies but applies to requests too); give requests their own, much smaller cap, and
+      count connections with a semaphore taken before the spawn rather than `clients.len()`.
+- [ ] **A per-launch token** (written 0600 beside the PID file, required in the first frame)
+      would also stop a hostile *local process*, which the `Origin` check does not.
+
 ### The test suite stranded its scratch databases in tmpfs (found 2026-10-10)
 
 - [x] **Every `cargo test --workspace` left 44 directories in `/tmp`, and `/tmp` is RAM here.**
