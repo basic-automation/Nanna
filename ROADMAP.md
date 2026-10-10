@@ -10929,7 +10929,7 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      halves in lockstep; TypeScript 7 still blocked (`vue-tsc` 3.3.12). Verified: clippy 0
      warnings, **2828 Rust tests / 89 binaries, 0 failures**, vitest 437/437, typecheck 0 errors,
      `pnpm generate` green.
-     - [ ] *(2026-10-08, same day)* **The GUI half was reverted: Nuxt 4.6.0 does not generate on
+     - [x] *(2026-10-08, same day)* **The GUI half was reverted: Nuxt 4.6.0 does not generate on
            Windows.** The release build (`release.yml` run 37778398050) failed in `pnpm generate`:
            every prerendered route answered 500, "Either manifest or precomputed data must be
            provided" (nuxt `runtime/server/renderer/build-files.js` → `vue-bundle-renderer`
@@ -10952,7 +10952,8 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `frontend-windows` judge it ([v4.6.1](https://github.com/nuxt/nuxt/releases/tag/v4.6.1)).
            *(same run)* Taken as its own commit in the 2026-10-10 nightly (`^4.6.1`, with `vite
            8.3.4`); Linux: vitest 442/442, typecheck 0, `pnpm generate` prerenders 4 routes. Its
-           `frontend-windows` check is the verdict — reverted before merge if red.
+           `frontend-windows` check is the verdict — reverted before merge if red. **Green:**
+           `pnpm generate (Windows)` passed in 1m50s on PR #423, so the fix is confirmed.
    - *(2026-09-27 sweep)* `cargo update` → the Tauri plugin minors (`dialog 2.8.0`, `fs 2.6.0`,
      `notification 2.5.0`, `process 2.4.0`, `shell 2.4.0`, `updater 2.13.0`,
      `tauri-winrt-notification 0.8.1`) plus `notify-rust 4.18.1`; the JS halves bumped in
