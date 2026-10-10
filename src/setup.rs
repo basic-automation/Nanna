@@ -91,6 +91,7 @@ async fn run_scheduled_dream(
         duration_ms: 0,
         started_at,
         finished_at: Utc::now(),
+        skipped: false,
     }
 }
 
@@ -106,6 +107,7 @@ fn skipped_result(task: &ScheduledTask, why: &str) -> TaskResult {
         duration_ms: 0,
         started_at: now,
         finished_at: now,
+        skipped: false,
     }
 }
 
@@ -212,6 +214,7 @@ pub fn create_scheduler(
                         duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
                         started_at,
                         finished_at,
+                        skipped: false,
                     }
                 }
                 Err(e) => {
@@ -226,6 +229,7 @@ pub fn create_scheduler(
                         duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
                         started_at,
                         finished_at,
+                        skipped: false,
                     }
                 }
             }

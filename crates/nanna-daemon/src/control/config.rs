@@ -62,6 +62,8 @@ impl ControlPlane {
     /// Called with the config lock released: provider resolution can block on
     /// the keyring or refresh an expired Claude CLI token over the network.
     async fn propagate_committed(&self, config: &Config) {
+        // `[agent].system_prompt` / `name` take effect on the next turn.
+        *self.system_prompt.write().await = super::system_prompt_for(&config.agent);
         self.rebuild_llm_providers(config).await;
         self.apply_scheduler_settings(config).await;
         if let Some(ref live) = self.live_embedding {
@@ -104,10 +106,23 @@ impl ControlPlane {
         router.rebuild(&creds);
     }
 
+    /// The live config with every secret blanked, for anything that leaves
+    /// the daemon. The live copy holds the keys filled in from the secure
+    /// store, and `config.get` / `config.export` serialized it as it was: any
+    /// client of the socket read the user's API keys and OAuth token in
+    /// plaintext, though the export was documented to carry none. An import of
+    /// such an export keeps the stored secrets (absent fields refill).
+    async fn config_without_secrets(&self) -> Config {
+        let mut config = self.config.read().await.clone();
+        config.strip_secrets_for_disk();
+        debug_assert!(config.llm.api_key.is_none() && config.llm.anthropic_oauth_token.is_none());
+        config
+    }
+
     pub(super) async fn handle_config(&self, _client_id: &str, action: ConfigAction) -> Value {
         match action {
             ConfigAction::Get { path } => {
-                let serialized = serde_json::to_value(&*self.config.read().await);
+                let serialized = serde_json::to_value(&self.config_without_secrets().await);
                 let config_value = match serialized {
                     Ok(v) => v,
                     Err(e) => return json!({ "error": "serialize_failed", "message": e.to_string() }),
@@ -136,9 +151,9 @@ impl ControlPlane {
             ConfigAction::Reset { path: None } => self.config_reset().await,
             ConfigAction::Reload => self.config_reload().await,
             ConfigAction::Export => {
-                let config = self.config.read().await;
+                let config = self.config_without_secrets().await;
                 // Export as JSON (TOML export would require additional dependencies)
-                match serde_json::to_value(&*config) {
+                match serde_json::to_value(&config) {
                     Ok(v) => json!({ "config": v, "format": "json" }),
                     Err(e) => json!({ "error": "export_failed", "message": e.to_string() })
                 }

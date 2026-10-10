@@ -317,6 +317,26 @@ async fn adding_an_extension_to_an_existing_file_is_refused() {
     );
 }
 
+/// Conventional variants are siblings, not forks: `.env.local` beside `.env`
+/// and `Dockerfile.dev` beside `Dockerfile` were refused as copies.
+#[tokio::test]
+async fn conventional_variants_are_not_forks() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".env"), "A=1\n").unwrap();
+    std::fs::write(dir.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+    for (name, body) in [(".env.local", "A=2\n"), ("Dockerfile.dev", "FROM alpine\n")] {
+        let path = dir.path().join(name).to_string_lossy().into_owned();
+        let result = run_write(json!({ "file_path": path, "content": body }), dir.path())
+            .await
+            .expect("write returns");
+        assert_ne!(result["success"], Value::Bool(false), "{name}: {result}");
+        assert!(dir.path().join(name).is_file(), "{name} was written");
+    }
+}
+
 /// The refusal must stay narrow: sibling FORMATS are legitimate. Their stems
 /// are not themselves files, which is exactly what distinguishes them from a
 /// copy of an extensionless original.
@@ -353,4 +373,109 @@ async fn a_suffixed_name_with_no_original_is_fine() {
     .await
     .expect("a fresh script name must succeed");
     assert!(dir.path().join("build.sh").exists());
+}
+
+/// The rule registry is not a file the model may rewrite: `"{}"` erased every
+/// rule the user had declared, and `force` must not open it either — only
+/// `lift_invariant`, which asks the user, changes it.
+#[tokio::test]
+async fn the_declared_rules_cannot_be_rewritten_even_with_force() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let registry = dir.path().join(".nanna/declared_invariants.json");
+    std::fs::create_dir_all(registry.parent().expect("parent")).expect("mkdir");
+    let rules = r#"{"invariants":[{"kind":"no_delete","glob":"tests"}]}"#;
+    std::fs::write(&registry, rules).expect("seed registry");
+
+    let content = run_fail(
+        json!({ "file_path": ".nanna/declared_invariants.json", "content": "{}", "force": true }),
+        dir.path(),
+    )
+    .await;
+    assert!(content.contains("lift_invariant"), "{content}");
+    assert_eq!(
+        std::fs::read_to_string(&registry).expect("read"),
+        rules,
+        "untouched"
+    );
+}
+
+/// Ledger keys fold case only where the filesystem does. On Linux
+/// `README.md` and `readme.md` are two files; one lowercased key let a read
+/// of either satisfy the blind-rewrite hold for the other.
+#[tokio::test]
+async fn the_ledger_keeps_a_files_case_where_the_filesystem_does() {
+    if skill_missing() || cfg!(windows) || cfg!(target_os = "macos") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let result = run_write(
+        json!({ "file_path": "README.md", "content": "# Project\n\nSome text.\n" }),
+        dir.path(),
+    )
+    .await
+    .expect("write returns");
+    assert_ne!(result["success"], Value::Bool(false), "{result}");
+    let ledger = std::fs::read_to_string(dir.path().join(".nanna/write_hiwater.json"))
+        .expect("the ledger is written");
+    assert!(ledger.contains("\"README.md\""), "{ledger}");
+    assert!(!ledger.contains("\"readme.md\""), "{ledger}");
+}
+
+/// A path with an apostrophe is one shell word to the checks that shell out.
+/// Spliced between single quotes it re-split: the Python syntax gate ran
+/// nothing, so invalid code was written, and its temp files were left behind.
+#[tokio::test]
+async fn an_apostrophe_in_the_path_does_not_switch_the_checks_off() {
+    if skill_missing() || cfg!(windows) || which_python().is_none() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    // The gate shells out to `python`, so this run may spawn processes.
+    let mut permissions = ToolPermissions::none()
+        .with_read([dir.path()])
+        .with_write([dir.path()]);
+    permissions.run = true;
+    let tool = ScriptedTool::from_file(skill_path())
+        .expect("read write_file tool.ts")
+        .with_permissions(permissions)
+        .with_timeout(common::FIXTURE_TIMEOUT_MS);
+    let result = ScriptEngine::new()
+        .execute_with_workdir(
+            &tool,
+            json!({ "file_path": "it's.py", "content": "def broken(:\n    pass\n" }),
+            None,
+            None,
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .expect("failures are returned, not thrown")
+        .value;
+    assert_eq!(result["success"], Value::Bool(false), "{result}");
+    let content = result["content"].as_str().expect("content");
+    assert!(
+        content.contains("line 1"),
+        "the gate named the bad line: {content}"
+    );
+    assert!(
+        !dir.path().join("it's.py").exists(),
+        "invalid code was not written"
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+        .expect("list")
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+        .filter(|name| name.contains("__chk"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files leaked: {leftovers:?}");
+}
+
+/// The gate needs a `python` on PATH; without one it fails open by design.
+fn which_python() -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join("python"))
+            .find(|candidate| candidate.is_file())
+    })
 }

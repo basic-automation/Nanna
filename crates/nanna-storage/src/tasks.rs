@@ -57,6 +57,14 @@ pub const TASK_LABEL_MAX_BYTES: usize = 64;
 /// builder.
 pub const ACTIVITY_ACTIONS_MAX: usize = 4;
 
+/// Most rows [`TaskRepository::newest_activities_of`] returns in one read.
+///
+/// Bound justification: its caller counts a run of markers that a bound of
+/// its own breaks (the router's hand-backs stop at `HAND_BACKS_MAX` = 2 before
+/// the human is asked), so 64 is far past any real run while keeping the read
+/// a single small page (~64 short rows).
+pub const ACTIVITY_MARKER_ROWS_MAX: usize = 64;
+
 /// Maximum tool names in one task's `tool_scope`.
 ///
 /// Bound justification: the scope is a hint (it gates nothing — the harness
@@ -249,29 +257,9 @@ impl TaskRepository {
         let by_id: HashMap<i64, &Task> = scope_tasks.iter().map(|t| (t.id, t)).collect();
 
         if let Some(parent_id) = new.parent_id {
-            let parent = by_id.get(&parent_id).ok_or_else(|| {
-                StorageError::Invalid(format!("parent task #{parent_id} not found in scope"))
-            })?;
-            if is_closed_status(&parent.status) {
-                return Err(StorageError::Invalid(format!(
-                    "cannot add a child to {} task #{parent_id}",
-                    parent.status
-                )));
-            }
-            let depth = parent_depth(&by_id, parent_id)?;
-            if depth + 1 >= TASK_DEPTH_MAX {
-                return Err(StorageError::Invalid(format!(
-                    "hierarchy depth limit {TASK_DEPTH_MAX} reached"
-                )));
-            }
+            check_new_parent(&by_id, parent_id)?;
         }
-        for dep in &new.depends_on {
-            if !by_id.contains_key(dep) {
-                return Err(StorageError::Invalid(format!(
-                    "dependency task #{dep} not found in scope"
-                )));
-            }
-        }
+        check_dependencies_in_scope(&by_id, &new.depends_on)?;
         // A pure depends_on cycle is impossible for a new task (nothing
         // depends on it yet) — but the parent-completion invariant makes an
         // ancestor an implicit dependent, so depending on an ancestor
@@ -290,7 +278,14 @@ impl TaskRepository {
             .map(std::string::ToString::to_string);
 
         let conn = self.conn.lock().await;
-        if let Err(err) = ensure_member_exists(&conn, new.assignee.as_deref(), "assignee").await {
+        if let Err(err) = ensure_assignee_on_board(
+            &conn,
+            new.assignee.as_deref(),
+            &new.scope,
+            new.scope_id.as_deref(),
+        )
+        .await
+        {
             drop(conn);
             return Err(err);
         }
@@ -326,7 +321,7 @@ impl TaskRepository {
                 (),
             )
             .await?;
-        let task = match rows.next().await? {
+        let mut task = match rows.next().await? {
             Some(row) => decode_task_row(&row)?,
             None => return Err(StorageError::NotFound("task just created".to_string())),
         };
@@ -334,6 +329,10 @@ impl TaskRepository {
         // Rows on the shared turso connection silently swallows later writes.
         drop(rows);
         drop(conn);
+        // Derived, like every read's: the decoded row says `false`, and a card
+        // created waiting on an open dependency was reported workable.
+        task.blocked = is_blocked(&task, &by_id);
+        debug_assert!(!task.blocked || !task.depends_on.is_empty());
 
         // The actor is the creator. It used to be the assignee, which the row
         // already carries in its own `assignee` column (migration 021) — so the
@@ -525,6 +524,16 @@ impl TaskRepository {
             // finished card back to `in_progress`.
             let conn = self.conn.lock().await;
             let mut task = get_raw_with(&conn, id).await?;
+            // Only the dates this patch writes: a card stored with a bad
+            // date before the check existed stays editable in other fields.
+            for (field, value) in [
+                ("due_at", &patch.due_at),
+                ("deadline_at", &patch.deadline_at),
+            ] {
+                if let Some(Some(value)) = value {
+                    validate_date_format(field, value)?;
+                }
+            }
             let changed = apply_patch(&mut task, patch)?;
             validate_dates(task.due_at.as_deref(), task.deadline_at.as_deref())?;
             // Snapshot before the write when this update can change what blocks
@@ -539,8 +548,13 @@ impl TaskRepository {
                 None
             };
             if changed.contains(&"assignee")
-                && let Err(err) =
-                    ensure_member_exists(&conn, task.assignee.as_deref(), "assignee").await
+                && let Err(err) = ensure_assignee_on_board(
+                    &conn,
+                    task.assignee.as_deref(),
+                    &task.scope,
+                    task.scope_id.as_deref(),
+                )
+                .await
             {
                 drop(conn);
                 return Err(err);
@@ -585,27 +599,12 @@ impl TaskRepository {
         // the parent's) are scaffolding of the dead contract and still
         // cancel; their subtrees are walked, so a grandchild with its own
         // check survives the same way.
-        if changed.contains(&"status") && task.status == "cancelled" {
-            self.cascade_cancel(&task, actor).await?;
-        }
-        // Emitted from `changed`, so each event describes a real transition:
-        // `apply_patch` compares both of these fields before recording them.
-        if changed.contains(&"status") {
-            self.emit(
-                TaskEventKind::StatusChanged,
-                &task,
-                actor,
-                serde_json::json!({ "status": task.status }),
-            );
-        }
-        if changed.contains(&"assignee") {
-            self.emit(
-                TaskEventKind::Assigned,
-                &task,
-                actor,
-                serde_json::json!({ "assignee": task.assignee }),
-            );
-        }
+        let cascaded = if changed.contains(&"status") && task.status == "cancelled" {
+            self.cascade_cancel(&task, actor).await?
+        } else {
+            Vec::new()
+        };
+        self.emit_update_events(&task, &cascaded, &changed, actor);
         // After the cascade, so a subtree cancelled above is already reflected
         // and its dependents' releases are part of this one diff.
         if let Some(before) = blocking_before {
@@ -615,6 +614,57 @@ impl TaskRepository {
             self.emit_block_transitions(&before, &after, actor);
         }
         self.get(id).await
+    }
+
+    /// The events one `update` announces, from what it actually changed:
+    /// status and assignee transitions, each child a cancellation cascaded to,
+    /// and an `Updated` naming every other field that changed.
+    fn emit_update_events(
+        &self,
+        task: &Task,
+        cascaded: &[Task],
+        changed: &[&'static str],
+        actor: Option<&str>,
+    ) {
+        // Emitted from `changed`, so each event describes a real transition:
+        // `apply_patch` compares both of these fields before recording them.
+        if changed.contains(&"status") {
+            self.emit(
+                TaskEventKind::StatusChanged,
+                task,
+                actor,
+                serde_json::json!({ "status": task.status }),
+            );
+        }
+        for child in cascaded {
+            self.emit(
+                TaskEventKind::StatusChanged,
+                child,
+                actor,
+                serde_json::json!({ "status": child.status, "cascade_from": task.id }),
+            );
+        }
+        if changed.contains(&"assignee") {
+            self.emit(
+                TaskEventKind::Assigned,
+                task,
+                actor,
+                serde_json::json!({ "assignee": task.assignee }),
+            );
+        }
+        let edited: Vec<&str> = changed
+            .iter()
+            .copied()
+            .filter(|field| *field != "status" && *field != "assignee")
+            .collect();
+        if !edited.is_empty() {
+            self.emit(
+                TaskEventKind::Updated,
+                task,
+                actor,
+                serde_json::json!({ "fields": edited }),
+            );
+        }
     }
 
     /// Complete a task. The harness (or service layer) runs the acceptance
@@ -778,7 +828,8 @@ impl TaskRepository {
         .await?;
         drop(conn);
         self.log_activity(id, actor, "reopened", None).await?;
-        let reopened = self.get_raw(id).await?;
+        // `get`, not `get_raw`: the derived `blocked` flag is part of the answer.
+        let reopened = self.get(id).await?;
         self.emit(
             TaskEventKind::StatusChanged,
             &reopened,
@@ -1260,9 +1311,39 @@ impl TaskRepository {
         task_id: i64,
         actions: &[&str],
     ) -> Result<Option<TaskActivityEntry>, StorageError> {
+        let newest = self.newest_activities_of(task_id, actions, 1).await?;
+        debug_assert!(newest.len() <= 1, "asked for one row");
+        Ok(newest.into_iter().next())
+    }
+
+    /// The newest `limit` activity rows of card `task_id` whose action is one
+    /// of `actions`, newest first.
+    ///
+    /// The many-row form of [`Self::newest_activity_of`], for counting a run
+    /// of markers (the router's hand-backs): filtering by action in SQL means
+    /// unrelated rows — edits, reorders, a run's own notes — can never push a
+    /// marker out of the window being counted.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a row does
+    /// not decode. Unparseable detail JSON loads as `None`.
+    ///
+    /// # Panics
+    /// When `actions` is empty or longer than [`ACTIVITY_ACTIONS_MAX`], or
+    /// `limit` is outside `1..=ACTIVITY_MARKER_ROWS_MAX`.
+    pub async fn newest_activities_of(
+        &self,
+        task_id: i64,
+        actions: &[&str],
+        limit: usize,
+    ) -> Result<Vec<TaskActivityEntry>, StorageError> {
         assert!(
             (1..=ACTIVITY_ACTIONS_MAX).contains(&actions.len()),
             "one to {ACTIVITY_ACTIONS_MAX} actions"
+        );
+        assert!(
+            (1..=ACTIVITY_MARKER_ROWS_MAX).contains(&limit),
+            "one to {ACTIVITY_MARKER_ROWS_MAX} rows"
         );
         debug_assert!(task_id > 0, "store ids start at 1");
         let placeholders = (0..actions.len())
@@ -1272,7 +1353,7 @@ impl TaskRepository {
         let sql = format!(
             "SELECT id, task_id, actor, action, detail, created_at, assignee \
              FROM task_activity WHERE task_id = ?1 AND action IN ({placeholders}) \
-             ORDER BY id DESC LIMIT 1"
+             ORDER BY id DESC LIMIT {limit}"
         );
         let mut params = vec![turso::Value::Integer(task_id)];
         params.extend(
@@ -1282,32 +1363,29 @@ impl TaskRepository {
         );
         let conn = self.conn.lock().await;
         let mut rows = conn.query(&sql, params).await?;
-        let entry = match rows.next().await? {
-            Some(row) => {
-                let detail_str: Option<String> = row.get(4)?;
-                Some(TaskActivityEntry {
-                    id: row.get(0)?,
-                    task_id: row.get(1)?,
-                    actor: row.get(2)?,
-                    action: row.get(3)?,
-                    detail: detail_str.and_then(|s| serde_json::from_str(&s).ok()),
-                    created_at: row.get(5)?,
-                    assignee: row.get(6)?,
-                })
-            }
-            None => None,
-        };
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let detail_str: Option<String> = row.get(4)?;
+            entries.push(TaskActivityEntry {
+                id: row.get(0)?,
+                task_id: row.get(1)?,
+                actor: row.get(2)?,
+                action: row.get(3)?,
+                detail: detail_str.and_then(|s| serde_json::from_str(&s).ok()),
+                created_at: row.get(5)?,
+                assignee: row.get(6)?,
+            });
+        }
         // Held until the cursor is gone: an open `Rows` on the shared
         // connection swallows later writes.
         drop(rows);
         drop(conn);
+        debug_assert!(entries.len() <= limit, "LIMIT bounds the read");
         debug_assert!(
-            entry
-                .as_ref()
-                .is_none_or(|e| actions.contains(&e.action.as_str())),
+            entries.iter().all(|e| actions.contains(&e.action.as_str())),
             "only an asked-for action comes back"
         );
-        Ok(entry)
+        Ok(entries)
     }
 
     /// One thread post by its id.
@@ -1569,6 +1647,14 @@ impl TaskRepository {
             self.emit_block_transitions(&scope_tasks, &after, actor);
         }
 
+        for gone in scope_tasks.iter().filter(|t| doomed.contains(&t.id)) {
+            self.emit(
+                TaskEventKind::Deleted,
+                gone,
+                actor,
+                serde_json::json!({ "subtree_of": id }),
+            );
+        }
         let count = doomed.len() as u64;
         if let Some(actor) = actor {
             tracing::debug!("{actor} deleted task #{id} subtree ({count} tasks)");
@@ -1742,17 +1828,27 @@ impl TaskRepository {
         now: &str,
     ) -> Result<(usize, usize), StorageError> {
         let today = day_of(now);
-        let pending = self.list_time_announcable(&today).await?;
+        // The SQL prefilter compares stored prefixes, and an offset
+        // timestamp's prefix is its LOCAL day, up to a day off its UTC day
+        // either way: widen by one day there and judge exactly below.
+        let horizon = chrono::NaiveDate::parse_from_str(&today, "%Y-%m-%d")
+            .ok()
+            .and_then(|day| day.succ_opt())
+            .map_or_else(|| today.clone(), |day| day.to_string());
+        let pending = self.list_time_announcable(&horizon).await?;
         let mut due_count = 0usize;
         let mut overdue_count = 0usize;
         for task in pending {
             let due_crossed = task.due_announced_at.is_none()
-                && task.due_at.as_deref().is_some_and(|at| day_of(at) <= today);
+                && task
+                    .due_at
+                    .as_deref()
+                    .is_some_and(|at| utc_day_of(at) <= today);
             let overdue_crossed = task.overdue_announced_at.is_none()
                 && task
                     .deadline_at
                     .as_deref()
-                    .is_some_and(|at| day_of(at) < today);
+                    .is_some_and(|at| utc_day_of(at) < today);
             if due_crossed {
                 self.mark_announced(task.id, "due_announced_at", now).await?;
                 self.emit(
@@ -1778,11 +1874,13 @@ impl TaskRepository {
         Ok((due_count, overdue_count))
     }
 
-    /// Open cards with an un-announced date or deadline that `now` has reached.
+    /// Open cards with an un-announced date or deadline whose stored day is
+    /// at most `horizon` — a superset of what is due, which `announce_due`
+    /// then judges exactly.
     ///
     /// The filtering is done in SQL so a board with thousands of settled cards
     /// does not decode all of them every five minutes.
-    async fn list_time_announcable(&self, today: &str) -> Result<Vec<Task>, StorageError> {
+    async fn list_time_announcable(&self, horizon: &str) -> Result<Vec<Task>, StorageError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
@@ -1792,9 +1890,9 @@ impl TaskRepository {
                        (due_announced_at IS NULL AND due_at IS NOT NULL \
                         AND substr(due_at, 1, 10) <= ?1) \
                        OR (overdue_announced_at IS NULL AND deadline_at IS NOT NULL \
-                           AND substr(deadline_at, 1, 10) < ?1))"
+                           AND substr(deadline_at, 1, 10) <= ?1))"
                 ),
-                turso::params![today],
+                turso::params![horizon],
             )
             .await?;
         let mut tasks = Vec::new();
@@ -1885,7 +1983,15 @@ impl TaskRepository {
 
     /// Close the open subtree of a just-cancelled `task` — see the comment at
     /// the call site in [`Self::update`] for which children re-parent instead.
-    async fn cascade_cancel(&self, task: &Task, actor: Option<&str>) -> Result<(), StorageError> {
+    /// Returns the descendants it cancelled, so the caller can announce each
+    /// one: a child closed here is as closed as one cancelled by hand, and the
+    /// memory write-through and timeline see a close only through its event.
+    async fn cascade_cancel(
+        &self,
+        task: &Task,
+        actor: Option<&str>,
+    ) -> Result<Vec<Task>, StorageError> {
+        let mut cancelled = Vec::new();
         let scope_tasks = self
             .load_scope(&task.scope, task.scope_id.as_deref())
             .await?;
@@ -1935,12 +2041,18 @@ impl TaskRepository {
                             Some(serde_json::json!({ "cascade_from": task.id })),
                         )
                         .await?;
+                        cancelled.push(child);
                     }
                     queue.push_back(t.id);
                 }
             }
         }
-        Ok(())
+        debug_assert!(
+            cancelled.len() < seen.len(),
+            "the root is never its own child"
+        );
+        debug_assert!(cancelled.iter().all(|c| c.status == "cancelled"));
+        Ok(cancelled)
     }
 
     async fn get_raw(&self, id: i64) -> Result<Task, StorageError> {
@@ -2087,11 +2199,20 @@ fn apply_status_patch(
                 if task.status != *status {
                     changed.push("status");
                 }
+                let reopening = is_closed_status(&task.status) && status != "cancelled";
                 task.status.clone_from(status);
                 // Reopening a closed task must clear its completion stamp.
                 if status != "cancelled" && task.completed_at.is_some() {
                     task.completed_at = None;
                 }
+                // ...and its due/overdue announcements, as `reopen` does
+                // (migration 020): a card announced overdue, done, then
+                // reopened here while still late was never announced again.
+                if reopening {
+                    task.due_announced_at = None;
+                    task.overdue_announced_at = None;
+                }
+                debug_assert!(!reopening || !is_closed_status(&task.status));
             }
             "done" => {
                 return Err(StorageError::Invalid(
@@ -3174,6 +3295,18 @@ fn day_of(at: &str) -> String {
     at.chars().take(10).collect()
 }
 
+/// The UTC day of a stored date, for comparing against the sweep's UTC
+/// "today". A bare day and the store's own `YYYY-MM-DD HH:MM:SS` are already
+/// that; an RFC 3339 timestamp with an offset is converted, because its prefix
+/// is its LOCAL day — `2026-10-09T20:00:00-07:00` is 10-10 in UTC, and read
+/// as 10-09 it was announced overdue at 00:30 UTC, hours before it passed.
+fn utc_day_of(at: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(at).map_or_else(
+        |_| day_of(at),
+        |instant| instant.with_timezone(&chrono::Utc).date_naive().to_string(),
+    )
+}
+
 /// Whether a status means the task is closed.
 ///
 /// The single definition of "closed" in the store. It was written out by hand
@@ -3230,6 +3363,47 @@ async fn open_ids_among(
 
 fn is_closed_status(status: &str) -> bool {
     matches!(status, "done" | "cancelled")
+}
+
+/// A new card may go under `parent_id` only if that card is in scope, open,
+/// and shallow enough to take a child within the depth bound.
+fn check_new_parent(by_id: &HashMap<i64, &Task>, parent_id: i64) -> Result<(), StorageError> {
+    let parent = by_id.get(&parent_id).ok_or_else(|| {
+        StorageError::Invalid(format!("parent task #{parent_id} not found in scope"))
+    })?;
+    if is_closed_status(&parent.status) {
+        return Err(StorageError::Invalid(format!(
+            "cannot add a child to {} task #{parent_id}",
+            parent.status
+        )));
+    }
+    let depth = parent_depth(by_id, parent_id)?;
+    if depth + 1 >= TASK_DEPTH_MAX {
+        return Err(StorageError::Invalid(format!(
+            "hierarchy depth limit {TASK_DEPTH_MAX} reached"
+        )));
+    }
+    debug_assert!(depth + 1 < TASK_DEPTH_MAX);
+    Ok(())
+}
+
+/// Every id in `depends_on` names a card in the same scope.
+fn check_dependencies_in_scope(
+    by_id: &HashMap<i64, &Task>,
+    depends_on: &[i64],
+) -> Result<(), StorageError> {
+    debug_assert!(
+        depends_on.len() <= TASK_DEPS_MAX,
+        "bounded before the scope is read"
+    );
+    depends_on
+        .iter()
+        .find(|dep| !by_id.contains_key(dep))
+        .map_or(Ok(()), |dep| {
+            Err(StorageError::Invalid(format!(
+                "dependency task #{dep} not found in scope"
+            )))
+        })
 }
 
 fn is_blocked(task: &Task, by_id: &HashMap<i64, &Task>) -> bool {
@@ -3361,19 +3535,33 @@ fn subtree_height(by_id: &HashMap<i64, &Task>, root: i64) -> usize {
     height
 }
 
-/// Reject dependency graphs where following `depends_on` edges from `start`
-/// can reach `start` again (cycle check on write — reject, don't detect
-/// later). Bounded by the number of tasks in scope.
+/// Reject graphs in which `start` would (transitively) wait on itself
+/// (cycle check on write — reject, don't detect later). Bounded by the number
+/// of tasks in scope.
+///
+/// A card waits on two kinds of edge: its `depends_on`, and — through the
+/// parent-completion invariant — each of its sub-tasks. Following only the
+/// first missed a deadlock built from both: with A the parent of T and T
+/// depending on D, setting D to depend on A closes D → A → T → D, and no card
+/// in it can ever finish. The ancestor check below catches that only when the
+/// edited card is the descendant, not when the edge is added at D.
 fn check_dependency_cycle(by_id: &HashMap<i64, &Task>, start: i64) -> Result<(), StorageError> {
     let Some(start_task) = by_id.get(&start) else {
         return Ok(());
     };
+    let mut children: HashMap<i64, Vec<i64>> = HashMap::new();
+    for task in by_id.values() {
+        if let Some(parent_id) = task.parent_id {
+            children.entry(parent_id).or_default().push(task.id);
+        }
+    }
     let mut visited: HashSet<i64> = HashSet::new();
     let mut queue: VecDeque<i64> = start_task.depends_on.iter().copied().collect();
     while let Some(current) = queue.pop_front() {
         if current == start {
             return Err(StorageError::Invalid(format!(
-                "dependency cycle: task #{start} would (transitively) depend on itself"
+                "dependency cycle: task #{start} would (transitively) wait on itself — a \
+                 card waits on its dependencies, and a parent on its sub-tasks"
             )));
         }
         if !visited.insert(current) {
@@ -3382,7 +3570,12 @@ fn check_dependency_cycle(by_id: &HashMap<i64, &Task>, start: i64) -> Result<(),
         if let Some(task) = by_id.get(&current) {
             queue.extend(task.depends_on.iter().copied());
         }
+        if let Some(kids) = children.get(&current) {
+            queue.extend(kids.iter().copied());
+        }
     }
+    debug_assert!(visited.len() <= by_id.len() + start_task.depends_on.len());
+    debug_assert!(!visited.contains(&start), "reaching start returned above");
     Ok(())
 }
 
@@ -3407,6 +3600,30 @@ fn check_parent_cycle(by_id: &HashMap<i64, &Task>, start: i64) -> Result<(), Sto
     Ok(())
 }
 
+/// A date field must be one of the forms every reader parses: a day
+/// (`YYYY-MM-DD`), RFC 3339, or the store's own `YYYY-MM-DD HH:MM:SS`.
+///
+/// Every reader compares the first ten characters as text (`day_of`,
+/// `validate_dates`, the due/overdue sweep) and the recurrence moves dates
+/// with a real parser, so a model writing `10/15/2026` got a card announced
+/// due at once (`'1' < '2'`), and `Friday` one never due at all — and a
+/// recurring card kept last round's dates forever.
+fn validate_date_format(field: &str, value: &str) -> Result<(), StorageError> {
+    debug_assert!(field == "due_at" || field == "deadline_at");
+    let parses = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+        || chrono::DateTime::parse_from_rfc3339(value).is_ok()
+        || chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").is_ok();
+    if parses {
+        // Each accepted form starts with the day, so the text compare holds.
+        debug_assert!(chrono::NaiveDate::parse_from_str(&day_of(value), "%Y-%m-%d").is_ok());
+        return Ok(());
+    }
+    Err(StorageError::Invalid(format!(
+        "{field} {value:?} is not a date: use YYYY-MM-DD (or an RFC 3339 timestamp such as \
+         2026-10-15T09:00:00Z)"
+    )))
+}
+
 /// A card deferred past its own deadline can never be worked (P25 decision 10):
 /// it stays out of the inbox until `due_at`, by which time `deadline_at` has
 /// already passed. Same-day is fine — the comparison is on the date part, so an
@@ -3429,6 +3646,62 @@ fn validate_dates(due_at: Option<&str>, deadline_at: Option<&str>) -> Result<(),
     Ok(())
 }
 
+/// An assignee must be a member of the card's own board: owned by the card's
+/// workspace (the global board's are those with no owner), or owned by the
+/// human — the human and their personal agents, who travel between
+/// workspaces. The same rule as `MemberRepository::list_for_workspace`.
+///
+/// Existence alone was checked, so a card opened from the Inbox (which spans
+/// every board) could be given to another workspace's agent from the shown
+/// board's roster — an agent that cannot see the card's folders or memory.
+/// Session-scoped cards (the chat harness's) are on no board: existence only.
+async fn ensure_assignee_on_board(
+    conn: &Connection,
+    assignee: Option<&str>,
+    scope: &str,
+    scope_id: Option<&str>,
+) -> Result<(), StorageError> {
+    let Some(member_id) = assignee else {
+        return Ok(());
+    };
+    ensure_member_exists(conn, Some(member_id), "assignee").await?;
+    if scope == "session" {
+        return Ok(());
+    }
+    let board = if scope == "workspace" { scope_id } else { None };
+    debug_assert!(
+        scope != "workspace" || board.is_some(),
+        "a workspace card names its board"
+    );
+    let mut rows = conn
+        .query(
+            "SELECT owner_kind, owner_id FROM members WHERE id = ?1",
+            turso::params![member_id.to_string()],
+        )
+        .await?;
+    let owner = match rows.next().await? {
+        Some(row) => Some((row.get::<String>(0)?, row.get::<Option<String>>(1)?)),
+        None => None,
+    };
+    // Drop the open cursor before the caller's write: an unfinished Rows on
+    // the shared turso connection silently swallows later writes.
+    drop(rows);
+    let Some((owner_kind, owner_id)) = owner else {
+        return Err(StorageError::NotFound(format!("member '{member_id}'")));
+    };
+    if owner_kind == "human" || (owner_kind == "workspace" && owner_id.as_deref() == board) {
+        return Ok(());
+    }
+    Err(StorageError::Invalid(format!(
+        "assignee '{member_id}' is not on this card's board ({}); assign a member of {}",
+        board.unwrap_or("global"),
+        board.map_or_else(
+            || "the global board".to_string(),
+            |b| format!("workspace {b}")
+        )
+    )))
+}
+
 /// `tasks.assignee` holds a `members.id` (P25 Stage 1). SQLite cannot add a
 /// foreign key to an existing column and `PRAGMA foreign_keys` is off on this
 /// connection, so the reference is enforced here — on write, under the same
@@ -3444,6 +3717,11 @@ fn validate_new_task_fields(new: &NewTask) -> Result<(), StorageError> {
     validate_scope(&new.scope, new.scope_id.as_deref())?;
     validate_title(&new.title)?;
     validate_priority(new.priority)?;
+    for (field, value) in [("due_at", &new.due_at), ("deadline_at", &new.deadline_at)] {
+        if let Some(value) = value {
+            validate_date_format(field, value)?;
+        }
+    }
     validate_dates(new.due_at.as_deref(), new.deadline_at.as_deref())?;
     validate_labels(&new.labels)?;
     validate_tool_scope(&new.tool_scope)?;
@@ -4508,6 +4786,103 @@ mod tests {
             )
             .await;
         assert!(matches!(err, Err(StorageError::Invalid(_))));
+    }
+
+    /// The wedge built from the other end: the edge is added at a root card,
+    /// so the edited card has no ancestors and the ancestor check passes. A is
+    /// the parent of T, T depends on D; D depending on A closes D → A → T → D.
+    #[tokio::test]
+    async fn a_dependency_that_closes_a_loop_through_a_parent_is_rejected() {
+        let (_s, repo) = repo().await;
+        let a = repo.create(new_task("A")).await.unwrap();
+        let d = repo.create(new_task("D")).await.unwrap();
+        let mut nt = new_task("T");
+        nt.parent_id = Some(a.id);
+        nt.depends_on = vec![d.id];
+        let t = repo.create(nt).await.unwrap();
+        let err = repo
+            .update(
+                d.id,
+                TaskPatch {
+                    depends_on: Some(vec![a.id]),
+                    ..TaskPatch::default()
+                },
+                None,
+            )
+            .await;
+        let Err(StorageError::Invalid(message)) = err else {
+            panic!("D -> A -> T -> D must be rejected, got {err:?}");
+        };
+        assert!(message.contains("cycle"), "{message}");
+        assert!(
+            repo.get(d.id).await.unwrap().depends_on.is_empty(),
+            "nothing written"
+        );
+
+        // Depending on A from a card outside A's subtree's waits stays legal.
+        let e = repo.create(new_task("E")).await.unwrap();
+        let updated = repo
+            .update(
+                e.id,
+                TaskPatch {
+                    depends_on: Some(vec![a.id]),
+                    ..TaskPatch::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.depends_on, vec![a.id]);
+        assert_eq!(repo.get(t.id).await.unwrap().depends_on, vec![d.id]);
+    }
+
+    /// Readers compare the first ten characters as text, so only forms that
+    /// start with the day may be stored — on create and on a patch that sets
+    /// one; a legacy row's other fields stay editable.
+    #[tokio::test]
+    async fn a_date_that_is_not_iso_is_refused() {
+        let (_s, repo) = repo().await;
+        for bad in [
+            "10/15/2026",
+            "Friday",
+            "tomorrow",
+            "2026-13-01",
+            "2026-10-15T09:00",
+        ] {
+            let mut nt = new_task("dated");
+            nt.due_at = Some(bad.to_string());
+            let Err(StorageError::Invalid(message)) = repo.create(nt).await else {
+                panic!("{bad:?} must be refused as a defer date");
+            };
+            assert!(message.contains("YYYY-MM-DD"), "{message}");
+        }
+        for good in [
+            "2026-10-15",
+            "2026-10-15T09:00:00Z",
+            "2026-10-15T09:00:00-07:00",
+            "2026-10-15 09:00:00",
+        ] {
+            let mut nt = new_task("dated");
+            nt.deadline_at = Some(good.to_string());
+            assert!(repo.create(nt).await.is_ok(), "{good:?} is a date");
+        }
+        let card = repo.create(new_task("later")).await.unwrap();
+        let err = repo
+            .update(
+                card.id,
+                TaskPatch {
+                    deadline_at: Some(Some("next week".to_string())),
+                    ..TaskPatch::default()
+                },
+                None,
+            )
+            .await;
+        assert!(matches!(err, Err(StorageError::Invalid(_))), "{err:?}");
+        assert_eq!(
+            repo.get(card.id).await.unwrap().deadline_at,
+            None,
+            "nothing written"
+        );
     }
 
     #[tokio::test]

@@ -886,7 +886,7 @@ impl MemoryService {
         let results = self.store.search_owned_by(&embedding, 1, None).await;
         
         if let Some((existing, similarity)) = results.first() {
-            let action = IngestAction::from_similarity(*similarity);
+            let action = ingest_action(*similarity, &metadata, &existing.metadata);
             
             match action {
                 // Same rule as `remember_with_importance`: only a neighbour that
@@ -1014,9 +1014,20 @@ impl MemoryService {
         if merged == existing_content {
             return Ok(FoldResult::Subset);
         }
-        let merged_embedding = (embed_fn)(&merged)
-            .await
-            .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
+        // A failing embedder must not cost the write: the first embed of this
+        // ingest succeeded, and propagating the re-embed's error stored the
+        // incoming fact nowhere — against this service's own rule that a
+        // failing provider is not an error. The merge lands with no vector,
+        // which `rewrite_with_binding` queues for backfill.
+        let merged_embedding = match (embed_fn)(&merged).await {
+            Ok(vector) => vector,
+            Err(e) => {
+                warn!(
+                    "re-embedding the fold into {existing_id} failed ({e}); merged unembedded, queued for backfill"
+                );
+                Vec::new()
+            }
+        };
         match self
             .rewrite_with_binding(existing_id, &merged, merged_embedding, Some(existing_content))
             .await?
@@ -1155,7 +1166,7 @@ impl MemoryService {
         let results = self.store.search_owned_by(&embedding, 1, None).await;
         
         if let Some((existing, similarity)) = results.first() {
-            let action = IngestAction::from_similarity(*similarity);
+            let action = ingest_action(*similarity, &metadata, &existing.metadata);
             
             // Don't reinforce error memories — let them die
             let skip_reinforce = existing.content.contains("Error:")
@@ -1342,7 +1353,7 @@ impl MemoryService {
         let results = self.store.search_owned_by(&embedding, 1, owner).await;
         
         if let Some((existing, similarity)) = results.first() {
-            let action = IngestAction::from_similarity(*similarity);
+            let action = ingest_action(*similarity, &metadata, &existing.metadata);
             
             // A near neighbour is a reason to STRENGTHEN it, never on its own a
             // reason to throw the new observation away.
@@ -1571,6 +1582,46 @@ impl MemoryService {
         query: &str,
         scope: crate::RecallScope<'_>,
     ) -> Result<RecallReport, MemoryError> {
+        self.recall_in_scope_shown(query, scope, self.config.max_results)
+            .await
+    }
+
+    /// [`Self::recall_scoped_with_coverage`] for a caller that shows at most
+    /// `shown_max` results.
+    ///
+    /// Recall is a review: each result it returns is strengthened (the
+    /// testing effect). A caller that asks for the default `max_results` and
+    /// keeps the first five strengthened ranks 6..10 too — memories nobody
+    /// saw, whose stability grew on every turn they were cut. Asking with the
+    /// number actually shown reviews exactly those.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if no embedding function is configured, or if
+    /// embedding the query fails.
+    pub async fn recall_scoped_with_coverage_shown(
+        &self,
+        query: &str,
+        workspace_id: Option<&str>,
+        shown_max: usize,
+    ) -> Result<(Vec<RecallResult>, crate::SearchCoverage), MemoryError> {
+        let report = self
+            .recall_in_scope_shown(
+                query,
+                crate::RecallScope::from_workspace(workspace_id),
+                shown_max,
+            )
+            .await?;
+        Ok((report.results, report.coverage))
+    }
+
+    async fn recall_in_scope_shown(
+        &self,
+        query: &str,
+        scope: crate::RecallScope<'_>,
+        shown_max: usize,
+    ) -> Result<RecallReport, MemoryError> {
+        let shown_max = shown_max.clamp(1, self.config.max_results.max(1));
         let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
 
         let embed_started = std::time::Instant::now();
@@ -1612,7 +1663,7 @@ impl MemoryService {
             .await;
 
         let filtered = self
-            .rank_and_assemble(results, &chunk_hits, scope, min_score)
+            .rank_and_assemble(results, &chunk_hits, scope, min_score, shown_max)
             .await;
 
         let timings = RecallTimings {
@@ -1665,8 +1716,10 @@ impl MemoryService {
         chunk_hits: &HashMap<String, crate::chunk_rank::ChunkHit>,
         scope: crate::RecallScope<'_>,
         min_score: f32,
+        shown_max: usize,
     ) -> Vec<RecallResult> {
         debug_assert!(min_score.is_finite(), "a similarity floor is a number");
+        debug_assert!(shown_max >= 1 && shown_max <= self.config.max_results.max(1));
         // Filter by min score and weight, apply testing effect
         let mut filtered = Vec::new();
         let mut updates = Vec::new();
@@ -1744,10 +1797,15 @@ impl MemoryService {
                 workspace_id: entry.workspace_id,
             });
 
-            if filtered.len() >= self.config.max_results {
+            if filtered.len() >= shown_max {
                 break;
             }
         }
+        debug_assert_eq!(
+            updates.len(),
+            filtered.len(),
+            "exactly what is returned is reviewed"
+        );
 
         if !updates.is_empty() {
             self.pending_updates.write().await.extend(updates);
@@ -3182,6 +3240,31 @@ pub const MEMORY_CHUNK_MAX_CHARS: usize = MEMORY_CHUNK_TARGET_CHARS;
 /// SIMD cosine is exact here; a dimension mismatch or empty vector yields no
 /// match rather than a panic.
 #[must_use]
+/// What a live write does with its nearest neighbour.
+///
+/// Similarity decides, unless the two differ in verbatim pin (a user's stated
+/// fact vs an observation): absorbing keeps the SURVIVOR's metadata, so a
+/// stated fact folded into an observed row — or discarded as already
+/// contained in one — came back marked `observed`, and the next dream could
+/// paraphrase the user's words. The dream path partitions on the pin first
+/// (`partition_verbatim_pinned`); the live path now keeps them apart too, by
+/// writing the incoming fact as its own row.
+fn ingest_action<S1, S2>(
+    similarity: f32,
+    incoming: &HashMap<String, String, S1>,
+    existing: &HashMap<String, String, S2>,
+) -> IngestAction
+where
+    S1: std::hash::BuildHasher,
+    S2: std::hash::BuildHasher,
+{
+    if is_verbatim_pinned(incoming) == is_verbatim_pinned(existing) {
+        IngestAction::from_similarity(similarity)
+    } else {
+        IngestAction::Create
+    }
+}
+
 fn find_duplicate_target(survivors: &[MemoryEntry], candidate: &MemoryEntry) -> Option<usize> {
     if candidate.embedding.is_empty() {
         return None;
@@ -3475,6 +3558,145 @@ mod tests {
             !coverage.is_complete(),
             "so this empty answer is a blackout, not a miss — and must not be \
              reported with the same words"
+        );
+    }
+
+    /// Only what recall returns is reviewed. Asking for the default page and
+    /// trimming to five strengthened the cut ranks as if they had been shown.
+    #[tokio::test]
+    async fn recall_reviews_only_what_it_shows() {
+        use std::sync::Arc;
+
+        let embed: EmbedFn = Arc::new(|text: &str| {
+            let text = text.to_string();
+            Box::pin(async move {
+                // Distinct but all close to the query, so none fold together
+                // and all clear the similarity floor.
+                let tilt = text.len() % 7;
+                Ok(vec![
+                    1.0_f32,
+                    f32::from(u8::try_from(tilt).unwrap_or(0)) * 0.01,
+                    0.0,
+                ])
+            })
+        });
+        let config = MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        };
+        let service = MemoryService::new(config).with_embed_fn(embed);
+        for fact in ["alpha one", "beta two two", "gamma three three"] {
+            service
+                .remember_with_importance(fact, HashMap::new(), 3.0)
+                .await
+                .expect("write");
+        }
+        let stored = service.list_all().await.len();
+        assert!(
+            stored >= 2,
+            "the fixture stores more than one memory: {stored}"
+        );
+        let before = service.pending_update_count().await;
+
+        let (shown, _) = service
+            .recall_scoped_with_coverage_shown("query", None, 1)
+            .await
+            .expect("recall");
+        assert_eq!(shown.len(), 1);
+        assert_eq!(
+            service.pending_update_count().await - before,
+            1,
+            "one result shown, one review queued"
+        );
+    }
+
+    /// A user's stated fact is never absorbed into an observed neighbour: the
+    /// survivor's metadata wins an absorb, so the fact came back `observed`
+    /// and lost its verbatim pin.
+    #[tokio::test]
+    async fn a_stated_fact_is_not_folded_into_an_observation() {
+        use std::sync::Arc;
+
+        let embed: EmbedFn = Arc::new(|text: &str| {
+            let text = text.to_string();
+            Box::pin(async move {
+                if text.contains("Never") {
+                    Ok(vec![0.85_f32, 0.526_8, 0.0])
+                } else {
+                    Ok(vec![1.0_f32, 0.0, 0.0])
+                }
+            })
+        });
+        let config = MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        };
+        let service = MemoryService::new(config).with_embed_fn(embed);
+        let fact = |kind: &str| {
+            HashMap::from([(crate::FACT_TYPE_METADATA_KEY.to_string(), kind.to_string())])
+        };
+        service
+            .remember("deploys were frozen last Friday", fact("observed"))
+            .await
+            .expect("observation");
+        service
+            .remember("Never deploy on Fridays", fact("stated"))
+            .await
+            .expect("stated fact");
+
+        let all = service.list_all().await;
+        assert_eq!(
+            all.len(),
+            2,
+            "kept apart: {:?}",
+            all.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+        assert!(
+            all.iter().any(|m| m.content == "Never deploy on Fridays"
+                && crate::is_verbatim_pinned(&m.metadata)),
+            "the user's words stand as their own pinned row"
+        );
+    }
+
+    /// A fold whose re-embed fails still lands. The incoming fact's own embed
+    /// succeeded and placed it in the Update band of a neighbour; the merged
+    /// text's embed then failed (a 429, a timeout) and the error propagated,
+    /// so the fact was stored nowhere.
+    #[tokio::test]
+    async fn a_fold_whose_re_embed_fails_still_lands() {
+        use std::sync::Arc;
+
+        let embed: EmbedFn = Arc::new(|text: &str| {
+            let text = text.to_string();
+            Box::pin(async move {
+                if text.contains("drips") && text.contains("washer") {
+                    Err("rate limited".to_string())
+                } else if text.contains("washer") {
+                    Ok(vec![0.85_f32, 0.526_8, 0.0])
+                } else {
+                    Ok(vec![1.0_f32, 0.0, 0.0])
+                }
+            })
+        });
+        let config = MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        };
+        let service = MemoryService::new(config).with_embed_fn(embed);
+        service
+            .remember("the kitchen tap drips", HashMap::new())
+            .await
+            .expect("first write");
+        service
+            .remember("the tap needs a new washer", HashMap::new())
+            .await
+            .expect("a failing re-embed is not a failed write");
+
+        let all = service.list_all().await;
+        assert!(
+            all.iter().any(|m| m.content.contains("washer")),
+            "the second fact landed: {:?}",
+            all.iter().map(|m| &m.content).collect::<Vec<_>>()
         );
     }
 
@@ -5026,7 +5248,13 @@ mod tests {
             (scoped_entry("weak", None), 0.2),
         ];
         let out = service
-            .rank_and_assemble(results, &HashMap::new(), crate::RecallScope::Everything, 0.4)
+            .rank_and_assemble(
+                results,
+                &HashMap::new(),
+                crate::RecallScope::Everything,
+                0.4,
+                service.config.max_results,
+            )
             .await;
         let ids: Vec<&str> = out.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["real"], "NaN is rejected like any sub-floor score");
@@ -5046,6 +5274,7 @@ mod tests {
                 &hits,
                 crate::RecallScope::Everything,
                 0.4,
+                service.config.max_results,
             )
             .await;
         assert_eq!(out.len(), 1, "the chunk evidence stands on its own");

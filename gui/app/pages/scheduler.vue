@@ -10,7 +10,7 @@
           </p>
         </div>
         <div class="flex items-center gap-2">
-          <UiSwitch v-model="schedulerEnabled" label="Scheduler enabled" @update:modelValue="toggleScheduler" />
+          <UiSwitch :model-value="schedulerEnabled" label="Scheduler enabled" @update:modelValue="toggleScheduler" />
           <span class="text-sm text-nanna-text-muted">{{ schedulerEnabled ? 'Enabled' : 'Disabled' }}</span>
           <UiButton @click="openCreateModal" size="sm" :disabled="!schedulerEnabled">
             ➕ New Job
@@ -284,6 +284,8 @@ const schedulerEnabled = ref(true)
 
 const showModal = ref(false)
 const editing = ref(false)
+/** The job being edited, by id: two jobs may share a name. */
+const editingId = ref<string | null>(null)
 const form = ref({
   name: '',
   schedule: '',
@@ -363,12 +365,15 @@ async function loadSchedulerState() {
   }
 }
 
+// One-way bound: the switch shows what the daemon accepted. With v-model it
+// flipped on the click, so a refused save left it showing the wrong state.
 async function toggleScheduler(enabled: boolean) {
   try {
     await invoke('set_scheduler_enabled', { enabled })
     schedulerEnabled.value = enabled
   } catch (e) {
     console.error('Failed to toggle scheduler:', e)
+    toast.show(`Could not ${enabled ? 'enable' : 'disable'} the scheduler`, 'error', String(e))
   }
 }
 
@@ -381,6 +386,7 @@ function openCreateModal() {
 
 function editJob(job: CronJob) {
   editing.value = true
+  editingId.value = job.id
   form.value = {
     name: job.name,
     schedule: job.schedule,
@@ -415,12 +421,13 @@ async function validateSchedule() {
 async function saveJob() {
   try {
     if (editing.value) {
-      // Find the job ID by name (since we can't change name)
-      const existingJob = jobs.value.find(j => j.name === form.value.name)
-      if (existingJob) {
+      // The prompt is part of the edit: only the schedule used to be sent,
+      // so a changed prompt was dropped while the modal closed as if saved.
+      if (editingId.value) {
         await invoke('update_cron_job', {
-          jobId: existingJob.id,
+          jobId: editingId.value,
           schedule: form.value.schedule,
+          payload: form.value.payload,
         })
       }
     } else {

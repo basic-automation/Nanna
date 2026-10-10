@@ -23,8 +23,11 @@ const isOpen = ref(false)
 const recentHashes = new Map<string, number>()
 const DEDUPE_WINDOW_MS = 2000
 
-function hashNotification(n: Pick<AppNotification, 'type' | 'title' | 'source'>): string {
-  return `${n.type}:${n.source}:${n.title}`
+// The summary is part of a notice's identity: two board notices from one
+// agent share a title ("New card for you from …") and differ only there, so
+// keying on the title alone dropped the second card's notice for good.
+function hashNotification(n: Pick<AppNotification, 'type' | 'title' | 'source' | 'summary'>): string {
+  return `${n.type}:${n.source}:${n.title}:${n.summary}`
 }
 
 export function useNotificationCenter() {

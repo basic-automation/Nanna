@@ -833,7 +833,7 @@ fn memory_write_services(
                 // every `remember` call passes through — both this service
                 // and its `memory.embed` alias.
                 let tags = tags_with_provenance(tags, &params);
-                let workspace = ws.read().await.clone();
+                let workspace = crate::run_workspace::resolve(&ws).await;
                 match mem
                     .remember_scoped(&content, tags, importance, workspace)
                     .await
@@ -880,7 +880,7 @@ fn memory_write_services(
                 // every `remember` call passes through — both this service
                 // and its `memory.embed` alias.
                 let tags = tags_with_provenance(tags, &params);
-                let workspace = ws.read().await.clone();
+                let workspace = crate::run_workspace::resolve(&ws).await;
                 match mem
                     .remember_scoped(&content, tags, importance, workspace)
                     .await
@@ -932,9 +932,9 @@ fn memory_search_services(
                 let page_chars = opt_count(&params, "page_chars")?
                     .unwrap_or(nanna_memory::MEMORY_CHUNK_TARGET_CHARS);
                 let offset = opt_count(&params, "offset")?.unwrap_or(0);
-                let workspace = ws.read().await;
+                let workspace = crate::run_workspace::resolve(&ws).await;
                 match mem
-                    .recall_scoped_with_coverage(&query, workspace.as_deref())
+                    .recall_scoped_with_coverage_shown(&query, workspace.as_deref(), limit)
                     .await
                 {
                     // An empty answer from a scan that could not compare
@@ -2755,6 +2755,13 @@ async fn dream_once(
 /// store.
 ///
 /// Returns the scheduler's `(success, output, error)` triple.
+/// What a scheduled prompt answers when it did not start. Settled as a run,
+/// a cron job's `next_run` moved past the occurrence and it was lost; the
+/// scheduler keeps a skipped cron job due instead (`TaskResult::skipped`).
+const SKIPPED_RUN_IN_FLIGHT: &str = "Skipped (a run is in flight)";
+const SKIPPED_RESUME_PARKED: &str =
+    "Yielded to a live chat turn; a resume is already parked, the next tick covers this one";
+
 async fn run_scheduled_agent_prompt(
     task: &nanna_core::ScheduledTask,
     agent: &Arc<AgentService>,
@@ -2782,7 +2789,7 @@ async fn run_scheduled_agent_prompt(
             "Skipping scheduled task '{}': a run is already in flight",
             task.name
         );
-        return (true, Some("Skipped (a run is in flight)".to_string()), None);
+        return (true, Some(SKIPPED_RUN_IN_FLIGHT.to_string()), None);
     }
     if !agent.has_configured_model().await {
         // Nothing to run the prompt with: a daemon with
@@ -2989,15 +2996,7 @@ fn park_scheduled_resume(
             None,
         )
     } else {
-        (
-            true,
-            Some(
-                "Yielded to a live chat turn; a resume is \
-                 already parked, the next tick covers this one"
-                    .to_string(),
-            ),
-            None,
-        )
+        (true, Some(SKIPPED_RESUME_PARKED.to_string()), None)
     }
 }
 
@@ -3727,6 +3726,10 @@ impl DaemonServer {
                         .await
                     }
                 };
+                let skipped = matches!(
+                    output.as_deref(),
+                    Some(SKIPPED_RUN_IN_FLIGHT | SKIPPED_RESUME_PARKED)
+                );
                 nanna_core::TaskResult {
                     task_id: task.id.clone(),
                     task_name: task.name.clone(),
@@ -3736,6 +3739,7 @@ impl DaemonServer {
                     duration_ms: crate::numeric::millis_u64(start.elapsed()),
                     started_at,
                     finished_at: chrono::Utc::now(),
+                    skipped,
                 }
             })
         })

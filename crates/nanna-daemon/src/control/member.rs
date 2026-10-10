@@ -26,6 +26,15 @@ const AGENT_SLUG_MAX_BYTES: usize = MEMBER_ID_MAX_BYTES - AGENT_MEMBER_PREFIX.le
 /// overwrite.
 const AGENT_RANDOM_SLUG_BYTES: usize = 8;
 
+// Who a deleted member's released cards are written by — the router wakes on
+// it (`board_router_trigger::WakeReason::MemberDeleted`).
+use crate::board_router_trigger::MEMBER_DELETE_ACTOR;
+
+/// Release rounds one member delete may take (each releases up to
+/// `ASSIGNED_CARDS_MAX` cards). Bound justification: 16 000 open cards on
+/// one member is far past any board; a store that never empties is a fault.
+const MEMBER_DELETE_RELEASE_ROUNDS_MAX: usize = 16;
+
 impl ControlPlane {
     pub(super) async fn handle_member(&self, action: MemberAction) -> Value {
         let Some(ref storage) = self.storage else {
@@ -67,10 +76,7 @@ impl ControlPlane {
                 status,
                 profile,
             } => member_update(&repo, &id, name, avatar, status.as_deref(), profile).await,
-            MemberAction::Delete { id } => match repo.delete(&id).await {
-                Ok(removed) => json!({ "removed": removed }),
-                Err(e) => storage_error("member_delete_failed", &e),
-            },
+            MemberAction::Delete { id } => self.member_delete(storage, &repo, &id).await,
         };
         if mutates && roster_changed(&response) {
             self.notify_members_changed();
@@ -83,6 +89,66 @@ impl ControlPlane {
     fn notify_members_changed(&self) {
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(Event::MembersChanged);
+        }
+    }
+
+    /// Delete a member that is not working, after releasing its open cards.
+    ///
+    /// A delete used to check nothing: a member mid-run lost every post its
+    /// run made (each refused as "not a board member") — its question to the
+    /// human included — while the run kept spending; and its open cards kept
+    /// the dead id, assigned to nobody who exists, until a member created
+    /// later under the same name (on any board) inherited them and its next
+    /// free slot started another board's card. Cards go back to `pending`
+    /// with no assignee, written through the task store so the boards hear it.
+    async fn member_delete(
+        &self,
+        storage: &nanna_storage::Storage,
+        repo: &MemberRepository,
+        id: &str,
+    ) -> Value {
+        if let Some(ref runs) = self.task_runs
+            && runs.member_is_working(id).await
+        {
+            return json!({
+                "error": "invalid_member",
+                "message": format!("{id} is working a card; stop its run first, then delete it"),
+            });
+        }
+        let tasks = storage.tasks();
+        let mut released = 0usize;
+        // Bounded: each round releases what it read, so a member with more
+        // than one page of cards empties in a few rounds; the cap only stops a
+        // store that keeps answering with cards it never releases.
+        for _ in 0..MEMBER_DELETE_RELEASE_ROUNDS_MAX {
+            let cards = match tasks
+                .assigned_open(id, nanna_storage::ASSIGNED_CARDS_MAX)
+                .await
+            {
+                Ok(cards) => cards,
+                Err(e) => return storage_error("member_delete_failed", &e),
+            };
+            if cards.is_empty() {
+                break;
+            }
+            for card in cards {
+                let patch = nanna_storage::TaskPatch {
+                    assignee: Some(None),
+                    status: (card.status == "in_progress").then(|| "pending".to_string()),
+                    ..nanna_storage::TaskPatch::default()
+                };
+                if let Err(e) = tasks
+                    .update(card.id, patch, Some(MEMBER_DELETE_ACTOR))
+                    .await
+                {
+                    return storage_error("member_delete_failed", &e);
+                }
+                released += 1;
+            }
+        }
+        match repo.delete(id).await {
+            Ok(removed) => json!({ "removed": removed, "cards_released": released }),
+            Err(e) => storage_error("member_delete_failed", &e),
         }
     }
 

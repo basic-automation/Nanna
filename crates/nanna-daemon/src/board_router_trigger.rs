@@ -83,13 +83,13 @@ pub const HAND_BACK_LIMIT_ACTION: &str = "hand_back_limit";
 /// done. A hand-back before it is not part of the current row.
 const COMPLETED_ACTION: &str = "completed";
 
-/// How much of a card's activity is read to count its hand-backs.
+/// How many of a card's come-back markers are read to count its hand-backs.
 ///
-/// Bound justification: one run leaves a handful of rows on its card
-/// (started, notes, checks, the hand-back, the release, the router's post),
-/// so 256 rows hold dozens of runs — far more than [`HAND_BACKS_MAX`] — while
-/// staying one small indexed read.
-const HAND_BACK_SCAN_ROWS: i64 = 256;
+/// Bound justification: only the four marker actions are read, and the count
+/// is broken by the human being asked once it reaches [`HAND_BACKS_MAX`], so
+/// a real run of hand-backs is at most a few rows; the store's page ceiling
+/// leaves room for a count that a crash interrupted before it asked.
+const HAND_BACK_SCAN_ROWS: usize = nanna_storage::ACTIVITY_MARKER_ROWS_MAX;
 
 /// Member-profile key holding the router's own model list, walked in order
 /// with failover. Absent or empty means the agent's chat models.
@@ -122,7 +122,14 @@ pub enum WakeReason {
     /// The stall sweep took the card back from a member that was not working
     /// it (P25 decision 7's `stalled`).
     Stalled,
+    /// The card's member was deleted and its cards released
+    /// ([`MEMBER_DELETE_ACTOR`]). Routed like any board work, but not a
+    /// failed attempt, so it does not count toward the retry bound.
+    MemberDeleted,
 }
+
+/// The actor `member.delete` releases a deleted member's open cards as.
+pub const MEMBER_DELETE_ACTOR: &str = "member_delete";
 
 /// One queued wake: route card `task_id` because of `reason`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +161,12 @@ pub fn wake_for(event: &TaskEvent) -> Option<Wake> {
                 && event.detail.get("assignee") == Some(&serde_json::Value::Null) =>
         {
             WakeReason::Stalled
+        }
+        TaskEventKind::Assigned
+            if event.actor.as_deref() == Some(MEMBER_DELETE_ACTOR)
+                && event.detail.get("assignee") == Some(&serde_json::Value::Null) =>
+        {
+            WakeReason::MemberDeleted
         }
         TaskEventKind::Assigned
             if event
@@ -290,16 +303,13 @@ pub async fn card_to_route(storage: &Storage, wake: Wake) -> Option<Task> {
     if wake.reason == WakeReason::Created {
         return Some(card);
     }
-    if wake.reason == WakeReason::Stalled {
-        return match tasks.created_by(task_id).await {
-            Ok(creator) if crate::card_run_trigger::is_board_creator(creator.as_deref()) => {
-                Some(card)
-            }
-            Ok(_) => {
-                debug!(
-                    task_id,
-                    "board router: stalled card is not board work; skipped"
-                );
+    if wake.reason == WakeReason::RecurringReopened {
+        // Only the board client's recurring cards are released at reopen
+        // (`reopen_for_next_round`); any other keeps its assignee.
+        return match created_by_board_client(&tasks, task_id).await {
+            Ok(true) => Some(card),
+            Ok(false) => {
+                debug!(task_id, "board router: not a board-client card; skipped");
                 None
             }
             Err(e) => {
@@ -308,10 +318,15 @@ pub async fn card_to_route(storage: &Storage, wake: Wake) -> Option<Task> {
             }
         };
     }
-    match created_by_board_client(&tasks, task_id).await {
-        Ok(true) => {}
-        Ok(false) => {
-            debug!(task_id, "board router: not a board-client card; skipped");
+    // A card that came back (a hand-back, a stall) or was answered is board
+    // work whoever on the board made it: a router's split or an agent's
+    // hand-on is released exactly like a card the human typed, and nothing
+    // but the router takes up a pending card nobody holds. Gating these on
+    // the board client stranded such cards unowned forever.
+    match tasks.created_by(task_id).await {
+        Ok(creator) if crate::card_run_trigger::is_board_creator(creator.as_deref()) => {}
+        Ok(_) => {
+            debug!(task_id, "board router: not board work; skipped");
             return None;
         }
         Err(e) => {
@@ -321,11 +336,21 @@ pub async fn card_to_route(storage: &Storage, wake: Wake) -> Option<Task> {
     }
     if matches!(
         wake.reason,
-        WakeReason::RecurringReopened | WakeReason::HandedBack
+        WakeReason::Stalled | WakeReason::HandedBack | WakeReason::MemberDeleted
     ) {
         return Some(card);
     }
     debug_assert_eq!(wake.reason, WakeReason::ClarificationAnswered);
+    if let Some(assignee) = card.assignee.as_deref() {
+        // A member asked this one itself (`ask_user`, a provider refusal):
+        // the answer restarts that member's run, which keeps its card. Only
+        // a card nobody holds — the router's own clarify — goes back to it.
+        debug!(
+            task_id,
+            assignee, "board router: answered card still has its member; skipped"
+        );
+        return None;
+    }
     match answered_clarifications(&tasks, &card).await {
         Ok(answers) if !answers.is_empty() => Some(card),
         Ok(_) => {
@@ -358,11 +383,23 @@ pub async fn hand_backs_in_a_row(
     tasks: &TaskRepository,
     task_id: i64,
 ) -> Result<(usize, String), StorageError> {
-    let activity = tasks.activity(task_id, HAND_BACK_SCAN_ROWS).await?;
+    let activity = tasks
+        .newest_activities_of(
+            task_id,
+            &[
+                crate::tasks::HANDED_BACK_ACTION,
+                crate::tasks::STALLED_ACTION,
+                HAND_BACK_LIMIT_ACTION,
+                COMPLETED_ACTION,
+            ],
+            HAND_BACK_SCAN_ROWS,
+        )
+        .await?;
     let mut count = 0usize;
     let mut latest: Option<String> = None;
-    // `activity` is the newest rows, oldest first: walk it backwards.
-    for row in activity.iter().rev() {
+    // Newest first, and only the markers: an edit or a run's notes between
+    // two hand-backs can no longer push the earlier one out of the count.
+    for row in &activity {
         if row.action == HAND_BACK_LIMIT_ACTION || row.action == COMPLETED_ACTION {
             break;
         }
@@ -817,6 +854,23 @@ mod tests {
         );
     }
 
+    /// A deleted member's released cards go back to the router.
+    #[test]
+    fn a_deleted_members_released_card_wakes_the_router() {
+        let mut released = event(TaskEventKind::Assigned, "global", Some(MEMBER_DELETE_ACTOR));
+        released.detail = json!({ "assignee": null });
+        assert_eq!(
+            wake_for(&released).map(|w| w.reason),
+            Some(WakeReason::MemberDeleted)
+        );
+        released.detail = json!({ "assignee": "agent:other" });
+        assert_eq!(
+            wake_for(&released),
+            None,
+            "only a release, not a reassignment"
+        );
+    }
+
     #[test]
     fn an_agent_clearing_its_own_assignment_is_a_hand_back() {
         let mut released = event(TaskEventKind::Assigned, "global", Some("agent:builder"));
@@ -897,6 +951,129 @@ mod tests {
             0,
             "asking the human starts the count over"
         );
+    }
+
+    /// A card the router split off, or an agent handed on, comes back to the
+    /// router like the human's own: before, only `gui` cards were routed on a
+    /// hand-back, so these sat pending with nobody on them forever.
+    #[tokio::test]
+    async fn a_handed_back_card_is_routed_whoever_on_the_board_made_it() {
+        let storage = Storage::in_memory().await.unwrap();
+        let tasks = storage.tasks();
+        let mut routed = Vec::new();
+        for creator in [
+            BOARD_CLIENT_ACTOR,
+            "router:global",
+            "agent:builder",
+            "harness",
+        ] {
+            let card = tasks
+                .create(nanna_storage::NewTask {
+                    scope: "global".to_string(),
+                    title: format!("Made by {creator}"),
+                    priority: 3,
+                    created_by: Some(creator.to_string()),
+                    ..nanna_storage::NewTask::default()
+                })
+                .await
+                .unwrap();
+            for reason in [WakeReason::HandedBack, WakeReason::Stalled] {
+                let wake = Wake {
+                    task_id: card.id,
+                    reason,
+                };
+                routed.push((
+                    creator,
+                    reason,
+                    card_to_route(&storage, wake).await.is_some(),
+                ));
+            }
+        }
+        for (creator, reason, was_routed) in routed {
+            assert_eq!(
+                was_routed,
+                creator != "harness",
+                "{creator} card on {reason:?}"
+            );
+        }
+    }
+
+    /// A member that asked the human itself keeps its card: the answer
+    /// restarts its run, and the router must not reassign the card under it.
+    #[tokio::test]
+    async fn an_answer_to_a_members_own_question_is_not_the_routers() {
+        let storage = Storage::in_memory().await.unwrap();
+        let (card, clarification) = waiting_card(
+            &storage,
+            "router:global",
+            vec![nanna_storage::routing::CLARIFICATION_LABEL.to_string()],
+        )
+        .await;
+        let tasks = storage.tasks();
+        tasks
+            .complete(clarification, Some(BOARD_CLIENT_ACTOR), None)
+            .await
+            .unwrap();
+        assert!(
+            card_to_route(&storage, answered(card)).await.is_some(),
+            "a router-made card nobody holds goes back to the router"
+        );
+        tasks
+            .update(
+                card,
+                nanna_storage::TaskPatch {
+                    assignee: Some(Some(nanna_storage::HUMAN_MEMBER_ID.to_string())),
+                    ..nanna_storage::TaskPatch::default()
+                },
+                Some(BOARD_CLIENT_ACTOR),
+            )
+            .await
+            .unwrap();
+        assert!(
+            card_to_route(&storage, answered(card)).await.is_none(),
+            "a card its member still holds is the member's"
+        );
+    }
+
+    /// The count reads markers by action: a busy card's edits between two
+    /// hand-backs must not push the first out of the window. Read through a
+    /// 256-row page of every action, 300 edits left the count at 1, and the
+    /// router routed again instead of asking the human — without end.
+    #[tokio::test]
+    async fn edits_between_hand_backs_do_not_hide_one() {
+        let storage = Storage::in_memory().await.unwrap();
+        let tasks = storage.tasks();
+        let card = tasks
+            .create(nanna_storage::NewTask {
+                scope: "global".to_string(),
+                title: "Busy card".to_string(),
+                priority: 3,
+                created_by: Some(BOARD_CLIENT_ACTOR.to_string()),
+                ..nanna_storage::NewTask::default()
+            })
+            .await
+            .unwrap();
+        let hand_back = || async {
+            tasks
+                .log_activity(
+                    card.id,
+                    Some("agent:builder"),
+                    crate::tasks::HANDED_BACK_ACTION,
+                    Some(json!({"member": "agent:builder", "reason": "ran out"})),
+                )
+                .await
+                .unwrap();
+        };
+        hand_back().await;
+        for _ in 0..300 {
+            tasks
+                .log_activity(card.id, Some(BOARD_CLIENT_ACTOR), "updated", None)
+                .await
+                .unwrap();
+        }
+        hand_back().await;
+        let (count, _) = hand_backs_in_a_row(&tasks, card.id).await.unwrap();
+        assert_eq!(count, HAND_BACKS_MAX, "both hand-backs are counted");
     }
 
     /// Finishing a card ends its row of hand-backs: a recurring card handed

@@ -30,6 +30,19 @@ describe('useCloseHandler', () => {
     vi.spyOn(console, 'error').mockImplementation(() => {})
   })
 
+  it('a remembered close choice survives a restart', async () => {
+    localStorage.clear()
+    invoke.mockImplementation(async (cmd: string) => (cmd === 'get_close_mode' ? 'ask' : null))
+    const first = await freshHandler()
+    await first.setCloseMode('minimize_to_tray')
+
+    // A new process starts at "ask"; the stored choice is pushed back.
+    const second = await freshHandler()
+    expect(await second.loadCloseMode()).toBe('minimize_to_tray')
+    expect(invoke).toHaveBeenCalledWith('set_close_mode', { mode: 'minimize_to_tray' })
+    localStorage.clear()
+  })
+
   it('quits through perform_quit, which also stops the daemon', async () => {
     invoke.mockResolvedValue(null)
     const handler = await freshHandler()

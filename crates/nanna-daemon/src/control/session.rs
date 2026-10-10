@@ -199,6 +199,7 @@ impl SubSessionRun {
         // permanent entry per sub-agent the daemon ever runs, and a stale
         // entry now WINS over the global default for that id.
         agent.tools().clear_session_workdir(&sid).await;
+        crate::run_workspace::release(&sid);
     }
 
     /// Extract project knowledge from a finished sub-agent task into the

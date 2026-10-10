@@ -960,6 +960,24 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// stream; there is no value of these keys it could truthfully carry.
 const SOURCE_LOCATOR_METADATA_KEYS: [&str; 2] = ["source_id", "chunk"];
 
+/// Keys that say **which single record** a memory is a copy of: a board
+/// card's copy, one post's copy, a card's folded story and what that fold
+/// covered (P25 decision 14).
+///
+/// Unlike a descriptive key, an identity is false of a summary unless EVERY
+/// member is that record — agreement among the members that happen to carry
+/// it is not enough. A summary of a card's fold and an unrelated chat memory
+/// inherited the fold's `board_event=episode` / `source_task_id`, and when
+/// the card closed again the fold phase found that summary as the card's old
+/// fold and `forget`-ed it, taking the unrelated memory with it.
+const RECORD_IDENTITY_METADATA_KEYS: [&str; 5] = [
+    "board_event",
+    "source_task_id",
+    "source_note_id",
+    "episode_events",
+    "episode_kept",
+];
+
 /// Metadata for a consolidated entry: only what is true of the whole cluster.
 ///
 /// The merge used to be first-writer-wins across the cluster, which asserts one
@@ -973,6 +991,8 @@ const SOURCE_LOCATOR_METADATA_KEYS: [&str; 2] = ["source_id", "chunk"];
 ///    agrees** on the value. Unanimity is the exact condition under which the
 ///    claim survives the merge; disagreement means the merged entry has no
 ///    truthful value to state, so it states none.
+/// 3. A **record identity** ([`RECORD_IDENTITY_METADATA_KEYS`]) is inherited
+///    only when every source carries it, with one value.
 ///
 /// Pure, so the rule is testable without a store.
 #[must_use]
@@ -1003,11 +1023,26 @@ fn consolidated_metadata(memories: &[MemoryEntry]) -> HashMap<String, String> {
         }
     }
 
+    for key in RECORD_IDENTITY_METADATA_KEYS {
+        if memories.iter().any(|m| !m.metadata.contains_key(key)) {
+            merged.remove(key);
+        }
+    }
+
     debug_assert!(
         merged
             .keys()
             .all(|k| !SOURCE_LOCATOR_METADATA_KEYS.contains(&k.as_str())),
         "a source locator survived the merge"
+    );
+    debug_assert!(
+        RECORD_IDENTITY_METADATA_KEYS
+            .iter()
+            .all(|key| !merged.contains_key(*key)
+                || memories
+                    .iter()
+                    .all(|m| m.metadata.get(*key) == merged.get(*key))),
+        "a record identity survived that not every member is"
     );
     merged
 }
@@ -1783,6 +1818,58 @@ mod tests {
         assert!(
             !consolidated.metadata.contains_key("chunk"),
             "and it has no position inside one"
+        );
+    }
+
+    /// A record identity survives only if every member IS that record: a
+    /// summary of a card's folded story and an unrelated memory is not the
+    /// card's fold — inheriting the fold's identity let the next fold of the
+    /// card `forget` the summary and the unrelated memory inside it.
+    #[test]
+    fn a_summary_is_a_record_only_if_every_member_is() {
+        let mut fold = entry_with("fold", vec![1.0, 0.0, 0.0, 0.0], 0);
+        for (key, value) in [
+            ("source", "task_board"),
+            ("board_event", "episode"),
+            ("source_task_id", "7"),
+            ("episode_events", "5"),
+            ("episode_kept", "5"),
+        ] {
+            fold.metadata.insert(key.to_string(), value.to_string());
+        }
+        let mut chat = entry_with("chat", vec![1.0, 0.0, 0.0, 0.0], 0);
+        chat.metadata
+            .insert("source".to_string(), "task_board".to_string());
+        let mixed = MemoryCluster::new(
+            vec![fold.clone(), chat],
+            CompressionLevel::Essence,
+            &FsrsParameters::default(),
+        );
+        let summary = create_consolidated_entry(&mixed, "a gist".to_string(), vec![0.0; 4]);
+        for key in RECORD_IDENTITY_METADATA_KEYS {
+            assert!(
+                !summary.metadata.contains_key(key),
+                "{key} is not true of the summary"
+            );
+        }
+        assert_eq!(
+            summary.metadata.get("source").map(String::as_str),
+            Some("task_board"),
+            "a descriptive key every carrier agrees on still survives"
+        );
+
+        let mut twin = fold.clone();
+        twin.id = "fold-twin".to_string();
+        let same = MemoryCluster::new(
+            vec![fold, twin],
+            CompressionLevel::Essence,
+            &FsrsParameters::default(),
+        );
+        let summary = create_consolidated_entry(&same, "a gist".to_string(), vec![0.0; 4]);
+        assert_eq!(
+            summary.metadata.get("source_task_id").map(String::as_str),
+            Some("7"),
+            "every member is card #7's record, so the summary is too"
         );
     }
 

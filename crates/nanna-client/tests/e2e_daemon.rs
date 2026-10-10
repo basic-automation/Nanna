@@ -245,6 +245,36 @@ async fn daemon_starts_and_client_connects() {
 
 /// A session created through the client is visible to a subsequent request — the
 /// daemon is the one that owns session state, per "channels as control-plane clients".
+/// The daemon's socket is for native clients. A web page the user visits can
+/// open `ws://127.0.0.1:<port>` too (browsers apply no CORS to a `WebSocket`) —
+/// and always sends `Origin` — so a handshake carrying one is refused before
+/// a single request is read; the same handshake without it is accepted.
+#[tokio::test]
+async fn a_web_page_cannot_open_the_daemons_socket() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;
+
+    let mut from_a_page = daemon.url().into_client_request().expect("request");
+    from_a_page.headers_mut().insert(
+        "origin",
+        "https://example.com".parse().expect("header value"),
+    );
+    match tokio_tungstenite::connect_async(from_a_page).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), 403);
+        }
+        Err(other) => panic!("expected an HTTP refusal, got {other}"),
+        Ok(_) => panic!("a browser-origin handshake was accepted"),
+    }
+
+    let native = daemon.url().into_client_request().expect("request");
+    assert!(
+        tokio_tungstenite::connect_async(native).await.is_ok(),
+        "a native client (no Origin) still connects"
+    );
+    daemon.stop();
+}
+
 #[tokio::test]
 async fn created_session_is_visible_to_the_client() {
     let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;

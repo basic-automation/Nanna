@@ -1,6 +1,6 @@
 export default {
   name: "web_search",
-  version: "0.1.0",
+  version: "0.1.1",
   output: "memory",
   description: "Search the web using Brave Search API. Returns titles, URLs, and descriptions of search results.",
   parameters: {
@@ -24,13 +24,20 @@ export default {
     }
 
     var url = "https://api.search.brave.com/res/v1/web/search?q=" + encodeURIComponent(input.query) + "&count=" + numResults;
-    var response = Nanna.fetch(url, {
-      headers: {
-        "Accept": "application/json",
-        "Accept-Encoding": "gzip",
-        "X-Subscription-Token": apiKey
-      }
-    });
+    // A DNS failure or a timeout makes the bridge raise; returned, not
+    // thrown, as in web_fetch — a raise reads to the model as corruption.
+    var response;
+    try {
+      response = Nanna.fetch(url, {
+        headers: {
+          "Accept": "application/json",
+          "Accept-Encoding": "gzip",
+          "X-Subscription-Token": apiKey
+        }
+      });
+    } catch (e) {
+      return { content: "web_search: the search request failed (" + e + "). Nothing was searched; retry later or use web_fetch on a known URL.", success: false };
+    }
 
     if (response.status !== 200) {
       return "Error: Brave Search API returned status " + response.status + ": " + response.body.substring(0, 200);

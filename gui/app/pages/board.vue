@@ -194,7 +194,7 @@
             @change="assign(($event.target as HTMLSelectElement).value)"
           >
             <option value="" disabled>Unassigned — the router will pick</option>
-            <option v-for="member in assignableMembers" :key="member.id" :value="member.id">
+            <option v-for="member in cardAssignable" :key="member.id" :value="member.id">
               {{ member.name }}
             </option>
           </select>
@@ -286,27 +286,34 @@
         <dt class="text-nui-muted">Labels</dt>
         <dd>
           <input
-            :value="selected.labels.join(', ')"
+            v-model="labelsDraft"
             data-testid="card-labels"
             :class="FIELD"
             :disabled="!editable"
             placeholder="comma, separated"
-            @change="patchCard({ labels: splitList(($event.target as HTMLInputElement).value).map(l => l.replace(/^#/, '')) })"
+            @focus="focusLabels"
+            @blur="blurLabels"
+            @change="patchCard({ labels: splitList(labelsDraft).map(l => l.replace(/^#/, '')) })"
           >
         </dd>
       </dl>
       <textarea
-        :value="selected.description ?? ''"
+        v-model="descriptionDraft"
         data-testid="card-description"
         rows="3"
         :class="[FIELD, 'resize-y']"
         :disabled="!editable"
         placeholder="Description — what done looks like, links, context"
-        @change="patchCard({ description: ($event.target as HTMLTextAreaElement).value })"
+        @focus="focusDescription"
+        @blur="blurDescription"
+        @change="patchCard({ description: descriptionDraft })"
       />
 
       <!-- Where the card sits: its parent, what it waits on, its sub-cards -->
-      <section class="flex flex-col gap-2 text-xs" data-testid="card-relations">
+      <p v-if="!selectedOnShownBoard" class="text-xs text-nui-muted" data-testid="card-other-board">
+        On {{ boardLabel(selected, workspaces) }} — open that board to see its sub-cards and what it waits on.
+      </p>
+      <section v-else class="flex flex-col gap-2 text-xs" data-testid="card-relations">
         <p v-if="parentCard" class="text-nui-muted">
           Part of
           <button type="button" class="text-nui-accent hover:underline" @click="selectCard(parentCard.id)">
@@ -425,6 +432,7 @@ import { computed, inject, onMounted, onUnmounted, reactive, ref, watch, type Re
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { renderMarkdown } from '~/lib/markdown'
+import { useFieldDraft } from '~/composables/useFieldDraft'
 import {
   applyFilters, arrangeColumns, assignable, boardKey, boardLabel, boardLabels, childCounts, filtering, NO_FILTERS, columnOf, dayOf, eventIsForBoard,
   isDeferred, isOverdue, memberName, postKindLabel, runActionFor, splitAssigned, splitList, todayUtc,
@@ -604,6 +612,18 @@ const selected = computed(() => {
     : cards.value.find(card => card.id === selectedId.value) ?? null
 })
 
+// Typed text survives the reloads every board event triggers: see useFieldDraft.
+const {
+  draft: descriptionDraft,
+  focus: focusDescription,
+  blur: blurDescription,
+} = useFieldDraft(() => selected.value?.description ?? '', () => selectedId.value)
+const {
+  draft: labelsDraft,
+  focus: focusLabels,
+  blur: blurLabels,
+} = useFieldDraft(() => selected.value?.labels.join(', ') ?? '', () => selectedId.value)
+
 async function loadCard(id: number) {
   const ticket = ++cardTicket
   try {
@@ -670,6 +690,34 @@ async function assign(memberId: string) {
 const FIELD = 'w-full rounded border border-white/10 bg-nui-bg px-2 py-0.5 text-xs text-nui-fg outline-none [color-scheme:dark] disabled:opacity-60'
 
 /** The selected card's parent, if it has one on this board. */
+/**
+ * Whether the open card lives on the board being shown. Inbox and Upcoming
+ * span every board, so a card opened there may not: its assignee comes from
+ * its own board's roster (the store refuses anyone else), and its relations
+ * are not in `cards` — read from the shown board they looked absent.
+ */
+const selectedOnShownBoard = computed(() => selected.value !== null
+  && eventIsForBoard({ scope: selected.value.scope, scope_id: selected.value.scope_id }, board.value))
+const cardRoster = ref<BoardMember[]>([])
+let cardRosterTicket = 0
+watch(
+  () => selected.value && !selectedOnShownBoard.value
+    ? (selected.value.scope === 'workspace' ? selected.value.scope_id : null) ?? ''
+    : undefined,
+  async (workspaceId) => {
+    const ticket = ++cardRosterTicket
+    cardRoster.value = []
+    if (workspaceId === undefined) return
+    try {
+      const reply = await invoke<{ members?: BoardMember[] }>('list_members', { workspaceId: workspaceId || null })
+      if (ticket === cardRosterTicket && !refusal(reply)) cardRoster.value = reply.members ?? []
+    } catch (e) {
+      console.error("Failed to load the card's board roster:", e)
+    }
+  },
+)
+const cardAssignable = computed(() => selectedOnShownBoard.value ? assignableMembers.value : assignable(cardRoster.value))
+
 const parentCard = computed(() => {
   const parentId = selected.value?.parent_id
   return parentId == null ? null : cards.value.find(card => card.id === parentId) ?? null

@@ -302,6 +302,10 @@ impl ControlPlane {
         if let Some(ref ws_arc) = self.services_workspace_id {
             *ws_arc.write().await = effective_ws_id.clone();
         }
+        // ...and per run: the shared slot above is whichever turn prepared
+        // last, so a concurrent turn in another workspace (or a card run)
+        // read this one's. The services resolve through this binding first.
+        crate::run_workspace::bind(session_id, effective_ws_id.clone());
 
         // Each harness step re-anchors from the task store, so the
         // conversation must ride in the system prompt (the retired

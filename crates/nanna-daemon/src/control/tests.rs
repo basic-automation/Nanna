@@ -255,6 +255,69 @@ async fn a_saved_ollama_token_reaches_the_running_embedder_but_the_model_waits()
 /// address (the agent can send one) used to re-read the store for the new
 /// address, find no record, and hand the old server's token to the new one:
 /// chat, embeddings and the probe would all have sent it there.
+/// `[agent].system_prompt` and `name` reach the prompt a turn uses — set over
+/// IPC, they take effect without a restart; blank, the built-in prompt stands.
+#[tokio::test]
+async fn the_agent_prompt_and_name_settings_reach_the_live_prompt() {
+    let default = super::system_prompt_for(&nanna_config::AgentConfig::default());
+    assert!(default.contains("You are Nanna"), "the built-in prompt");
+    let named = super::system_prompt_for(&nanna_config::AgentConfig {
+        name: "Luna".to_string(),
+        ..nanna_config::AgentConfig::default()
+    });
+    assert!(named.starts_with("Your name is Luna."), "{named}");
+
+    let cp = Arc::new(ControlPlane::new(Arc::new(SessionManager::new())));
+    let reply = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "agent.system_prompt".into(),
+                value: json!("You answer in haiku."),
+            }),
+        )
+        .await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    let live = cp.system_prompt.read().await.clone();
+    assert!(live.starts_with("You answer in haiku."), "{live}");
+    assert!(
+        live.contains("## Platform"),
+        "the tools' platform facts are kept: {live}"
+    );
+}
+
+/// The live config holds the secrets filled in from the secure store; what a
+/// client of the socket reads back must hold none of them.
+#[tokio::test]
+async fn config_get_and_export_carry_no_secrets() {
+    let cp = Arc::new(ControlPlane::new(Arc::new(SessionManager::new())));
+    {
+        let mut config = cp.config.write().await;
+        config.llm.api_key = Some("sk-ant-live-secret".to_string());
+        config.llm.anthropic_oauth_token = Some("oauth-live-secret".to_string());
+        config.tools.brave_api_key = Some("brave-live-secret".to_string());
+    }
+    for action in [
+        ConfigAction::Get { path: None },
+        ConfigAction::Get {
+            path: Some("llm".to_string()),
+        },
+        ConfigAction::Export,
+    ] {
+        let reply = cp.handle("test", Action::Config(action)).await.to_string();
+        assert!(
+            !reply.contains("live-secret"),
+            "a secret left the daemon: {reply}"
+        );
+        assert!(!reply.contains("error"), "{reply}");
+    }
+    assert_eq!(
+        cp.config.read().await.llm.api_key.as_deref(),
+        Some("sk-ant-live-secret"),
+        "the live config keeps its key"
+    );
+}
+
 /// A typo'd path is refused, not answered `updated` while serde drops it.
 #[tokio::test]
 async fn config_set_of_an_unknown_path_is_refused() {
@@ -2449,7 +2512,7 @@ async fn task_verdicts_answers_the_rollup_over_ipc() {
             avatar: None,
             kind: nanna_storage::MemberKind::Agent,
             owner_kind: nanna_storage::MemberOwner::Workspace,
-            owner_id: None,
+            owner_id: Some("ws1".to_string()),
             status: nanna_storage::MemberStatus::Idle,
             profile: serde_json::json!({}),
         })
@@ -2509,6 +2572,54 @@ async fn task_verdicts_answers_the_rollup_over_ipc() {
     let refused =
         ask(serde_json::json!({ "type": "task", "action": "verdicts", "window": 0 })).await;
     assert_eq!(refused["error"], "bad_window", "{refused}");
+}
+
+/// Deleting a member releases its open cards (no dangling assignee for a
+/// later same-named member to inherit), and a client can unassign a card
+/// with `"assignee": ""`.
+#[tokio::test]
+async fn deleting_a_member_releases_its_cards_and_an_empty_assignee_clears() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+    let created =
+        ask(serde_json::json!({ "type": "member", "action": "create", "name": "Ada" })).await;
+    let ada = created["member"]["id"].as_str().expect("id").to_string();
+    let tasks = storage.tasks();
+    let new_card = |title: &str| nanna_storage::NewTask {
+        scope: "global".to_string(),
+        title: title.to_string(),
+        priority: 3,
+        assignee: Some(ada.clone()),
+        created_by: Some("gui".to_string()),
+        ..nanna_storage::NewTask::default()
+    };
+    let held = tasks.create(new_card("Held")).await.expect("card");
+    let other = tasks.create(new_card("Other")).await.expect("card");
+
+    let cleared = ask(serde_json::json!({
+        "type": "task", "action": "update", "id": other.id, "patch": { "assignee": "" },
+    }))
+    .await;
+    assert!(
+        cleared["task"]["assignee"].is_null(),
+        "\"\" unassigns: {cleared}"
+    );
+
+    let deleted = ask(serde_json::json!({ "type": "member", "action": "delete", "id": ada })).await;
+    assert_eq!(deleted["removed"], true, "{deleted}");
+    assert_eq!(deleted["cards_released"], 1, "{deleted}");
+    let after = tasks.get(held.id).await.expect("card");
+    assert_eq!(after.assignee, None, "no dangling id");
+    assert_eq!(after.status, "pending");
 }
 
 #[tokio::test]

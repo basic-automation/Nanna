@@ -90,6 +90,29 @@ pub enum ConfigError {
     NoDirFound,
     #[error("Missing required field: {0}")]
     MissingField(String),
+    #[error(
+        "{0} did not parse when it was last read, so saving over it would replace every \
+         setting in it with defaults; fix the file (or move it aside), then try again"
+    )]
+    UnreadableNotOverwritten(PathBuf),
+}
+
+/// Config files this process failed to parse, so must not overwrite.
+///
+/// A process that cannot read its config falls back to defaults (the GUI
+/// does, so it can still open) — and its next settings save then wrote those
+/// defaults over the file: one hand-edit typo and the provider, models, data
+/// directory and channels were all gone. The CLI already refused this
+/// (`config_or_refusal`); recording the failure here covers every writer.
+/// Cleared by the next successful parse of the same path.
+static UNREADABLE_CONFIGS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+fn unreadable_configs() -> std::sync::MutexGuard<'static, std::collections::HashSet<PathBuf>> {
+    UNREADABLE_CONFIGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Main configuration structure
@@ -939,7 +962,14 @@ impl Config {
         store: &crate::credentials::SecureStore,
     ) -> Result<(Self, String), ConfigError> {
         let content = std::fs::read_to_string(path)?;
-        let mut config: Self = toml::from_str(&content)?;
+        let mut config: Self = match toml::from_str(&content) {
+            Ok(config) => config,
+            Err(e) => {
+                unreadable_configs().insert(path.to_path_buf());
+                return Err(e.into());
+            }
+        };
+        unreadable_configs().remove(path);
         info!("Loaded config from {path:?}");
         provider_key::refile_provider_key(&mut config.llm, store);
         channel_secrets::adopt(&mut config.channels, store);
@@ -965,6 +995,9 @@ impl Config {
     /// Returns `ConfigError::Io` if the directory cannot be created or the file cannot be written.
     /// Returns `ConfigError::Parse` if the config cannot be serialized.
     pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
+        if unreadable_configs().contains(path) {
+            return Err(ConfigError::UnreadableNotOverwritten(path.to_path_buf()));
+        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -977,9 +1010,35 @@ impl Config {
         // Temp file + rename, never an in-place write: the daemon watches this
         // file and applies what it reads, so a truncate-then-write could be
         // read half-written — a config missing everything past the cut.
-        let tmp = path.with_extension("toml.tmp");
-        fs::write(&tmp, contents)?;
-        fs::rename(&tmp, path)?;
+        //
+        // The temp name is this writer's own: the GUI and the daemon both
+        // save, and one fixed `config.toml.tmp` let one rename the other's
+        // half-written file into place. The data is synced before the rename
+        // (and the directory after it): otherwise a power loss can leave the
+        // renamed file EMPTY on filesystems that do not order the two, and an
+        // empty file loads as `Config::default()` — every setting gone.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos());
+        let tmp = path.with_extension(format!("toml.{}.{nanos}.tmp", std::process::id()));
+        debug_assert!(tmp != path, "the temp file is never the config itself");
+        {
+            use std::io::Write as _;
+            let mut file = fs::File::create(&tmp)?;
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()?;
+        }
+        if let Err(e) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        #[cfg(unix)]
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = fs::File::open(parent)
+        {
+            // Best effort: the rename itself is durable once its directory is.
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 
@@ -1728,6 +1787,50 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config that failed to parse is never overwritten by this process:
+    /// the GUI loads defaults when it cannot read the file, and its next
+    /// settings save replaced the user's whole config with them.
+    #[test]
+    fn a_config_that_did_not_parse_is_not_overwritten() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        let typo = "[llm]\nprovider = \"ollama\"\nmodel = \"qwen\n";
+        std::fs::write(&path, typo).expect("write");
+        assert!(Config::load_from(&path).is_err(), "the typo does not parse");
+
+        let err = Config::default().save_to(&path);
+        assert!(
+            matches!(err, Err(ConfigError::UnreadableNotOverwritten(_))),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), typo, "untouched");
+
+        std::fs::write(&path, "[llm]\nprovider = \"ollama\"\n").expect("fixed by hand");
+        assert!(Config::load_from(&path).is_ok());
+        assert!(Config::default().save_to(&path).is_ok(), "a readable file saves again");
+    }
+
+    /// A save leaves exactly the config: each writer's own temp file is
+    /// renamed into place (or removed), never a shared `config.toml.tmp`.
+    #[test]
+    fn a_save_round_trips_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.agent.name = "Nanna-test".to_string();
+        config.save_to(&path).expect("first save");
+        config.agent.name = "Nanna-test-2".to_string();
+        config.save_to(&path).expect("second save");
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+            .collect();
+        assert_eq!(names, vec!["config.toml".to_string()], "nothing but the config");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("Nanna-test-2"), "{text}");
+    }
 
     // -----------------------------------------------------------------
     // Any-provider API key detection (onboarding gate)

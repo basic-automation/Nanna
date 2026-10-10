@@ -1,6 +1,6 @@
 export default {
   name: "file_buffer",
-  version: "0.1.7",
+  version: "0.1.8",
   output: "memory",
   description: "Write a LARGE file across MULTIPLE tool calls: append chunks of text one call at a time, then commit once to write the real file. Use this instead of write_file when a file is too long to write in one call. Sequence: file_buffer(action=\"append\", file_path, content) repeatedly in order from the top of the file, then file_buffer(action=\"commit\", file_path) to write it. action=\"show\" previews the pending buffer, action=\"clear\" discards it. The real file only changes on commit. Commit carries write_file's safety net: a shrinking commit over a file that changed since you last read it returns the file's current content to merge, a shrinking commit that deletes more top-level sections than it keeps is held ONCE with the removed names (commit the same buffer again to confirm), the previous version is parked at <file>.__prev__ and the richest earlier version at <file>.__best__, and the cheapest structural check runs on the result with its verdict appended.",
   parameters: {
@@ -28,6 +28,20 @@ export default {
       try { Nanna.log("info", msg); } catch (e) { /* logging is optional */ }
     }
 
+    // A path as one shell word for Nanna.exec's `sh -c`: single-quoted with
+    // embedded quotes escaped, and a leading `~/` left to the shell as
+    // "$HOME". The bridge expands `~` when it writes; quoted literally, the
+    // shell looked for a file named `~/x.py` (a valid file then "does NOT
+    // parse"), and an apostrophe re-split the words — `Bob's and Ann's
+    // notes.md` made a cleanup run `rm -f Bobs and …`.
+    function shq(path) {
+      var p = String(path);
+      var home = "";
+      if (p === "~" || p.indexOf("~/") === 0) { home = "\"$HOME\""; p = p.substring(1); }
+      if (p === "") return home;
+      return home + "'" + p.split("'").join("'\\''") + "'";
+    }
+
     // Anti-erosion ratchet state, shared with write_file v0.1.15 (full
     // design comment lives there). Commit is a TRUSTED in-band mutator: its
     // shrink guard judges against the same floor write_file defends, and a
@@ -39,7 +53,10 @@ export default {
     var HIWATER_STATE = ".nanna/write_hiwater.json";
     var HIWATER_MAX_ENTRIES = 200;
     function hiwaterNormKey(path) {
-      var k = path.split("\\").join("/").toLowerCase();
+      var k = path.split("\\").join("/");
+      // Case folds only where the filesystem does: on Linux `README.md` and
+      // `readme.md` are two files, and one key let a read of either count for both.
+      if (Nanna.platform === "win32" || Nanna.platform === "darwin") k = k.toLowerCase();
       while (k.indexOf("./") === 0) k = k.substring(2);
       while (k.indexOf("//") !== -1) k = k.split("//").join("/");
       return k;
@@ -343,6 +360,17 @@ export default {
     // existence is tooling detail.
     function invariantRefusal(path, verb) {
       try {
+        // The registry itself is one of the rules' paths: rewriting it to
+        // "{}" erased every rule the user had declared, with no undo snapshot
+        // (.nanna/ is housekeeping). Only lift_invariant, which asks the
+        // user, changes it.
+        var regKey = hiwaterKey(path);
+        var regTail = "/.nanna/declared_invariants.json";
+        if (regKey === ".nanna/declared_invariants.json" ||
+            (regKey.length > regTail.length && regKey.lastIndexOf(regTail) === regKey.length - regTail.length)) {
+          return verb + " REFUSED — " + path + " holds the rules the user declared; nothing was " +
+            "written. Only lift_invariant (which asks the user) changes it. Continue with your task.";
+        }
         var list = invariantsLoad();
         if (list.length === 0) return "";
         var canon = hiwaterKey(path);
@@ -453,7 +481,7 @@ export default {
           "    print('NEW_OK')\n" +
           "except SyntaxError as e:\n" +
           "    print('NEW_BAD line ' + str(e.lineno) + ': ' + str(e.msg))\n");
-        var cmd = "python '" + chk + "' '" + newTmp + "'; rc=$?; rm -f '" + chk + "' '" + newTmp + "'; exit $rc";
+        var cmd = "python " + shq(chk) + " " + shq(newTmp) + "; rc=$?; rm -f " + shq(chk) + " " + shq(newTmp) + "; exit $rc";
         var result = Nanna.exec(cmd, null, 30);
         var out = result && result.stdout ? result.stdout : "";
         var bad = out.indexOf("NEW_BAD");
@@ -513,10 +541,10 @@ export default {
       if (path.indexOf("'") !== -1) return null;
       var cmd = null;
       var toolName = null;
-      if (kind === "sh") { cmd = "sh -n '" + path + "'"; toolName = "sh -n"; }
-      else if (kind === "bash") { cmd = "bash -n '" + path + "'"; toolName = "bash -n"; }
-      else if (kind === "node") { cmd = "node --check '" + path + "'"; toolName = "node --check"; }
-      else if (kind === "py") { cmd = "python -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding=\"utf-8\").read())' '" + path + "'"; toolName = "python ast"; }
+      if (kind === "sh") { cmd = "sh -n " + shq(path); toolName = "sh -n"; }
+      else if (kind === "bash") { cmd = "bash -n " + shq(path); toolName = "bash -n"; }
+      else if (kind === "node") { cmd = "node --check " + shq(path); toolName = "node --check"; }
+      else if (kind === "py") { cmd = "python -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding=\"utf-8\").read())' " + shq(path); toolName = "python ast"; }
       if (!cmd) return null;
       try {
         var r = Nanna.exec(cmd, null, 15);
@@ -943,10 +971,16 @@ export default {
         return fail("file_buffer failed writing " + filePath + " — the buffer is KEPT. " +
           writeFailureNote(filePath, String(eC), "Retry the commit."));
       }
+      // Blank the draft through the bridge FIRST — it resolves the path the
+      // read above used — and only then tidy with the shell. The shell sees
+      // the path as written, so for a bridge-repaired path its `rm -f`
+      // removed nothing, "succeeded", and the committed draft stayed: the
+      // next append landed on top of content already written to the file.
+      try { Nanna.writeFile(bufPath, ""); } catch (eZ) { /* the rm below may still clear it */ }
       try {
-        Nanna.exec("rm -f '" + bufPath + "' '" + filePath + ".__cleared__'", null, 15);
+        Nanna.exec("rm -f " + shq(bufPath) + " " + shq(filePath + ".__cleared__"), null, 15);
       } catch (eRm) {
-        try { Nanna.writeFile(bufPath, ""); } catch (eZ) { /* leftovers are harmless */ }
+        // An empty draft is no draft; leftovers are harmless.
       }
 
       // Structural verdict on what landed (P22): the .py gate above already
@@ -1114,10 +1148,13 @@ export default {
         }
         try { Nanna.writeFile(clearMarker, "1"); } catch (eWk) { /* best effort */ }
       }
+      // Blanked through the bridge first, as on commit: the shell's `rm`
+      // can miss a bridge-repaired path.
+      try { Nanna.writeFile(bufPath, ""); } catch (eZ2) { /* the rm below may still clear it */ }
       try {
-        Nanna.exec("rm -f '" + bufPath + "'", null, 15);
+        Nanna.exec("rm -f " + shq(bufPath), null, 15);
       } catch (eRm2) {
-        try { Nanna.writeFile(bufPath, ""); } catch (eZ2) { /* best effort */ }
+        // An empty draft is no draft.
       }
       return { content: "Buffer for " + filePath + " discarded. The real file was not touched. NOTE: this file cannot be discarded again — repair the next draft instead of regenerating it.", success: true };
     }

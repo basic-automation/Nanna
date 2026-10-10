@@ -1,6 +1,6 @@
 export default {
   name: "code_search",
-  version: "0.3.1",
+  version: "0.3.3",
   output: "memory",
   description: "Search for a pattern across files in a directory tree. Returns matching lines with context. Supports regex patterns, a filename glob filter, and a depth bound.",
   parameters: {
@@ -522,8 +522,13 @@ function walkLines(content, regex, maxMatches, ctx, sliceChars, deadlineAt) {
     if (pos < content.length && got.length > 0 && got[got.length - 1] === "") {
       got.pop();
     }
+    // A CRLF file's lines carry their `\r` after a split on `\n`, and
+    // without the `m` flag `$` does not match before it: `\{$` found nothing
+    // in a CRLF file (and the miss was blamed on a pattern spanning lines).
     for (var g = 0; g < got.length; g++) {
-      lines.push(got[g]);
+      var line = got[g];
+      if (line.length > 0 && line.charCodeAt(line.length - 1) === 13) line = line.substring(0, line.length - 1);
+      lines.push(line);
     }
 
     // Scan what just landed. The per-line loop is free next to the split.
@@ -601,6 +606,11 @@ function hasBinaryExt(name, exts) {
 }
 
 function formatFileMatches(filepath, lines, matchIndices, ctx) {
+  // Every match line is marked, and a match inside an earlier match's window
+  // still gets its own trailing context: skipping a match already shown as
+  // context dropped its `>` and every line after the first window.
+  var isMatch = {};
+  for (var k = 0; k < matchIndices.length; k++) isMatch[matchIndices[k]] = true;
   var sections = [];
   var shown = {};
 
@@ -609,18 +619,25 @@ function formatFileMatches(filepath, lines, matchIndices, ctx) {
     var start = Math.max(0, matchIdx - ctx);
     var end = Math.min(lines.length - 1, matchIdx + ctx);
 
-    if (shown[matchIdx]) continue;
-
     var section = [];
+    var firstNew = -1;
     for (var i = start; i <= end; i++) {
       if (shown[i]) continue;
       shown[i] = true;
-      var marker = i === matchIdx ? ">" : " ";
+      if (firstNew < 0) firstNew = i;
+      var marker = isMatch[i] ? ">" : " ";
       var lineNum = String(i + 1);
       while (lineNum.length < 4) lineNum = " " + lineNum;
       section.push(marker + lineNum + ": " + lines[i]);
     }
-    sections.push(section.join("\n"));
+    if (section.length === 0) continue;
+    // Contiguous with what is already shown: continue that section rather
+    // than start a new one behind a "..." separator.
+    if (sections.length > 0 && shown[firstNew - 1]) {
+      sections[sections.length - 1] += "\n" + section.join("\n");
+    } else {
+      sections.push(section.join("\n"));
+    }
   }
 
   return "=== " + filepath + " (" + matchIndices.length + " match" + (matchIndices.length > 1 ? "es" : "") + ") ===\n" + sections.join("\n  ...\n");

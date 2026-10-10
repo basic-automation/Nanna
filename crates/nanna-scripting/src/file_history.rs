@@ -62,10 +62,20 @@ pub const TOTAL_BYTES_MAX: u64 = 4 * SESSION_BYTES_MAX;
 const INDEX_FILE: &str = "index.json";
 const UNSCOPED_SESSION: &str = "unscoped";
 
-/// Suffixes of the recovery copies `write_file` parks beside a file. Writing a
-/// park is itself a backup; snapshotting it would spend the window on copies of
-/// copies.
-const RECOVERY_PARK_SUFFIXES: [&str; 2] = [".__prev__", ".__best__"];
+/// Suffixes of the files the editing skills keep beside a real one: the
+/// recovery copies `write_file` parks (a park is itself a backup), and the
+/// working files — `file_buffer`'s draft and its cleared marker, the Python
+/// syntax gate's two scratch files. Snapshotting them spent the window on
+/// copies of copies: a file built from 100 `file_buffer` appends pushed every
+/// real checkpoint out of the 100 kept, so `restore` answered "pruned".
+const RECOVERY_PARK_SUFFIXES: [&str; 6] = [
+    ".__prev__",
+    ".__best__",
+    ".__buffer__",
+    ".__cleared__",
+    ".__chk.py",
+    ".__chk_new.py",
+];
 
 /// One file's state immediately before a write replaced it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -387,6 +397,24 @@ impl FileHistory {
         } else {
             None
         };
+        // What the restore replaces is saved first — unless it is too large
+        // to keep, in which case `record_before_write` skips it and the
+        // restore would destroy it unsaved while reporting it saved. Refuse.
+        if let Ok(meta) = tokio::fs::metadata(&checkpoint.path).await
+            && meta.is_file()
+            && meta.len() > SNAPSHOT_BYTES_MAX
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is {} bytes, larger than file history keeps ({SNAPSHOT_BYTES_MAX}); \
+                     restoring would replace it with no copy kept — copy it aside first. \
+                     Nothing was changed.",
+                    checkpoint.path.display(),
+                    meta.len()
+                ),
+            ));
+        }
         self.record_before_write(session, &checkpoint.path).await?;
         let Some(content) = snapshot else {
             match tokio::fs::remove_file(&checkpoint.path).await {
@@ -584,6 +612,31 @@ mod tests {
         );
     }
 
+    /// A restore over a file too large to keep is refused: the replaced
+    /// content could not be saved, and the restore used to destroy it while
+    /// saying it was saved.
+    #[tokio::test]
+    async fn a_restore_over_an_unkeepable_file_is_refused() {
+        let (dir, history) = store();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, b"small, kept").expect("write");
+        let saved = history
+            .record_before_write(None, &path)
+            .await
+            .expect("record")
+            .expect("a checkpoint");
+        let file = std::fs::File::create(&path).expect("create");
+        file.set_len(SNAPSHOT_BYTES_MAX + 1).expect("sparse");
+
+        let err = history.restore(None, saved.seq).await.expect_err("refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat").len(),
+            SNAPSHOT_BYTES_MAX + 1,
+            "the large file is untouched"
+        );
+    }
+
     fn checkpoint(seq: u64, baseline: bool, bytes: u64) -> Checkpoint {
         Checkpoint {
             seq,
@@ -636,6 +689,19 @@ mod tests {
     fn recovery_parks_and_session_names_are_handled() {
         assert!(is_tool_housekeeping(Path::new("/w/main.rs.__prev__")));
         assert!(is_tool_housekeeping(Path::new("/w/main.rs.__best__")));
+        for scratch in [
+            "/w/app.py.__buffer__",
+            "/w/app.py.__cleared__",
+            "/w/app.py.__buffer__.__cleared__",
+            "/w/app.py.__chk.py",
+            "/w/app.py.__chk_new.py",
+        ] {
+            assert!(is_tool_housekeeping(Path::new(scratch)), "{scratch}");
+        }
+        assert!(
+            !is_tool_housekeeping(Path::new("/w/buffer.py")),
+            "a real file named like one"
+        );
         assert!(is_tool_housekeeping(Path::new(
             "/home/u/.nanna/write_hiwater.json"
         )));

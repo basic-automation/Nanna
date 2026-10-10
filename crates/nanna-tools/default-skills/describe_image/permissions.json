@@ -1,6 +1,6 @@
 {
-    "read": ["~"],
-    "write": ["~"],
+    "read": ["*"],
+    "write": ["*"],
     "run": true,
     "net": ["*"],
     "env": true

@@ -8384,6 +8384,105 @@ as its turn (`TurnAdmission`, scope default `session`).
       *(same run, after review)* The fenced re-judge also re-reads the card's last touch: a post
       or an edit between the sweep's read and the fence now keeps the card (it was the one input
       `still_stalled` did not repeat). Mutation-checked like the other two.
+- [x] *(found 2026-10-10, audit of the router and card-run triggers)* **Four ways a card came back
+      to nobody, or to the wrong one, fixed.** (1) **A handed-back card the board client did not
+      type was never routed again.** `card_to_route` let `stalled` through for all board work
+      (`is_board_creator`) but sent `handed_back` and an answered clarification through the
+      `gui`-only check, so a router split or an agent's hand-on that its run gave up on sat
+      `pending` with nobody on it forever (as did a router-split card that stalled twice, was
+      asked about, and answered). Every come-back wake now takes board work whoever made it;
+      the recurrence reopen stays `gui`-only, since only those cards are released at reopen.
+      (2) **An answer to a member's own question went to the router.** Any `unblocked` by a
+      done clarification was routed, including the ones a member asked itself (`ask_user`, a
+      provider refusal) — whose answer is meant to restart that member — so the router could
+      reassign, split or park a card its member was about to resume. Routed now only when nobody
+      holds the card (the router's own clarify, `ask_the_human`). (3) **The retry bound read a
+      256-row window of every action**, so 256 edits or run notes between two hand-backs hid the
+      first and the router routed again instead of asking the human — without limit, a run each
+      time; the same class as the 2026-10-05 "after 64 edits" fix. New store read
+      `newest_activities_of(task_id, actions, limit)` (`ACTIVITY_MARKER_ROWS_MAX` = 64) counts
+      only the four markers. (4) **A reassignment during the old run's wind-down was refused and
+      never retried:** a hand-back releases the card before the run's slot is removed (the
+      harness's end-of-run sweeps, a 15 s heal pause), so the new member's start met "already
+      being worked" and only the freed member was re-woken. The run's end now also wakes its
+      card (`RunWake::Card`), which `try_start` re-judges from the store. Tests
+      `a_handed_back_card_is_routed_whoever_on_the_board_made_it`,
+      `an_answer_to_a_members_own_question_is_not_the_routers`,
+      `edits_between_hand_backs_do_not_hide_one` (300 edits), and the extended
+      `a_finished_card_run_announces_its_member_free`; daemon 715, e2e 56 green.
+- [x] *(found 2026-10-10, audit of the task store)* **Six store defects, fixed.** (1) **A
+      deadlock the cycle check could not see:** it followed only `depends_on`, never the
+      parent-waits-on-its-sub-tasks edge, so with A the parent of T and T depending on D,
+      `update(D, depends_on: [A])` was admitted (D has no ancestors, so the ancestor check
+      passed) and D → A → T → D could never finish. `check_dependency_cycle` now walks both
+      edges. (2) **Cards closed by a parent's cancellation were never announced:** the cascade
+      wrote each child `cancelled` with no `StatusChanged`, so their memory copies and timeline
+      never recorded the close (decision 14). Each now gets its event, with `cascade_from`.
+      (3) **`due_at`/`deadline_at` were never checked for form** though every reader compares
+      their first ten characters as text: `10/15/2026` fell due at once (`'1' < '2'`), `Friday`
+      never, and a recurring card kept last round's dates. Refused now unless `YYYY-MM-DD`, RFC
+      3339 or `YYYY-MM-DD HH:MM:SS` — on create, and on a patch that sets the date, so a legacy
+      row stays editable; `tasks.update` with `""` now clears, as the GUI's does. (4)
+      **Reopening through `update` kept the due/overdue markers** `reopen` clears (migration
+      020), so a late card done and reopened was never announced late again. (5) `create` and
+      `reopen` answered `blocked: false` for a card waiting on an open one. (6) **A recurring
+      card's offset timestamp was moved in UTC**: `2026-10-05T20:00:00-07:00` became
+      `…-10-13T03:00:00+00:00`, a day late every round by the text compare; it keeps its offset.
+      Tests: `a_dependency_that_closes_a_loop_through_a_parent_is_rejected`,
+      `cancelling_a_parent_announces_each_child_it_closes`, `a_date_that_is_not_iso_is_refused`,
+      `a_card_reopened_by_update_is_announced_overdue_again`,
+      `a_card_created_waiting_on_an_open_one_says_it_is_blocked`, and an offset case in
+      `a_rounds_dates_move_to_its_occurrence`; (1) and (4) mutation-checked (red without the
+      fix). Storage + daemon 1003 green.
+- [x] *(found 2026-10-10, audit of the memory write-through and dream fold)* **A re-fold could
+      delete unrelated memories.** `consolidated_metadata` inherits a key when every member that
+      *carries* it agrees, so a summary of card #7's fold and an unrelated chat memory came out
+      as `board_event=episode, source_task_id=7`; when #7 closed again the fold phase took that
+      summary for #7's old fold and `forget`-ed it — and the chat memory inside it. Record
+      identities (`board_event`, `source_task_id`, `source_note_id`, `episode_events`,
+      `episode_kept`) are now inherited only when **every** member carries the same value
+      (`RECORD_IDENTITY_METADATA_KEYS`); this also stops a summary of one post and other
+      memories claiming to be that post's copy. Also: a card past one event page is folded from
+      its first and last half-pages, and the fold's markers counted only what was read, so the
+      middle vanished unannounced — the story's header now says how many events were not read.
+      Tests `a_summary_is_a_record_only_if_every_member_is`, extended
+      `a_long_card_folds_from_both_ends_and_refolds_when_it_grows`. **Not changed:** a fold
+      clustered with its own card's post copy keeps `source_task_id` but not `board_event`, so
+      the card is folded again beside the summary — the story stored twice, nothing lost.
+- [x] *(found 2026-10-10, audit of the board client)* **Two board-client defects, fixed.** (1)
+      **A half-typed description or label list was wiped by any board event.** Both fields were
+      bound one way (`:value`, saved on `change`); Vue re-applies `value` on every re-render, and
+      the board reloads ~250 ms after every card event (an agent's post, a chat run's task
+      write), so the text snapped back — and the field then equalled its start, so `change`
+      never fired and the edit was lost silently. Now `v-model` drafts (`useFieldDraft`) that
+      follow the stored value except while the field is being edited, and always on opening
+      another card. **Verified in the real app over WebDriver:** typed into a card's
+      description, created another card over IPC (the board reloaded and showed it), the text
+      stayed; the save then persisted it through the daemon. (2) **A card opened from the Inbox
+      or Upcoming could be given to another workspace's agent:** the assignee list was the
+      *shown* board's roster and the store checked only that the member existed. The store now
+      refuses an assignee not on the card's own board (`ensure_assignee_on_board`, the
+      `list_for_workspace` rule: owned by the card's workspace, or human-owned; session cards
+      unchanged); the card view offers its own board's roster, and instead of sub-cards and
+      dependencies it could not see (shown as "not on this board") says which board it is on.
+      Tests `useFieldDraft.spec.ts` (4), `a_card_is_assigned_only_to_a_member_of_its_own_board`.
+- [x] *(found 2026-10-10, audit of the task and member IPC)* **Deleting a member checked
+      nothing.** A member mid-run was deleted under its run: every post the run made (its
+      question to the human included) was refused as "not a board member" while it kept
+      spending. And its open cards kept the dead id — assigned to nobody who exists, never
+      routed — until a member created later under the same name, on any board, inherited them
+      and its next free slot started another board's card. `member.delete` now refuses a member
+      that is working, and releases its open cards first (unassigned, back to `pending`, through
+      the task store). Also: a `task.update` with `"assignee": ""` was refused (the empty id is
+      no member) — there was no way to unassign a card; `""` now clears `assignee` and
+      `project`, as it already did dates. Test
+      `deleting_a_member_releases_its_cards_and_an_empty_assignee_clears`. **Still open:** the
+      released cards were not routed. *(same run)* `WakeReason::MemberDeleted` (the release's own
+      `Assigned` by `member_delete`) routes them like any board work, without counting toward the
+      retry bound. Test `a_deleted_members_released_card_wakes_the_router`.
+      *(same run)* A field edit or a card delete emitted no task event, so other views refreshed
+      only on the next unrelated one: new `TaskEventKind::Updated` (`detail.fields` names what
+      changed) and `Deleted` (each card of the subtree). Test `edits_and_deletes_are_announced`.
 - [x] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
       *(2026-09-28)* `RouterDecision::Assign` gained optional `labels` and `acceptance`. Labels
@@ -10336,6 +10435,408 @@ keep the phases readable; promote individual items into a phase when they become
       `a_bounded_flat_listing_keeps_the_first_names_on_every_filesystem` (alphabetically-first
       entry created last); the `project_structure` suite now passes on btrfs and tmpfs alike.
 
+### Any web page could drive the daemon over loopback (found 2026-10-10, security audit)
+
+- [x] **The IPC WebSocket accepted browser handshakes.** `ipc.rs` used a plain
+      `accept_async_with_config` — no `Origin` check, no token — and browsers apply no CORS to
+      WebSockets, so a page the user opened could connect to `ws://127.0.0.1:5149`, call
+      `tool.execute exec` / `config.export` / `system.shutdown`, and read the replies (a
+      DNS-rebinding page likewise). Every legitimate client (GUI's Rust client, CLI,
+      `nanna-client`) is native tungstenite and sends no `Origin`; a browser always does, so a
+      handshake carrying one is now refused 403 (`RefuseBrowserOrigins`). The handshake also has
+      a 10 s deadline (`IPC_HANDSHAKE_TIMEOUT`): the connection cap counts only handshaken
+      clients, so a peer that never upgraded held a task and a socket forever. e2e
+      `a_web_page_cannot_open_the_daemons_socket` (refused with `Origin`, accepted without).
+- [x] **`config.get` / `config.export` returned every secret in plaintext** — the live config
+      holds the keys filled in from the secure store — though the export was recorded as carrying
+      none (that was true only of the GUI's own export). Both now serialize a copy passed through
+      `strip_secrets_for_disk`; an import of such an export keeps the stored secrets. Test
+      `config_get_and_export_carry_no_secrets`.
+- [x] **`nanna server` (:3000) answered any origin** (`CorsLayer` `allow_origin(Any)`), and
+      `/api/v1/chat` runs the agent with its tools, unauthenticated — so a page could `fetch` it
+      and read the reply. The CORS layer is gone, and `/api` refuses a request with an `Origin`
+      or a non-loopback `Host` (`local_callers_only`; the `Host` check is what stops a
+      DNS-rebinding page, which is same-origin). Webhooks keep their own signature checks. The
+      daemon's health server also dropped `Access-Control-Allow-Origin: *` (`/status` carries the
+      last provider error's text). Test `only_a_local_native_caller_reaches_the_api`.
+- *Considered and not done (2026-10-10):* a smaller cap on inbound IPC frames. The 128 MiB read
+  limit is shared by design (`no_hardcoded_daemon_port` pins both ends to it), and requests
+  include session and config **imports**, the mirror of the exports that needed it. With browser
+  handshakes refused and a 10 s handshake deadline, what remains is a hostile local process,
+  which the token item below covers.
+- [ ] **A per-launch token** (written 0600 beside the PID file, required in the first frame)
+      would also stop a hostile *local process*, which the `Origin` check does not.
+
+### The tool layer's guards had holes (found 2026-10-10, security audit)
+
+- [x] **`no_delete` was enforced nowhere, and exec could erase the guards' own records.**
+      `write_file` leaves `no_delete` to exec ("enforced where deletions happen") — but exec never
+      read `.nanna/declared_invariants.json`, so under a declared "never delete anything under
+      tests/" `rm tests/test_03.sh` ran, as did `sed -i`/`>` rewrites under `read_only`; and
+      `rm -f .nanna/write_hiwater.json` (or `echo {} >` it) reset every file's high-water — the
+      erosion the ratchet exists to stop. exec 0.1.7 refuses any redirect/`rm`/`mv` onto
+      `.nanna/`, and enforces `no_delete` (rm/mv), `read_only` (any) and `no_create_under`
+      (a redirect creating a file) with `write_file`'s matcher. The registry itself was a
+      writable file too: `write_file`/`edit_file`/`file_buffer` now refuse it even with `force`
+      — only `lift_invariant`, which asks the user, changes it. Tests `exec_skill.rs` (2,
+      red on exec 0.1.6) and `the_declared_rules_cannot_be_rewritten_even_with_force`.
+- [x] **Seven skills could not read the workspace.** `read_pdf`, `ocr`, `analyze_image`,
+      `describe_image`, `transcribe`, `lift_invariant` and `todo` shipped home-only (`~`) scopes,
+      but a workspace is often outside home (here `/mnt/deepmem`, on Windows `D:\`): every file
+      was refused, and `lift_invariant` answered "nothing was lifted" while the rule stood. Now
+      `*`, like `read_file`/`write_file`. Installed `permissions.json` files are never
+      overwritten (the user may have edited them), so a release would have fixed only new
+      installs: `bootstrap_default_skills` now replaces one that is still exactly the scope
+      Nanna shipped (`SUPERSEDED_PERMISSIONS`); any other is kept. Tests
+      `only_an_unedited_superseded_permissions_file_is_replaced`,
+      `every_superseded_scope_is_corrected_in_the_bundle`.
+- [x] **`read_file` and `web_search` threw.** A non-UTF-8 file (an image, a PDF) and a
+      DNS/timeout failure raised past unguarded bridge calls and reached the model as stacked
+      "Execution failed:" errors. Both return now. Test `a_binary_file_is_answered_not_thrown`
+      (red on read_file 0.1.3).
+- [x] **Paths reach `sh -c` unquoted and unexpanded** (`write_file` py gate/structural check/
+      sweep, `edit_file`, `file_buffer`, exec's post-redirect check): `~/x.py` is checked as a
+      literal `'~/x.py'` (the gate is skipped, a valid file is reported "does NOT parse"), and a
+      name with an apostrophe re-tokenizes — `Bob's and Ann's notes.md` made the sweep run
+      `rm -f Bobs and …`. Pass `Nanna.stat(p).path` through one quoting helper
+      (`'` → `'\''`).
+      *(2026-10-10, same run)* `shq()` in all four skills: single-quoted with `'` escaped and a
+      leading `~/` left to the shell as `"$HOME"`; the "unquotable — no verdict" bail-outs are gone.
+      Test `an_apostrophe_in_the_path_does_not_switch_the_checks_off` (invalid code in `it's.py`
+      is now refused by the gate; it was written before, red on write_file 0.1.17).
+- [x] **Ledger and read-mark keys are lowercased on every OS** (`hiwaterNormKey`, five copies):
+      on Linux `readme.md` and `README.md` share one entry, so reading one satisfies the
+      blind-rewrite hold for the other. Lowercase only when `Nanna.platform === "win32"`.
+      *(2026-10-10, same run)* Folded on `win32` and `darwin` only (both filesystems fold case by
+      default). Entries an older skill wrote lowercased on Linux no longer match mixed-case
+      names — those files start a fresh high-water (fail-open, once). Test
+      `the_ledger_keeps_a_files_case_where_the_filesystem_does`.
+
+### Scheduled work that fired off time or not at all (found 2026-10-10, audit of the scheduler)
+
+- [x] **A cron occurrence whose run did not start was lost.** A scheduled prompt that met a
+      live run answers "Skipped (a run is in flight)" (or yields when a resume is already
+      parked), and `settle_run` settled that as a run: `next_run` moved to the next occurrence,
+      so a daily 09:00 job that met a heartbeat or a chat turn did not run that day. The comment
+      said "the next tick picks up whatever was due" — true for intervals, not for cron.
+      `TaskResult::skipped` now marks it, and a skipped cron job stays due (no history row, no
+      `next_run` move) so the next tick retries. Test `a_skipped_cron_occurrence_stays_due`.
+- [x] **Re-enabling a cron job fired it at once, off schedule.** A disabled job's `next_run` stays
+      at the occurrence it was switched off at; enabling only flipped the flag, so Thursday's
+      re-enable of a Monday-09:00 job found Monday due and ran at 14:00 (a restart in the same
+      state did not — it recomputes). `set_task_enabled` recomputes from now on the off→on edge.
+      Test `a_re_enabled_cron_job_waits_for_its_next_occurrence`; the master switch's edge too (below).
+- [x] **A recurring card finished before its next occurrence reopens the same round** (completed
+      08:00, cron 09:00 the same day: reopened with the same `due_at`, announced due again), and
+      **after downtime it reopens on the oldest missed round**, overdue at once. Search the next
+      occurrence from the later of `completed_at` and the end of the anchor day, then step to the
+      latest occurrence `<= now` (`sweep_recurrences`, `crates/nanna-daemon/src/tasks.rs`).
+      *(2026-10-10, same run)* `round_occurrence`: the search starts after the end of the card's
+      own day (its date, else its deadline) or its completion, whichever is later, then steps to
+      the latest occurrence `<= now` (`RECURRENCE_CATCH_UP_STEPS_MAX` = 1024). Test
+      `a_round_opens_after_its_own_day_and_on_the_latest_occurrence`.
+- [x] **A deadline with a non-UTC offset is announced overdue before it passes**: the sweep
+      compares the stored local-day prefix with a UTC "today". Compare instants for timestamp
+      values; keep day granularity for bare `YYYY-MM-DD` (`announce_due`).
+      *(2026-10-10, same run)* Instants would contradict the pinned day granularity (a
+      `…T00:01Z` deadline has its whole day), so an RFC 3339 value is judged on its **UTC** day
+      (`utc_day_of`), matching the sweep's UTC today; the SQL prefilter widens one day so a
+      positive offset (local day ahead of UTC) is not missed. Test
+      `an_offset_deadline_is_judged_on_its_utc_day`.
+- [x] **"Run now" holds the scheduler's read lock for the whole run** (`control/scheduler.rs`),
+      so a settings save or a `remind` call — and then every reader behind that writer — waits
+      minutes. Hand out an owned run handle and drop the guard before awaiting.
+      *(2026-10-10, same run)* `Scheduler::run_now_handle` hands out the run's pieces as owned
+      `Arc`s (`RunNowHandle`); the control plane drops the guard before awaiting it. Test
+      `a_manual_run_does_not_hold_the_scheduler_lock`. The master-switch variant of the
+      re-enable bug is fixed the same run: switching the scheduler back on re-arms stale cron
+      occurrences (`rearm_stale_cron`, test `re_enabling_the_scheduler_does_not_fire_stale_cron_jobs`).
+
+### Memory writes and reviews that went wrong quietly (found 2026-10-10, audit of recall and ingest)
+
+- [x] **A fold whose re-embed failed lost the write.** The incoming fact's own embed placed it in
+      a neighbour's Update band; the merged text's embed then failed (a 429, a timeout) and
+      `fold_into_memory` propagated it, so `remember` stored the fact nowhere — against the
+      service's own rule that a failing provider is not an error. The merge now lands with no
+      vector and is queued for backfill. Test `a_fold_whose_re_embed_fails_still_lands` (red
+      without the fix).
+- [x] **Recall strengthened memories nobody saw.** Each recall queues a testing-effect review per
+      result, from a default page of `max_results` (10); the memory tool and chat injection then
+      kept 5 — ranks 6..10 were reviewed on every turn they were cut, their stability growing.
+      `recall_scoped_with_coverage_shown(query, workspace, shown_max)` reviews exactly what it
+      returns; the tool, `recall_memories` and `recall_memories_scoped` use it. Test
+      `recall_reviews_only_what_it_shows`. **Still open:** chat injection's later filter (a
+      memory already in the last 4 messages is dropped) happens after the review.
+- [x] **Memory tools read ONE process-wide workspace slot.** `workspace_id_for_services` is
+      overwritten by every chat turn's prep and never reset, and `memory.store` / `memory.search`
+      / the turn's auto-extraction read it live — so a card run on workspace B's board recalls
+      and writes A's memories after a chat in A (or everything, if no chat has run), and two
+      concurrent sessions in different workspaces cross. Same class as the tool-cwd slot fixed
+      by `bind_session_workdir`: resolve the workspace per run session, and register each card
+      run's card workspace there (decision 13).
+      *(2026-10-10, same run)* `run_workspace`: a map from run session to workspace (bounded
+      at 4096, entries live exactly as long as their run). A chat turn binds its session in
+      `prepare_chat_turn` and releases it at teardown (beside `clear_session_workdir`); a
+      background card/scope run binds `card:<id>` / `run:<scope>:<id>` to its board's workspace
+      at launch and releases it with its slot. `memory.store`/`.embed`/`.search`, the `tasks.*`
+      workspace scope and the harness's auto-extraction resolve through the caller's run session
+      first, the shared slot only when unbound. Test
+      `a_run_resolves_its_own_workspace_not_the_shared_slot`. Still the documented rule, not
+      changed: a run with no workspace (a global-board card, a chat with none) recalls
+      `Everything`.
+- [x] **A stated fact folded into an observed neighbour loses its pin.** The live write path's
+      fold keeps the survivor's metadata (`update_content_and_embedding_if` rewrites content and
+      vector only), so a user assertion becomes `observed` and the next dream may paraphrase it
+      — the laundering the dream path's `partition_verbatim_pinned` prevents. Fold only within
+      equal pin status, or upgrade the survivor to `stated` in the same write.
+      *(2026-10-10, same run)* `ingest_action`: a neighbour that differs in verbatim pin is never
+      absorbed — the incoming fact becomes its own row — in all three live ingest paths (the
+      contained-discard included). Test `a_stated_fact_is_not_folded_into_an_observation` (red
+      without the fix).
+
+### A config file that could be lost on save (found 2026-10-10, audit of config persistence)
+
+- [x] **One typo in `config.toml` and the GUI overwrote it with defaults.** `load_gui_config` falls
+      back to `Config::default()` when the file does not parse, and every Settings setter then
+      `save()`s that copy — provider, models, Ollama host, channels, MCP servers and
+      `[general] data_dir` replaced by defaults, which the daemon's watcher then applied live. The
+      CLI already refused this (`config_or_refusal`, 2026-10-09). Now `Config` remembers, per
+      process, a path that failed to parse, and `save_to` refuses it
+      (`ConfigError::UnreadableNotOverwritten`) until a load parses it again — every writer,
+      the GUI's ~30 setters included, without touching them. Test
+      `a_config_that_did_not_parse_is_not_overwritten`.
+- [x] **`save_to` was not crash-safe and its temp file was shared.** `fs::write` + rename with no
+      fsync can leave the renamed file empty after a power loss (an empty file loads as
+      defaults), and the fixed `config.toml.tmp` let the GUI and the daemon rename each other's
+      half-written file. The temp name is now per-writer, synced before the rename, removed if
+      the rename fails, and the directory is synced after it (Unix). Test
+      `a_save_round_trips_and_leaves_no_temp_file`.
+- [~] **The GUI files environment-supplied secrets into the keyring.** `store_secrets()` /
+      `migrate_secrets_to_keyring()` on a Settings save store every non-blank secret the cached
+      config holds — including ones that came from `OPENAI_API_KEY`, `TELEGRAM_BOT_TOKEN`, … —
+      so after the variable is unset the stale key keeps being used. Save only the field the
+      user entered, or reuse the daemon's `file_secrets_brought_in` rule.
+      *(2026-10-10, same run — the provider half.)* `set_provider_api_key` files only the key
+      entered (`SecureStore::set` under its own name) instead of `store_secrets()`. **Still
+      open:** the channel wizard's `store_and_save` (`migrate_secrets_to_keyring`) — channels
+      go with P25 decision 18, and `channel_secrets` has no per-channel filer.
+- [ ] **Non-secret environment overrides are written into `config.toml`** (`PORT`,
+      `TELEGRAM_WEBHOOK_URL`, `DISCORD_*`, a whole channel section from a token), and a `set` of
+      an overridden path answers `updated` and then silently reverts on the watcher's reload.
+      Resolve `PORT` at `server_port`, limit `override_channels` to secrets, refuse a `set` of an
+      env-overridden path.
+
+### File skills that answered wrongly (found 2026-10-10, audit of the file skills)
+
+- [x] **`edit_file` mixed LF into CRLF files.** Its CRLF conversion ran only when the exact match
+      failed, and a one-line `old_string` always matches exactly — so adding lines after a
+      one-line anchor (the commonest edit) left LF lines inside a CRLF file and reported success;
+      the loose-match and line-number-recovery paths had the same gap. The file's style is judged
+      once and every replacement written in it. Test
+      `lines_added_after_a_one_line_anchor_keep_a_crlf_file_crlf` (red on 0.1.12).
+- [x] **`find_files` never matched a slash pattern under a relative or default root.** The bridge
+      names entries by their resolved path (`/ws/./src/main.rs`) and the raw `"."` never prefixed
+      them, so `src/**/*.rs` found nothing and names printed absolute. It strips the
+      bridge-resolved root now. Test `a_slash_pattern_matches_under_the_default_root`.
+- [x] **`code_search`/`search_file` missed `$` in CRLF files** (each line kept its `\r`; the miss
+      was blamed on a pattern spanning lines). Lines are stored without it. Test
+      `end_anchored_patterns_match_in_a_crlf_file`.
+- [x] **`file_history` spent its window on scratch files**: every `file_buffer` append (and the
+      syntax gate's `.__chk*.py`) was a checkpoint, so 100 appends pushed real checkpoints out
+      and `restore` answered "pruned". `.__buffer__`, `.__cleared__`, `.__chk.py`,
+      `.__chk_new.py` are housekeeping now.
+- [x] **`code_outline` skipped `pub(crate)`/`pub(super)`/`unsafe`/`extern` Rust items** (and
+      `impl<T>` lines).
+- [x] *(same run)* **`file_buffer` could re-commit a stale draft**: it cleared the draft with an
+      unchecked `rm -f`, which misses a bridge-repaired path, so the next append landed on content
+      already committed. The draft is blanked through the bridge first. **The fork guard refused
+      conventional variants** (`.env.local` beside `.env`, `Dockerfile.dev` beside `Dockerfile`):
+      dotfile stems and variant suffixes are exempt in `write_file` and `edit_file`; `minidb.sh`
+      is still refused. Test `conventional_variants_are_not_forks`.
+- [x] *(same run)* **A match inside an earlier match's context lost its `>` marker** (and in
+      `code_search` its whole trailing context): markers come from the set of all matches, and
+      `code_search` renders the unshown part of each window, joined to the section it continues.
+      Test `a_match_inside_another_matchs_context_is_marked`.
+- [x] *(same run)* **`file_history restore` over an 8 MiB+ file destroyed it unsaved** while
+      saying the replaced content was saved; it is refused now. Test
+      `a_restore_over_an_unkeepable_file_is_refused`.
+- [x] *(same run)* `file_history list` capped at 100 of the up-to-500 a session holds, so the
+      oldest baselines were unreachable; the cap is now recent + baseline (500).
+- [x] *(same run)* `web_fetch` (every `Nanna.fetch`) decoded bodies as UTF-8 whatever the
+      `Content-Type` declared; a Latin-1 or Shift-JIS page came back as U+FFFD. Bodies are decoded
+      in the declared charset (`encoding_rs`, already in the graph). Test
+      `a_declared_charset_decodes_the_body`.
+
+### GUI settings that did not do what they showed (found 2026-10-10, audit of the GUI outside the board)
+
+- [x] **Editing a scheduled job dropped the new prompt.** The edit sent only the schedule
+      (`update_cron_job {jobId, schedule}`, the Rust side passing `None` for the payload) and found
+      the job by name; the modal closed as saved. It sends the prompt and keeps the edited job's
+      id.
+- [x] **"Remember my choice" on close was forgotten every launch** (`set_close_mode` lives in the
+      GUI process only). The choice is kept in the webview's storage and pushed back on load.
+      Test `a remembered close choice survives a restart`.
+- [x] **Two board notices from one agent within 2 s: the second was dropped** — the de-dup key
+      was type/source/title, and the card's name is only in the summary. The summary is part of
+      the key now.
+- [x] **Three memory setters awaited the daemon while holding the AppState write lock**
+      (`set_auto_remember_messages`, `set_max_compression_ratio`, `set_min_remaining_memories`)
+      — the class closed elsewhere; the backend handle is cloned and the guard dropped first.
+- [x] **The custom system prompt and the agent name are saved and never used**: nothing outside
+      `nanna-config` reads `[agent].system_prompt`/`name` (the daemon builds
+      `default_system_prompt()`, and `ControlPlane::set_system_prompt` has no caller), nor
+      `streaming_enabled`. Apply them on config load/reload, or remove the editors (the
+      dead-fields class).
+      *(2026-10-10, same run)* `system_prompt_for`: a non-blank custom prompt replaces the
+      built-in one (the platform section kept), a non-default name is stated ahead of it; applied
+      at startup and on every committed config change (`propagate_committed`), so a Settings
+      save takes effect on the next turn. Test
+      `the_agent_prompt_and_name_settings_reach_the_live_prompt`. `streaming_enabled` is still
+      unread.
+- [x] *(same run)* **Three GUI races and a silent failure:** switching tools quickly let the
+      previous tool's source land under the new tool's header (ready to be saved over it), and
+      switching memory scopes let a slower list overwrite the newer one — both now keep a request
+      ticket; a refused config import showed nothing (its handler ran after the outer `try` had
+      returned) and now shows the error.
+- [x] **A daemon-side save can undo a GUI setting made a moment earlier**: save-only setters wait
+      for the 2 s watcher while `config_set` setters make the daemon save its whole (older) copy
+      — reorder embeddings, then chat models within ~2.5 s, and the first change is lost. After a
+      GUI save, ask the daemon to `config_reload` instead of `config_set`ting one key.
+      *(2026-10-10, same run)* The eight setters that `config_set` one key after saving (chat and
+      sub-agent model lists, routing, the memory settings) now `config_reload`.
+      *(later)* The five save-only setters (embedding and OCR model lists, embedded OCR, the
+      iteration policy, max tokens) now ask for the reload too, instead of waiting for the
+      watcher's poll.
+
+### CLI commands that reported what did not happen (found 2026-10-10, audit of the CLI)
+
+- [x] **`nanna config` printed every stored secret** (the loaded config carries the keyring's and
+      the environment's keys; only the file is stripped). It prints a stripped copy.
+- [x] **`nanna daemon stop` said "stopped" at the signal**, so `stop && start` found the draining
+      daemon alive, started nothing, exited 0 — and left no daemon. It now waits for the exit (as
+      `restart` already did) before reporting.
+- [x] `nanna daemon start` reports success for a child that exits at once (port taken): keep the
+      `Child`, poll `try_wait` and the PID file for a few seconds.
+      *(2026-10-10, same run)* `watch_start`: a child that exits within 5 s fails the start and
+      points at the log; one still booting is reported as "still starting up". Test
+      `a_child_that_exits_at_once_fails_the_start`.
+- [ ] `daemon stop` signals a PID it could not identify as the daemon (`Unknown` probe; every live
+      PID on macOS, any `nanna.exe` on Windows) — a reused PID gets SIGTERM / `taskkill /T`. Needs
+      a real identity probe on those platforms before refusing `Unknown`, or `stop` breaks there.
+- [x] Quick setup (`nanna chat` with no key) saves the env-overridden runtime config: `PORT`, a
+      channel section built from `TELEGRAM_BOT_TOKEN`, env API keys over stored ones. Save a
+      freshly loaded file plus the entered key.
+      *(2026-10-10, same run)* Done: the file is re-read without overrides, stripped of every
+      secret but the entered key, and saved; the running copy gets the key directly. No unit
+      test (an interactive prompt).
+- [x] `--config` is ignored by `credentials` (it edits the default file) and mislabelled by
+      `init` and `status`.
+      *(2026-10-10, same run)* `credentials` loads from and saves to the `--config` file;
+      `init` and `status` name it. Verified on the built CLI: `status` and `config` label the
+      `--config` file, and `config` printed no secret line against this host's keyring.
+
+### Context assembly that could lose or reject a turn (found 2026-10-10, audit of context management)
+
+- [x] **Whitespace-only text blocks reached providers.** `sanitize_messages` dropped only `""`;
+      Anthropic also rejects whitespace, and a model's `\n\n` before a tool call is stored as a
+      block — every later turn of that session failed there. Test
+      `whitespace_only_text_blocks_are_dropped_before_sending`.
+- [x] **The context-overflow retry cut messages without saying so** (`truncate_to_limit`'s count
+      was discarded): it now posts the loss notice every other cut path posts.
+- [x] **A message larger than the summarizer's window was retired after only its first part was
+      read** (`summarize_chunk` truncated it; the caller counted the whole chunk consumed). A chunk
+      read in part is never retired: the first chunk tries the next summarizer, a later one ends
+      the pass before it. *No dedicated test* — it needs a summarizer with a tiny window, which
+      the scripted rig does not model yet.
+- [x] **The hard-limit check counts only the base system prompt** — not the workspace slice, the
+      workdir note, or the tool definitions — so on a 32k Ollama window a compressed request can
+      still exceed it (Ollama then truncates the front; a cloud provider 400s). Charge
+      `effective_system_prompt()` and the active tool definitions in the budget.
+      *(2026-10-10, same run)* `estimate_tokens` charges `effective_system_prompt()` and
+      `tool_definition_tokens`, which `build_iteration_request` sets from the request's own tool
+      list each iteration (transient, `#[serde(skip)]`). Test
+      `tool_definitions_count_against_the_hard_limit`; agent/daemon/e2e 1250 green.
+- [x] **Dedup folds the only remaining copy of re-read content** into "already in the summary"
+      (chunk hashes from summarized-away blocks match a later re-read), so a file the model
+      re-reads to edit disappears again; only fold when another surviving message holds it.
+      *(2026-10-10, same run)* Done: a block folds only when a later surviving message carries the
+      same content (the newest copy always survives). Test
+      `a_re_read_that_is_the_only_copy_survives_the_next_step`.
+- [x] Images were estimated at a flat 1000 tokens. *(same run)* `estimate_image_tokens` reads
+      the PNG/GIF/JPEG size from the base64 head (w·h/750, capped at the ~1,600 a provider bills
+      after its downscale; an unreadable size or a URL is charged the cap). Test
+      `images_are_estimated_from_their_pixel_size`.
+
+### MCP servers that could exhaust or confuse the daemon (found 2026-10-10, audit of the MCP client)
+
+- [x] **A stdio server's message had no size cap.** `BufReader::lines()` grew one `String` until
+      the daemon was OOM-killed when a server wrote a multi-gigabyte result or bytes with no
+      newline; both HTTP transports already cap a message at 16 MiB. The reader now refuses a line
+      past 16 MiB (`STDIO_LINE_BYTES_MAX`), keeps a half-read line across the shutdown `select!`,
+      and ends the session the same way a read error does. Test
+      `a_stdio_line_is_capped_and_split_on_newlines`.
+- [ ] **An MCP question to the user is cut off by the tool's own deadline.** `McpAskUser` waits up
+      to 600 s for the answer, but `McpToolWrapper::timeout_secs()` is 65 s and the registry
+      backstop drops the call at about 75 s, so an answer given later never reaches the server.
+      User think-time should not count against the tool's deadline.
+- [ ] **No server's tools appear until every server has started.** `start_all` starts servers one
+      after another and registers only after the loop, so one slow `npx -y` server (60 s probe +
+      60 s `initialize`) holds back every other server's tools and status. Register each server
+      as its handshake finishes, or start them concurrently.
+- [ ] **A cold start over 60 s fails a modern-only stdio server.** A probe timeout reads as
+      "legacy"; the queued `server/discover` and `initialize` then both arrive, and a modern-only
+      server rejects `initialize` with `-32022`. Re-classify that error and finish the modern
+      handshake.
+- [ ] **Tool names from two servers can collide.** `mcp__{server}__{tool}` is sanitized after the
+      duplicate-name check (`home assistant` vs `home.assistant`, or `__` inside names), the
+      registry's `insert` silently replaces the earlier tool, and `resync_server` can unregister
+      the other server's tool. De-duplicate on the sanitized name and skip a name another server
+      owns.
+- [ ] *(lead)* Under the AppImage, stdio MCP servers inherit the bundle's `LD_LIBRARY_PATH`;
+      `exec` scrubs it (`scrub_appimage_library_path`), `StdioTransport::spawn_with_env` does not.
+
+### Browser tools that broke after one call (found 2026-10-10, audit of the browser services)
+
+- [x] **The browser died with the first call's runtime and was never relaunched.** Every
+      `Nanna.service(...)` runs on a runtime built for that call and dropped after it. The first
+      browser call launched Chromium there, so its CDP connection and event handler were
+      cancelled when the call returned — the handler never ran to its end, so `alive` stayed
+      true — and every later call failed with "send failed because receiver is gone" until the
+      daemon restarted. The integration test called every service on one long-lived runtime, so
+      it never saw it. `CdpBrowser` now keeps the runtime that built it (the daemon's) and
+      launches and drives the connection there (`launch_connected`). Test
+      `the_browser_outlives_the_runtime_of_the_call_that_launched_it` (red before: the second
+      call failed).
+- [ ] **Closed browsers leave `nanna-chromium-*` profiles behind.** `close()` drops the browser
+      (SIGKILL, no wait) and deletes the profile at once; Chromium's NetworkService child
+      outlives the kill and re-creates `Default/Network Persistent State` and its cache index in
+      the deleted directory (reproduced by hand). Nothing calls `BrowserManager::close` either —
+      not the daemon on shutdown, not the integration test. Close over CDP, wait for the process,
+      then delete the profile; call `close` on shutdown and in the test.
+- [ ] **A navigation that times out leaks its tab.** `new_page(url)` only returns the page once it
+      has loaded, so a deadline that fires first leaves a live tab with no handle to close it.
+      Open `about:blank`, then `goto` under the deadline and close the page on any error.
+- [ ] **`browser_evaluate` of an expression with no value fails.** chromiumoxide's `into_value`
+      errors with "No value found" for `undefined`, `NaN`, `Infinity` and `BigInt`, so
+      `localStorage.setItem(...)` reports failure after it ran. Read the remote object's `value`
+      or `unserializableValue` instead.
+- [ ] **A selector that matches nothing is a successful empty extract.** `#hedline` returns
+      "(no content extracted)" as success; report "no element matches" instead.
+
+### The test suite stranded its scratch databases in tmpfs (found 2026-10-10)
+
+- [x] **Every `cargo test --workspace` left 44 directories in `/tmp`, and `/tmp` is RAM here.**
+      `nanna-storage`'s `embedding_buckets` / `memory_chunks` / `migration_012_memory_chunks` and
+      `nanna-timeline`'s `event_log` each made a per-test directory and never removed it; the
+      `persistence_across_restarts` unit test removed its `.db` but not the `-wal` beside it.
+      Found at ORIENT: **1382 entries, 1.1 GB**, 33 copies of every tag — the tmpfs whose quota
+      already kills these runs mid-link. *(2026-10-10)* Fixed with a std-only drop guard
+      (`TempDb`, `Deref<Target = str>` so no call site changed; `nanna-storage` keeps no
+      dev-dependencies) that asserts it only deletes under `temp_dir()`; the timeline's `open()`
+      returns the `Storage` and its guard together, declared so the database closes first. The
+      unit test now removes the WAL too. Re-measured: 274 tests in the two crates, **0 entries
+      left behind** (was 44 per run). The 1382 stale ones were deleted.
+
 ### The workspace is not rustfmt-formatted, and nothing checks (found 2026-09-24)
 
 - [ ] **`cargo fmt --check` reports 3407 hunks across 212 files on a clean `origin/master`**, and
@@ -10813,6 +11314,24 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `pnpm outdated` reports `4.1.0 → 2.24.3` — the v4 line is published under `next`, so `latest`
            points at the *older* Vue-2 package. **Never let `pnpm update --latest` "upgrade" this one**;
            it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
+   - *(2026-10-10 sweep)* `cargo update` → **`tauri 2.12.3`** (`tauri-build`/`-codegen`/`-macros` 2.7.2)
+     with the plugin minors (`dialog 2.8.2`, `fs 2.7.0`, `notification 2.6.0`, `shell 2.5.0`,
+     `updater 2.13.3` — `minisign-verify 0.3`), `uuid 1.28` (req bumped), `tokio-util 0.7.20`,
+     `serde_json 1.0.152`, `cc 1.7`, `syn 3.0.7`. Taken this time *with* the ~25 Windows-only
+     `windows-sys` edges it re-resolves downward (`rustix`/`tempfile`/`errno`/`winreg`/… onto
+     0.45/0.52/0.59): no new crate version enters the graph — all five `windows-sys` lines were
+     already locked — and this PR's `release-check` Windows job builds that surface. **Pinned
+     back again:** `rustpython-ruff_* 0.16.10 → 0.16.5` (`rustpython-codegen 0.6.0` still E0026/
+     E0308) and a new one, **`pymath 0.2.0`'s `malachite-bigint` re-resolving to 0.13** beside
+     `rustpython-stdlib`'s 0.12 (E0277 `BigInt: From<BigUint>`, 17 errors) — `cargo update -p
+     malachite-bigint@0.13.0 --precise 0.12.0`. Still blocked: `rten 0.27` (`ocrs 0.13.1` wants
+     `^0.26`), the toolchain pin (`turso_core 0.8.3-pre.1` still `branches ^0.4.3`, no 0.4.7).
+     GUI: the Tauri JS halves in lockstep (`api 2.12.3`, `plugin-dialog 2.8.2`, `-notification
+     2.6.0`, `-shell 2.5.0`, `-updater 2.13.3`), `vue-router 5.4.0`, `@lucide/vue 1.55.0`,
+     `@vitejs/plugin-vue 6.0.10`, `vue-tsc 3.3.13`; nuxt stays exactly 4.5.2 (4.6.1 is out — see
+     the item below), TypeScript 7 still blocked. Verified: clippy 0 warnings (workspace and
+     `nanna-gui`), **2918 Rust tests / 94 binaries, 0 failures**, vitest 442/442, typecheck 0
+     errors, `pnpm generate` green, `cargo build --release -p nanna-daemon` green (9m05s).
    - *(2026-10-09 sweep)* `cargo update` offered 15: taken **`toml 1.1.8` / `toml_edit 0.25.17` /
      `toml_parser 1.1.5`** (the lock also re-resolved `cssparser-macros`' `syn` from 3 to 2 — same
      checksum, the registry's dependency metadata changed). **Held back:** `rustpython-ruff_*
@@ -10847,7 +11366,7 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      halves in lockstep; TypeScript 7 still blocked (`vue-tsc` 3.3.12). Verified: clippy 0
      warnings, **2828 Rust tests / 89 binaries, 0 failures**, vitest 437/437, typecheck 0 errors,
      `pnpm generate` green.
-     - [ ] *(2026-10-08, same day)* **The GUI half was reverted: Nuxt 4.6.0 does not generate on
+     - [x] *(2026-10-08, same day)* **The GUI half was reverted: Nuxt 4.6.0 does not generate on
            Windows.** The release build (`release.yml` run 37778398050) failed in `pnpm generate`:
            every prerendered route answered 500, "Either manifest or precomputed data must be
            provided" (nuxt `runtime/server/renderer/build-files.js` → `vue-bundle-renderer`
@@ -10860,6 +11379,18 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `frontend-windows` judge it; check the windows `buildDir`/manifest path handling first
            (the roadmap's 2026-07 "manifest-race mitigation" pinned `buildDir` for a related
            Windows-only failure).
+           *(research 2026-10-10)* **Nuxt 4.6.1 (2026-10-09) carries the likely fix.** Commit
+           [`21657c6`](https://github.com/nuxt/nuxt/commit/21657c6fc) "inline nuxt runtime when
+           resolved to windows paths": nitro's inline list matched the literal `'nuxt/dist'`,
+           which a backslash module id on Windows never contains, so the Nuxt runtime was
+           externalized and loaded as a second instance without the build manifest — exactly
+           "Either manifest or precomputed data must be provided". It is now `isNuxtDistId`
+           (a regex over the `pathe`-normalized id). Re-try `nuxt 4.6.1` as its own PR and let
+           `frontend-windows` judge it ([v4.6.1](https://github.com/nuxt/nuxt/releases/tag/v4.6.1)).
+           *(same run)* Taken as its own commit in the 2026-10-10 nightly (`^4.6.1`, with `vite
+           8.3.4`); Linux: vitest 442/442, typecheck 0, `pnpm generate` prerenders 4 routes. Its
+           `frontend-windows` check is the verdict — reverted before merge if red. **Green:**
+           `pnpm generate (Windows)` passed in 1m50s on PR #423, so the fix is confirmed.
    - *(2026-09-27 sweep)* `cargo update` → the Tauri plugin minors (`dialog 2.8.0`, `fs 2.6.0`,
      `notification 2.5.0`, `process 2.4.0`, `shell 2.4.0`, `updater 2.13.0`,
      `tauri-winrt-notification 0.8.1`) plus `notify-rust 4.18.1`; the JS halves bumped in

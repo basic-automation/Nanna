@@ -72,7 +72,7 @@ fn estimate_message_tokens(msg: &AnthropicMessage) -> usize {
                 estimate_tokens_for_family(&input.to_string(), TokenContentFamily::Code) + 50
             }
             ContentBlock::ToolResult { content, .. } => estimate_tokens(content) + 20,
-            ContentBlock::Image { .. } => 1000, // Images are ~1k tokens
+            ContentBlock::Image { source } => nanna_llm::estimate_image_tokens(source),
             ContentBlock::Thinking { thinking, .. } => estimate_tokens(thinking),
         })
         .sum()
@@ -527,6 +527,11 @@ pub struct AgentContext {
     /// since it's already represented in the `consolidated_summary`.
     #[serde(default)]
     summarized_content_hashes: HashSet<u64>,
+    /// Estimated tokens of the tool definitions the last request carried,
+    /// set by the loop each iteration (see [`Self::set_tool_definition_tokens`]).
+    /// Transient: re-measured on the next request, never persisted.
+    #[serde(skip)]
+    tool_definition_tokens: usize,
     /// Index of the message carrying the LIVE request — the thing the user
     /// actually asked for this turn. Provenance, not a guess: neither index 0
     /// nor `role == "user"` identifies it, because the loop pushes synthetic
@@ -577,6 +582,7 @@ impl AgentContext {
             growth: ContextGrowthTracker::default(),
             pending_loss_notices: Vec::new(),
             summarized_content_hashes: HashSet::new(),
+            tool_definition_tokens: 0,
             pinned_request: None,
         }
     }
@@ -897,10 +903,14 @@ impl AgentContext {
         messages
             .into_iter()
             .map(|mut msg| {
-                // Remove empty text blocks
-                msg.content.retain(|block| {
-                    !matches!(block, ContentBlock::Text { text } if text.is_empty())
-                });
+                // Remove empty and whitespace-only text blocks: Anthropic
+                // rejects both ("text content blocks must contain
+                // non-whitespace text"), and a model's "\n\n" before a tool
+                // call is stored as one — every later turn of that session
+                // then failed on Anthropic.
+                msg.content.retain(
+                    |block| !matches!(block, ContentBlock::Text { text } if text.trim().is_empty()),
+                );
                 // Ensure message has at least one content block
                 if msg.content.is_empty() {
                     msg.content.push(ContentBlock::Text {
@@ -912,108 +922,86 @@ impl AgentContext {
             .collect()
     }
 
-    /// Deduplicate messages by replacing large content blocks that were already summarized.
+    /// Fold a large block into a note only when a LATER surviving message
+    /// carries the same content.
     ///
-    /// Uses content-defined chunking (CDC) to detect partial duplicates - even if
-    /// content is split differently, overlapping chunks will be detected.
+    /// Uses content-defined chunking (CDC), so a copy split differently still
+    /// matches. This used to fold anything matching what summarization had
+    /// already REMOVED — but a summarized message is gone from the context, so
+    /// a surviving match is always a later re-read, and the summary is lossy:
+    /// the note ("already included in previous context summary") replaced the
+    /// only literal copy left. A model that re-read a file to edit it lost the
+    /// text again once it took one more step, and re-read it again. Now the
+    /// newest copy of any content always survives; older duplicates fold.
+    /// The newest message and the pinned live request are never folded.
     fn deduplicate_messages(&self) -> Vec<AnthropicMessage> {
-        let mut dedup_count = 0;
-        let mut bytes_saved = 0;
-        let mut deduped = Vec::with_capacity(self.messages.len());
-        // Never placeholdered: the newest message (it carries the tool results
-        // the model is about to answer) and the pinned live request. A fresh
-        // re-read of a file whose earlier read was summarised used to be
-        // replaced by "already included in previous context summary" — but the
-        // summary is lossy, so the model lost the very text it had just asked
-        // for, and asked again.
         let newest = self.messages.len().saturating_sub(1);
         let pinned = self.pinned_index();
+        let mut later: HashSet<u64> = HashSet::new();
+        let mut dedup_count = 0usize;
+        let mut bytes_saved = 0usize;
+        let mut deduped: Vec<AnthropicMessage> = Vec::with_capacity(self.messages.len());
 
-        for (index, msg) in self.messages.iter().enumerate() {
-            if index == newest || index == pinned {
-                deduped.push(msg.clone());
-                continue;
-            }
+        // Newest first, so `later` holds exactly what follows each message.
+        for (index, msg) in self.messages.iter().enumerate().rev() {
+            let foldable = index != newest && index != pinned;
             let mut new_content = Vec::with_capacity(msg.content.len());
-
             for block in &msg.content {
-                match block {
-                    ContentBlock::Text { text } if text.len() >= DEDUP_MIN_SIZE => {
-                        // Check CDC coverage - what percentage of chunks are already known?
-                        let coverage = dedup_coverage(text, &self.summarized_content_hashes);
-
-                        if coverage >= DEDUP_THRESHOLD {
-                            // Most of this content was already summarized
-                            new_content.push(ContentBlock::Text {
-                                text: format!(
-                                    "[Content ({:.0}% duplicate) already included in previous context summary]",
-                                    coverage * 100.0
-                                ),
-                            });
-                            dedup_count += 1;
-                            bytes_saved += text.len();
-                            debug!(
-                                coverage = format!("{:.1}%", coverage * 100.0),
-                                original_len = text.len(),
-                                "Deduplicated previously summarized content via CDC"
-                            );
-                        } else if coverage > 0.0 {
-                            // Partial overlap - keep full content but log it
-                            debug!(
-                                coverage = format!("{:.1}%", coverage * 100.0),
-                                original_len = text.len(),
-                                "Partial duplicate detected, keeping full content"
-                            );
-                            new_content.push(block.clone());
-                        } else {
-                            new_content.push(block.clone());
-                        }
-                    }
-                    ContentBlock::ToolResult { tool_use_id, content, is_error }
-                        if content.len() >= DEDUP_MIN_SIZE =>
-                    {
-                        let coverage = dedup_coverage(content, &self.summarized_content_hashes);
-
-                        if coverage >= DEDUP_THRESHOLD {
-                            new_content.push(ContentBlock::ToolResult {
-                                tool_use_id: tool_use_id.clone(),
-                                content: format!(
-                                    "[Output ({:.0}% duplicate) already included in previous context summary]",
-                                    coverage * 100.0
-                                ),
-                                is_error: *is_error,
-                            });
-                            dedup_count += 1;
-                            bytes_saved += content.len();
-                            debug!(
-                                coverage = format!("{:.1}%", coverage * 100.0),
-                                original_len = content.len(),
-                                "Deduplicated previously summarized tool result via CDC"
-                            );
-                        } else {
-                            new_content.push(block.clone());
-                        }
+                let (text, is_result) = match block {
+                    ContentBlock::Text { text } if text.len() >= DEDUP_MIN_SIZE => (text, false),
+                    ContentBlock::ToolResult { content, .. } if content.len() >= DEDUP_MIN_SIZE => {
+                        (content, true)
                     }
                     _ => {
                         new_content.push(block.clone());
+                        continue;
                     }
+                };
+                let coverage = dedup_coverage(text, &later);
+                if foldable && coverage >= DEDUP_THRESHOLD {
+                    let note = format!(
+                        "[{} ({:.0}% duplicate) repeated in full later in this conversation]",
+                        if is_result { "Output" } else { "Content" },
+                        coverage * 100.0
+                    );
+                    new_content.push(match block {
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            is_error,
+                            ..
+                        } => ContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: note,
+                            is_error: *is_error,
+                        },
+                        _ => ContentBlock::Text { text: note },
+                    });
+                    dedup_count += 1;
+                    bytes_saved += text.len();
+                } else {
+                    later.extend(chunk_and_hash(text));
+                    new_content.push(block.clone());
                 }
             }
-
             deduped.push(AnthropicMessage {
                 role: msg.role.clone(),
                 content: new_content,
             });
         }
+        deduped.reverse();
+        debug_assert_eq!(
+            deduped.len(),
+            self.messages.len(),
+            "folding never drops a message"
+        );
 
         if dedup_count > 0 {
             info!(
                 dedup_count = dedup_count,
                 bytes_saved = bytes_saved,
-                "Deduplicated content blocks using CDC"
+                "Deduplicated content blocks repeated later (CDC)"
             );
         }
-
         deduped
     }
 
@@ -1621,10 +1609,22 @@ impl AgentContext {
     #[must_use]
     pub fn estimate_tokens(&self) -> usize {
         // Family-aware heuristic from nanna-llm (ASCII English/code + CJK density).
-        let system_tokens = estimate_tokens(&self.system_prompt);
+        // The system prompt AS SENT — with the workspace slice and the
+        // working-directory note — and the tool definitions: counting only the
+        // base prompt let a "compressed" request on a 32k local window still
+        // run several thousand tokens over (the server then cut the front of
+        // the prompt, or a cloud provider answered 400).
+        let system_tokens = estimate_tokens(&self.effective_system_prompt());
         let message_tokens: usize = self.messages.iter().map(estimate_message_tokens).sum();
 
-        system_tokens + message_tokens
+        system_tokens + self.tool_definition_tokens + message_tokens
+    }
+
+    /// Record the tool definitions' size for the budget: the loop calls this
+    /// with each iteration's request, so the next check counts what is sent.
+    pub fn set_tool_definition_tokens(&mut self, tokens: usize) {
+        debug_assert!(tokens < 1 << 24, "a tool list is not millions of tokens");
+        self.tool_definition_tokens = tokens;
     }
 
     /// Estimated tokens of the step frame: the pinned message carrying the
@@ -2242,9 +2242,25 @@ impl AgentContext {
 
             for (i, (chunk, end)) in chunks.iter().enumerate() {
                 match Self::summarize_chunk(&client, &model_name, chunk).await {
-                    Ok(summary) => {
+                    // Read whole: the messages it covers may be retired.
+                    Ok((summary, read)) if read >= chunk.len() => {
                         parts.push(summary);
                         consumed = *end;
+                    }
+                    // Read only in part (one message larger than this model's
+                    // window): retiring it would delete what was never read.
+                    // The first chunk tries the next summarizer, whose window
+                    // may hold it; a later one ends the pass before it.
+                    Ok((_, read)) => {
+                        warn!(
+                            model = %model_spec,
+                            chunk = i + 1,
+                            read_chars = read,
+                            chunk_chars = chunk.len(),
+                            "Chunk larger than the summarizer's window; not retired"
+                        );
+                        failed = i == 0;
+                        break;
                     }
                     Err(e) => {
                         warn!(
@@ -2304,11 +2320,13 @@ impl AgentContext {
     /// The truncation here is a backstop, not the sizing mechanism — chunks
     /// arrive pre-fitted. It only bites when a single message exceeds the whole
     /// window, which the caller accounts for separately.
+    /// Summarize `content`; the summary and how many bytes of it were read.
+    /// Fewer than `content.len()` means the model's window cut it short.
     async fn summarize_chunk(
         client: &nanna_llm::LlmClient,
         model_name: &str,
         content: &str,
-    ) -> Result<String, String> {
+    ) -> Result<(String, usize), String> {
         let cache = nanna_llm::ModelInfoCache::default_location();
         let model_info = client.get_model_info(model_name, cache.as_ref()).await;
         let max_chars = model_info.hard_input_limit().saturating_sub(512).saturating_mul(4);
@@ -2349,7 +2367,8 @@ impl AgentContext {
         }
 
         if plausible_summary(&summary, truncated.len()) {
-            Ok(summary)
+            debug_assert!(truncated.len() <= content.len());
+            Ok((summary, truncated.len()))
         } else {
             Err(format!(
                 "Implausible summary returned ({} chars for {} chars of input)",
@@ -2771,7 +2790,7 @@ Provide a concise summary (2-4 paragraphs max):"
                     ContentBlock::ToolUse { input, .. } => estimate_token_count(input.to_string().len()),
                     ContentBlock::ToolResult { content, .. } => estimate_token_count(content.len()),
                     ContentBlock::Thinking { thinking, .. } => estimate_token_count(thinking.len()),
-                    ContentBlock::Image { .. } => 1000,
+                    ContentBlock::Image { source } => nanna_llm::estimate_image_tokens(source),
                 })
                 .sum::<usize>()
             )
@@ -2860,6 +2879,28 @@ fn chrono_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A whitespace-only text block never reaches a provider: Anthropic
+    /// rejects it, and a model's "\n\n" before a tool call is stored as one.
+    #[test]
+    fn whitespace_only_text_blocks_are_dropped_before_sending() {
+        let mut msg = AnthropicMessage::assistant_text("\n\n");
+        msg.content.push(ContentBlock::Text {
+            text: "kept".to_string(),
+        });
+        let out =
+            AgentContext::sanitize_messages(vec![msg, AnthropicMessage::assistant_text(" \t ")]);
+        assert!(
+            matches!(&out[0].content[..], [ContentBlock::Text { text }] if text == "kept"),
+            "{:?}",
+            out[0].content
+        );
+        assert!(
+            matches!(&out[1].content[..], [ContentBlock::Text { text }] if text == "[No content]"),
+            "{:?}",
+            out[1].content
+        );
+    }
 
     /// The data-loss bug: extraction can gather far more than the summarizer
     /// will read, so the replacement must be keyed to what was actually
@@ -3813,13 +3854,58 @@ mod tests {
             other => panic!("expected a tool result, got {other:?}"),
         };
         assert!(
-            content(&deduped[1]).contains("already included"),
-            "older copies still fold"
+            content(&deduped[1]).contains("repeated in full later"),
+            "an older copy folds when a later one carries it"
         );
         assert_eq!(
             content(&deduped[3]),
             file,
             "the newest result is sent whole"
+        );
+    }
+
+    /// The tool definitions a request carries count against its window: a
+    /// context whose messages fit can still be over once they are added.
+    #[test]
+    fn tool_definitions_count_against_the_hard_limit() {
+        let mut ctx = AgentContext::new("s1");
+        ctx.messages.push(AnthropicMessage::user_text("hello"));
+        let base = ctx.estimate_tokens();
+        assert!(!ctx.exceeds_hard_limit());
+        ctx.set_tool_definition_tokens(1_000);
+        assert_eq!(ctx.estimate_tokens(), base + 1_000);
+        ctx.set_tool_definition_tokens(ctx.message_hard_limit());
+        assert!(
+            ctx.exceeds_hard_limit(),
+            "the definitions alone fill the window"
+        );
+    }
+
+    /// The only surviving copy of content is never folded, even when it
+    /// matches what summarization removed: the summary is lossy, and a file
+    /// re-read to be edited vanished again one step later.
+    #[test]
+    fn a_re_read_that_is_the_only_copy_survives_the_next_step() {
+        let file = "fn main() { println!(\"a line of a real file\"); }\n".repeat(200);
+        let mut ctx = AgentContext::new("s1");
+        ctx.summarized_content_hashes.extend(chunk_and_hash(&file));
+        ctx.messages
+            .push(AnthropicMessage::user_text("edit main.rs"));
+        ctx.pin_live_request();
+        ctx.messages
+            .push(AnthropicMessage::user(vec![ContentBlock::ToolResult {
+                tool_use_id: "re-read".to_string(),
+                content: file.clone(),
+                is_error: None,
+            }]));
+        ctx.messages
+            .push(AnthropicMessage::assistant_text("now editing it"));
+
+        let deduped = ctx.deduplicate_messages();
+        assert!(
+            matches!(&deduped[1].content[0], ContentBlock::ToolResult { content, .. } if *content == file),
+            "the re-read is kept whole: {:?}",
+            deduped[1].content
         );
     }
 

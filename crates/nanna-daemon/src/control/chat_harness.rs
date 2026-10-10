@@ -851,9 +851,12 @@ impl ChatTurn {
         // `services_workspace_id` is the same handle the tool
         // services use (prep just updated it), so tools and
         // memory agree.
-        let active_workspace_id = match &self.this.services_workspace_id {
-            Some(ws) => ws.read().await.clone(),
-            None => None,
+        let active_workspace_id = match crate::run_workspace::bound(&self.session_id) {
+            Some(bound) => bound,
+            None => match &self.this.services_workspace_id {
+                Some(ws) => ws.read().await.clone(),
+                None => None,
+            },
         };
 
         // THE one place a chat turn's model is decided. Hoisted
@@ -2277,6 +2280,7 @@ impl ChatTurn {
         // admitted until the stale binding is gone; its own
         // `prepare_chat_turn` binds a fresh one.
         self.agent.tools().clear_session_workdir(&self.session_id).await;
+        crate::run_workspace::release(&self.session_id);
 
         // Every exit path releases all three registrations — a leaked
         // entry would make the session look busy forever, and a leaked

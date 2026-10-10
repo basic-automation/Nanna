@@ -317,10 +317,16 @@ async function importConfig() {
 
       if (!confirmed) return
 
-      const content = await file.text()
-      await invoke('import_config', { config: content })
-      showToast('Configuration imported', 'success')
-      await loadSettings()
+      // Inside the handler's own try: the outer one has returned by the time
+      // the file is chosen, so a refused import used to say nothing at all.
+      try {
+        const content = await file.text()
+        await invoke('import_config', { config: content })
+        showToast('Configuration imported', 'success')
+        await loadSettings()
+      } catch (err: any) {
+        showToast(`Could not import configuration: ${err?.message || err}`, 'error')
+      }
     }
 
     input.click()

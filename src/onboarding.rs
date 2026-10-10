@@ -385,7 +385,7 @@ pub fn run_onboarding(config_path: &std::path::Path) -> anyhow::Result<Config> {
         );
     }
 
-    let config_path = Config::default_config_path()?;
+    // The file just written (`--config`), not always the default path.
     println!(
         "  {CHECK}Configuration saved to {}",
         style(config_path.display()).green()
@@ -428,8 +428,20 @@ pub fn quick_setup(config: &mut Config, config_path: &std::path::Path) -> anyhow
         anyhow::bail!("API key is required. Set {env_var} or run 'nanna init'");
     }
 
+    // Save the FILE plus this key — not the running config, which carries
+    // environment overrides (`PORT`, a channel section built from
+    // `TELEGRAM_BOT_TOKEN`) and the environment's own API keys: saving it
+    // wrote those into config.toml and the keyring, where they outlived the
+    // variables. Every other secret is stripped so only the entered key is filed.
+    let mut on_disk = if config_path.exists() {
+        Config::load_from(&config_path.to_path_buf())?
+    } else {
+        Config::default()
+    };
+    on_disk.strip_secrets_for_disk();
+    store_entered_key(&mut on_disk.llm, api_key.clone());
     store_entered_key(&mut config.llm, api_key);
-    if persist_config(config, config_path)? {
+    if persist_config(&mut on_disk, config_path)? {
         println!("{CHECK}API key saved to the OS keychain.");
     } else {
         warn_key_not_read_back(env_var);
@@ -438,12 +450,11 @@ pub fn quick_setup(config: &mut Config, config_path: &std::path::Path) -> anyhow
 }
 
 /// Show setup status.
-pub fn show_status(config: &Config) -> anyhow::Result<()> {
+pub fn show_status(config: &Config, config_path: &std::path::Path) {
     println!("{}", style("Nanna Configuration Status").bold());
     println!("{}", "─".repeat(40));
 
-    // Config path
-    let config_path = Config::default_config_path()?;
+    // The file the config came from (`--config`), not always the default.
     println!(
         "Config: {}",
         if config_path.exists() {
@@ -510,8 +521,6 @@ pub fn show_status(config: &Config) -> anyhow::Result<()> {
     } else {
         println!("  Path: (current directory)");
     }
-
-    Ok(())
 }
 
 #[cfg(test)]

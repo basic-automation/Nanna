@@ -141,6 +141,12 @@ pub struct TaskResult {
     pub duration_ms: u64,
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
+    /// The run did not start (another run held the model, a resume was
+    /// already parked). A skipped cron occurrence stays due, so the next tick
+    /// retries it; settling it as a run moved `next_run` to the following
+    /// occurrence, and a daily 09:00 job that met a chat turn did not run
+    /// that day at all.
+    pub skipped: bool,
 }
 
 /// Job run history entry
@@ -279,6 +285,43 @@ impl SchedulerRuntime {
 #[must_use]
 pub fn clamp_heartbeat_secs(secs: u64) -> u64 {
     secs.max(MIN_HEARTBEAT_INTERVAL_SECS)
+}
+
+/// An owned manual run (see [`Scheduler::run_now_handle`]).
+pub struct RunNowHandle {
+    executor: TaskExecutor,
+    tasks: Arc<RwLock<HashMap<String, ScheduledTask>>>,
+    storage: Option<Arc<Storage>>,
+    history: Arc<RwLock<HashMap<String, Vec<JobRun>>>>,
+    in_flight: InFlight,
+}
+
+impl RunNowHandle {
+    /// Run `task_id` now and settle it like a scheduled run. `None` when no
+    /// task has that id or it is already running.
+    pub async fn run(self, task_id: &str) -> Option<TaskResult> {
+        let Some(claim) = InFlightClaim::take(&self.in_flight, task_id) else {
+            info!("Task {task_id} is already running; run-now skipped");
+            return None;
+        };
+        let task = {
+            let tasks = self.tasks.read().await;
+            tasks.get(task_id).cloned()?
+        };
+        debug_assert_eq!(task.id, task_id, "the claim and the task name one job");
+        let one_shot = task.task_type.is_one_shot();
+        let result = (self.executor)(task).await;
+        settle_run(
+            &self.tasks,
+            self.storage.as_ref(),
+            &self.history,
+            one_shot,
+            &result,
+        )
+        .await;
+        drop(claim);
+        Some(result)
+    }
 }
 
 /// The main scheduler
@@ -581,8 +624,27 @@ impl Scheduler {
 
     /// Enable/disable a task (persisted). `false` when no task has `task_id`.
     pub async fn set_task_enabled(&self, task_id: &str, enabled: bool) -> bool {
-        self.modify_task(task_id, |task| task.enabled = enabled)
-            .await
+        self.modify_task(task_id, |task| {
+            let enabling = enabled && !task.enabled;
+            task.enabled = enabled;
+            // A disabled cron job's `next_run` stays where it was when it was
+            // switched off, so re-enabling it days later found that stale
+            // occurrence due and fired at once, off schedule. It resumes at
+            // its next occurrence from now — as a restart already did.
+            if enabling
+                && let TaskType::Cron {
+                    parsed: Some(ref p),
+                    ref mut next_run,
+                    ..
+                } = task.task_type
+            {
+                *next_run = p.next_from_now();
+                debug_assert!(
+                    next_run.is_none_or(|next| next > Utc::now() - chrono::Duration::seconds(1))
+                );
+            }
+        })
+        .await
     }
 
     /// Replace a task's payload (persisted). `false` when no task has
@@ -703,27 +765,24 @@ impl Scheduler {
     /// 1), came back at 0 after a restart and was delivered a second time, and
     /// could run concurrently with the loop's own run of it.
     pub async fn run_now(&self, task_id: &str) -> Option<TaskResult> {
-        let executor = self.executor.as_ref()?;
-        let Some(claim) = InFlightClaim::take(&self.in_flight, task_id) else {
-            info!("Task {task_id} is already running; run-now skipped");
-            return None;
-        };
-        let task = {
-            let tasks = self.tasks.read().await;
-            tasks.get(task_id).cloned()?
-        };
-        let one_shot = task.task_type.is_one_shot();
-        let result = executor(task).await;
-        settle_run(
-            &self.tasks,
-            self.storage.as_ref(),
-            &self.history,
-            one_shot,
-            &result,
-        )
-        .await;
-        drop(claim);
-        Some(result)
+        self.run_now_handle()?.run(task_id).await
+    }
+
+    /// What a manual run needs, owned — so a caller holding this scheduler
+    /// behind a lock can drop the guard before awaiting the run. Awaiting
+    /// [`Self::run_now`] under the guard held it for the whole run (minutes,
+    /// for a dream cycle or an agent prompt), and a settings save or a
+    /// `remind` queued for the write lock — and every reader behind it —
+    /// waited that long. `None` when no executor is set.
+    #[must_use]
+    pub fn run_now_handle(&self) -> Option<RunNowHandle> {
+        Some(RunNowHandle {
+            executor: self.executor.clone()?,
+            tasks: Arc::clone(&self.tasks),
+            storage: self.storage.clone(),
+            history: Arc::clone(&self.history),
+            in_flight: Arc::clone(&self.in_flight),
+        })
     }
 
     /// Start the scheduler.
@@ -765,6 +824,7 @@ impl Scheduler {
                 config.check_interval
             );
 
+            let mut was_enabled = runtime.enabled();
             loop {
                 tokio::select! {
                     _ = shutdown_rx.recv() => {
@@ -806,7 +866,12 @@ impl Scheduler {
 
                         // Master switch: leave jobs loaded, fire nothing.
                         if !runtime.enabled() {
+                            was_enabled = false;
                             continue;
+                        }
+                        if !was_enabled {
+                            was_enabled = true;
+                            rearm_stale_cron(&tasks, Utc::now()).await;
                         }
 
                         // Check for due tasks
@@ -933,6 +998,18 @@ async fn settle_run(
         "a run cannot finish before it starts"
     );
 
+    if result.skipped {
+        // Not a run: nothing to record, and a cron job keeps its `next_run`
+        // so the next tick retries it. Interval and one-shot jobs re-arm as
+        // before (their next tick IS the retry).
+        let mut tasks_guard = tasks.write().await;
+        if let Some(t) = tasks_guard.get_mut(&task_id)
+            && matches!(t.task_type, TaskType::Cron { .. })
+        {
+            return;
+        }
+    }
+
     record_run_in(history, &result.task_id, result).await;
 
     let next_run = {
@@ -962,6 +1039,26 @@ async fn settle_run(
 
     if let Some(storage) = storage {
         settle_in_storage(storage, &task_id, one_shot, result, next_run.as_deref()).await;
+    }
+}
+
+/// Move every cron job whose `next_run` passed while the scheduler's master
+/// switch was off to its next occurrence from `now`. Switching the scheduler
+/// back on otherwise found each stale occurrence due and fired every cron job
+/// at once, off schedule — what a restart in the same state never did.
+async fn rearm_stale_cron(tasks: &Arc<RwLock<HashMap<String, ScheduledTask>>>, now: DateTime<Utc>) {
+    let mut tasks = tasks.write().await;
+    for task in tasks.values_mut() {
+        if let TaskType::Cron {
+            parsed: Some(ref p),
+            ref mut next_run,
+            ..
+        } = task.task_type
+            && next_run.is_some_and(|next| next < now)
+        {
+            *next_run = p.next(&now);
+            debug_assert!(next_run.is_none_or(|next| next > now));
+        }
     }
 }
 
@@ -1310,6 +1407,7 @@ mod tests {
                     duration_ms: 100,
                     started_at: Utc::now(),
                     finished_at: Utc::now(),
+                    skipped: false,
                 }
             })
         });
@@ -1361,6 +1459,7 @@ mod tests {
                     duration_ms: 0,
                     started_at: Utc::now(),
                     finished_at: Utc::now(),
+                    skipped: false,
                 }
             })
         });
@@ -1392,6 +1491,184 @@ mod tests {
         assert!(
             after > before,
             "due tasks keep running beside a stuck heartbeat ({before} → {after})"
+        );
+    }
+
+    /// A manual run awaited through its handle holds no scheduler lock: a
+    /// settings save (a write) goes through while the run is still going.
+    #[tokio::test]
+    async fn a_manual_run_does_not_hold_the_scheduler_lock() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let executor: TaskExecutor = Arc::new(move |task: ScheduledTask| {
+            let release_rx = Arc::clone(&release_rx);
+            Box::pin(async move {
+                let rx = release_rx.lock().await.take();
+                if let Some(rx) = rx {
+                    let _ = rx.await;
+                }
+                let now = Utc::now();
+                TaskResult {
+                    task_id: task.id.clone(),
+                    task_name: task.name.clone(),
+                    success: true,
+                    output: None,
+                    error: None,
+                    duration_ms: 0,
+                    started_at: now,
+                    finished_at: now,
+                    skipped: false,
+                }
+            })
+        });
+        let scheduler = Scheduler::new(SchedulerConfig::default()).with_executor(executor);
+        let task = Scheduler::cron_task("digest", "0 9 * * *", "prompt").expect("cron");
+        let id = task.id.clone();
+        scheduler.add_task(task).await;
+        let shared = Arc::new(RwLock::new(scheduler));
+
+        let handle = shared
+            .read()
+            .await
+            .run_now_handle()
+            .expect("an executor is set");
+        let run = tokio::spawn(async move { handle.run(&id).await });
+        tokio::task::yield_now().await;
+        let write = tokio::time::timeout(Duration::from_secs(2), shared.write()).await;
+        assert!(
+            write.is_ok(),
+            "the write lock is free while the run is in flight"
+        );
+        drop(write);
+        let _ = release_tx.send(());
+        let result = run.await.expect("joined").expect("ran");
+        assert!(result.success);
+    }
+
+    /// Switching the scheduler back on moves cron jobs that went stale while
+    /// it was off to their next occurrence; jobs not yet due are untouched.
+    #[tokio::test]
+    async fn re_enabling_the_scheduler_does_not_fire_stale_cron_jobs() {
+        let scheduler = Scheduler::new(SchedulerConfig::default());
+        let stale = Scheduler::cron_task("stale", "0 9 * * *", "p").expect("cron");
+        let fresh = Scheduler::cron_task("fresh", "0 9 * * *", "p").expect("cron");
+        let (stale_id, fresh_id) = (stale.id.clone(), fresh.id.clone());
+        scheduler.add_task(stale).await;
+        scheduler.add_task(fresh).await;
+        let now = Utc::now();
+        let fresh_next = scheduler
+            .get_task(&fresh_id)
+            .await
+            .expect("job")
+            .task_type
+            .next_run();
+        if let Some(TaskType::Cron { next_run, .. }) = scheduler
+            .tasks
+            .write()
+            .await
+            .get_mut(&stale_id)
+            .map(|t| &mut t.task_type)
+        {
+            *next_run = Some(now - chrono::Duration::days(2));
+        }
+        rearm_stale_cron(&scheduler.tasks, now).await;
+        let stale_next = scheduler
+            .get_task(&stale_id)
+            .await
+            .expect("job")
+            .task_type
+            .next_run();
+        assert!(stale_next.is_some_and(|next| next > now), "{stale_next:?}");
+        assert_eq!(
+            scheduler
+                .get_task(&fresh_id)
+                .await
+                .expect("job")
+                .task_type
+                .next_run(),
+            fresh_next,
+            "a job not yet due keeps its occurrence"
+        );
+    }
+
+    /// A cron occurrence whose run did not start stays due: the next tick
+    /// retries it. Settled as a run, a daily job that met a chat turn at its
+    /// minute moved to tomorrow and did not run that day.
+    #[tokio::test]
+    async fn a_skipped_cron_occurrence_stays_due() {
+        let scheduler = Scheduler::new(SchedulerConfig::default());
+        let task = Scheduler::cron_task("digest", "0 9 * * *", "prompt").expect("cron");
+        let id = task.id.clone();
+        scheduler.add_task(task).await;
+        let due_at = Utc::now() - chrono::Duration::minutes(1);
+        if let Some(TaskType::Cron { next_run, .. }) = scheduler
+            .tasks
+            .write()
+            .await
+            .get_mut(&id)
+            .map(|t| &mut t.task_type)
+        {
+            *next_run = Some(due_at);
+        }
+        let now = Utc::now();
+        let skipped = TaskResult {
+            task_id: id.clone(),
+            task_name: "digest".to_string(),
+            success: true,
+            output: Some("Skipped (a run is in flight)".to_string()),
+            error: None,
+            duration_ms: 0,
+            started_at: now,
+            finished_at: now,
+            skipped: true,
+        };
+        settle_run(&scheduler.tasks, None, &scheduler.history, false, &skipped).await;
+        let job = scheduler.get_task(&id).await.expect("job");
+        assert_eq!(job.task_type.next_run(), Some(due_at), "still due");
+        assert_eq!(job.run_count, 0, "a skip is not a run");
+        assert!(job.last_run.is_none());
+
+        let ran = TaskResult {
+            skipped: false,
+            ..skipped
+        };
+        settle_run(&scheduler.tasks, None, &scheduler.history, false, &ran).await;
+        let job = scheduler.get_task(&id).await.expect("job");
+        assert!(
+            job.task_type.next_run().is_some_and(|next| next > now),
+            "a real run moves on"
+        );
+        assert_eq!(job.run_count, 1);
+    }
+
+    /// Re-enabling a cron job resumes it at its next occurrence from now, not
+    /// at the stale one it was switched off at — which fired it at once.
+    #[tokio::test]
+    async fn a_re_enabled_cron_job_waits_for_its_next_occurrence() {
+        let scheduler = Scheduler::new(SchedulerConfig::default());
+        let task = Scheduler::cron_task("digest", "0 9 * * *", "prompt").expect("cron");
+        let id = task.id.clone();
+        scheduler.add_task(task).await;
+        assert!(scheduler.set_task_enabled(&id, false).await);
+        let stale = Utc::now() - chrono::Duration::days(3);
+        if let Some(TaskType::Cron { next_run, .. }) = scheduler
+            .tasks
+            .write()
+            .await
+            .get_mut(&id)
+            .map(|t| &mut t.task_type)
+        {
+            *next_run = Some(stale);
+        }
+        assert!(scheduler.set_task_enabled(&id, true).await);
+        let job = scheduler.get_task(&id).await.expect("job");
+        assert!(job.enabled);
+        assert!(
+            job.task_type
+                .next_run()
+                .is_some_and(|next| next > Utc::now()),
+            "not due at once: {:?}",
+            job.task_type.next_run()
         );
     }
 
@@ -1455,6 +1732,7 @@ mod tests {
                     duration_ms: 1,
                     started_at: Utc::now(),
                     finished_at: Utc::now(),
+                    skipped: false,
                 }
             })
         });
@@ -1505,6 +1783,7 @@ mod tests {
                     duration_ms: 150,
                     started_at: Utc::now(),
                     finished_at: Utc::now(),
+                    skipped: false,
                 }
             })
         });

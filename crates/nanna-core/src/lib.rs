@@ -25,7 +25,7 @@ pub use dreaming::{
     DreamingRuntime, DreamingRuntimeConfig, create_dreaming_executor,
 };
 pub use scheduler::{
-    Scheduler, SchedulerConfig, SchedulerRuntime, ScheduledTask, TaskType, TaskResult,
+    RunNowHandle, Scheduler, SchedulerConfig, SchedulerRuntime, ScheduledTask, TaskType, TaskResult,
     TaskExecutor, JobRun,
     heartbeat_task, recurring_task, delayed_task, at_task, consolidation_task, is_task_due,
     clamp_heartbeat_secs, MIN_HEARTBEAT_INTERVAL_SECS,

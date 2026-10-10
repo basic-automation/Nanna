@@ -22,7 +22,6 @@ pub use state::{AppState, AppStateBuilder, ProcessedReply};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tower_http::compression::CompressionLayer;
-use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -56,15 +55,12 @@ pub async fn start_server(config: ServerConfig, state: AppState) -> anyhow::Resu
     // Start the scheduler for periodic tasks (dreaming, heartbeats)
     state.start_scheduler().await;
 
+    // No CORS layer: `/api` runs the agent with its tools, and a permissive
+    // one (`allow_origin(Any)`) let any web page the user opened POST to it
+    // and read the reply. Native callers send no `Origin` and need none.
     let app = create_router(state.clone())
         .layer(TraceLayer::new_for_http())
-        .layer(CompressionLayer::new())
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        );
+        .layer(CompressionLayer::new());
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     let listener = TcpListener::bind(addr).await?;

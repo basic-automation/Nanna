@@ -19,6 +19,9 @@ chrono.workspace = true
 reqwest.workspace = true
 url = "2"
 walkdir = "2"
+# Decode fetched bodies in their declared charset (already in the graph via
+# reqwest's `charset` feature).
+encoding_rs = "0.8"
 directories.workspace = true
 
 # Tree-kill + per-child Job Object for exec timeouts (bridge.rs

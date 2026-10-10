@@ -10,7 +10,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use nanna_scripting::ServiceFn;
-use nanna_scripting::file_history::{Checkpoint, FileHistory, RECENT_CHECKPOINTS_MAX};
+use nanna_scripting::file_history::{
+    BASELINE_CHECKPOINTS_MAX, Checkpoint, FileHistory, RECENT_CHECKPOINTS_MAX,
+};
 use serde_json::{Value, json};
 
 /// Checkpoints listed when the caller names no limit — a screenful for a model.
@@ -61,7 +63,10 @@ pub(crate) async fn list(history: &FileHistory, params: &Value) -> Result<Value,
     let limit = crate::tasks::opt_i64(params, "limit")?
         .and_then(|n| usize::try_from(n).ok())
         .unwrap_or(LIST_DEFAULT)
-        .clamp(1, RECENT_CHECKPOINTS_MAX);
+        // Everything a session can hold: recent checkpoints AND the baselines
+        // kept beside them. Capped at the recent bound alone, "raise limit"
+        // could never reach the oldest baselines it advertised.
+        .clamp(1, RECENT_CHECKPOINTS_MAX + BASELINE_CHECKPOINTS_MAX);
     let path = params
         .get("path")
         .and_then(Value::as_str)

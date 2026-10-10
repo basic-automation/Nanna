@@ -1,6 +1,6 @@
 export default {
   name: "write_file",
-  version: "0.1.17",
+  version: "0.1.18",
   output: "memory",
   description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. For files too long to write in one call, use file_buffer (append chunks, then commit) instead. SAFETY: a shrinking rewrite of a file that changed since you last read it returns the file's CURRENT content to merge (not a refusal); a shrinking rewrite that deletes more top-level sections than it keeps is held ONCE with the current content and the removed names — send the same content again to confirm the deletions; blocked if new content is under 30% of the last known-good size (likely truncation), if a .py file would not parse, or if the filename looks like a versioned copy. After each write the cheapest structural check (sh -n / node --check / JSON.parse) runs and its verdict is appended; a full overwrite parks the previous version at <file>.__prev__ for recovery and the richest earlier version at <file>.__best__.",
   parameters: {
@@ -26,6 +26,20 @@ export default {
     // prefix. A safety net you cannot audit is not a safety net. Best-effort.
     function glog(msg) {
       try { Nanna.log("info", msg); } catch (e) { /* logging is optional */ }
+    }
+
+    // A path as one shell word for Nanna.exec's `sh -c`: single-quoted with
+    // embedded quotes escaped, and a leading `~/` left to the shell as
+    // "$HOME". The bridge expands `~` when it writes; quoted literally, the
+    // shell looked for a file named `~/x.py` (a valid file then "does NOT
+    // parse"), and an apostrophe re-split the words — `Bob's and Ann's
+    // notes.md` made a cleanup run `rm -f Bobs and …`.
+    function shq(path) {
+      var p = String(path);
+      var home = "";
+      if (p === "~" || p.indexOf("~/") === 0) { home = "\"$HOME\""; p = p.substring(1); }
+      if (p === "") return home;
+      return home + "'" + p.split("'").join("'\\''") + "'";
     }
 
     // A refusal the model keeps re-earning has stopped being information.
@@ -116,10 +130,12 @@ export default {
     // daemon lifetime; missions touch tens of files, so 200 entries with
     // least-recently-updated eviction loses nothing real.
     var HIWATER_MAX_ENTRIES = 200;
-    // Slash/case normalization plus "./" stripping. Lowercase is correct
-    // here because this daemon targets Windows paths.
+    // Slash/case normalization plus "./" stripping.
     function hiwaterNormKey(path) {
-      var k = path.split("\\").join("/").toLowerCase();
+      var k = path.split("\\").join("/");
+      // Case folds only where the filesystem does: on Linux `README.md` and
+      // `readme.md` are two files, and one key let a read of either count for both.
+      if (Nanna.platform === "win32" || Nanna.platform === "darwin") k = k.toLowerCase();
       while (k.indexOf("./") === 0) k = k.substring(2);
       while (k.indexOf("//") !== -1) k = k.split("//").join("/");
       return k;
@@ -337,6 +353,17 @@ export default {
     // the sentence reads as this tool's refusal, not a generic one.
     function invariantRefusal(path, verb) {
       try {
+        // The registry itself is one of the rules' paths: rewriting it to
+        // "{}" erased every rule the user had declared, with no undo snapshot
+        // (.nanna/ is housekeeping). Only lift_invariant, which asks the
+        // user, changes it.
+        var regKey = hiwaterKey(path);
+        var regTail = "/.nanna/declared_invariants.json";
+        if (regKey === ".nanna/declared_invariants.json" ||
+            (regKey.length > regTail.length && regKey.lastIndexOf(regTail) === regKey.length - regTail.length)) {
+          return verb + " REFUSED — " + path + " holds the rules the user declared; nothing was " +
+            "written. Only lift_invariant (which asks the user) changes it. Continue with your task.";
+        }
         var list = invariantsLoad();
         if (list.length === 0) return "";
         var canon = hiwaterKey(path);
@@ -526,7 +553,7 @@ export default {
           "    print('NEW_OK')\n" +
           "except SyntaxError as e:\n" +
           "    print('NEW_BAD line ' + str(e.lineno) + ': ' + str(e.msg))\n");
-        var cmd = "python '" + chk + "' '" + newTmp + "'; rc=$?; rm -f '" + chk + "' '" + newTmp + "'; exit $rc";
+        var cmd = "python " + shq(chk) + " " + shq(newTmp) + "; rc=$?; rm -f " + shq(chk) + " " + shq(newTmp) + "; exit $rc";
         var result = Nanna.exec(cmd, null, 30);
         var out = result && result.stdout ? result.stdout : "";
         var bad = out.indexOf("NEW_BAD");
@@ -598,13 +625,12 @@ export default {
           return { ok: false, tool: "JSON.parse", detail: jd };
         }
       }
-      if (path.indexOf("'") !== -1) return null; // unquotable — no verdict
       var cmd = null;
       var toolName = null;
-      if (kind === "sh") { cmd = "sh -n '" + path + "'"; toolName = "sh -n"; }
-      else if (kind === "bash") { cmd = "bash -n '" + path + "'"; toolName = "bash -n"; }
-      else if (kind === "node") { cmd = "node --check '" + path + "'"; toolName = "node --check"; }
-      else if (kind === "py") { cmd = "python -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding=\"utf-8\").read())' '" + path + "'"; toolName = "python ast"; }
+      if (kind === "sh") { cmd = "sh -n " + shq(path); toolName = "sh -n"; }
+      else if (kind === "bash") { cmd = "bash -n " + shq(path); toolName = "bash -n"; }
+      else if (kind === "node") { cmd = "node --check " + shq(path); toolName = "node --check"; }
+      else if (kind === "py") { cmd = "python -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding=\"utf-8\").read())' " + shq(path); toolName = "python ast"; }
       if (!cmd) return null;
       try {
         var r = Nanna.exec(cmd, null, 15);
@@ -1026,6 +1052,15 @@ export default {
       // their stems are not files: config.json next to config.yaml, tool.ts
       // next to tool.js, index.css next to index.html.
       var lastDot = baseName.lastIndexOf(".");
+      // Conventional variants are siblings, not copies: `.env.local` beside
+      // `.env`, `Dockerfile.dev` beside `Dockerfile` were refused as forks.
+      // A dotfile stem (`.env`, `.gitignore`) and a variant suffix exempt it;
+      // a language extension on an extensionless file (`minidb.sh`) does not.
+      var variantSuffixes = ["local", "dev", "development", "prod", "production", "staging", "test", "example", "sample", "template", "dist", "override", "ci", "debug", "release"];
+      var addedSuffix = lastDot > 0 ? baseName.substring(lastDot + 1).toLowerCase() : "";
+      if (lastDot > 0 && (baseName.charAt(0) === "." || variantSuffixes.indexOf(addedSuffix) !== -1)) {
+        lastDot = -1;
+      }
       if (lastDot > 0) {
         var stem = baseName.substring(0, lastDot);
         var dirPart = filePath.split("\\").join("/");
@@ -1066,7 +1101,7 @@ export default {
       if (syntaxDetail === null) {
         var sweepBufPath = filePath + ".__buffer__";
         try {
-          Nanna.exec("rm -f '" + sweepBufPath + "' '" + filePath + ".__cleared__' '" + sweepBufPath + ".__cleared__'", null, 15);
+          Nanna.exec("rm -f " + shq(sweepBufPath) + " " + shq(filePath + ".__cleared__") + " " + shq(sweepBufPath + ".__cleared__"), null, 15);
         } catch (eSweep) {
           // Stale draft leftovers are harmless.
         }

@@ -1374,6 +1374,105 @@ pub enum ImageSource {
     },
 }
 
+/// Most tokens one image costs: the provider downscales larger images to
+/// about 1.15 megapixels, which it bills at about 1,600 tokens.
+pub const IMAGE_TOKENS_MAX: usize = 1_600;
+
+/// Estimated tokens for an image, from its pixel size (≈ width × height / 750,
+/// the providers' published rule), capped at [`IMAGE_TOKENS_MAX`].
+///
+/// A flat 1,000 undercounted every ordinary screenshot (≈ 1,600 after the
+/// provider's downscale), so a turn with a few of them overran the window it
+/// was budgeted to fit. A size that cannot be read (a URL, an unknown format)
+/// is charged the cap — over-estimating summarizes early; under-estimating
+/// earns a 400.
+#[must_use]
+pub fn estimate_image_tokens(source: &ImageSource) -> usize {
+    let ImageSource::Base64 { data, .. } = source else {
+        return IMAGE_TOKENS_MAX;
+    };
+    let head = decode_base64_prefix(data, IMAGE_HEADER_BYTES_MAX);
+    image_dimensions(&head).map_or(IMAGE_TOKENS_MAX, |(width, height)| {
+        let pixels = u64::from(width).saturating_mul(u64::from(height));
+        let tokens = usize::try_from(pixels.div_ceil(750)).unwrap_or(IMAGE_TOKENS_MAX);
+        tokens.clamp(1, IMAGE_TOKENS_MAX)
+    })
+}
+
+/// How much of an image is decoded to find its size: a JPEG's frame header
+/// can sit behind EXIF and ICC segments, which rarely exceed 64 KiB.
+const IMAGE_HEADER_BYTES_MAX: usize = 64 * 1024;
+
+/// Decode at most `max_bytes` from the start of standard base64 `data`,
+/// stopping at the first character that is not part of the alphabet.
+fn decode_base64_prefix(data: &str, max_bytes: usize) -> Vec<u8> {
+    fn value(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some(u32::from(c - b'A')),
+            b'a'..=b'z' => Some(u32::from(c - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(c - b'0') + 52),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(max_bytes.min(data.len()));
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for c in data.bytes() {
+        let Some(v) = value(c) else { break };
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(u8::try_from((acc >> bits) & 0xFF).unwrap_or(0));
+            if out.len() >= max_bytes {
+                break;
+            }
+        }
+    }
+    debug_assert!(out.len() <= max_bytes);
+    out
+}
+
+/// `(width, height)` from a PNG, GIF or JPEG header, if `bytes` holds one.
+fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let be16 = |at: usize| {
+        Some(u32::from(u16::from_be_bytes(
+            bytes.get(at..at + 2)?.try_into().ok()?,
+        )))
+    };
+    let be32 = |at: usize| Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some((be32(16)?, be32(20)?));
+    }
+    if bytes.starts_with(b"GIF8") {
+        let le16 = |at: usize| {
+            Some(u32::from(u16::from_le_bytes(
+                bytes.get(at..at + 2)?.try_into().ok()?,
+            )))
+        };
+        return Some((le16(6)?, le16(8)?));
+    }
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        // Walk the segments to a start-of-frame marker (SOF0..SOF15, not
+        // DHT/JPG/DAC), whose payload holds height then width.
+        let mut at = 2usize;
+        while at + 4 <= bytes.len() {
+            if bytes[at] != 0xFF {
+                return None;
+            }
+            let marker = bytes[at + 1];
+            let length = usize::try_from(be16(at + 2)?).ok()?;
+            if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+                return Some((be16(at + 7)?, be16(at + 5)?));
+            }
+            at = at.checked_add(2 + length)?;
+        }
+    }
+    None
+}
+
 /// Anthropic message format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicMessage {
@@ -4278,9 +4377,8 @@ pub fn estimate_request_tokens(request: &CompletionRequest) -> usize {
                 ContentBlock::ToolResult { content, .. } => {
                     total += estimate_tokens(content);
                 }
-                ContentBlock::Image { .. } => {
-                    // Images are ~1000 tokens for small, more for large
-                    total += 1000;
+                ContentBlock::Image { source } => {
+                    total += estimate_image_tokens(source);
                 }
                 ContentBlock::Thinking { thinking, .. } => {
                     total += estimate_tokens(thinking);
@@ -8987,6 +9085,58 @@ mod tests {
         }
     }
     use super::*;
+
+    fn b64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
+            for k in 0..=chunk.len() {
+                let index = usize::try_from((n >> (18 - 6 * k)) & 63).unwrap_or(0);
+                out.push(char::from(ALPHABET[index]));
+            }
+        }
+        out
+    }
+
+    /// An image is charged by its pixel size, not a flat 1,000: a 1×1 PNG
+    /// is a token, an ordinary screenshot the provider's cap, and a size that
+    /// cannot be read the cap too.
+    #[test]
+    fn images_are_estimated_from_their_pixel_size() {
+        let png = |w: u32, h: u32| {
+            let mut header = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+            header.extend_from_slice(&w.to_be_bytes());
+            header.extend_from_slice(&h.to_be_bytes());
+            ImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: b64(&header),
+            }
+        };
+        assert_eq!(estimate_image_tokens(&png(1, 1)), 1);
+        assert_eq!(estimate_image_tokens(&png(600, 500)), 400);
+        assert_eq!(estimate_image_tokens(&png(1920, 1080)), IMAGE_TOKENS_MAX);
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0x01,
+            0xF4, 0x02, 0x58,
+        ];
+        let source = ImageSource::Base64 {
+            media_type: "image/jpeg".to_string(),
+            data: b64(&jpeg),
+        };
+        assert_eq!(
+            estimate_image_tokens(&source),
+            400,
+            "600 × 500 from the SOF0 frame header"
+        );
+        let url = ImageSource::Url {
+            url: "https://example.com/x.png".to_string(),
+        };
+        assert_eq!(estimate_image_tokens(&url), IMAGE_TOKENS_MAX);
+    }
 
     #[test]
     fn test_message_construction() {

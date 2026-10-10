@@ -1,6 +1,6 @@
 export default {
   name: "edit_file",
-  version: "0.1.11",
+  version: "0.1.12",
   output: "memory",
   description: "Replace one exact text snippet in a file with new text — an in-place edit for small changes. Use this instead of rewriting the whole file with write_file. ALL THREE main parameters are REQUIRED: file_path, old_string, new_string. old_string must be text that exists in the file (copy it verbatim; indentation differences are tolerated) — include 2-3 surrounding lines to make it unique. Only the matched snippet changes; the rest of the file is untouched. After each edit the cheapest structural check (sh -n / node --check / JSON.parse) runs on the result and its verdict is appended — including whether the file parsed before the edit. Use write_file only for new files or full rewrites.",
   parameters: {
@@ -28,6 +28,20 @@ export default {
     // is indistinguishable from a guard that never fired). Best-effort.
     function glog(msg) {
       try { Nanna.log("info", msg); } catch (e) { /* logging is optional */ }
+    }
+
+    // A path as one shell word for Nanna.exec's `sh -c`: single-quoted with
+    // embedded quotes escaped, and a leading `~/` left to the shell as
+    // "$HOME". The bridge expands `~` when it writes; quoted literally, the
+    // shell looked for a file named `~/x.py` (a valid file then "does NOT
+    // parse"), and an apostrophe re-split the words — `Bob's and Ann's
+    // notes.md` made a cleanup run `rm -f Bobs and …`.
+    function shq(path) {
+      var p = String(path);
+      var home = "";
+      if (p === "~" || p.indexOf("~/") === 0) { home = "\"$HOME\""; p = p.substring(1); }
+      if (p === "") return home;
+      return home + "'" + p.split("'").join("'\\''") + "'";
     }
 
     // Repeat-refusal escalation, shared with write_file — see the long note
@@ -99,7 +113,10 @@ export default {
     var HIWATER_STATE = ".nanna/write_hiwater.json";
     var HIWATER_MAX_ENTRIES = 200;
     function hiwaterNormKey(path) {
-      var k = path.split("\\").join("/").toLowerCase();
+      var k = path.split("\\").join("/");
+      // Case folds only where the filesystem does: on Linux `README.md` and
+      // `readme.md` are two files, and one key let a read of either count for both.
+      if (Nanna.platform === "win32" || Nanna.platform === "darwin") k = k.toLowerCase();
       while (k.indexOf("./") === 0) k = k.substring(2);
       while (k.indexOf("//") !== -1) k = k.split("//").join("/");
       return k;
@@ -393,6 +410,17 @@ export default {
     }
     function invariantRefusal(path, verb) {
       try {
+        // The registry itself is one of the rules' paths: rewriting it to
+        // "{}" erased every rule the user had declared, with no undo snapshot
+        // (.nanna/ is housekeeping). Only lift_invariant, which asks the
+        // user, changes it.
+        var regKey = hiwaterKey(path);
+        var regTail = "/.nanna/declared_invariants.json";
+        if (regKey === ".nanna/declared_invariants.json" ||
+            (regKey.length > regTail.length && regKey.lastIndexOf(regTail) === regKey.length - regTail.length)) {
+          return verb + " REFUSED — " + path + " holds the rules the user declared; nothing was " +
+            "written. Only lift_invariant (which asks the user) changes it. Continue with your task.";
+        }
         var list = invariantsLoad();
         if (list.length === 0) return "";
         var canon = hiwaterKey(path);
@@ -601,7 +629,7 @@ export default {
           "    print('NEW_OK')\n" +
           "except SyntaxError as e:\n" +
           "    print('NEW_BAD line ' + str(e.lineno) + ': ' + str(e.msg))\n");
-        var cmd = "python '" + chk + "' '" + newTmp + "'; rc=$?; rm -f '" + chk + "' '" + newTmp + "'; exit $rc";
+        var cmd = "python " + shq(chk) + " " + shq(newTmp) + "; rc=$?; rm -f " + shq(chk) + " " + shq(newTmp) + "; exit $rc";
         var result = Nanna.exec(cmd, null, 30);
         var out = result && result.stdout ? result.stdout : "";
         var bad = out.indexOf("NEW_BAD");
@@ -667,10 +695,10 @@ export default {
       if (path.indexOf("'") !== -1) return null;
       var cmd = null;
       var toolName = null;
-      if (kind === "sh") { cmd = "sh -n '" + path + "'"; toolName = "sh -n"; }
-      else if (kind === "bash") { cmd = "bash -n '" + path + "'"; toolName = "bash -n"; }
-      else if (kind === "node") { cmd = "node --check '" + path + "'"; toolName = "node --check"; }
-      else if (kind === "py") { cmd = "python -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding=\"utf-8\").read())' '" + path + "'"; toolName = "python ast"; }
+      if (kind === "sh") { cmd = "sh -n " + shq(path); toolName = "sh -n"; }
+      else if (kind === "bash") { cmd = "bash -n " + shq(path); toolName = "bash -n"; }
+      else if (kind === "node") { cmd = "node --check " + shq(path); toolName = "node --check"; }
+      else if (kind === "py") { cmd = "python -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding=\"utf-8\").read())' " + shq(path); toolName = "python ast"; }
       if (!cmd) return null;
       try {
         var r = Nanna.exec(cmd, null, 15);
@@ -804,8 +832,18 @@ export default {
     // file). Only the matched snippet is touched — the rest of the file keeps
     // its own line endings. The replacement is converted to the matched
     // flavor so the edit does not introduce mixed endings.
+    // The file's own line-ending style, judged once. A one-line old_string
+    // always matches exactly, so the CRLF conversion below (which runs only
+    // when the exact match fails) never touched the replacement: adding
+    // lines after a one-line anchor — the commonest edit — left LF lines in a
+    // CRLF file and reported success. Every path now writes in the file's style.
+    var fileIsCrlf = content.indexOf("\r\n") >= 0 && content.split("\r\n").join("").indexOf("\n") < 0;
+    function inFileEol(text) {
+      if (!fileIsCrlf) return text;
+      return text.split("\r\n").join("\n").split("\n").join("\r\n");
+    }
     var needle = oldStr;
-    var replacement = newStr;
+    var replacement = inFileEol(newStr);
     if (content.indexOf(needle) < 0) {
       var oldLf = oldStr.split("\r\n").join("\n");
       var oldCrlf = oldLf.split("\n").join("\r\n");
@@ -868,7 +906,7 @@ export default {
       var spans = findLooseSpans(content, oldStr);
       if (spans.length === 1) {
         var spanText = content.substring(spans[0].start, spans[0].end);
-        var looseReplacement = newStr;
+        var looseReplacement = inFileEol(newStr);
         if (spanText.indexOf("\r\n") >= 0) {
           looseReplacement = newStr.split("\r\n").join("\n").split("\n").join("\r\n");
         }
@@ -884,11 +922,12 @@ export default {
         // tab-separated file is never reinterpreted.
         var recovered = false;
         var unnumbered = stripLineNumberBlock(oldStr);
+        if (unnumbered !== null) unnumbered = inFileEol(unnumbered);
         if (unnumbered !== null && unnumbered !== oldStr && content.indexOf(unnumbered) !== -1) {
           var occurrences = content.split(unnumbered).length - 1;
           if (occurrences === 1) {
             glog("edit_file: matched after stripping read_file line numbers from old_string: " + filePath);
-            updated = content.split(unnumbered).join(newStr);
+            updated = content.split(unnumbered).join(inFileEol(newStr));
             replaced = 1;
             recovered = true;
           }
@@ -964,6 +1003,13 @@ export default {
     var forkSlash = forkBase.lastIndexOf("/");
     var forkName = forkSlash >= 0 ? forkBase.substring(forkSlash + 1) : forkBase;
     var forkDot = forkName.lastIndexOf(".");
+    // Conventional variants (`.env.local`, `Dockerfile.dev`) are siblings,
+    // not forks — the same exemption as write_file's guard.
+    var forkVariants = ["local", "dev", "development", "prod", "production", "staging", "test", "example", "sample", "template", "dist", "override", "ci", "debug", "release"];
+    if (forkDot > 0 && (forkName.charAt(0) === "." ||
+        forkVariants.indexOf(forkName.substring(forkDot + 1).toLowerCase()) !== -1)) {
+      forkDot = -1;
+    }
     if (forkDot > 0) {
       var forkStem = forkName.substring(0, forkDot);
       var forkStemPath = forkSlash >= 0

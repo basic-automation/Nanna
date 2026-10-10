@@ -1,6 +1,6 @@
 export default {
   name: "find_files",
-  version: "0.1.0",
+  version: "0.1.1",
   output: "memory",
   description: "Find files by NAME using a glob pattern — the 'where is it?' tool, when you know what a file is called but not where it lives. Use this instead of list_dir when you would otherwise walk a tree by hand, and instead of code_search when you are looking for a filename rather than for text inside files. Two pattern shapes: a pattern with NO slash matches the file's NAME at any depth (`*.rs` finds every Rust file in the tree; `Cargo.toml` finds every manifest), while a pattern WITH a slash is matched against the path relative to the search root (`src/**/*.rs`, `crates/*/Cargo.toml`). `*` matches within one path segment, `**` crosses segments, `?` matches one character. Returns paths relative to the search root, with sizes.",
   parameters: {
@@ -109,7 +109,19 @@ export default {
     var scanCapped = entries.length > SCAN_MAX;
     if (scanCapped) entries.length = SCAN_MAX;
 
-    var rootPrefix = normalizeSlashes(root);
+    // Strip the root the BRIDGE resolved, not the raw argument: listDir
+    // names entries by their resolved absolute path (`/ws/./src/main.rs` for
+    // the default "."), so a relative or default root never prefixed them,
+    // every "relative" path stayed absolute, and a pattern with a slash
+    // (`src/**/*.rs`) could not match anything.
+    var resolvedRoot = root;
+    try {
+      var rootStat = Nanna.stat(root);
+      if (rootStat && rootStat.path) resolvedRoot = String(rootStat.path);
+    } catch (eRoot) {
+      // Listing worked, so the root exists; keep the argument as written.
+    }
+    var rootPrefix = dropDotSegments(normalizeSlashes(resolvedRoot));
     if (rootPrefix.charAt(rootPrefix.length - 1) !== "/") rootPrefix += "/";
 
     var matches = [];
@@ -118,7 +130,7 @@ export default {
       var entry = entries[i];
       if (entry.entry_type !== "file") continue;
       filesSeen++;
-      var absolute = normalizeSlashes(String(entry.name));
+      var absolute = dropDotSegments(normalizeSlashes(String(entry.name)));
       var relative = absolute.indexOf(rootPrefix) === 0
         ? absolute.substring(rootPrefix.length)
         : absolute;
@@ -254,6 +266,15 @@ function globToRegExp(glob) {
 
 function escapeRegExp(ch) {
   return ".+^$()|{}\\]".indexOf(ch) === -1 ? ch : "\\" + ch;
+}
+
+// `/ws/./src` → `/ws/src`, `/ws/.` → `/ws`: the bridge joins the workdir
+// with a relative argument as written, so `.` survives as a segment.
+function dropDotSegments(p) {
+  var out = p;
+  while (out.indexOf("/./") !== -1) out = out.split("/./").join("/");
+  if (out.length > 2 && out.substring(out.length - 2) === "/.") out = out.substring(0, out.length - 2);
+  return out;
 }
 
 function normalizeSlashes(path) {

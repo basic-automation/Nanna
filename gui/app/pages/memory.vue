@@ -291,7 +291,11 @@ const filteredMemories = computed(() => {
   )
 })
 
+/** The latest fetch; a slower earlier one (another scope) must not land over it. */
+let fetchTicket = 0
+
 async function fetchMemories() {
+  const ticket = ++fetchTicket
   isLoading.value = true
   loadError.value = null
   try {
@@ -299,12 +303,14 @@ async function fetchMemories() {
       scope: memoryScope.value,
       workspaceId: currentWorkspace?.value?.id,
     })
+    if (ticket !== fetchTicket) return
     semanticMemories.value = res as any[]
   } catch (e) {
+    if (ticket !== fetchTicket) return
     console.error('Failed to fetch memories:', e)
     loadError.value = e instanceof Error ? e.message : String(e)
   } finally {
-    isLoading.value = false
+    if (ticket === fetchTicket) isLoading.value = false
   }
 }
 

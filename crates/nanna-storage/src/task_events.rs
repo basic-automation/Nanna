@@ -25,9 +25,10 @@ use serde_json::Value;
 
 /// What happened to a task in the store.
 ///
-/// All nine of P25's kinds now exist, and every one has a real emit point —
+/// All nine of P25's kinds exist, and every one has a real emit point —
 /// five from direct writes, two derived from dependency transitions, and two
-/// from the time sweep. Nothing here is declared ahead of the machinery that
+/// from the time sweep — plus `Updated` and `Deleted`, so a client showing a
+/// card hears every change to it, not only the ones the router acts on. Nothing here is declared ahead of the machinery that
 /// sends it: a kind a consumer can match on but never receive is a dead field
 /// wearing a feature's clothes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -55,6 +56,12 @@ pub enum TaskEventKind {
     Overdue,
     /// A card was completed — the recorded verdict.
     Verdict,
+    /// Fields other than status and assignee changed (title, labels, dates,
+    /// priority, description, …); `detail.fields` names them. Before it, an
+    /// edit reached no other open view until some unrelated event arrived.
+    Updated,
+    /// The card (and its subtree) was deleted.
+    Deleted,
 }
 
 impl TaskEventKind {
@@ -72,6 +79,8 @@ impl TaskEventKind {
             Self::Due => "due",
             Self::Overdue => "overdue",
             Self::Verdict => "verdict",
+            Self::Updated => "updated",
+            Self::Deleted => "deleted",
         }
     }
 }
@@ -116,7 +125,7 @@ mod tests {
     use super::*;
 
     /// Every kind, so a new variant has to be added here too.
-    const ALL: [TaskEventKind; 9] = [
+    const ALL: [TaskEventKind; 11] = [
         TaskEventKind::Created,
         TaskEventKind::Assigned,
         TaskEventKind::StatusChanged,
@@ -126,6 +135,8 @@ mod tests {
         TaskEventKind::Due,
         TaskEventKind::Overdue,
         TaskEventKind::Verdict,
+        TaskEventKind::Updated,
+        TaskEventKind::Deleted,
     ];
 
     #[test]

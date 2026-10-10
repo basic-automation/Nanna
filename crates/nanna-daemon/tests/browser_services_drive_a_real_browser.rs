@@ -169,3 +169,47 @@ async fn a_service_call_without_a_url_is_refused_by_name() {
         assert!(err.contains("url"), "{name} refused unhelpfully: {err}");
     }
 }
+
+/// Call `name` the way the scripting bridge does: on a throwaway
+/// current-thread runtime of its own, dropped when the call returns.
+async fn call_on_own_runtime(service: ServiceFn, name: &'static str, params: Value) -> Value {
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a throwaway runtime");
+        runtime
+            .block_on(service(params))
+            .unwrap_or_else(|e| panic!("{name} failed: {e}"))
+    })
+    .await
+    .expect("the call's thread")
+}
+
+/// Every `Nanna.service(...)` runs on a runtime built for that one call and
+/// dropped after it. The browser used to launch on the first call's runtime, so
+/// its connection died with it: every later call failed until the daemon
+/// restarted, and the browser was never relaunched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_browser_outlives_the_runtime_of_the_call_that_launched_it() {
+    let data_dir = tempfile::tempdir().expect("temp data dir");
+    let services = build_browser_services(data_dir.path());
+    if find_browser_executable().is_none() {
+        assert!(services.is_empty(), "no browser, nothing registered");
+        return;
+    }
+    let url = serve_probe_page().await;
+    let evaluate = services
+        .get("browser.evaluate")
+        .expect("registered")
+        .clone();
+    for round in 1..=2 {
+        let evaluated = call_on_own_runtime(
+            evaluate.clone(),
+            "browser.evaluate",
+            json!({ "url": url, "expression": "document.title" }),
+        )
+        .await;
+        assert_eq!(evaluated["value"], "Probe", "call {round}: {evaluated}");
+    }
+}

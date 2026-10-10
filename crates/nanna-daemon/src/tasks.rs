@@ -110,7 +110,7 @@ async fn resolve_scope(
             Ok(("session".to_string(), Some(session_id.to_string())))
         }
         "workspace" => {
-            let ws = workspace_id.read().await.clone();
+            let ws = crate::run_workspace::resolve(workspace_id).await;
             let ws =
                 ws.ok_or_else(|| "workspace scope requires an active workspace".to_string())?;
             Ok(("workspace".to_string(), Some(ws)))
@@ -895,14 +895,16 @@ fn task_update_service(storage: &Arc<Storage>) -> ServiceFn {
                 priority: opt_i64(&params, "priority")?.map(|p| p.max(2)),
                 labels: opt_string_vec(&params, "labels")?,
                 tool_scope: opt_string_vec(&params, "tools")?,
+                // An empty string clears the date, as the GUI's does.
                 due_at: params
                     .get("due_at")
                     .and_then(Value::as_str)
-                    .map(|s| Some(s.to_string())),
+                    .map(|s| Some(s.trim()).filter(|s| !s.is_empty()).map(str::to_string)),
+                // An empty string clears the date, as the GUI's does.
                 deadline_at: params
                     .get("deadline_at")
                     .and_then(Value::as_str)
-                    .map(|s| Some(s.to_string())),
+                    .map(|s| Some(s.trim()).filter(|s| !s.is_empty()).map(str::to_string)),
                 recurrence: params
                     .get("recurrence")
                     .and_then(Value::as_str)
@@ -1439,6 +1441,21 @@ pub const CARD_RUN_SESSION_PREFIX: &str = "card:";
 #[must_use]
 pub fn card_run_session_id(card_id: i64) -> String {
     format!("{CARD_RUN_SESSION_PREFIX}{card_id}")
+}
+
+/// Bind a background run's memory and `tasks.*` workspace scope to its own
+/// board — never the shared slot the last chat turn wrote. `free_slot`
+/// releases it. A run over a session's plan is that chat session, whose own
+/// turn binds it.
+fn bind_run_workspace(source: &TursoTaskSource, run_session: &str) {
+    if source.scope == "session" {
+        return;
+    }
+    let workspace = (source.scope == "workspace")
+        .then(|| source.scope_id.clone())
+        .flatten();
+    debug_assert!(source.scope != "workspace" || workspace.is_some());
+    crate::run_workspace::bind(run_session, workspace);
 }
 
 /// The tool session a background run's tools see — never the shared slot.
@@ -5395,7 +5412,8 @@ pub async fn sweep_recurrences(storage: &Arc<Storage>) -> usize {
             .as_deref()
             .and_then(parse_db_time)
             .unwrap_or(now);
-        let Some(occurrence) = expr.next(&completed).filter(|next| *next <= now) else {
+        let anchor = task.due_at.as_deref().or(task.deadline_at.as_deref());
+        let Some(occurrence) = round_occurrence(&expr, completed, anchor, now) else {
             continue;
         };
         if reopen_for_next_round(&repo, &task, Some(occurrence)).await {
@@ -5404,6 +5422,49 @@ pub async fn sweep_recurrences(storage: &Arc<Storage>) -> usize {
         }
     }
     reopened
+}
+
+/// Most occurrences one sweep steps through to reach the current round.
+///
+/// Bound justification: a card recurs at most daily in any real use (a board
+/// is not a cron table), and 1024 daily steps cover nearly three years of the
+/// daemon being off; an hourly card covers six weeks. Past the bound the
+/// round reached so far is used — late, never skipped — and a later sweep
+/// keeps catching up.
+const RECURRENCE_CATCH_UP_STEPS_MAX: usize = 1024;
+
+/// The occurrence that opens a recurring card's next round, if it has come.
+///
+/// Two ways the first occurrence after completion was the wrong one:
+/// - **finished early.** A daily 09:00 card due today and completed at
+///   08:00 found today's 09:00 as its "next" round and reopened the round
+///   just done — same date, announced due again. The search starts after the
+///   end of the card's own day (`anchor`: its date, else its deadline).
+/// - **downtime.** After the daemon was off for a month the first occurrence
+///   was a month old, so the card reopened on that round and was overdue at
+///   once. It steps on to the latest occurrence not after `now`.
+fn round_occurrence(
+    expr: &nanna_core::CronExpr,
+    completed: chrono::DateTime<chrono::Utc>,
+    anchor: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let anchor_day_end = anchor
+        .and_then(|stored| stored.get(..10))
+        .and_then(|day| chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").ok())
+        .and_then(|day| day.and_hms_opt(23, 59, 59))
+        .map(|end| end.and_utc());
+    let start = anchor_day_end.map_or(completed, |end| end.max(completed));
+    let mut occurrence = expr.next(&start).filter(|next| *next <= now)?;
+    for _ in 0..RECURRENCE_CATCH_UP_STEPS_MAX {
+        match expr.next(&occurrence) {
+            Some(next) if next <= now && next > occurrence => occurrence = next,
+            _ => break,
+        }
+    }
+    debug_assert!(occurrence <= now, "a round opens only once it has come");
+    debug_assert!(occurrence > start, "and only after the round before it");
+    Some(occurrence)
 }
 
 /// Reopen recurring `task` for its next round; `true` when it reopened.
@@ -5487,12 +5548,17 @@ fn next_round_dates(
                 (day_of(stored)? + shift).format("%Y-%m-%d").to_string(),
             ));
         }
+        if stored.contains('T') {
+            // In the offset it was written in: re-rendered in UTC, an evening
+            // `-07:00` time moved to the next day's prefix, and every reader
+            // compares that prefix — the card fell due a day late each round.
+            let at = chrono::DateTime::parse_from_rfc3339(stored).ok()? + shift;
+            let moved = at.to_rfc3339();
+            debug_assert_eq!(moved.get(..10), Some(at.date_naive().to_string().as_str()));
+            return Some(Some(moved));
+        }
         let at = parse_db_time(stored)? + shift;
-        Some(Some(if stored.contains('T') {
-            at.to_rfc3339()
-        } else {
-            at.format("%Y-%m-%d %H:%M:%S").to_string()
-        }))
+        Some(Some(at.format("%Y-%m-%d %H:%M:%S").to_string()))
     };
     let dates = (moved(due_at)?, moved(deadline_at)?);
     debug_assert!(
@@ -5938,6 +6004,16 @@ mod tests {
             ),
             Some((None, Some("2026-10-12 17:00:00".to_string())))
         );
+        // An offset timestamp stays in its offset: in UTC this evening time
+        // would read as the next day, and the round would fall due a day late.
+        assert_eq!(
+            next_round_dates(
+                Some("2026-10-05T20:00:00-07:00"),
+                None,
+                at("2026-10-12T09:00:00Z")
+            ),
+            Some((Some("2026-10-12T20:00:00-07:00".to_string()), None))
+        );
         // No dates, a date not behind the occurrence, or an unreadable one: unchanged.
         assert_eq!(
             next_round_dates(None, None, at("2026-10-12T09:00:00Z")),
@@ -5950,6 +6026,59 @@ mod tests {
         assert_eq!(
             next_round_dates(Some("soon"), None, at("2026-10-12T09:00:00Z")),
             None
+        );
+    }
+
+    #[test]
+    fn a_round_opens_after_its_own_day_and_on_the_latest_occurrence() {
+        let at = |text: &str| {
+            chrono::DateTime::parse_from_rfc3339(text)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let daily = nanna_core::CronExpr::parse("0 9 * * *").unwrap();
+        // Finished early, before today's occurrence: today's round is done.
+        let completed = at("2026-10-10T08:00:00Z");
+        assert_eq!(
+            round_occurrence(
+                &daily,
+                completed,
+                Some("2026-10-10"),
+                at("2026-10-10T09:05:00Z")
+            ),
+            None,
+            "the round just finished is not reopened"
+        );
+        assert_eq!(
+            round_occurrence(
+                &daily,
+                completed,
+                Some("2026-10-10"),
+                at("2026-10-11T09:05:00Z")
+            ),
+            Some(at("2026-10-11T09:00:00Z"))
+        );
+        // Downtime: a weekly card done on 09-07, daemon back on 10-10.
+        let weekly = nanna_core::CronExpr::parse("0 9 * * 1").unwrap();
+        assert_eq!(
+            round_occurrence(
+                &weekly,
+                at("2026-09-07T10:00:00Z"),
+                Some("2026-09-07"),
+                at("2026-10-10T12:00:00Z")
+            ),
+            Some(at("2026-10-05T09:00:00Z")),
+            "the current round, not the oldest missed one"
+        );
+        // No date to anchor on: the first occurrence after completion.
+        assert_eq!(
+            round_occurrence(
+                &daily,
+                at("2026-10-09T15:00:00Z"),
+                None,
+                at("2026-10-10T10:00:00Z")
+            ),
+            Some(at("2026-10-10T09:00:00Z"))
         );
     }
 
@@ -8759,6 +8888,7 @@ impl TaskRunManager {
         let cancel = self
             .claim_slot(key.clone(), scope_key, goal.clone(), card.clone(), Some(&source.storage))
             .await?;
+        let run_card = card.as_ref().map(|claim| claim.card_id);
         let busy_member = card.map(|claim| claim.member_id);
         set_member_status(&source.storage, busy_member.as_deref(), MemberStatus::Busy).await;
         source.mark_run(RUN_STARTED_ACTION, Value::Null).await;
@@ -8773,6 +8903,7 @@ impl TaskRunManager {
 
         let manager = self.clone();
         let run_session = background_run_session(&source);
+        bind_run_workspace(&source, &run_session);
         let run = async move {
             // Bounded auto-resume (standard for every model): the task store
             // IS the checkpoint, so a run stopped by a provider incident is
@@ -8855,11 +8986,11 @@ impl TaskRunManager {
                 report: serde_json::to_value(&report).unwrap_or(Value::Null),
             });
             set_member_status(&source.storage, busy_member.as_deref(), MemberStatus::Idle).await;
-            manager.runs.write().await.remove(&key);
-            manager.reports.write().await.insert(key, (report, resumes));
+            manager.free_slot(key, (report, resumes), &source).await;
             // After the slot is free, or the member's next card would be
-            // refused as "already working".
-            manager.announce_member_free(busy_member);
+            // refused as "already working" — and the card's next member's
+            // start refused as "already being worked".
+            manager.announce_member_free(busy_member, run_card);
         };
         // Tools execute inline in the run's own future, so the task-local
         // scope covers every call the run makes.
@@ -8870,20 +9001,48 @@ impl TaskRunManager {
         Ok(())
     }
 
-    /// Hand a freed member to the card-run worker. Never waits: a full queue
-    /// is logged, and the member's waiting cards still start on their next
-    /// assignment or date.
-    fn announce_member_free(&self, member_id: Option<String>) {
+    /// Close a finished run's books: free its slot, keep its report, and drop
+    /// the workspace binding `bind_run_workspace` made for it.
+    async fn free_slot(
+        &self,
+        key: String,
+        report: (LongHorizonReport, usize),
+        source: &TursoTaskSource,
+    ) {
+        let removed = self.runs.write().await.remove(&key);
+        debug_assert!(removed.is_some(), "a run frees the slot it claimed");
+        self.reports.write().await.insert(key, report);
+        if source.scope != "session" {
+            crate::run_workspace::release(&background_run_session(source));
+        }
+    }
+
+    /// Hand a freed member, and the card its run held, to the card-run
+    /// worker. Never waits: a full queue is logged, and the member's waiting
+    /// cards still start on their next assignment or date.
+    ///
+    /// The card wake covers a card that changed hands while the run wound
+    /// down: a hand-back releases the card before the run's slot is removed,
+    /// so the router's reassignment to another member reached `claim_slot`
+    /// while the slot still stood, was refused as "already being worked", and
+    /// nothing retried it — the card sat `pending` with its new member and no
+    /// run. `try_start` re-judges the card from the store, so a card that is
+    /// closed, waiting, or still the freed member's starts nothing new.
+    fn announce_member_free(&self, member_id: Option<String>, card_id: Option<i64>) {
         let (Some(queue), Some(member_id)) = (self.member_free.as_ref(), member_id) else {
             return;
         };
-        if let Err(tokio::sync::mpsc::error::TrySendError::Full(wake)) =
-            queue.try_send(crate::card_run_trigger::RunWake::MemberFree(member_id))
-        {
-            tracing::warn!(
-                ?wake,
-                "card run queue is full; a freed member's next card waits"
-            );
+        debug_assert!(!member_id.is_empty(), "a claim names its member");
+        debug_assert!(card_id.is_none_or(|id| id > 0), "store ids start at 1");
+        let wakes = std::iter::once(crate::card_run_trigger::RunWake::MemberFree(member_id))
+            .chain(card_id.map(crate::card_run_trigger::RunWake::Card));
+        for wake in wakes {
+            if let Err(tokio::sync::mpsc::error::TrySendError::Full(wake)) = queue.try_send(wake) {
+                tracing::warn!(
+                    ?wake,
+                    "card run queue is full; a freed member's next card waits"
+                );
+            }
         }
     }
 
@@ -10733,13 +10892,18 @@ mod card_run_tests {
     async fn a_finished_card_run_announces_its_member_free() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let manager = super::TaskRunManager::new().with_member_free(tx);
-        manager.announce_member_free(None);
-        manager.announce_member_free(Some(AGENT.to_string()));
+        manager.announce_member_free(None, None);
+        manager.announce_member_free(Some(AGENT.to_string()), Some(7));
         assert_eq!(
             rx.try_recv().ok(),
             Some(crate::card_run_trigger::RunWake::MemberFree(
                 AGENT.to_string()
             ))
+        );
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(crate::card_run_trigger::RunWake::Card(7)),
+            "the card the run held is re-judged: its next member may be waiting"
         );
         assert!(rx.try_recv().is_err(), "nothing for a run without a member");
     }

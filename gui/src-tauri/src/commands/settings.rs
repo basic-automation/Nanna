@@ -497,11 +497,22 @@ pub async fn set_provider_api_key(
     }
 
     // Durable storage is the OS keyring; config.toml never receives secrets.
-    // (claude-proxy is a URL, not a secret — strip_secrets leaves it alone.)
-    // store_secrets() refills what it stores, so in-memory state (and the OAuth
-    // badge) keeps the session's credentials.
-    if provider != "claude-proxy"
-        && let Err(e) = state_guard.config.store_secrets()
+    // (claude-proxy is a URL, not a secret.) Only the key entered HERE is
+    // filed: `store_secrets()` filed every secret the cached config held —
+    // including ones that came from the environment (`OPENAI_API_KEY`, …) —
+    // so after the variable was unset the stale key kept being used, from a
+    // place the user never put it.
+    let store_key = match provider.as_str() {
+        "anthropic" => Some(nanna_config::credentials::keys::ANTHROPIC_API_KEY),
+        "openai" => Some(nanna_config::credentials::keys::OPENAI_API_KEY),
+        "brave" => Some(nanna_config::credentials::keys::BRAVE_API_KEY),
+        "openrouter" => Some(nanna_config::credentials::keys::OPENROUTER_API_KEY),
+        "github" => Some(nanna_config::credentials::keys::GITHUB_TOKEN),
+        _ => None,
+    };
+    debug_assert_eq!(store_key.is_none(), provider == "claude-proxy");
+    if let Some(key) = store_key
+        && let Err(e) = nanna_config::credentials::SecureStore::new().set(key, &api_key)
     {
         error!("Failed to store API key in keyring: {e}");
         return Err(format!("failed to store API key securely: {e}"));
@@ -2084,7 +2095,11 @@ pub async fn set_max_tokens(
     state_guard.config.llm.max_tokens = tokens;
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {e}"))?;
+    // Tell the daemon now rather than leave it to the file watcher's poll:
+    // in that window another setter's daemon-side save could undo this one.
+    let backend = state_guard.backend.clone();
     drop(state_guard);
+    let _ = backend.config_reload().await;
     info!("Max tokens set to: {}", tokens);
     Ok(())
 }
@@ -2119,7 +2134,11 @@ pub async fn set_agent_iteration_policy(
     state_guard.config.agent.nudge_interval_iterations = nudge_interval;
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {e}"))?;
+    // Tell the daemon now rather than leave it to the file watcher's poll:
+    // in that window another setter's daemon-side save could undo this one.
+    let backend = state_guard.backend.clone();
     drop(state_guard);
+    let _ = backend.config_reload().await;
     info!(
         "Agent iteration policy set: max={:?}, nudge_after={}, nudge_interval={}",
         max_iterations, nudge_after, nudge_interval
@@ -2280,10 +2299,10 @@ pub async fn set_chat_model_priority(
     // save above stays ordered under it, the daemon call does not need it.
     let backend = state_guard.backend.clone();
     drop(state_guard);
-    let _ = backend.config_set(
-        "llm.model_priority",
-        serde_json::to_value(&priority).unwrap_or_default(),
-    ).await;
+    // Re-read the whole file rather than set one key: `config_set` made
+    // the daemon save ITS copy, which could still lack a change another
+    // setter wrote to the file moments ago — and undo it.
+    let _ = backend.config_reload().await;
 
     // Emit model-status event so the GUI badge updates
     let _ = app.emit("model-status", ModelStatusEvent {
@@ -2336,7 +2355,11 @@ pub async fn set_embedding_model_priority(
 
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {e}"))?;
+    // Tell the daemon now rather than leave it to the file watcher's poll:
+    // in that window another setter's daemon-side save could undo this one.
+    let backend = state_guard.backend.clone();
     drop(state_guard);
+    let _ = backend.config_reload().await;
 
     info!("Embedding model priority set: {:?}", priority);
     Ok(())
@@ -2419,7 +2442,11 @@ pub async fn set_ocr_model_priority(
 
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {e}"))?;
+    // Tell the daemon now rather than leave it to the file watcher's poll:
+    // in that window another setter's daemon-side save could undo this one.
+    let backend = state_guard.backend.clone();
     drop(state_guard);
+    let _ = backend.config_reload().await;
 
     info!("OCR model priority set: {:?}", priority);
     Ok(())
@@ -2455,7 +2482,11 @@ pub async fn set_use_embedded_ocr(
 
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {e}"))?;
+    // Tell the daemon now rather than leave it to the file watcher's poll:
+    // in that window another setter's daemon-side save could undo this one.
+    let backend = state_guard.backend.clone();
     drop(state_guard);
+    let _ = backend.config_reload().await;
 
     info!("Embedded OCR (ocrs) set to: {}", enabled);
     Ok(())
@@ -2504,10 +2535,10 @@ pub async fn set_model_routing(
     // save above stays ordered under it, the daemon call does not need it.
     let backend = state_guard.backend.clone();
     drop(state_guard);
-    let _ = backend.config_set(
-        "llm.model_routing",
-        serde_json::to_value(&routes).unwrap_or_default(),
-    ).await;
+    // Re-read the whole file rather than set one key: `config_set` made
+    // the daemon save ITS copy, which could still lack a change another
+    // setter wrote to the file moments ago — and undo it.
+    let _ = backend.config_reload().await;
 
     info!("Model routing set: {:?}", routes);
     Ok(())
@@ -2551,10 +2582,10 @@ pub async fn set_routing_first_turn_primary(
     // save above stays ordered under it, the daemon call does not need it.
     let backend = state_guard.backend.clone();
     drop(state_guard);
-    let _ = backend.config_set(
-        "llm.routing_first_turn_primary",
-        serde_json::Value::Bool(enabled),
-    ).await;
+    // Re-read the whole file rather than set one key: `config_set` made
+    // the daemon save ITS copy, which could still lack a change another
+    // setter wrote to the file moments ago — and undo it.
+    let _ = backend.config_reload().await;
 
     info!("Routing first turn primary set: {}", enabled);
     Ok(())
@@ -2610,14 +2641,10 @@ pub async fn set_sub_agent_models(
     // save above stays ordered under it, the daemon call does not need it.
     let backend = state_guard.backend.clone();
     drop(state_guard);
-    let _ = backend.config_set(
-        "llm.sub_agent_models",
-        serde_json::json!(models),
-    ).await;
-    let _ = backend.config_set(
-        "llm.sub_agent_model",
-        serde_json::Value::Null,
-    ).await;
+    // Re-read the whole file rather than set one key: `config_set` made
+    // the daemon save ITS copy, which could still lack a change another
+    // setter wrote to the file moments ago — and undo it.
+    let _ = backend.config_reload().await;
 
     info!("Sub-agent models set: {:?}", models);
     Ok(())

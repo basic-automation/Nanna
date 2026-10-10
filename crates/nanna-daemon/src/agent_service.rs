@@ -2395,7 +2395,11 @@ impl AgentService {
     /// Get memory context for a query
     pub async fn recall_memories(&self, query: &str, limit: usize) -> Vec<MemoryContext> {
         if let Some(ref memory) = self.memory {
-            match memory.recall(query).await {
+            match memory
+                .recall_scoped_with_coverage_shown(query, None, limit)
+                .await
+                .map(|(results, _coverage)| results)
+            {
                 Ok(results) => {
                     results.into_iter()
                         .take(limit)
@@ -2419,7 +2423,13 @@ impl AgentService {
     /// Recall memories scoped to a workspace (workspace sees global + own, None sees all)
     pub async fn recall_memories_scoped(&self, query: &str, limit: usize, workspace_id: Option<&str>) -> Vec<MemoryContext> {
         if let Some(ref memory) = self.memory {
-            match memory.recall_scoped(query, workspace_id).await {
+            // Only what is shown is reviewed (the testing effect): asking for
+            // `limit` rather than trimming the default page afterwards.
+            match memory
+                .recall_scoped_with_coverage_shown(query, workspace_id, limit)
+                .await
+                .map(|(results, _coverage)| results)
+            {
                 Ok(results) => {
                     results.into_iter()
                         .take(limit)

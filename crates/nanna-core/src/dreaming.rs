@@ -259,6 +259,7 @@ pub fn create_dreaming_executor(
                     duration_ms: elapsed_ms(start),
                     started_at: now,
                     finished_at: now,
+                    skipped: false,
                 };
             }
 
@@ -285,6 +286,7 @@ pub fn create_dreaming_executor(
                         duration_ms: elapsed_ms(start),
                         started_at,
                         finished_at,
+                        skipped: false,
                     }
                 }
                 Err(e) => {
@@ -299,6 +301,7 @@ pub fn create_dreaming_executor(
                         duration_ms: elapsed_ms(start),
                         started_at,
                         finished_at,
+                        skipped: false,
                     }
                 }
             }

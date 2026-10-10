@@ -3,27 +3,33 @@
 use crate::state::AppState;
 use crate::webhooks;
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    routing::{get, post},
     Json, Router,
+    extract::{Path, Request, State},
+    http::{HeaderMap, StatusCode, header},
+    middleware::{self, Next},
+    response::Response,
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Create the main router
 pub fn create_router(state: AppState) -> Router {
-    Router::new()
-        // Health check and metrics
-        .route("/health", get(health_check))
-        .route("/metrics", get(metrics))
-        // API routes
+    // The API drives the agent, tools included: only a local native caller.
+    let api = Router::new()
         .route("/api/v1/chat", post(chat))
         .route("/api/v1/sessions", post(create_session))
         .route("/api/v1/sessions/{session_id}", get(get_session))
         .route("/api/v1/sessions/{session_id}/messages", post(send_message))
         .route("/api/v1/sessions/{session_id}/messages", get(get_messages))
-        // Webhook routes
+        .route_layer(middleware::from_fn(local_callers_only));
+    Router::new()
+        // Health check and metrics
+        .route("/health", get(health_check))
+        .route("/metrics", get(metrics))
+        .merge(api)
+        // Webhook routes — reached through a tunnel under the provider's
+        // host, and authenticated by their signatures instead.
         .route("/webhooks/telegram", post(webhooks::telegram::handle))
         .route("/webhooks/discord", post(webhooks::discord::handle))
         .route("/webhooks/slack", post(webhooks::slack::handle))
@@ -31,6 +37,44 @@ pub fn create_router(state: AppState) -> Router {
         .route("/webhooks/signal/health", get(webhooks::signal::health))
         .route("/webhooks/generic", post(webhooks::generic::handle))
         .with_state(state)
+}
+
+/// Refuse an API request a web page could have made.
+///
+/// A browser marks a cross-site request with `Origin`; a DNS-rebinding page is
+/// same-origin, so a `GET` from it carries none — but its `Host` is the
+/// attacker's name, never a loopback one. Native clients send no `Origin` and
+/// address the server as `127.0.0.1`, `localhost` or `[::1]`.
+async fn local_callers_only(request: Request, next: Next) -> Result<Response, StatusCode> {
+    if is_local_native_request(request.headers()) {
+        return Ok(next.run(request).await);
+    }
+    tracing::warn!(
+        host = ?request.headers().get(header::HOST),
+        origin = ?request.headers().get(header::ORIGIN),
+        "refused an API request from a web page or a foreign host"
+    );
+    Err(StatusCode::FORBIDDEN)
+}
+
+/// Whether `headers` describe a native caller on this machine.
+fn is_local_native_request(headers: &HeaderMap) -> bool {
+    if headers.contains_key(header::ORIGIN) {
+        return false;
+    }
+    let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) else {
+        // HTTP/1.1 requires Host; a request without one is not a browser's.
+        return true;
+    };
+    let name = host.strip_prefix('[').map_or_else(
+        || host.rsplit_once(':').map_or(host, |(name, _port)| name),
+        |bracketed| {
+            bracketed
+                .split_once(']')
+                .map_or(bracketed, |(name, _)| name)
+        },
+    );
+    matches!(name, "127.0.0.1" | "localhost" | "::1")
 }
 
 /// Health check response
@@ -266,7 +310,7 @@ async fn get_messages(
 
 #[cfg(test)]
 mod tests {
-    use super::MessageResponse;
+    use super::{HeaderMap, MessageResponse, is_local_native_request};
     use crate::ProcessedReply;
 
     fn stored_reply(id: i64, content: &str) -> nanna_storage::Message {
@@ -308,5 +352,45 @@ mod tests {
         assert_eq!(response.role, "assistant");
         assert_eq!(response.content, "unsaved");
         assert_eq!((response.tokens_in, response.tokens_out), (None, None));
+    }
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, value.parse().expect("header value"));
+        }
+        map
+    }
+
+    /// A web page is refused whether it is cross-site (it sends `Origin`) or
+    /// a DNS-rebinding page posing as same-origin (its `Host` is not loopback);
+    /// a native client on this machine is let through.
+    #[test]
+    fn only_a_local_native_caller_reaches_the_api() {
+        for local in [
+            "127.0.0.1:3000",
+            "localhost:3000",
+            "[::1]:3000",
+            "localhost",
+        ] {
+            assert!(
+                is_local_native_request(&headers(&[("host", local)])),
+                "{local}"
+            );
+        }
+        assert!(
+            is_local_native_request(&HeaderMap::new()),
+            "no Host: not a browser"
+        );
+        for foreign in ["evil.example:3000", "127.0.0.1.evil.example", "[::2]:3000"] {
+            assert!(
+                !is_local_native_request(&headers(&[("host", foreign)])),
+                "{foreign}"
+            );
+        }
+        assert!(!is_local_native_request(&headers(&[
+            ("host", "127.0.0.1:3000"),
+            ("origin", "https://example.com"),
+        ])));
     }
 }

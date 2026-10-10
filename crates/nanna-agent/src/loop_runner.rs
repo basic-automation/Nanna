@@ -5426,6 +5426,14 @@ impl Agent {
         if state.wrap_up.engaged {
             request.tools = None;
         }
+        // The definitions this request carries count against its window.
+        let tool_tokens = request.tools.as_ref().map_or(0, |tools| {
+            nanna_llm::estimate_tokens(&serde_json::to_string(tools).unwrap_or_default())
+        });
+        self.context
+            .write()
+            .await
+            .set_tool_definition_tokens(tool_tokens);
         if let Some(ref routed) = routed_model {
             self.retarget_request_to_routed(&mut request, routed, options).await;
         }
@@ -5712,7 +5720,16 @@ impl Agent {
                     if keep > 2 {
                         ctx.drop_oldest(keep);
                     }
-                    ctx.truncate_to_limit();
+                    // Announced like every other cut: a history that is
+                    // silently shorter on the retry reads as corruption.
+                    let dropped = ctx.truncate_to_limit();
+                    ctx.push_summarization_failure_notice(
+                        dropped,
+                        "the provider rejected the request as too long",
+                    );
+                    for notice in ctx.take_pending_loss_notices() {
+                        ctx.messages.push(AnthropicMessage::user_text(&notice));
+                    }
                     let remaining = ctx.messages.len();
                     let est_after = ctx.estimate_request_tokens();
                     info!(
