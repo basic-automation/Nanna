@@ -628,10 +628,7 @@ mod tests {
         let file = std::fs::File::create(&path).expect("create");
         file.set_len(SNAPSHOT_BYTES_MAX + 1).expect("sparse");
 
-        let err = history
-            .restore(None, saved.seq)
-            .await
-            .expect_err("refused");
+        let err = history.restore(None, saved.seq).await.expect_err("refused");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
         assert_eq!(
             std::fs::metadata(&path).expect("stat").len(),
