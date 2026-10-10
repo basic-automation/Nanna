@@ -916,108 +916,86 @@ impl AgentContext {
             .collect()
     }
 
-    /// Deduplicate messages by replacing large content blocks that were already summarized.
+    /// Fold a large block into a note only when a LATER surviving message
+    /// carries the same content.
     ///
-    /// Uses content-defined chunking (CDC) to detect partial duplicates - even if
-    /// content is split differently, overlapping chunks will be detected.
+    /// Uses content-defined chunking (CDC), so a copy split differently still
+    /// matches. This used to fold anything matching what summarization had
+    /// already REMOVED — but a summarized message is gone from the context, so
+    /// a surviving match is always a later re-read, and the summary is lossy:
+    /// the note ("already included in previous context summary") replaced the
+    /// only literal copy left. A model that re-read a file to edit it lost the
+    /// text again once it took one more step, and re-read it again. Now the
+    /// newest copy of any content always survives; older duplicates fold.
+    /// The newest message and the pinned live request are never folded.
     fn deduplicate_messages(&self) -> Vec<AnthropicMessage> {
-        let mut dedup_count = 0;
-        let mut bytes_saved = 0;
-        let mut deduped = Vec::with_capacity(self.messages.len());
-        // Never placeholdered: the newest message (it carries the tool results
-        // the model is about to answer) and the pinned live request. A fresh
-        // re-read of a file whose earlier read was summarised used to be
-        // replaced by "already included in previous context summary" — but the
-        // summary is lossy, so the model lost the very text it had just asked
-        // for, and asked again.
         let newest = self.messages.len().saturating_sub(1);
         let pinned = self.pinned_index();
+        let mut later: HashSet<u64> = HashSet::new();
+        let mut dedup_count = 0usize;
+        let mut bytes_saved = 0usize;
+        let mut deduped: Vec<AnthropicMessage> = Vec::with_capacity(self.messages.len());
 
-        for (index, msg) in self.messages.iter().enumerate() {
-            if index == newest || index == pinned {
-                deduped.push(msg.clone());
-                continue;
-            }
+        // Newest first, so `later` holds exactly what follows each message.
+        for (index, msg) in self.messages.iter().enumerate().rev() {
+            let foldable = index != newest && index != pinned;
             let mut new_content = Vec::with_capacity(msg.content.len());
-
             for block in &msg.content {
-                match block {
-                    ContentBlock::Text { text } if text.len() >= DEDUP_MIN_SIZE => {
-                        // Check CDC coverage - what percentage of chunks are already known?
-                        let coverage = dedup_coverage(text, &self.summarized_content_hashes);
-
-                        if coverage >= DEDUP_THRESHOLD {
-                            // Most of this content was already summarized
-                            new_content.push(ContentBlock::Text {
-                                text: format!(
-                                    "[Content ({:.0}% duplicate) already included in previous context summary]",
-                                    coverage * 100.0
-                                ),
-                            });
-                            dedup_count += 1;
-                            bytes_saved += text.len();
-                            debug!(
-                                coverage = format!("{:.1}%", coverage * 100.0),
-                                original_len = text.len(),
-                                "Deduplicated previously summarized content via CDC"
-                            );
-                        } else if coverage > 0.0 {
-                            // Partial overlap - keep full content but log it
-                            debug!(
-                                coverage = format!("{:.1}%", coverage * 100.0),
-                                original_len = text.len(),
-                                "Partial duplicate detected, keeping full content"
-                            );
-                            new_content.push(block.clone());
-                        } else {
-                            new_content.push(block.clone());
-                        }
-                    }
-                    ContentBlock::ToolResult { tool_use_id, content, is_error }
-                        if content.len() >= DEDUP_MIN_SIZE =>
-                    {
-                        let coverage = dedup_coverage(content, &self.summarized_content_hashes);
-
-                        if coverage >= DEDUP_THRESHOLD {
-                            new_content.push(ContentBlock::ToolResult {
-                                tool_use_id: tool_use_id.clone(),
-                                content: format!(
-                                    "[Output ({:.0}% duplicate) already included in previous context summary]",
-                                    coverage * 100.0
-                                ),
-                                is_error: *is_error,
-                            });
-                            dedup_count += 1;
-                            bytes_saved += content.len();
-                            debug!(
-                                coverage = format!("{:.1}%", coverage * 100.0),
-                                original_len = content.len(),
-                                "Deduplicated previously summarized tool result via CDC"
-                            );
-                        } else {
-                            new_content.push(block.clone());
-                        }
+                let (text, is_result) = match block {
+                    ContentBlock::Text { text } if text.len() >= DEDUP_MIN_SIZE => (text, false),
+                    ContentBlock::ToolResult { content, .. } if content.len() >= DEDUP_MIN_SIZE => {
+                        (content, true)
                     }
                     _ => {
                         new_content.push(block.clone());
+                        continue;
                     }
+                };
+                let coverage = dedup_coverage(text, &later);
+                if foldable && coverage >= DEDUP_THRESHOLD {
+                    let note = format!(
+                        "[{} ({:.0}% duplicate) repeated in full later in this conversation]",
+                        if is_result { "Output" } else { "Content" },
+                        coverage * 100.0
+                    );
+                    new_content.push(match block {
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            is_error,
+                            ..
+                        } => ContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: note,
+                            is_error: *is_error,
+                        },
+                        _ => ContentBlock::Text { text: note },
+                    });
+                    dedup_count += 1;
+                    bytes_saved += text.len();
+                } else {
+                    later.extend(chunk_and_hash(text));
+                    new_content.push(block.clone());
                 }
             }
-
             deduped.push(AnthropicMessage {
                 role: msg.role.clone(),
                 content: new_content,
             });
         }
+        deduped.reverse();
+        debug_assert_eq!(
+            deduped.len(),
+            self.messages.len(),
+            "folding never drops a message"
+        );
 
         if dedup_count > 0 {
             info!(
                 dedup_count = dedup_count,
                 bytes_saved = bytes_saved,
-                "Deduplicated content blocks using CDC"
+                "Deduplicated content blocks repeated later (CDC)"
             );
         }
-
         deduped
     }
 
@@ -3858,13 +3836,41 @@ mod tests {
             other => panic!("expected a tool result, got {other:?}"),
         };
         assert!(
-            content(&deduped[1]).contains("already included"),
-            "older copies still fold"
+            content(&deduped[1]).contains("repeated in full later"),
+            "an older copy folds when a later one carries it"
         );
         assert_eq!(
             content(&deduped[3]),
             file,
             "the newest result is sent whole"
+        );
+    }
+
+    /// The only surviving copy of content is never folded, even when it
+    /// matches what summarization removed: the summary is lossy, and a file
+    /// re-read to be edited vanished again one step later.
+    #[test]
+    fn a_re_read_that_is_the_only_copy_survives_the_next_step() {
+        let file = "fn main() { println!(\"a line of a real file\"); }\n".repeat(200);
+        let mut ctx = AgentContext::new("s1");
+        ctx.summarized_content_hashes.extend(chunk_and_hash(&file));
+        ctx.messages
+            .push(AnthropicMessage::user_text("edit main.rs"));
+        ctx.pin_live_request();
+        ctx.messages
+            .push(AnthropicMessage::user(vec![ContentBlock::ToolResult {
+                tool_use_id: "re-read".to_string(),
+                content: file.clone(),
+                is_error: None,
+            }]));
+        ctx.messages
+            .push(AnthropicMessage::assistant_text("now editing it"));
+
+        let deduped = ctx.deduplicate_messages();
+        assert!(
+            matches!(&deduped[1].content[0], ContentBlock::ToolResult { content, .. } if *content == file),
+            "the re-read is kept whole: {:?}",
+            deduped[1].content
         );
     }
 

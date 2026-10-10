@@ -10733,9 +10733,12 @@ keep the phases readable; promote individual items into a phase when they become
       workdir note, or the tool definitions — so on a 32k Ollama window a compressed request can
       still exceed it (Ollama then truncates the front; a cloud provider 400s). Charge
       `effective_system_prompt()` and the active tool definitions in the budget.
-- [ ] **Dedup folds the only remaining copy of re-read content** into "already in the summary"
+- [x] **Dedup folds the only remaining copy of re-read content** into "already in the summary"
       (chunk hashes from summarized-away blocks match a later re-read), so a file the model
       re-reads to edit disappears again; only fold when another surviving message holds it.
+      *(2026-10-10, same run)* Done: a block folds only when a later surviving message carries the
+      same content (the newest copy always survives). Test
+      `a_re_read_that_is_the_only_copy_survives_the_next_step`.
 - [ ] Images are estimated at a flat 1000 tokens; estimate from pixel size.
 
 ### The test suite stranded its scratch databases in tmpfs (found 2026-10-10)
