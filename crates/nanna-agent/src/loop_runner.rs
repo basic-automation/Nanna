@@ -5712,7 +5712,16 @@ impl Agent {
                     if keep > 2 {
                         ctx.drop_oldest(keep);
                     }
-                    ctx.truncate_to_limit();
+                    // Announced like every other cut: a history that is
+                    // silently shorter on the retry reads as corruption.
+                    let dropped = ctx.truncate_to_limit();
+                    ctx.push_summarization_failure_notice(
+                        dropped,
+                        "the provider rejected the request as too long",
+                    );
+                    for notice in ctx.take_pending_loss_notices() {
+                        ctx.messages.push(AnthropicMessage::user_text(&notice));
+                    }
                     let remaining = ctx.messages.len();
                     let est_after = ctx.estimate_request_tokens();
                     info!(

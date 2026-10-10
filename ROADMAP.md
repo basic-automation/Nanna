@@ -10707,6 +10707,28 @@ keep the phases readable; promote individual items into a phase when they become
 - [ ] `--config` is ignored by `credentials` (it edits the default file) and mislabelled by
       `init` and `status`.
 
+### Context assembly that could lose or reject a turn (found 2026-10-10, audit of context management)
+
+- [x] **Whitespace-only text blocks reached providers.** `sanitize_messages` dropped only `""`;
+      Anthropic also rejects whitespace, and a model's `\n\n` before a tool call is stored as a
+      block — every later turn of that session failed there. Test
+      `whitespace_only_text_blocks_are_dropped_before_sending`.
+- [x] **The context-overflow retry cut messages without saying so** (`truncate_to_limit`'s count
+      was discarded): it now posts the loss notice every other cut path posts.
+- [x] **A message larger than the summarizer's window was retired after only its first part was
+      read** (`summarize_chunk` truncated it; the caller counted the whole chunk consumed). A chunk
+      read in part is never retired: the first chunk tries the next summarizer, a later one ends
+      the pass before it. *No dedicated test* — it needs a summarizer with a tiny window, which
+      the scripted rig does not model yet.
+- [ ] **The hard-limit check counts only the base system prompt** — not the workspace slice, the
+      workdir note, or the tool definitions — so on a 32k Ollama window a compressed request can
+      still exceed it (Ollama then truncates the front; a cloud provider 400s). Charge
+      `effective_system_prompt()` and the active tool definitions in the budget.
+- [ ] **Dedup folds the only remaining copy of re-read content** into "already in the summary"
+      (chunk hashes from summarized-away blocks match a later re-read), so a file the model
+      re-reads to edit disappears again; only fold when another surviving message holds it.
+- [ ] Images are estimated at a flat 1000 tokens; estimate from pixel size.
+
 ### The test suite stranded its scratch databases in tmpfs (found 2026-10-10)
 
 - [x] **Every `cargo test --workspace` left 44 directories in `/tmp`, and `/tmp` is RAM here.**

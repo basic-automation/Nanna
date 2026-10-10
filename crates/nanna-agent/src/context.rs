@@ -897,10 +897,14 @@ impl AgentContext {
         messages
             .into_iter()
             .map(|mut msg| {
-                // Remove empty text blocks
-                msg.content.retain(|block| {
-                    !matches!(block, ContentBlock::Text { text } if text.is_empty())
-                });
+                // Remove empty and whitespace-only text blocks: Anthropic
+                // rejects both ("text content blocks must contain
+                // non-whitespace text"), and a model's "\n\n" before a tool
+                // call is stored as one — every later turn of that session
+                // then failed on Anthropic.
+                msg.content.retain(
+                    |block| !matches!(block, ContentBlock::Text { text } if text.trim().is_empty()),
+                );
                 // Ensure message has at least one content block
                 if msg.content.is_empty() {
                     msg.content.push(ContentBlock::Text {
@@ -2242,9 +2246,25 @@ impl AgentContext {
 
             for (i, (chunk, end)) in chunks.iter().enumerate() {
                 match Self::summarize_chunk(&client, &model_name, chunk).await {
-                    Ok(summary) => {
+                    // Read whole: the messages it covers may be retired.
+                    Ok((summary, read)) if read >= chunk.len() => {
                         parts.push(summary);
                         consumed = *end;
+                    }
+                    // Read only in part (one message larger than this model's
+                    // window): retiring it would delete what was never read.
+                    // The first chunk tries the next summarizer, whose window
+                    // may hold it; a later one ends the pass before it.
+                    Ok((_, read)) => {
+                        warn!(
+                            model = %model_spec,
+                            chunk = i + 1,
+                            read_chars = read,
+                            chunk_chars = chunk.len(),
+                            "Chunk larger than the summarizer's window; not retired"
+                        );
+                        failed = i == 0;
+                        break;
                     }
                     Err(e) => {
                         warn!(
@@ -2304,11 +2324,13 @@ impl AgentContext {
     /// The truncation here is a backstop, not the sizing mechanism — chunks
     /// arrive pre-fitted. It only bites when a single message exceeds the whole
     /// window, which the caller accounts for separately.
+    /// Summarize `content`; the summary and how many bytes of it were read.
+    /// Fewer than `content.len()` means the model's window cut it short.
     async fn summarize_chunk(
         client: &nanna_llm::LlmClient,
         model_name: &str,
         content: &str,
-    ) -> Result<String, String> {
+    ) -> Result<(String, usize), String> {
         let cache = nanna_llm::ModelInfoCache::default_location();
         let model_info = client.get_model_info(model_name, cache.as_ref()).await;
         let max_chars = model_info.hard_input_limit().saturating_sub(512).saturating_mul(4);
@@ -2349,7 +2371,8 @@ impl AgentContext {
         }
 
         if plausible_summary(&summary, truncated.len()) {
-            Ok(summary)
+            debug_assert!(truncated.len() <= content.len());
+            Ok((summary, truncated.len()))
         } else {
             Err(format!(
                 "Implausible summary returned ({} chars for {} chars of input)",
@@ -2860,6 +2883,28 @@ fn chrono_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A whitespace-only text block never reaches a provider: Anthropic
+    /// rejects it, and a model's "\n\n" before a tool call is stored as one.
+    #[test]
+    fn whitespace_only_text_blocks_are_dropped_before_sending() {
+        let mut msg = AnthropicMessage::assistant_text("\n\n");
+        msg.content.push(ContentBlock::Text {
+            text: "kept".to_string(),
+        });
+        let out =
+            AgentContext::sanitize_messages(vec![msg, AnthropicMessage::assistant_text(" \t ")]);
+        assert!(
+            matches!(&out[0].content[..], [ContentBlock::Text { text }] if text == "kept"),
+            "{:?}",
+            out[0].content
+        );
+        assert!(
+            matches!(&out[1].content[..], [ContentBlock::Text { text }] if text == "[No content]"),
+            "{:?}",
+            out[1].content
+        );
+    }
 
     /// The data-loss bug: extraction can gather far more than the summarizer
     /// will read, so the replacement must be keyed to what was actually
