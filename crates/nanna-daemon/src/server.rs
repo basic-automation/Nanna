@@ -934,7 +934,7 @@ fn memory_search_services(
                 let offset = opt_count(&params, "offset")?.unwrap_or(0);
                 let workspace = ws.read().await;
                 match mem
-                    .recall_scoped_with_coverage(&query, workspace.as_deref())
+                    .recall_scoped_with_coverage_shown(&query, workspace.as_deref(), limit)
                     .await
                 {
                     // An empty answer from a scan that could not compare

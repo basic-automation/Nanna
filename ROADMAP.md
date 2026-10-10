@@ -10522,6 +10522,34 @@ keep the phases readable; promote individual items into a phase when they become
       so a settings save or a `remind` call — and then every reader behind that writer — waits
       minutes. Hand out an owned run handle and drop the guard before awaiting.
 
+### Memory writes and reviews that went wrong quietly (found 2026-10-10, audit of recall and ingest)
+
+- [x] **A fold whose re-embed failed lost the write.** The incoming fact's own embed placed it in
+      a neighbour's Update band; the merged text's embed then failed (a 429, a timeout) and
+      `fold_into_memory` propagated it, so `remember` stored the fact nowhere — against the
+      service's own rule that a failing provider is not an error. The merge now lands with no
+      vector and is queued for backfill. Test `a_fold_whose_re_embed_fails_still_lands` (red
+      without the fix).
+- [x] **Recall strengthened memories nobody saw.** Each recall queues a testing-effect review per
+      result, from a default page of `max_results` (10); the memory tool and chat injection then
+      kept 5 — ranks 6..10 were reviewed on every turn they were cut, their stability growing.
+      `recall_scoped_with_coverage_shown(query, workspace, shown_max)` reviews exactly what it
+      returns; the tool, `recall_memories` and `recall_memories_scoped` use it. Test
+      `recall_reviews_only_what_it_shows`. **Still open:** chat injection's later filter (a
+      memory already in the last 4 messages is dropped) happens after the review.
+- [ ] **Memory tools read ONE process-wide workspace slot.** `workspace_id_for_services` is
+      overwritten by every chat turn's prep and never reset, and `memory.store` / `memory.search`
+      / the turn's auto-extraction read it live — so a card run on workspace B's board recalls
+      and writes A's memories after a chat in A (or everything, if no chat has run), and two
+      concurrent sessions in different workspaces cross. Same class as the tool-cwd slot fixed
+      by `bind_session_workdir`: resolve the workspace per run session, and register each card
+      run's card workspace there (decision 13).
+- [ ] **A stated fact folded into an observed neighbour loses its pin.** The live write path's
+      fold keeps the survivor's metadata (`update_content_and_embedding_if` rewrites content and
+      vector only), so a user assertion becomes `observed` and the next dream may paraphrase it
+      — the laundering the dream path's `partition_verbatim_pinned` prevents. Fold only within
+      equal pin status, or upgrade the survivor to `stated` in the same write.
+
 ### The test suite stranded its scratch databases in tmpfs (found 2026-10-10)
 
 - [x] **Every `cargo test --workspace` left 44 directories in `/tmp`, and `/tmp` is RAM here.**
