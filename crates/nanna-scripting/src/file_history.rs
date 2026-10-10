@@ -397,6 +397,24 @@ impl FileHistory {
         } else {
             None
         };
+        // What the restore replaces is saved first — unless it is too large
+        // to keep, in which case `record_before_write` skips it and the
+        // restore would destroy it unsaved while reporting it saved. Refuse.
+        if let Ok(meta) = tokio::fs::metadata(&checkpoint.path).await
+            && meta.is_file()
+            && meta.len() > SNAPSHOT_BYTES_MAX
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is {} bytes, larger than file history keeps ({SNAPSHOT_BYTES_MAX}); \
+                     restoring would replace it with no copy kept — copy it aside first. \
+                     Nothing was changed.",
+                    checkpoint.path.display(),
+                    meta.len()
+                ),
+            ));
+        }
         self.record_before_write(session, &checkpoint.path).await?;
         let Some(content) = snapshot else {
             match tokio::fs::remove_file(&checkpoint.path).await {
@@ -591,6 +609,34 @@ mod tests {
                 .await
                 .expect("big")
                 .is_none()
+        );
+    }
+
+    /// A restore over a file too large to keep is refused: the replaced
+    /// content could not be saved, and the restore used to destroy it while
+    /// saying it was saved.
+    #[tokio::test]
+    async fn a_restore_over_an_unkeepable_file_is_refused() {
+        let (dir, history) = store();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, b"small, kept").expect("write");
+        let saved = history
+            .record_before_write(None, &path)
+            .await
+            .expect("record")
+            .expect("a checkpoint");
+        let file = std::fs::File::create(&path).expect("create");
+        file.set_len(SNAPSHOT_BYTES_MAX + 1).expect("sparse");
+
+        let err = history
+            .restore(None, saved.seq)
+            .await
+            .expect_err("refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat").len(),
+            SNAPSHOT_BYTES_MAX + 1,
+            "the large file is untouched"
         );
     }
 

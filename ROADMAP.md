@@ -10654,8 +10654,11 @@ keep the phases readable; promote individual items into a phase when they become
       `code_search` its whole trailing context): markers come from the set of all matches, and
       `code_search` renders the unshown part of each window, joined to the section it continues.
       Test `a_match_inside_another_matchs_context_is_marked`.
-- [ ] Still open from the same audit: `file_history restore` over an 8 MiB+
-      file says the replaced content was saved when it was not; `file_history list` caps at 100
+- [x] *(same run)* **`file_history restore` over an 8 MiB+ file destroyed it unsaved** while
+      saying the replaced content was saved; it is refused now. Test
+      `a_restore_over_an_unkeepable_file_is_refused`.
+- [ ] Still open from the same audit:
+      `file_history list` caps at 100
       of up to 500; `web_fetch` ignores the declared charset.
 
 ### GUI settings that did not do what they showed (found 2026-10-10, audit of the GUI outside the board)
