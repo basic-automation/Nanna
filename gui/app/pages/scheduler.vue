@@ -10,7 +10,7 @@
           </p>
         </div>
         <div class="flex items-center gap-2">
-          <UiSwitch v-model="schedulerEnabled" label="Scheduler enabled" @update:modelValue="toggleScheduler" />
+          <UiSwitch :model-value="schedulerEnabled" label="Scheduler enabled" @update:modelValue="toggleScheduler" />
           <span class="text-sm text-nanna-text-muted">{{ schedulerEnabled ? 'Enabled' : 'Disabled' }}</span>
           <UiButton @click="openCreateModal" size="sm" :disabled="!schedulerEnabled">
             ➕ New Job
@@ -365,12 +365,15 @@ async function loadSchedulerState() {
   }
 }
 
+// One-way bound: the switch shows what the daemon accepted. With v-model it
+// flipped on the click, so a refused save left it showing the wrong state.
 async function toggleScheduler(enabled: boolean) {
   try {
     await invoke('set_scheduler_enabled', { enabled })
     schedulerEnabled.value = enabled
   } catch (e) {
     console.error('Failed to toggle scheduler:', e)
+    toast.show(`Could not ${enabled ? 'enable' : 'disable'} the scheduler`, 'error', String(e))
   }
 }
 
