@@ -2291,10 +2291,10 @@ pub async fn set_chat_model_priority(
     // save above stays ordered under it, the daemon call does not need it.
     let backend = state_guard.backend.clone();
     drop(state_guard);
-    let _ = backend.config_set(
-        "llm.model_priority",
-        serde_json::to_value(&priority).unwrap_or_default(),
-    ).await;
+    // Re-read the whole file rather than set one key: `config_set` made
+    // the daemon save ITS copy, which could still lack a change another
+    // setter wrote to the file moments ago — and undo it.
+    let _ = backend.config_reload().await;
 
     // Emit model-status event so the GUI badge updates
     let _ = app.emit("model-status", ModelStatusEvent {
@@ -2515,10 +2515,10 @@ pub async fn set_model_routing(
     // save above stays ordered under it, the daemon call does not need it.
     let backend = state_guard.backend.clone();
     drop(state_guard);
-    let _ = backend.config_set(
-        "llm.model_routing",
-        serde_json::to_value(&routes).unwrap_or_default(),
-    ).await;
+    // Re-read the whole file rather than set one key: `config_set` made
+    // the daemon save ITS copy, which could still lack a change another
+    // setter wrote to the file moments ago — and undo it.
+    let _ = backend.config_reload().await;
 
     info!("Model routing set: {:?}", routes);
     Ok(())
@@ -2562,10 +2562,10 @@ pub async fn set_routing_first_turn_primary(
     // save above stays ordered under it, the daemon call does not need it.
     let backend = state_guard.backend.clone();
     drop(state_guard);
-    let _ = backend.config_set(
-        "llm.routing_first_turn_primary",
-        serde_json::Value::Bool(enabled),
-    ).await;
+    // Re-read the whole file rather than set one key: `config_set` made
+    // the daemon save ITS copy, which could still lack a change another
+    // setter wrote to the file moments ago — and undo it.
+    let _ = backend.config_reload().await;
 
     info!("Routing first turn primary set: {}", enabled);
     Ok(())
@@ -2621,14 +2621,10 @@ pub async fn set_sub_agent_models(
     // save above stays ordered under it, the daemon call does not need it.
     let backend = state_guard.backend.clone();
     drop(state_guard);
-    let _ = backend.config_set(
-        "llm.sub_agent_models",
-        serde_json::json!(models),
-    ).await;
-    let _ = backend.config_set(
-        "llm.sub_agent_model",
-        serde_json::Value::Null,
-    ).await;
+    // Re-read the whole file rather than set one key: `config_set` made
+    // the daemon save ITS copy, which could still lack a change another
+    // setter wrote to the file moments ago — and undo it.
+    let _ = backend.config_reload().await;
 
     info!("Sub-agent models set: {:?}", models);
     Ok(())

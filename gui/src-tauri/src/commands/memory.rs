@@ -35,8 +35,8 @@ fn score_to_f32(score: f64) -> f32 {
 ///
 /// Returns `Failed to save config: …` when `config.toml` cannot be written; the
 /// daemon is then not told, though this client's cached value has already
-/// changed. The push to the daemon (`config.set` of
-/// `memory.auto_remember_messages`) is best-effort and never fails the command.
+/// changed. The daemon is asked to re-read the
+/// file (`config.reload`), best-effort, and never fails the command.
 #[tauri::command]
 pub async fn set_auto_remember_messages(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -49,9 +49,10 @@ pub async fn set_auto_remember_messages(
     // request timeout, and every other command queues behind this lock.
     let backend = Arc::clone(&state_guard.backend);
     drop(state_guard);
-    let _ = backend
-        .config_set("memory.auto_remember_messages", serde_json::json!(enabled))
-        .await;
+    // Re-read the whole file rather than set one key: `config_set` made
+    // the daemon save ITS copy, which could still lack a change another
+    // setter wrote to the file moments ago — and undo it.
+    let _ = backend.config_reload().await;
     info!("Auto-remember messages set: {enabled}");
     Ok(())
 }
@@ -63,8 +64,8 @@ pub async fn set_auto_remember_messages(
 ///
 /// Returns `Failed to save config: …` when `config.toml` cannot be written; the
 /// daemon is then not told, though this client's cached value has already
-/// changed. The push to the daemon (`config.set` of
-/// `memory.max_compression_ratio`) is best-effort and never fails the command.
+/// changed. The daemon is asked to re-read the
+/// file (`config.reload`), best-effort, and never fails the command.
 #[tauri::command]
 pub async fn set_max_compression_ratio(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -78,9 +79,10 @@ pub async fn set_max_compression_ratio(
     // request timeout, and every other command queues behind this lock.
     let backend = Arc::clone(&state_guard.backend);
     drop(state_guard);
-    let _ = backend
-        .config_set("memory.max_compression_ratio", serde_json::json!(clamped))
-        .await;
+    // Re-read the whole file rather than set one key: `config_set` made
+    // the daemon save ITS copy, which could still lack a change another
+    // setter wrote to the file moments ago — and undo it.
+    let _ = backend.config_reload().await;
     info!("Max compression ratio set: {clamped}");
     Ok(())
 }
@@ -92,8 +94,8 @@ pub async fn set_max_compression_ratio(
 ///
 /// Returns `Failed to save config: …` when `config.toml` cannot be written; the
 /// daemon is then not told, though this client's cached value has already
-/// changed. The push to the daemon (`config.set` of
-/// `memory.min_remaining_memories`) is best-effort and never fails the command.
+/// changed. The daemon is asked to re-read the
+/// file (`config.reload`), best-effort, and never fails the command.
 #[tauri::command]
 pub async fn set_min_remaining_memories(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -107,9 +109,10 @@ pub async fn set_min_remaining_memories(
     // request timeout, and every other command queues behind this lock.
     let backend = Arc::clone(&state_guard.backend);
     drop(state_guard);
-    let _ = backend
-        .config_set("memory.min_remaining_memories", serde_json::json!(clamped))
-        .await;
+    // Re-read the whole file rather than set one key: `config_set` made
+    // the daemon save ITS copy, which could still lack a change another
+    // setter wrote to the file moments ago — and undo it.
+    let _ = backend.config_reload().await;
     info!("Min remaining memories set: {clamped}");
     Ok(())
 }

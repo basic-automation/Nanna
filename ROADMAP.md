@@ -10686,10 +10686,13 @@ keep the phases readable; promote individual items into a phase when they become
       save takes effect on the next turn. Test
       `the_agent_prompt_and_name_settings_reach_the_live_prompt`. `streaming_enabled` is still
       unread.
-- [ ] **A daemon-side save can undo a GUI setting made a moment earlier**: save-only setters wait
+- [~] **A daemon-side save can undo a GUI setting made a moment earlier**: save-only setters wait
       for the 2 s watcher while `config_set` setters make the daemon save its whole (older) copy
       — reorder embeddings, then chat models within ~2.5 s, and the first change is lost. After a
       GUI save, ask the daemon to `config_reload` instead of `config_set`ting one key.
+      *(2026-10-10, same run)* The eight setters that `config_set` one key after saving (chat and
+      sub-agent model lists, routing, the memory settings) now `config_reload`. **Still open:**
+      the save-only setters still wait for the 2 s watcher.
 
 ### CLI commands that reported what did not happen (found 2026-10-10, audit of the CLI)
 
