@@ -10689,6 +10689,24 @@ keep the phases readable; promote individual items into a phase when they become
       — reorder embeddings, then chat models within ~2.5 s, and the first change is lost. After a
       GUI save, ask the daemon to `config_reload` instead of `config_set`ting one key.
 
+### CLI commands that reported what did not happen (found 2026-10-10, audit of the CLI)
+
+- [x] **`nanna config` printed every stored secret** (the loaded config carries the keyring's and
+      the environment's keys; only the file is stripped). It prints a stripped copy.
+- [x] **`nanna daemon stop` said "stopped" at the signal**, so `stop && start` found the draining
+      daemon alive, started nothing, exited 0 — and left no daemon. It now waits for the exit (as
+      `restart` already did) before reporting.
+- [ ] `nanna daemon start` reports success for a child that exits at once (port taken): keep the
+      `Child`, poll `try_wait` and the PID file for a few seconds.
+- [ ] `daemon stop` signals a PID it could not identify as the daemon (`Unknown` probe; every live
+      PID on macOS, any `nanna.exe` on Windows) — a reused PID gets SIGTERM / `taskkill /T`. Needs
+      a real identity probe on those platforms before refusing `Unknown`, or `stop` breaks there.
+- [ ] Quick setup (`nanna chat` with no key) saves the env-overridden runtime config: `PORT`, a
+      channel section built from `TELEGRAM_BOT_TOKEN`, env API keys over stored ones. Save a
+      freshly loaded file plus the entered key.
+- [ ] `--config` is ignored by `credentials` (it edits the default file) and mislabelled by
+      `init` and `status`.
+
 ### The test suite stranded its scratch databases in tmpfs (found 2026-10-10)
 
 - [x] **Every `cargo test --workspace` left 44 directories in `/tmp`, and `/tmp` is RAM here.**

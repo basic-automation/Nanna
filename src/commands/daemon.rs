@@ -59,7 +59,20 @@ pub async fn handle_daemon_command(
         }
         DaemonAction::Stop => {
             println!("🌙 Stopping Nanna daemon...\n");
+            let was_running = pid_file.state()?.live_daemon().is_some();
             stop_daemon_process(&pid_file)?;
+            // A signalled daemon drains for seconds before it exits; reporting
+            // "stopped" at the signal made `stop && start` find it still alive,
+            // start nothing, exit 0 — and leave no daemon once it finished.
+            if was_running {
+                await_stopped(
+                    || Ok(pid_file.state()?.live_daemon()),
+                    RESTART_STOP_DEADLINE,
+                    RESTART_POLL_STEP,
+                )
+                .await?;
+                println!("✅ Daemon stopped");
+            }
         }
         DaemonAction::Status { host, port } => {
             print_daemon_status(&pid_file, &host, port).await?;
@@ -128,7 +141,7 @@ async fn await_stopped(
         if tokio::time::Instant::now() >= until {
             anyhow::bail!(
                 "the daemon (PID {pid}) is still running {}s after it was told to stop; \
-                 not restarted — run 'nanna daemon start' once it exits",
+                 check 'nanna daemon status', and start it again once it exits",
                 deadline.as_secs()
             );
         }
@@ -234,7 +247,7 @@ fn stop_daemon_process(pid_file: &PidFile) -> anyhow::Result<()> {
             .status()?;
 
         if status.success() {
-            println!("✅ Daemon stopped (PID {pid})");
+            println!("Stop signal sent to the daemon (PID {pid})");
         } else {
             println!("⚠️  Failed to stop daemon (PID {pid})");
             println!("   It may have already been terminated");
@@ -249,7 +262,7 @@ fn stop_daemon_process(pid_file: &PidFile) -> anyhow::Result<()> {
         match libc::pid_t::try_from(pid) {
             // SAFETY: kill(2) is safe to call with a valid PID and signal number
             Ok(target) if unsafe { libc::kill(target, libc::SIGTERM) } == 0 => {
-                println!("✅ Daemon stopped (PID {pid})");
+                println!("Stop signal sent to the daemon (PID {pid})");
             }
             Ok(_) => {
                 let err = std::io::Error::last_os_error();
@@ -365,7 +378,10 @@ mod tests {
         let message = waited.expect_err("a wedged daemon is an error").to_string();
         assert!(message.contains("PID 7"), "{message}");
         assert!(message.contains("still running"), "{message}");
-        assert!(message.contains("not restarted"), "{message}");
+        assert!(
+            message.contains("start it again once it exits"),
+            "{message}"
+        );
     }
     use super::*;
     use std::time::Duration;

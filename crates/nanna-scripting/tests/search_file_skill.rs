@@ -188,7 +188,7 @@ async fn a_match_inside_another_matchs_context_is_marked() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let body: String = (1..=20).map(|n| format!("row {n}\n")).collect::<String>();
+    let body = (1..=20).map(|n| format!("row {n}\n")).collect::<Vec<_>>().concat();
     let f = seed(
         dir.path(),
         "a.txt",
