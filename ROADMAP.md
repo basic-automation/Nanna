@@ -10696,8 +10696,11 @@ keep the phases readable; promote individual items into a phase when they become
 - [x] **`nanna daemon stop` said "stopped" at the signal**, so `stop && start` found the draining
       daemon alive, started nothing, exited 0 — and left no daemon. It now waits for the exit (as
       `restart` already did) before reporting.
-- [ ] `nanna daemon start` reports success for a child that exits at once (port taken): keep the
+- [x] `nanna daemon start` reports success for a child that exits at once (port taken): keep the
       `Child`, poll `try_wait` and the PID file for a few seconds.
+      *(2026-10-10, same run)* `watch_start`: a child that exits within 5 s fails the start and
+      points at the log; one still booting is reported as "still starting up". Test
+      `a_child_that_exits_at_once_fails_the_start`.
 - [ ] `daemon stop` signals a PID it could not identify as the daemon (`Unknown` probe; every live
       PID on macOS, any `nanna.exe` on Windows) — a reused PID gets SIGTERM / `taskkill /T`. Needs
       a real identity probe on those platforms before refusing `Unknown`, or `stop` breaks there.

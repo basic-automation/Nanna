@@ -49,8 +49,13 @@ pub async fn handle_daemon_command(
                 println!("   Run 'nanna daemon stop' to stop it");
                 return Ok(());
             }
-            let (pid, log_file) = spawn_daemon_process(&host, port, &data_dir, config_path)?;
-            println!("✅ Daemon started!");
+            let (mut child, log_file) = spawn_daemon_process(&host, port, &data_dir, config_path)?;
+            let pid = child.id();
+            if watch_start(&mut child, &pid_file, &log_file).await? {
+                println!("✅ Daemon started!");
+            } else {
+                println!("✅ Daemon launched — still starting up");
+            }
             println!("   PID: {pid}");
             println!("   Address: ws://{host}:{port}/ws");
             println!("   Logs: {}", log_file.display());
@@ -95,7 +100,9 @@ pub async fn handle_daemon_command(
                 // restart did not happen, so it must not exit 0.
                 anyhow::bail!("another daemon started in the meantime (PID {pid}); not restarted");
             }
-            let (pid, _) = spawn_daemon_process(&host, port, &data_dir, config_path)?;
+            let (mut child, log_file) = spawn_daemon_process(&host, port, &data_dir, config_path)?;
+            let pid = child.id();
+            watch_start(&mut child, &pid_file, &log_file).await?;
             println!("✅ Daemon restarted!");
             println!("   PID: {pid}");
             println!("   Address: ws://{host}:{port}/ws");
@@ -159,7 +166,7 @@ fn spawn_daemon_process(
     port: u16,
     data_dir: &Path,
     config_path: Option<&Path>,
-) -> anyhow::Result<(u32, PathBuf)> {
+) -> anyhow::Result<(std::process::Child, PathBuf)> {
     use std::fs;
     use std::process::{Command, Stdio};
 
@@ -188,7 +195,47 @@ fn spawn_daemon_process(
     command.creation_flags(0x0800_0000);
     let child = command.spawn()?;
 
-    Ok((child.id(), log_file))
+    Ok((child, log_file))
+}
+
+/// How long `start` watches a freshly spawned daemon before reporting.
+///
+/// Bound justification: a daemon that cannot start (its port is taken, the
+/// data directory is locked) exits within its first second, before any slow
+/// work; one that is merely slow to boot is still alive here and is reported
+/// as starting. Five seconds catches the first without waiting on the second.
+const START_WATCH: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Watch a spawned daemon until it claims the PID file, exits, or
+/// [`START_WATCH`] passes. Spawning was reported as "started" outright, so a
+/// child that exited at once (port 5149 taken) printed success and exit 0 with
+/// the only trace in the log.
+///
+/// # Errors
+///
+/// When the child exited, or its state cannot be read.
+async fn watch_start(
+    child: &mut std::process::Child,
+    pid_file: &PidFile,
+    log_file: &Path,
+) -> anyhow::Result<bool> {
+    let pid = child.id();
+    let until = tokio::time::Instant::now() + START_WATCH;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "the daemon exited at once ({status}); see {} for why",
+                log_file.display()
+            );
+        }
+        if pid_file.state()?.live_daemon() == Some(pid) {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= until {
+            return Ok(false);
+        }
+        tokio::time::sleep(RESTART_POLL_STEP).await;
+    }
 }
 
 /// The command line (after the program) of the daemon `start` launches.
@@ -346,6 +393,39 @@ fn stale_note(state: &PidFileState) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A daemon that exits at once is a failed start, not "✅ started"; one
+    /// still running when the watch ends is reported as still starting.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_that_exits_at_once_fails_the_start() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pid_file = PidFile::new(dir.path());
+        let log = dir.path().join("daemon.log");
+
+        let mut dead = std::process::Command::new("sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .expect("spawn");
+        let err = watch_start(&mut dead, &pid_file, &log)
+            .await
+            .expect_err("an exited child is a failed start");
+        assert!(err.to_string().contains("exited at once"), "{err}");
+
+        let mut alive = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn");
+        let up = watch_start(&mut alive, &pid_file, &log)
+            .await
+            .expect("still running");
+        assert!(
+            !up,
+            "running but never claimed the PID file: still starting"
+        );
+        let _ = alive.kill();
+        let _ = alive.wait();
+    }
 
     /// A daemon that takes a while to drain is waited for, not raced: the
     /// restart starts its successor only once the old one is gone.
