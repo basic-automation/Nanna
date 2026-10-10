@@ -604,17 +604,39 @@ impl TaskRepository {
         } else {
             Vec::new()
         };
+        self.emit_update_events(&task, &cascaded, &changed, actor);
+        // After the cascade, so a subtree cancelled above is already reflected
+        // and its dependents' releases are part of this one diff.
+        if let Some(before) = blocking_before {
+            let after = self
+                .load_scope(&task.scope, task.scope_id.as_deref())
+                .await?;
+            self.emit_block_transitions(&before, &after, actor);
+        }
+        self.get(id).await
+    }
+
+    /// The events one `update` announces, from what it actually changed:
+    /// status and assignee transitions, each child a cancellation cascaded to,
+    /// and an `Updated` naming every other field that changed.
+    fn emit_update_events(
+        &self,
+        task: &Task,
+        cascaded: &[Task],
+        changed: &[&'static str],
+        actor: Option<&str>,
+    ) {
         // Emitted from `changed`, so each event describes a real transition:
         // `apply_patch` compares both of these fields before recording them.
         if changed.contains(&"status") {
             self.emit(
                 TaskEventKind::StatusChanged,
-                &task,
+                task,
                 actor,
                 serde_json::json!({ "status": task.status }),
             );
         }
-        for child in &cascaded {
+        for child in cascaded {
             self.emit(
                 TaskEventKind::StatusChanged,
                 child,
@@ -625,20 +647,24 @@ impl TaskRepository {
         if changed.contains(&"assignee") {
             self.emit(
                 TaskEventKind::Assigned,
-                &task,
+                task,
                 actor,
                 serde_json::json!({ "assignee": task.assignee }),
             );
         }
-        // After the cascade, so a subtree cancelled above is already reflected
-        // and its dependents' releases are part of this one diff.
-        if let Some(before) = blocking_before {
-            let after = self
-                .load_scope(&task.scope, task.scope_id.as_deref())
-                .await?;
-            self.emit_block_transitions(&before, &after, actor);
+        let edited: Vec<&str> = changed
+            .iter()
+            .copied()
+            .filter(|field| *field != "status" && *field != "assignee")
+            .collect();
+        if !edited.is_empty() {
+            self.emit(
+                TaskEventKind::Updated,
+                task,
+                actor,
+                serde_json::json!({ "fields": edited }),
+            );
         }
-        self.get(id).await
     }
 
     /// Complete a task. The harness (or service layer) runs the acceptance
@@ -1621,6 +1647,14 @@ impl TaskRepository {
             self.emit_block_transitions(&scope_tasks, &after, actor);
         }
 
+        for gone in scope_tasks.iter().filter(|t| doomed.contains(&t.id)) {
+            self.emit(
+                TaskEventKind::Deleted,
+                gone,
+                actor,
+                serde_json::json!({ "subtree_of": id }),
+            );
+        }
         let count = doomed.len() as u64;
         if let Some(actor) = actor {
             tracing::debug!("{actor} deleted task #{id} subtree ({count} tasks)");

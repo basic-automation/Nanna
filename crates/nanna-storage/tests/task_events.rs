@@ -512,6 +512,49 @@ async fn a_card_created_waiting_on_an_open_one_says_it_is_blocked() {
     assert!(repo.get(waiting.id).await.expect("read").blocked);
 }
 
+/// An edit and a delete are announced, so every open view of a card hears
+/// them — before, only status and assignee changes reached other clients.
+#[tokio::test]
+async fn edits_and_deletes_are_announced() {
+    let (storage, recorder) = storage_with_recorder().await;
+    let repo = storage.tasks();
+    let parent = repo.create(card("plan")).await.expect("parent");
+    let child = repo
+        .create(NewTask {
+            parent_id: Some(parent.id),
+            ..card("step")
+        })
+        .await
+        .expect("child");
+    recorder.clear();
+
+    repo.update(
+        parent.id,
+        TaskPatch {
+            title: Some("plan, renamed".to_string()),
+            priority: Some(1),
+            ..TaskPatch::default()
+        },
+        Some("gui"),
+    )
+    .await
+    .expect("edited");
+    let updated = recorder.of_kind(TaskEventKind::Updated);
+    assert_eq!(updated.len(), 1);
+    let fields = updated[0].detail["fields"].as_array().expect("fields");
+    assert!(fields.iter().any(|f| f == "title") && fields.iter().any(|f| f == "priority"));
+
+    recorder.clear();
+    repo.delete(parent.id, Some("gui")).await.expect("deleted");
+    let mut gone: Vec<i64> = recorder
+        .of_kind(TaskEventKind::Deleted)
+        .iter()
+        .map(|e| e.task_id)
+        .collect();
+    gone.sort_unstable();
+    assert_eq!(gone, vec![parent.id, child.id], "the subtree is announced");
+}
+
 #[tokio::test]
 async fn reopening_a_dependency_blocks_its_dependent_again() {
     let (storage, recorder) = storage_with_recorder().await;
