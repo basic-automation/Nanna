@@ -8434,6 +8434,21 @@ as its turn (`TurnAdmission`, scope default `session`).
       `a_card_created_waiting_on_an_open_one_says_it_is_blocked`, and an offset case in
       `a_rounds_dates_move_to_its_occurrence`; (1) and (4) mutation-checked (red without the
       fix). Storage + daemon 1003 green.
+- [x] *(found 2026-10-10, audit of the memory write-through and dream fold)* **A re-fold could
+      delete unrelated memories.** `consolidated_metadata` inherits a key when every member that
+      *carries* it agrees, so a summary of card #7's fold and an unrelated chat memory came out
+      as `board_event=episode, source_task_id=7`; when #7 closed again the fold phase took that
+      summary for #7's old fold and `forget`-ed it — and the chat memory inside it. Record
+      identities (`board_event`, `source_task_id`, `source_note_id`, `episode_events`,
+      `episode_kept`) are now inherited only when **every** member carries the same value
+      (`RECORD_IDENTITY_METADATA_KEYS`); this also stops a summary of one post and other
+      memories claiming to be that post's copy. Also: a card past one event page is folded from
+      its first and last half-pages, and the fold's markers counted only what was read, so the
+      middle vanished unannounced — the story's header now says how many events were not read.
+      Tests `a_summary_is_a_record_only_if_every_member_is`, extended
+      `a_long_card_folds_from_both_ends_and_refolds_when_it_grows`. **Not changed:** a fold
+      clustered with its own card's post copy keeps `source_task_id` but not `board_event`, so
+      the card is folded again beside the summary — the story stored twice, nothing lost.
 - [x] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
       *(2026-09-28)* `RouterDecision::Assign` gained optional `labels` and `acceptance`. Labels

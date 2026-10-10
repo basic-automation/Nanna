@@ -439,6 +439,18 @@ pub async fn fold_closed_cards(storage: &Storage, memory: &MemoryService) -> Res
         let events = card_story(storage, &source, total)
             .await
             .map_err(|e| format!("reading card #{}'s episodes: {e}", card.id))?;
+        // The fold's own markers account only for what it read; a long card's
+        // middle was never read, and the story must say so (truncation is
+        // visible), or its marker counts read as the whole of it.
+        let unread = total.saturating_sub(events.len());
+        let unread_note = if unread == 0 {
+            String::new()
+        } else {
+            format!(
+                "; the {unread} events between its first and last {} were not read",
+                nanna_storage::MAX_EVENT_PAGE / 2
+            )
+        };
         let Some(fold) =
             nanna_timeline::compress_episode(&events, nanna_timeline::DREAM_FOLD_BUDGET)
         else {
@@ -452,12 +464,8 @@ pub async fn fold_closed_cards(storage: &Storage, memory: &MemoryService) -> Res
             ("episode_kept".to_string(), fold.kept.to_string()),
         ]);
         let content = format!(
-            "The story of card #{} \"{}\" ({} events, {} shown):\n{}",
-            card.id,
-            card.title,
-            total,
-            fold.kept,
-            fold.episode.content
+            "The story of card #{} \"{}\" ({} events, {} shown{}):\n{}",
+            card.id, card.title, total, fold.kept, unread_note, fold.episode.content
         );
         memory
             .remember_deferred_vector(
@@ -666,6 +674,18 @@ mod tests {
                 .collect()
         };
         assert_eq!(folds(memory.list_all().await), [(page + 200).to_string()]);
+        let unread = format!(
+            "the 200 events between its first and last {} were not read",
+            page / 2
+        );
+        assert!(
+            memory
+                .list_all()
+                .await
+                .iter()
+                .any(|m| m.content.contains(&unread)),
+            "the story says its middle was never read"
+        );
         assert_eq!(
             fold_closed_cards(&storage, &memory).await.expect("fold"),
             0,
