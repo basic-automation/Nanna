@@ -57,6 +57,14 @@ pub const TASK_LABEL_MAX_BYTES: usize = 64;
 /// builder.
 pub const ACTIVITY_ACTIONS_MAX: usize = 4;
 
+/// Most rows [`TaskRepository::newest_activities_of`] returns in one read.
+///
+/// Bound justification: its caller counts a run of markers that a bound of
+/// its own breaks (the router's hand-backs stop at `HAND_BACKS_MAX` = 2 before
+/// the human is asked), so 64 is far past any real run while keeping the read
+/// a single small page (~64 short rows).
+pub const ACTIVITY_MARKER_ROWS_MAX: usize = 64;
+
 /// Maximum tool names in one task's `tool_scope`.
 ///
 /// Bound justification: the scope is a hint (it gates nothing — the harness
@@ -1260,9 +1268,39 @@ impl TaskRepository {
         task_id: i64,
         actions: &[&str],
     ) -> Result<Option<TaskActivityEntry>, StorageError> {
+        let newest = self.newest_activities_of(task_id, actions, 1).await?;
+        debug_assert!(newest.len() <= 1, "asked for one row");
+        Ok(newest.into_iter().next())
+    }
+
+    /// The newest `limit` activity rows of card `task_id` whose action is one
+    /// of `actions`, newest first.
+    ///
+    /// The many-row form of [`Self::newest_activity_of`], for counting a run
+    /// of markers (the router's hand-backs): filtering by action in SQL means
+    /// unrelated rows — edits, reorders, a run's own notes — can never push a
+    /// marker out of the window being counted.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a row does
+    /// not decode. Unparseable detail JSON loads as `None`.
+    ///
+    /// # Panics
+    /// When `actions` is empty or longer than [`ACTIVITY_ACTIONS_MAX`], or
+    /// `limit` is outside `1..=ACTIVITY_MARKER_ROWS_MAX`.
+    pub async fn newest_activities_of(
+        &self,
+        task_id: i64,
+        actions: &[&str],
+        limit: usize,
+    ) -> Result<Vec<TaskActivityEntry>, StorageError> {
         assert!(
             (1..=ACTIVITY_ACTIONS_MAX).contains(&actions.len()),
             "one to {ACTIVITY_ACTIONS_MAX} actions"
+        );
+        assert!(
+            (1..=ACTIVITY_MARKER_ROWS_MAX).contains(&limit),
+            "one to {ACTIVITY_MARKER_ROWS_MAX} rows"
         );
         debug_assert!(task_id > 0, "store ids start at 1");
         let placeholders = (0..actions.len())
@@ -1272,7 +1310,7 @@ impl TaskRepository {
         let sql = format!(
             "SELECT id, task_id, actor, action, detail, created_at, assignee \
              FROM task_activity WHERE task_id = ?1 AND action IN ({placeholders}) \
-             ORDER BY id DESC LIMIT 1"
+             ORDER BY id DESC LIMIT {limit}"
         );
         let mut params = vec![turso::Value::Integer(task_id)];
         params.extend(
@@ -1282,32 +1320,29 @@ impl TaskRepository {
         );
         let conn = self.conn.lock().await;
         let mut rows = conn.query(&sql, params).await?;
-        let entry = match rows.next().await? {
-            Some(row) => {
-                let detail_str: Option<String> = row.get(4)?;
-                Some(TaskActivityEntry {
-                    id: row.get(0)?,
-                    task_id: row.get(1)?,
-                    actor: row.get(2)?,
-                    action: row.get(3)?,
-                    detail: detail_str.and_then(|s| serde_json::from_str(&s).ok()),
-                    created_at: row.get(5)?,
-                    assignee: row.get(6)?,
-                })
-            }
-            None => None,
-        };
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let detail_str: Option<String> = row.get(4)?;
+            entries.push(TaskActivityEntry {
+                id: row.get(0)?,
+                task_id: row.get(1)?,
+                actor: row.get(2)?,
+                action: row.get(3)?,
+                detail: detail_str.and_then(|s| serde_json::from_str(&s).ok()),
+                created_at: row.get(5)?,
+                assignee: row.get(6)?,
+            });
+        }
         // Held until the cursor is gone: an open `Rows` on the shared
         // connection swallows later writes.
         drop(rows);
         drop(conn);
+        debug_assert!(entries.len() <= limit, "LIMIT bounds the read");
         debug_assert!(
-            entry
-                .as_ref()
-                .is_none_or(|e| actions.contains(&e.action.as_str())),
+            entries.iter().all(|e| actions.contains(&e.action.as_str())),
             "only an asked-for action comes back"
         );
-        Ok(entry)
+        Ok(entries)
     }
 
     /// One thread post by its id.

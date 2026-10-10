@@ -8759,6 +8759,7 @@ impl TaskRunManager {
         let cancel = self
             .claim_slot(key.clone(), scope_key, goal.clone(), card.clone(), Some(&source.storage))
             .await?;
+        let run_card = card.as_ref().map(|claim| claim.card_id);
         let busy_member = card.map(|claim| claim.member_id);
         set_member_status(&source.storage, busy_member.as_deref(), MemberStatus::Busy).await;
         source.mark_run(RUN_STARTED_ACTION, Value::Null).await;
@@ -8858,8 +8859,9 @@ impl TaskRunManager {
             manager.runs.write().await.remove(&key);
             manager.reports.write().await.insert(key, (report, resumes));
             // After the slot is free, or the member's next card would be
-            // refused as "already working".
-            manager.announce_member_free(busy_member);
+            // refused as "already working" — and the card's next member's
+            // start refused as "already being worked".
+            manager.announce_member_free(busy_member, run_card);
         };
         // Tools execute inline in the run's own future, so the task-local
         // scope covers every call the run makes.
@@ -8870,20 +8872,32 @@ impl TaskRunManager {
         Ok(())
     }
 
-    /// Hand a freed member to the card-run worker. Never waits: a full queue
-    /// is logged, and the member's waiting cards still start on their next
-    /// assignment or date.
-    fn announce_member_free(&self, member_id: Option<String>) {
+    /// Hand a freed member, and the card its run held, to the card-run
+    /// worker. Never waits: a full queue is logged, and the member's waiting
+    /// cards still start on their next assignment or date.
+    ///
+    /// The card wake covers a card that changed hands while the run wound
+    /// down: a hand-back releases the card before the run's slot is removed,
+    /// so the router's reassignment to another member reached `claim_slot`
+    /// while the slot still stood, was refused as "already being worked", and
+    /// nothing retried it — the card sat `pending` with its new member and no
+    /// run. `try_start` re-judges the card from the store, so a card that is
+    /// closed, waiting, or still the freed member's starts nothing new.
+    fn announce_member_free(&self, member_id: Option<String>, card_id: Option<i64>) {
         let (Some(queue), Some(member_id)) = (self.member_free.as_ref(), member_id) else {
             return;
         };
-        if let Err(tokio::sync::mpsc::error::TrySendError::Full(wake)) =
-            queue.try_send(crate::card_run_trigger::RunWake::MemberFree(member_id))
-        {
-            tracing::warn!(
-                ?wake,
-                "card run queue is full; a freed member's next card waits"
-            );
+        debug_assert!(!member_id.is_empty(), "a claim names its member");
+        debug_assert!(card_id.is_none_or(|id| id > 0), "store ids start at 1");
+        let wakes = std::iter::once(crate::card_run_trigger::RunWake::MemberFree(member_id))
+            .chain(card_id.map(crate::card_run_trigger::RunWake::Card));
+        for wake in wakes {
+            if let Err(tokio::sync::mpsc::error::TrySendError::Full(wake)) = queue.try_send(wake) {
+                tracing::warn!(
+                    ?wake,
+                    "card run queue is full; a freed member's next card waits"
+                );
+            }
         }
     }
 
@@ -10733,13 +10747,18 @@ mod card_run_tests {
     async fn a_finished_card_run_announces_its_member_free() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let manager = super::TaskRunManager::new().with_member_free(tx);
-        manager.announce_member_free(None);
-        manager.announce_member_free(Some(AGENT.to_string()));
+        manager.announce_member_free(None, None);
+        manager.announce_member_free(Some(AGENT.to_string()), Some(7));
         assert_eq!(
             rx.try_recv().ok(),
             Some(crate::card_run_trigger::RunWake::MemberFree(
                 AGENT.to_string()
             ))
+        );
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(crate::card_run_trigger::RunWake::Card(7)),
+            "the card the run held is re-judged: its next member may be waiting"
         );
         assert!(rx.try_recv().is_err(), "nothing for a run without a member");
     }

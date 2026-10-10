@@ -8384,6 +8384,32 @@ as its turn (`TurnAdmission`, scope default `session`).
       *(same run, after review)* The fenced re-judge also re-reads the card's last touch: a post
       or an edit between the sweep's read and the fence now keeps the card (it was the one input
       `still_stalled` did not repeat). Mutation-checked like the other two.
+- [x] *(found 2026-10-10, audit of the router and card-run triggers)* **Four ways a card came back
+      to nobody, or to the wrong one, fixed.** (1) **A handed-back card the board client did not
+      type was never routed again.** `card_to_route` let `stalled` through for all board work
+      (`is_board_creator`) but sent `handed_back` and an answered clarification through the
+      `gui`-only check, so a router split or an agent's hand-on that its run gave up on sat
+      `pending` with nobody on it forever (as did a router-split card that stalled twice, was
+      asked about, and answered). Every come-back wake now takes board work whoever made it;
+      the recurrence reopen stays `gui`-only, since only those cards are released at reopen.
+      (2) **An answer to a member's own question went to the router.** Any `unblocked` by a
+      done clarification was routed, including the ones a member asked itself (`ask_user`, a
+      provider refusal) — whose answer is meant to restart that member — so the router could
+      reassign, split or park a card its member was about to resume. Routed now only when nobody
+      holds the card (the router's own clarify, `ask_the_human`). (3) **The retry bound read a
+      256-row window of every action**, so 256 edits or run notes between two hand-backs hid the
+      first and the router routed again instead of asking the human — without limit, a run each
+      time; the same class as the 2026-10-05 "after 64 edits" fix. New store read
+      `newest_activities_of(task_id, actions, limit)` (`ACTIVITY_MARKER_ROWS_MAX` = 64) counts
+      only the four markers. (4) **A reassignment during the old run's wind-down was refused and
+      never retried:** a hand-back releases the card before the run's slot is removed (the
+      harness's end-of-run sweeps, a 15 s heal pause), so the new member's start met "already
+      being worked" and only the freed member was re-woken. The run's end now also wakes its
+      card (`RunWake::Card`), which `try_start` re-judges from the store. Tests
+      `a_handed_back_card_is_routed_whoever_on_the_board_made_it`,
+      `an_answer_to_a_members_own_question_is_not_the_routers`,
+      `edits_between_hand_backs_do_not_hide_one` (300 edits), and the extended
+      `a_finished_card_run_announces_its_member_free`; daemon 715, e2e 56 green.
 - [x] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
       human-set fields; never reassign a card with a live run.
       *(2026-09-28)* `RouterDecision::Assign` gained optional `labels` and `acceptance`. Labels
