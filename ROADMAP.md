@@ -10336,6 +10336,20 @@ keep the phases readable; promote individual items into a phase when they become
       `a_bounded_flat_listing_keeps_the_first_names_on_every_filesystem` (alphabetically-first
       entry created last); the `project_structure` suite now passes on btrfs and tmpfs alike.
 
+### The test suite stranded its scratch databases in tmpfs (found 2026-10-10)
+
+- [x] **Every `cargo test --workspace` left 44 directories in `/tmp`, and `/tmp` is RAM here.**
+      `nanna-storage`'s `embedding_buckets` / `memory_chunks` / `migration_012_memory_chunks` and
+      `nanna-timeline`'s `event_log` each made a per-test directory and never removed it; the
+      `persistence_across_restarts` unit test removed its `.db` but not the `-wal` beside it.
+      Found at ORIENT: **1382 entries, 1.1 GB**, 33 copies of every tag — the tmpfs whose quota
+      already kills these runs mid-link. *(2026-10-10)* Fixed with a std-only drop guard
+      (`TempDb`, `Deref<Target = str>` so no call site changed; `nanna-storage` keeps no
+      dev-dependencies) that asserts it only deletes under `temp_dir()`; the timeline's `open()`
+      returns the `Storage` and its guard together, declared so the database closes first. The
+      unit test now removes the WAL too. Re-measured: 274 tests in the two crates, **0 entries
+      left behind** (was 44 per run). The 1382 stale ones were deleted.
+
 ### The workspace is not rustfmt-formatted, and nothing checks (found 2026-09-24)
 
 - [ ] **`cargo fmt --check` reports 3407 hunks across 212 files on a clean `origin/master`**, and

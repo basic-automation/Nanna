@@ -1986,8 +1986,11 @@ mod tests {
             assert_eq!(session.session_id, "persistent-session");
         }
 
-        // Cleanup
+        // Cleanup: the WAL sits beside the database and outlives it, so a
+        // cleanup that removes only the `.db` strands a `-wal` per run.
         let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        assert!(!db_path.exists());
     }
 
     fn sample_session(session_id: &str) -> Session {

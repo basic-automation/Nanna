@@ -11,7 +11,35 @@ use nanna_timeline::{
     TimelineError, was_truncated,
 };
 
-fn temp_db_path(tag: &str) -> String {
+/// One test's database file, in a fresh directory that is deleted on drop.
+///
+/// `/tmp` is tmpfs on the dev host, so a directory a test leaves behind is RAM
+/// held until reboot: before this guard every suite run stranded 44 of them,
+/// and 33 runs had accumulated 1.1 GB. Bind it before the `Storage` that opens
+/// it, so the database closes before its directory goes.
+struct TempDb {
+    dir: std::path::PathBuf,
+    path: String,
+}
+
+impl std::ops::Deref for TempDb {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.path
+    }
+}
+
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        // Only ever delete what `temp_db_path` created.
+        assert!(self.dir.starts_with(std::env::temp_dir()));
+        assert!(self.path.starts_with(&*self.dir.to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn temp_db_path(tag: &str) -> TempDb {
     let dir = std::env::temp_dir().join(format!(
         "nanna_timeline_{tag}_{}_{:p}",
         std::process::id(),
@@ -19,15 +47,33 @@ fn temp_db_path(tag: &str) -> String {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir.join("timeline.db").to_string_lossy().to_string()
+    let path = dir.join("timeline.db").to_string_lossy().to_string();
+    TempDb { dir, path }
 }
 
-async fn open(tag: &str) -> Storage {
-    Storage::new(&StorageConfig {
-        path: temp_db_path(tag),
+/// A test's open database and the directory it lives in. Fields drop in
+/// declaration order, so the database closes before `TempDb` deletes its files.
+struct Opened {
+    storage: Storage,
+    _db: TempDb,
+}
+
+impl std::ops::Deref for Opened {
+    type Target = Storage;
+
+    fn deref(&self) -> &Storage {
+        &self.storage
+    }
+}
+
+async fn open(tag: &str) -> Opened {
+    let db = temp_db_path(tag);
+    let storage = Storage::new(&StorageConfig {
+        path: db.to_string(),
     })
     .await
-    .expect("storage opens")
+    .expect("storage opens");
+    Opened { storage, _db: db }
 }
 
 fn episode(kind: EventKind, ts_unix_ms: i64, content: &str) -> Episode {
