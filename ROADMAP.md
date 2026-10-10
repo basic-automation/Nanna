@@ -10577,6 +10577,34 @@ keep the phases readable; promote individual items into a phase when they become
       contained-discard included). Test `a_stated_fact_is_not_folded_into_an_observation` (red
       without the fix).
 
+### A config file that could be lost on save (found 2026-10-10, audit of config persistence)
+
+- [x] **One typo in `config.toml` and the GUI overwrote it with defaults.** `load_gui_config` falls
+      back to `Config::default()` when the file does not parse, and every Settings setter then
+      `save()`s that copy — provider, models, Ollama host, channels, MCP servers and
+      `[general] data_dir` replaced by defaults, which the daemon's watcher then applied live. The
+      CLI already refused this (`config_or_refusal`, 2026-10-09). Now `Config` remembers, per
+      process, a path that failed to parse, and `save_to` refuses it
+      (`ConfigError::UnreadableNotOverwritten`) until a load parses it again — every writer,
+      the GUI's ~30 setters included, without touching them. Test
+      `a_config_that_did_not_parse_is_not_overwritten`.
+- [x] **`save_to` was not crash-safe and its temp file was shared.** `fs::write` + rename with no
+      fsync can leave the renamed file empty after a power loss (an empty file loads as
+      defaults), and the fixed `config.toml.tmp` let the GUI and the daemon rename each other's
+      half-written file. The temp name is now per-writer, synced before the rename, removed if
+      the rename fails, and the directory is synced after it (Unix). Test
+      `a_save_round_trips_and_leaves_no_temp_file`.
+- [ ] **The GUI files environment-supplied secrets into the keyring.** `store_secrets()` /
+      `migrate_secrets_to_keyring()` on a Settings save store every non-blank secret the cached
+      config holds — including ones that came from `OPENAI_API_KEY`, `TELEGRAM_BOT_TOKEN`, … —
+      so after the variable is unset the stale key keeps being used. Save only the field the
+      user entered, or reuse the daemon's `file_secrets_brought_in` rule.
+- [ ] **Non-secret environment overrides are written into `config.toml`** (`PORT`,
+      `TELEGRAM_WEBHOOK_URL`, `DISCORD_*`, a whole channel section from a token), and a `set` of
+      an overridden path answers `updated` and then silently reverts on the watcher's reload.
+      Resolve `PORT` at `server_port`, limit `override_channels` to secrets, refuse a `set` of an
+      env-overridden path.
+
 ### The test suite stranded its scratch databases in tmpfs (found 2026-10-10)
 
 - [x] **Every `cargo test --workspace` left 44 directories in `/tmp`, and `/tmp` is RAM here.**
