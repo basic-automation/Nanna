@@ -8477,7 +8477,9 @@ as its turn (`TurnAdmission`, scope default `session`).
       no member) — there was no way to unassign a card; `""` now clears `assignee` and
       `project`, as it already did dates. Test
       `deleting_a_member_releases_its_cards_and_an_empty_assignee_clears`. **Still open:** the
-      released cards are not routed (no wake reason covers a deleted member's cards).
+      released cards were not routed. *(same run)* `WakeReason::MemberDeleted` (the release's own
+      `Assigned` by `member_delete`) routes them like any board work, without counting toward the
+      retry bound. Test `a_deleted_members_released_card_wakes_the_router`.
       *(same run)* A field edit or a card delete emitted no task event, so other views refreshed
       only on the next unrelated one: new `TaskEventKind::Updated` (`detail.fields` names what
       changed) and `Deleted` (each card of the subtree). Test `edits_and_deletes_are_announced`.

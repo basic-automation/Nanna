@@ -122,7 +122,14 @@ pub enum WakeReason {
     /// The stall sweep took the card back from a member that was not working
     /// it (P25 decision 7's `stalled`).
     Stalled,
+    /// The card's member was deleted and its cards released
+    /// ([`MEMBER_DELETE_ACTOR`]). Routed like any board work, but not a
+    /// failed attempt, so it does not count toward the retry bound.
+    MemberDeleted,
 }
+
+/// The actor `member.delete` releases a deleted member's open cards as.
+pub const MEMBER_DELETE_ACTOR: &str = "member_delete";
 
 /// One queued wake: route card `task_id` because of `reason`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +161,12 @@ pub fn wake_for(event: &TaskEvent) -> Option<Wake> {
                 && event.detail.get("assignee") == Some(&serde_json::Value::Null) =>
         {
             WakeReason::Stalled
+        }
+        TaskEventKind::Assigned
+            if event.actor.as_deref() == Some(MEMBER_DELETE_ACTOR)
+                && event.detail.get("assignee") == Some(&serde_json::Value::Null) =>
+        {
+            WakeReason::MemberDeleted
         }
         TaskEventKind::Assigned
             if event
@@ -321,7 +334,10 @@ pub async fn card_to_route(storage: &Storage, wake: Wake) -> Option<Task> {
             return None;
         }
     }
-    if matches!(wake.reason, WakeReason::Stalled | WakeReason::HandedBack) {
+    if matches!(
+        wake.reason,
+        WakeReason::Stalled | WakeReason::HandedBack | WakeReason::MemberDeleted
+    ) {
         return Some(card);
     }
     debug_assert_eq!(wake.reason, WakeReason::ClarificationAnswered);
@@ -835,6 +851,23 @@ mod tests {
         assert_eq!(
             router_models(&json!({}), &[" ".to_string()]),
             Vec::<String>::new()
+        );
+    }
+
+    /// A deleted member's released cards go back to the router.
+    #[test]
+    fn a_deleted_members_released_card_wakes_the_router() {
+        let mut released = event(TaskEventKind::Assigned, "global", Some(MEMBER_DELETE_ACTOR));
+        released.detail = json!({ "assignee": null });
+        assert_eq!(
+            wake_for(&released).map(|w| w.reason),
+            Some(WakeReason::MemberDeleted)
+        );
+        released.detail = json!({ "assignee": "agent:other" });
+        assert_eq!(
+            wake_for(&released),
+            None,
+            "only a release, not a reassignment"
         );
     }
 

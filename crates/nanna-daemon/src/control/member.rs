@@ -26,8 +26,9 @@ const AGENT_SLUG_MAX_BYTES: usize = MEMBER_ID_MAX_BYTES - AGENT_MEMBER_PREFIX.le
 /// overwrite.
 const AGENT_RANDOM_SLUG_BYTES: usize = 8;
 
-/// Who a deleted member's released cards are written by, in their activity.
-const MEMBER_DELETE_ACTOR: &str = "member_delete";
+// Who a deleted member's released cards are written by — the router wakes on
+// it (`board_router_trigger::WakeReason::MemberDeleted`).
+use crate::board_router_trigger::MEMBER_DELETE_ACTOR;
 
 /// Release rounds one member delete may take (each releases up to
 /// `ASSIGNED_CARDS_MAX` cards). Bound justification: 16 000 open cards on
