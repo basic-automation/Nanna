@@ -10442,9 +10442,11 @@ keep the phases readable; promote individual items into a phase when they become
       DNS-rebinding page, which is same-origin). Webhooks keep their own signature checks. The
       daemon's health server also dropped `Access-Control-Allow-Origin: *` (`/status` carries the
       last provider error's text). Test `only_a_local_native_caller_reaches_the_api`.
-- [ ] **Inbound IPC frames may be 128 MiB** (`IPC_MAX_MESSAGE_BYTES` sizes the daemon's own
-      large replies but applies to requests too); give requests their own, much smaller cap, and
-      count connections with a semaphore taken before the spawn rather than `clients.len()`.
+- *Considered and not done (2026-10-10):* a smaller cap on inbound IPC frames. The 128 MiB read
+  limit is shared by design (`no_hardcoded_daemon_port` pins both ends to it), and requests
+  include session and config **imports**, the mirror of the exports that needed it. With browser
+  handshakes refused and a 10 s handshake deadline, what remains is a hostile local process,
+  which the token item below covers.
 - [ ] **A per-launch token** (written 0600 beside the PID file, required in the first frame)
       would also stop a hostile *local process*, which the `Origin` check does not.
 
