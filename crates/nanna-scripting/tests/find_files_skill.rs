@@ -323,3 +323,40 @@ async fn a_character_class_selects_and_negates() {
     assert!(negated.contains("c.rs"), "{negated}");
     assert!(negated.contains("Found 1 file(s)"), "{negated}");
 }
+
+/// With no `path` (the default "."), or a relative one, results are relative
+/// to the search root and a pattern with a slash matches. The bridge names
+/// entries by their resolved path (`/ws/./src/main.rs`) and the raw "." never
+/// prefixed them, so `src/**/*.rs` matched nothing and names printed absolute.
+#[tokio::test]
+async fn a_slash_pattern_matches_under_the_default_root() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::create_dir_all(dir.path().join("src/bin")).expect("mkdir");
+    std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").expect("write");
+    std::fs::write(dir.path().join("src/bin/tool.rs"), "fn main() {}\n").expect("write");
+    let tool = ScriptedTool::from_file(skill_path())
+        .expect("read find_files tool.ts")
+        .with_permissions(ToolPermissions::none().with_read([dir.path()]))
+        .with_timeout(common::FIXTURE_TIMEOUT_MS);
+    let result = ScriptEngine::new()
+        .execute_with_workdir(
+            &tool,
+            json!({ "pattern": "src/**/*.rs" }),
+            None,
+            None,
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .expect("find_files should not throw")
+        .value;
+    let content = result["content"].as_str().expect("content");
+    assert!(content.contains("src/main.rs"), "{content}");
+    assert!(content.contains("src/bin/tool.rs"), "{content}");
+    assert!(
+        !content.contains(&*dir.path().to_string_lossy()),
+        "paths are relative to the root: {content}"
+    );
+}

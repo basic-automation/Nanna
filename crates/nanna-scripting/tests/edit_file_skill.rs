@@ -176,6 +176,28 @@ async fn lf_old_string_matches_crlf_file_without_rewriting_endings() {
     assert_eq!(read(&path), "AAA\r\nBBB\r\nccc\r\n");
 }
 
+/// The commonest edit — lines added after a one-line anchor — writes in the
+/// file's style too. A one-line `old_string` matches exactly, so the CRLF
+/// conversion (which ran only when the exact match failed) was skipped and
+/// the new lines landed as LF inside a CRLF file.
+#[tokio::test]
+async fn lines_added_after_a_one_line_anchor_keep_a_crlf_file_crlf() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = seed(dir.path(), "a.txt", "aaa\r\nbbb\r\n");
+
+    run_edit(
+        json!({ "file_path": path, "old_string": "aaa", "new_string": "aaa\nadded" }),
+        dir.path(),
+    )
+    .await
+    .expect("one-line anchor matches");
+
+    assert_eq!(read(&path), "aaa\r\nadded\r\nbbb\r\n");
+}
+
 #[tokio::test]
 async fn crlf_old_string_matches_lf_file_without_rewriting_endings() {
     if skill_missing() {

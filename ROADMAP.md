@@ -10605,6 +10605,35 @@ keep the phases readable; promote individual items into a phase when they become
       Resolve `PORT` at `server_port`, limit `override_channels` to secrets, refuse a `set` of an
       env-overridden path.
 
+### File skills that answered wrongly (found 2026-10-10, audit of the file skills)
+
+- [x] **`edit_file` mixed LF into CRLF files.** Its CRLF conversion ran only when the exact match
+      failed, and a one-line `old_string` always matches exactly — so adding lines after a
+      one-line anchor (the commonest edit) left LF lines inside a CRLF file and reported success;
+      the loose-match and line-number-recovery paths had the same gap. The file's style is judged
+      once and every replacement written in it. Test
+      `lines_added_after_a_one_line_anchor_keep_a_crlf_file_crlf` (red on 0.1.12).
+- [x] **`find_files` never matched a slash pattern under a relative or default root.** The bridge
+      names entries by their resolved path (`/ws/./src/main.rs`) and the raw `"."` never prefixed
+      them, so `src/**/*.rs` found nothing and names printed absolute. It strips the
+      bridge-resolved root now. Test `a_slash_pattern_matches_under_the_default_root`.
+- [x] **`code_search`/`search_file` missed `$` in CRLF files** (each line kept its `\r`; the miss
+      was blamed on a pattern spanning lines). Lines are stored without it. Test
+      `end_anchored_patterns_match_in_a_crlf_file`.
+- [x] **`file_history` spent its window on scratch files**: every `file_buffer` append (and the
+      syntax gate's `.__chk*.py`) was a checkpoint, so 100 appends pushed real checkpoints out
+      and `restore` answered "pruned". `.__buffer__`, `.__cleared__`, `.__chk.py`,
+      `.__chk_new.py` are housekeeping now.
+- [x] **`code_outline` skipped `pub(crate)`/`pub(super)`/`unsafe`/`extern` Rust items** (and
+      `impl<T>` lines).
+- [ ] Still open from the same audit: a match inside an earlier match's context loses its `>`
+      marker (and in `code_search` its trailing context); `file_buffer` clears its draft with an
+      unchecked `rm -f` that misses a bridge-repaired path, so a stale buffer can be re-committed
+      (use `Nanna.writeFile(bufPath, "")`); `file_history restore` over an 8 MiB+ file says the
+      replaced content was saved when it was not; `edit_file`/`write_file`'s fork guard refuses
+      `.env.local` beside `.env`; `file_history list` caps at 100 of up to 500; `web_fetch` ignores
+      the declared charset.
+
 ### The test suite stranded its scratch databases in tmpfs (found 2026-10-10)
 
 - [x] **Every `cargo test --workspace` left 44 directories in `/tmp`, and `/tmp` is RAM here.**

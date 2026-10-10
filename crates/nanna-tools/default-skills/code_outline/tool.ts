@@ -1,6 +1,6 @@
 export default {
   name: "code_outline",
-  version: "0.1.0",
+  version: "0.1.1",
   output: "memory",
   description: "Generate a structural outline of a source file showing functions, classes, structs, and other definitions. Useful for understanding file structure without reading the entire file.",
   parameters: {
@@ -41,8 +41,12 @@ function getPatterns(ext) {
   switch (ext) {
     case "rs":
       return [
-        /^\s*(pub\s+)?(async\s+)?fn\s+/,
-        /^\s*(pub\s+)?(struct|enum|trait|impl|type|const|static|mod|use)\s+/,
+        // `pub(crate)` / `pub(super)` and the fn qualifiers (`const`, `async`,
+        // `unsafe`, `extern "C"`): `pub\s+` alone skipped every restricted
+        // item, so an outline of a daemon module listed none of its
+        // `pub(crate) async fn`s.
+        /^\s*(pub(\([^)]*\))?\s+)?((const|async|unsafe|default)\s+|extern\s+"[^"]*"\s+)*fn\s+/,
+        /^\s*(pub(\([^)]*\))?\s+)?(unsafe\s+)?(struct|enum|trait|impl|type|const|static|mod|use|union)\b/,
         /^\s*#\[derive/,
         /^\s*#\[cfg/
       ];

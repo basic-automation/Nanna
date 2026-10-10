@@ -62,10 +62,20 @@ pub const TOTAL_BYTES_MAX: u64 = 4 * SESSION_BYTES_MAX;
 const INDEX_FILE: &str = "index.json";
 const UNSCOPED_SESSION: &str = "unscoped";
 
-/// Suffixes of the recovery copies `write_file` parks beside a file. Writing a
-/// park is itself a backup; snapshotting it would spend the window on copies of
-/// copies.
-const RECOVERY_PARK_SUFFIXES: [&str; 2] = [".__prev__", ".__best__"];
+/// Suffixes of the files the editing skills keep beside a real one: the
+/// recovery copies `write_file` parks (a park is itself a backup), and the
+/// working files — `file_buffer`'s draft and its cleared marker, the Python
+/// syntax gate's two scratch files. Snapshotting them spent the window on
+/// copies of copies: a file built from 100 `file_buffer` appends pushed every
+/// real checkpoint out of the 100 kept, so `restore` answered "pruned".
+const RECOVERY_PARK_SUFFIXES: [&str; 6] = [
+    ".__prev__",
+    ".__best__",
+    ".__buffer__",
+    ".__cleared__",
+    ".__chk.py",
+    ".__chk_new.py",
+];
 
 /// One file's state immediately before a write replaced it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -636,6 +646,19 @@ mod tests {
     fn recovery_parks_and_session_names_are_handled() {
         assert!(is_tool_housekeeping(Path::new("/w/main.rs.__prev__")));
         assert!(is_tool_housekeeping(Path::new("/w/main.rs.__best__")));
+        for scratch in [
+            "/w/app.py.__buffer__",
+            "/w/app.py.__cleared__",
+            "/w/app.py.__buffer__.__cleared__",
+            "/w/app.py.__chk.py",
+            "/w/app.py.__chk_new.py",
+        ] {
+            assert!(is_tool_housekeeping(Path::new(scratch)), "{scratch}");
+        }
+        assert!(
+            !is_tool_housekeeping(Path::new("/w/buffer.py")),
+            "a real file named like one"
+        );
         assert!(is_tool_housekeeping(Path::new(
             "/home/u/.nanna/write_hiwater.json"
         )));

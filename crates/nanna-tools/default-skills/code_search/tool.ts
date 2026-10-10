@@ -1,6 +1,6 @@
 export default {
   name: "code_search",
-  version: "0.3.1",
+  version: "0.3.2",
   output: "memory",
   description: "Search for a pattern across files in a directory tree. Returns matching lines with context. Supports regex patterns, a filename glob filter, and a depth bound.",
   parameters: {
@@ -522,8 +522,13 @@ function walkLines(content, regex, maxMatches, ctx, sliceChars, deadlineAt) {
     if (pos < content.length && got.length > 0 && got[got.length - 1] === "") {
       got.pop();
     }
+    // A CRLF file's lines carry their `\r` after a split on `\n`, and
+    // without the `m` flag `$` does not match before it: `\{$` found nothing
+    // in a CRLF file (and the miss was blamed on a pattern spanning lines).
     for (var g = 0; g < got.length; g++) {
-      lines.push(got[g]);
+      var line = got[g];
+      if (line.length > 0 && line.charCodeAt(line.length - 1) === 13) line = line.substring(0, line.length - 1);
+      lines.push(line);
     }
 
     // Scan what just landed. The per-line loop is free next to the split.

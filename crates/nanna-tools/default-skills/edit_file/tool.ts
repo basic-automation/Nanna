@@ -832,8 +832,18 @@ export default {
     // file). Only the matched snippet is touched — the rest of the file keeps
     // its own line endings. The replacement is converted to the matched
     // flavor so the edit does not introduce mixed endings.
+    // The file's own line-ending style, judged once. A one-line old_string
+    // always matches exactly, so the CRLF conversion below (which runs only
+    // when the exact match fails) never touched the replacement: adding
+    // lines after a one-line anchor — the commonest edit — left LF lines in a
+    // CRLF file and reported success. Every path now writes in the file's style.
+    var fileIsCrlf = content.indexOf("\r\n") >= 0 && content.split("\r\n").join("").indexOf("\n") < 0;
+    function inFileEol(text) {
+      if (!fileIsCrlf) return text;
+      return text.split("\r\n").join("\n").split("\n").join("\r\n");
+    }
     var needle = oldStr;
-    var replacement = newStr;
+    var replacement = inFileEol(newStr);
     if (content.indexOf(needle) < 0) {
       var oldLf = oldStr.split("\r\n").join("\n");
       var oldCrlf = oldLf.split("\n").join("\r\n");
@@ -896,7 +906,7 @@ export default {
       var spans = findLooseSpans(content, oldStr);
       if (spans.length === 1) {
         var spanText = content.substring(spans[0].start, spans[0].end);
-        var looseReplacement = newStr;
+        var looseReplacement = inFileEol(newStr);
         if (spanText.indexOf("\r\n") >= 0) {
           looseReplacement = newStr.split("\r\n").join("\n").split("\n").join("\r\n");
         }
@@ -912,11 +922,12 @@ export default {
         // tab-separated file is never reinterpreted.
         var recovered = false;
         var unnumbered = stripLineNumberBlock(oldStr);
+        if (unnumbered !== null) unnumbered = inFileEol(unnumbered);
         if (unnumbered !== null && unnumbered !== oldStr && content.indexOf(unnumbered) !== -1) {
           var occurrences = content.split(unnumbered).length - 1;
           if (occurrences === 1) {
             glog("edit_file: matched after stripping read_file line numbers from old_string: " + filePath);
-            updated = content.split(unnumbered).join(newStr);
+            updated = content.split(unnumbered).join(inFileEol(newStr));
             replaced = 1;
             recovered = true;
           }

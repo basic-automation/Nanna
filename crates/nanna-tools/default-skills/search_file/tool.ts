@@ -1,6 +1,6 @@
 export default {
   name: "search_file",
-  version: "0.2.0",
+  version: "0.2.1",
   output: "memory",
   description: "Search within a single file for a pattern and return matching lines with surrounding context. Useful for finding specific functions, variables, or text in large files without reading the entire file. Returns line numbers so you can follow up with read_file for a broader view.",
   parameters: {
@@ -276,8 +276,13 @@ export default {
       if (pos < content.length && got.length > 0 && got[got.length - 1] === "") {
         got.pop();
       }
+      // A CRLF file's lines carry their `\r` after a split on `\n`, and
+      // without the `m` flag `$` does not match before it: `\{$` found nothing
+      // in a CRLF file (and the miss was blamed on a pattern spanning lines).
       for (var g = 0; g < got.length; g++) {
-        lines.push(got[g]);
+        var line = got[g];
+        if (line.length > 0 && line.charCodeAt(line.length - 1) === 13) line = line.substring(0, line.length - 1);
+        lines.push(line);
       }
 
       // Scan what just landed. The per-line loop is free next to the split.
