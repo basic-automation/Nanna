@@ -10984,7 +10984,8 @@ keep the phases readable; promote individual items into a phase when they become
       no longer the member's alone except to put it back to `pending` (`release_reassigned`), and
       the run's existing end wake (`announce_member_free`'s card wake) starts the new member.
       Test `a_card_reassigned_mid_run_is_left_to_its_new_member` (three stop kinds).
-      **Still open:** the `member_delete` fence race.
+      *(same day)* `member_delete` now judges and releases inside one `fence_starts`, as the stall
+      sweep does.
 - [x] **A rate limit during a run with sub-cards cancels the sub-cards.** `abandon` handles 429 and
       refused keys only for `id == subtree_root`; a leaf falls through to `cancelled`, and
       `provider_died` treats 429 as a crash and resumes (8 × 15 s) without the cooldown, cancelling

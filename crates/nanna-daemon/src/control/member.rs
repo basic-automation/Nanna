@@ -107,9 +107,14 @@ impl ControlPlane {
         repo: &MemberRepository,
         id: &str,
     ) -> Value {
-        if let Some(ref runs) = self.task_runs
-            && runs.member_is_working(id).await
-        {
+        // Judged and acted on inside one start fence: checked outside it, a
+        // start could register between the check and the release, and the
+        // member was deleted mid-run (every post of its run then refused).
+        let fence = match self.task_runs {
+            Some(ref runs) => Some(runs.fence_starts().await),
+            None => None,
+        };
+        if fence.as_ref().is_some_and(|fence| fence.member_is_working(id)) {
             return json!({
                 "error": "invalid_member",
                 "message": format!("{id} is working a card; stop its run first, then delete it"),
@@ -146,7 +151,9 @@ impl ControlPlane {
                 released += 1;
             }
         }
-        match repo.delete(id).await {
+        let deleted = repo.delete(id).await;
+        drop(fence);
+        match deleted {
             Ok(removed) => json!({ "removed": removed, "cards_released": released }),
             Err(e) => storage_error("member_delete_failed", &e),
         }
