@@ -11050,9 +11050,11 @@ keep the phases readable; promote individual items into a phase when they become
       can never finish. Exempt all-digit fragments or require a longer run.
       *(2026-10-11)* An all-digit fragment trips at 129 (one past a null SHA-512 in hex), others
       still at 20. Test `a_run_of_digits_is_held_to_the_longest_real_one`.
-- [ ] OpenAI-compatible tool-call deltas: `index` is required (a server that omits it loses every
+- [~] OpenAI-compatible tool-call deltas: `index` is required (a server that omits it loses every
       such chunk, its `finish_reason` included), and a new `id` at a used index overwrites the
       earlier call in the assembler. Default `index` to 0; give a new id a fresh block.
+      *(2026-10-11)* `index` defaults to 0 (test `a_tool_call_delta_without_an_index_is_kept`).
+      **Still open:** a new `id` at a used index still overwrites the earlier call.
 - [x] The router's `gpt-` prefix rule runs before the `:tag` (Ollama) rule, so a bare `gpt-oss:20b`
       goes to OpenAI (`llm_router.rs:74`). Check `:` first. *(2026-10-11)* Done; case added to
       `from_model_infers_provider_by_prefix`.

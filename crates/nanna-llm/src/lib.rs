@@ -6803,6 +6803,10 @@ impl From<OpenAiRoleCheckedDelta> for OpenAiChunkDelta {
 
 #[derive(Deserialize, Debug)]
 struct OpenAiToolCallDelta {
+    /// Some OpenAI-compatible servers omit it (one call per chunk). Required,
+    /// a chunk without it failed to decode and was dropped whole — its
+    /// `finish_reason` with it — so the call never reached the agent.
+    #[serde(default)]
     index: usize,
     id: Option<String>,
     function: Option<OpenAiFunctionDelta>,
@@ -7927,6 +7931,22 @@ mod tests {
         assert!(
             matches!(&read, Err(e) if !e.to_string().contains("No choices")),
             "{read:?}"
+        );
+    }
+
+    /// A tool-call delta without `index` is the first call, not a chunk to
+    /// drop.
+    #[test]
+    fn a_tool_call_delta_without_an_index_is_kept() {
+        let mut state = OpenAiStreamState::default();
+        let (events, _) = state
+            .on_line::<OpenAiChunkDelta>(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"c","function":{"name":"ls","arguments":"{}"}}]}}]}"#,
+            )
+            .expect("a chunk");
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::ContentBlockStart { tool_name: Some(name), .. } if name == "ls")),
+            "{events:?}"
         );
     }
 
