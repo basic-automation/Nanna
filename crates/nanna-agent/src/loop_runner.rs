@@ -97,6 +97,25 @@ fn pressure_tier_active_tools() -> HashSet<String> {
 /// Matches the provider's `tool '<name>' not found` shape anywhere in the
 /// rendered error (the message arrives wrapped in transport prefixes like
 /// `API error: 500 - {...}`).
+/// Whether a provider error is a rate limit or an overload, which a short
+/// backoff can cure. `429` must stand alone: matched as a substring it caught
+/// "prompt is too long: 214290 tokens" — a context overflow, which needs
+/// compressing, not three waits of 5, 10 and 20 s. Pure.
+fn is_rate_limit_message(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    if ["rate limit", "rate_limit", "too many requests", "overloaded"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return true;
+    }
+    lower.match_indices("429").any(|(at, _)| {
+        let before = lower[..at].chars().next_back();
+        let after = lower[at + 3..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_digit()) && !after.is_some_and(|c| c.is_ascii_digit())
+    })
+}
+
 fn provider_unknown_tool_name(message: &str) -> Option<&str> {
     let (_, rest) = message.split_once("tool '")?;
     let (name, tail) = rest.split_once('\'')?;
@@ -7000,6 +7019,7 @@ impl Agent {
         let mut attempt = 0;
 
         loop {
+            let streamed_before = state.streamed_text.len();
             let result = if let Some(ref on_text) = options.on_text {
                 self.call_llm_streaming(
                     request,
@@ -7030,14 +7050,12 @@ impl Agent {
             match result {
                 Ok(r) => return Ok(r),
                 Err(ref e) if attempt < max_retries => {
-                    let err_str = e.to_string().to_lowercase();
-                    let is_rate_limit = err_str.contains("rate limit")
-                        || err_str.contains("rate_limit")
-                        || err_str.contains("429")
-                        || err_str.contains("too many requests")
-                        || err_str.contains("overloaded");
-
-                    if is_rate_limit {
+                    // A retry here streams the reply again from the start; one
+                    // whose text already reached the user would show it twice
+                    // and persist both. Those go to the step ladder, which
+                    // retries with a fresh context.
+                    let emitted = state.streamed_text.len() > streamed_before;
+                    if is_rate_limit_message(&e.to_string()) && !emitted {
                         attempt += 1;
                         // Exponential backoff: 5s, 10s, 20s
                         let wait_secs = 5u64 * (1u64 << (attempt - 1));
@@ -10561,6 +10579,25 @@ fn parse_exit_code_prefix(text: &str) -> Option<i64> {
         return None;
     }
     rest[..digits_len].parse().ok()
+}
+
+#[cfg(test)]
+mod rate_limit_message_tests {
+    use super::is_rate_limit_message;
+
+    #[test]
+    fn a_429_must_stand_alone() {
+        assert!(is_rate_limit_message("API error: 429 - Too Many Requests"));
+        assert!(is_rate_limit_message("status 429"));
+        assert!(is_rate_limit_message("Rate limit exceeded: retry-after: 30"));
+        assert!(is_rate_limit_message("overloaded_error: Overloaded"));
+        assert!(
+            !is_rate_limit_message("prompt is too long: 214290 tokens > 200000 maximum"),
+            "a context overflow is compressed, not waited out"
+        );
+        assert!(!is_rate_limit_message("request 14295 failed"));
+        assert!(!is_rate_limit_message("API error: 500 - internal"));
+    }
 }
 
 #[cfg(test)]

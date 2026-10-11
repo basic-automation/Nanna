@@ -11022,12 +11022,15 @@ keep the phases readable; promote individual items into a phase when they become
       first probe that answers within ~1 s clears the park, finds the claim held, pushes the goal
       to `pending` (stuck, as above) and leaves `resumed` set so the next turn skips
       `TurnAdmission`. Spawn it after `release`, or `wait_until_idle` first.
-- [ ] **A streamed reply that fails mid-way is streamed again** (`call_llm` retries an
+- [x] **A streamed reply that fails mid-way is streamed again** (`call_llm` retries an
       `overloaded_error` from scratch after the first attempt's deltas reached `on_text` and
       `streamed_text`): the user sees the partial reply then the full one, and both are persisted.
       Retry automatically only when nothing was emitted. (Also: any error containing "429" is
       treated as a rate limit — a "prompt is too long: 214290 tokens" is retried 3× instead of
       compressed — and that retry ignores `retry_after`.)
+      *(2026-10-11)* `call_llm` retries only when nothing was streamed in the attempt, and
+      `is_rate_limit_message` requires a standalone `429` (test `a_429_must_stand_alone`).
+      **Still open:** that retry's 5/10/20 s ladder ignores the provider's `retry_after`.
 - [x] The crash watcher (`TurnWatcher::watch`) skips `demote_in_progress` and
       `run_workspace::release`: a panicked turn's item stays `in_progress` (and is resumed first).
       *(2026-10-11)* Both added, and the baseline is closed under the turn's own scope (it was
