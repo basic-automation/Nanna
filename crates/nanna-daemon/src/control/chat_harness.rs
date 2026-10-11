@@ -2996,6 +2996,11 @@ fn spawn_park_waiter(
     model: String,
 ) {
     tokio::spawn(async move {
+        // Spawned inside the parking turn, before its tail releases the
+        // session. A first probe that answered at once resumed into a claim
+        // still held: the goal was queued behind a turn that was ending (and
+        // stuck there), with the resume already counted.
+        registry.wait_until_idle(&session_id).await;
         loop {
             // The park may have been claimed by a user message in the
             // meantime — that turn already carries the work forward.

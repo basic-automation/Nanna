@@ -11018,10 +11018,11 @@ keep the phases readable; promote individual items into a phase when they become
       *(2026-10-11)* `run_what_arrived_late` does that — except after a Stop, where the queue waits
       for the next message (Stop is stop; a message typed right after Stop still waits — decide
       whether that one should run). *No dedicated test*; e2e (57) and daemon suites green.
-- [ ] The park waiter is spawned inside `finish_mission`, before `finish_turn` releases the claim: a
+- [x] The park waiter is spawned inside `finish_mission`, before `finish_turn` releases the claim: a
       first probe that answers within ~1 s clears the park, finds the claim held, pushes the goal
       to `pending` (stuck, as above) and leaves `resumed` set so the next turn skips
       `TurnAdmission`. Spawn it after `release`, or `wait_until_idle` first.
+      *(2026-10-11)* The waiter now `wait_until_idle`s before its first probe.
 - [x] **A streamed reply that fails mid-way is streamed again** (`call_llm` retries an
       `overloaded_error` from scratch after the first attempt's deltas reached `on_text` and
       `streamed_text`): the user sees the partial reply then the full one, and both are persisted.
