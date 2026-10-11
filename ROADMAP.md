@@ -10466,6 +10466,12 @@ keep the phases readable; promote individual items into a phase when they become
   which the token item below covers.
 - [ ] **A per-launch token** (written 0600 beside the PID file, required in the first frame)
       would also stop a hostile *local process*, which the `Origin` check does not.
+      *(2026-10-11, scoped, not started)* A 0600 file stops only **other users** (and sandboxed
+      apps that reach loopback but not `$HOME`); a same-user process reads it. Clients know only
+      the URL (`ClientConfig::url`), so the token has to be found by port, not data dir (e2e
+      daemons use their own data dirs). Six client sites: `nanna-client`, `daemon_client.rs` ×2,
+      `daemon_manager.rs` ×3 — a header on the handshake (`IntoClientRequest`) is simpler than a
+      first frame and refuses before the upgrade. Decide the threat model first.
 
 ### The tool layer's guards had holes (found 2026-10-10, security audit)
 
@@ -10620,11 +10626,18 @@ keep the phases readable; promote individual items into a phase when they become
       entered (`SecureStore::set` under its own name) instead of `store_secrets()`. **Still
       open:** the channel wizard's `store_and_save` (`migrate_secrets_to_keyring`) — channels
       go with P25 decision 18, and `channel_secrets` has no per-channel filer.
-- [ ] **Non-secret environment overrides are written into `config.toml`** (`PORT`,
+- [x] **Non-secret environment overrides are written into `config.toml`** (`PORT`,
       `TELEGRAM_WEBHOOK_URL`, `DISCORD_*`, a whole channel section from a token), and a `set` of
       an overridden path answers `updated` and then silently reverts on the watcher's reload.
       Resolve `PORT` at `server_port`, limit `override_channels` to secrets, refuse a `set` of an
       env-overridden path.
+      *(2026-10-11)* Done without dropping any variable's support: `save_to` (every writer — daemon,
+      CLI, GUI) gives each non-secret setting the environment overrides the file's own value and
+      drops a channel section the environment built from a token alone
+      (`env_settings::keep_file_values_of_env_settings`); `config.set` of one is refused
+      `env_overrides_setting`, naming the variable. Tests
+      `a_save_writes_the_files_values_not_the_environments`,
+      `a_setting_the_environment_overrides_is_refused_and_never_saved`.
 
 ### File skills that answered wrongly (found 2026-10-10, audit of the file skills)
 

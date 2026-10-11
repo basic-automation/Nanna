@@ -34,6 +34,9 @@ mod server_secret;
 mod api_keys;
 /// Forgetting a secret someone clears, and keeping the ones a change lacks.
 mod secret_clearing;
+/// Non-secret settings the environment overrides: kept out of saves, refused on set.
+mod env_settings;
+pub use env_settings::EnvOverriddenSetting;
 
 /// Canonical application identity for [`directories::ProjectDirs`].
 ///
@@ -995,6 +998,21 @@ impl Config {
     /// Returns `ConfigError::Io` if the directory cannot be created or the file cannot be written.
     /// Returns `ConfigError::Parse` if the config cannot be serialized.
     pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
+        self.save_to_with(path, process_env)
+    }
+
+    /// [`Self::save_to`] against a given environment: each non-secret
+    /// setting `env` overrides at load keeps the file's own value
+    /// ([`env_settings`]), so the variable's value is never written.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::save_to`].
+    pub fn save_to_with(
+        &self,
+        path: &Path,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), ConfigError> {
         if unreadable_configs().contains(path) {
             return Err(ConfigError::UnreadableNotOverwritten(path.to_path_buf()));
         }
@@ -1005,6 +1023,18 @@ impl Config {
         // durable home for API keys; the in-memory Config may still hold them
         // for the running process (loaded from keyring/env at boot).
         let mut disk = self.clone();
+        if !disk.settings_the_environment_overrides(&env).is_empty()
+            || env("TELEGRAM_BOT_TOKEN").is_some()
+            || env("DISCORD_BOT_TOKEN").is_some()
+        {
+            // The file as it stands (defaults when there is none yet); it
+            // parsed, or `unreadable_configs` would have refused above.
+            let on_disk = fs::read_to_string(path)
+                .ok()
+                .and_then(|text| toml::from_str::<Self>(&text).ok())
+                .unwrap_or_default();
+            disk.keep_file_values_of_env_settings(&on_disk, &env);
+        }
         disk.strip_secrets_for_disk();
         let contents = toml::to_string_pretty(&disk)?;
         // Temp file + rename, never an in-place write: the daemon watches this

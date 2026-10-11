@@ -3268,3 +3268,47 @@ async fn a_config_change_that_cannot_be_saved_says_so() {
     assert_eq!(reset["error"], "not_persisted", "{reset}");
     assert_eq!(reset["status"], "reset", "{reset}");
 }
+
+/// `PORT` overrides `server.port` at every load. A `set` of it answered
+/// `updated` and was put back by the watcher's reload seconds later; and any
+/// other save wrote the environment's port into `config.toml`, where it
+/// outlived the variable.
+#[tokio::test]
+async fn a_setting_the_environment_overrides_is_refused_and_never_saved() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut cp, _store) = persisting_control_plane(dir.path());
+    cp.environment = environment(&[("PORT", "8123")]);
+    let mut on_disk = Config::default();
+    on_disk.server.port = 4000;
+    boot_from(&cp, dir.path(), &on_disk).await;
+    assert_eq!(cp.config.read().await.server.port, 8123, "the environment wins at run time");
+    let cp = Arc::new(cp);
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "server.port".into(),
+                value: json!(9000),
+            }),
+        )
+        .await;
+    assert_eq!(resp["error"], "env_overrides_setting", "{resp}");
+    assert_eq!(resp["variable"], "PORT", "{resp}");
+    assert_eq!(cp.config.read().await.server.port, 8123, "nothing is applied");
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "agent.name".into(),
+                value: json!("Edited"),
+            }),
+        )
+        .await;
+    assert_eq!(resp["status"], "updated", "{resp}");
+    let saved = saved_config(dir.path());
+    assert!(saved.contains("port = 4000"), "the file's port, not PORT's:\n{saved}");
+    assert!(!saved.contains("8123"), "{saved}");
+    assert!(saved.contains("name = \"Edited\""), "{saved}");
+}

@@ -338,6 +338,12 @@ impl ControlPlane {
                     refusal["path"] = json!(path);
                     return refusal;
                 }
+                if let Err(mut refusal) = self.refuse_env_overridden_settings(&config, &new_config)
+                {
+                    warn!("config.set {path} refused: {}", refusal["message"]);
+                    refusal["path"] = json!(path);
+                    return refusal;
+                }
                 if let Err(message) = self.file_brought_in_secrets(&config, &new_config).await {
                     warn!("config.set {path} refused: {message}");
                     return json!({ "error": "secret_store_failed", "message": message, "path": path });
@@ -402,7 +408,7 @@ impl ControlPlane {
     /// restart, which the caller must say rather than reply a clean success.
     pub(super) fn save_config(&self, config: &Config) -> Option<String> {
         let config_path = self.config_path.as_ref()?;
-        match config.save_to(config_path) {
+        match config.save_to_with(config_path, &*self.environment) {
             Ok(()) => {
                 info!("Config saved to {}", config_path.display());
                 None
@@ -511,6 +517,48 @@ impl ControlPlane {
                 "every load takes {taken} in the daemon's environment, so the value given here \
                  would be replaced by the environment's within seconds. To change it here, \
                  unset {variables} in the daemon's environment and restart the daemon."
+            ),
+        }))
+    }
+
+    /// Refuse a change from `previous` to `changed` of a non-secret setting
+    /// the daemon's environment overrides (`PORT`, a channel's webhook URL or
+    /// Discord IDs): made, it answered `updated`, and the next load — the
+    /// config watcher reading the daemon's own save back seconds later — put
+    /// the environment's value back. `Err` is the response naming the
+    /// variable to unset. As [`Self::refuse_env_supplied_secrets`], only for
+    /// a control plane that saves.
+    fn refuse_env_overridden_settings(
+        &self,
+        previous: &Config,
+        changed: &Config,
+    ) -> Result<(), Value> {
+        if self.config_path.is_none() {
+            return Ok(());
+        }
+        let (Ok(before), Ok(after)) = (serde_json::to_value(previous), serde_json::to_value(changed))
+        else {
+            return Ok(());
+        };
+        let pointer = |path: &str| format!("/{}", path.replace('.', "/"));
+        let Some(setting) = changed
+            .settings_the_environment_overrides(&*self.environment)
+            .into_iter()
+            .find(|setting| {
+                before.pointer(&pointer(setting.path)) != after.pointer(&pointer(setting.path))
+            })
+        else {
+            return Ok(());
+        };
+        Err(json!({
+            "error": "env_overrides_setting",
+            "setting": setting.path,
+            "variable": setting.variable,
+            "message": format!(
+                "every load takes {} from {} in the daemon's environment, so the value given \
+                 here would be replaced by the environment's within seconds. To change it \
+                 here, unset {} in the daemon's environment and restart the daemon.",
+                setting.path, setting.variable, setting.variable
             ),
         }))
     }
