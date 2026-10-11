@@ -2745,8 +2745,18 @@ impl MemoryService {
             .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
 
         // Create consolidated entry (a fresh uuid, so it never collides with a
-        // source memory).
-        let consolidated = create_consolidated_entry(cluster, summary, embedding);
+        // source memory), its vector resolved against the CURRENT binding like
+        // every other write: stamped with the model and filed in its bucket, or,
+        // when the provider switched mid-dream, queued for backfill. It used to
+        // carry no model (so every restart re-filed it under a `legacy-*` key
+        // and hid it from search until backfill re-embedded it) and a vector of
+        // the wrong width failed the add, discarding the paid summary.
+        let (active_model, bound_dim) = self.active_binding().await;
+        let (embedding_model, embedding, embeddings) =
+            resolve_entry_vectors(active_model, bound_dim, embedding);
+        let mut consolidated = create_consolidated_entry(cluster, summary, embedding);
+        consolidated.embedding_model = embedding_model;
+        consolidated.embeddings = embeddings;
 
         // Add the consolidated memory FIRST, then remove the sources. If the add
         // fails (e.g. a dimension mismatch), `?` returns before any removal, so
@@ -3959,18 +3969,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consolidate_cluster_never_loses_memories_on_failed_add() {
+    async fn a_summary_is_stamped_with_the_model_or_queued_never_discarded() {
         use std::sync::Arc;
 
-        // The consolidated summary embeds to the WRONG dimension (2, not the
-        // store's 3), so `store.add(consolidated)` fails with a dimension
-        // mismatch — the exact partial failure the add-then-remove ordering
-        // guards against. The sources must survive: losing them would be
-        // irreversible data loss.
-        const SUMMARY: &str = "CONSOLIDATED";
+        // The second summary embeds to the WRONG width (2, not the store's 3):
+        // the provider switched mid-dream. It used to fail the add and discard
+        // the paid summary; it is now kept unembedded and queued for backfill.
+        const STALE: &str = "CONSOLIDATED AT A STALE WIDTH";
         let embed: EmbedFn = Arc::new(|text: &str| {
-            let v = if text == SUMMARY {
-                vec![1.0_f32, 0.0] // wrong dimension → add fails
+            let v = if text == STALE {
+                vec![1.0_f32, 0.0]
             } else {
                 vec![1.0_f32, 0.0, 0.0]
             };
@@ -3981,6 +3989,7 @@ mod tests {
             ..Default::default()
         };
         let service = MemoryService::new(config).with_embed_fn(embed);
+        service.rebind_embeddings("prov:test", 3, None).await;
 
         let mk = |id: &str| MemoryEntry {
             embedding_model: None,
@@ -3993,31 +4002,30 @@ mod tests {
             fsrs: FsrsState::default(),
             workspace_id: None,
         };
-        service.add_entry(mk("a")).await.unwrap();
-        service.add_entry(mk("b")).await.unwrap();
-        assert_eq!(service.count().await, 2);
+        for (ids, text) in [(["a", "b"], "CONSOLIDATED"), (["c", "d"], STALE)] {
+            for id in ids {
+                service.add_entry(mk(id)).await.unwrap();
+            }
+            let cluster = MemoryCluster::new(
+                ids.iter().map(|id| mk(id)).collect(),
+                CompressionLevel::Compressed,
+                &service.config.fsrs,
+            );
+            let summarize = move |_p: String| async move { Ok::<_, String>(text.to_string()) };
+            service
+                .consolidate_cluster(&cluster, &summarize)
+                .await
+                .expect("the summary lands");
+        }
 
-        let cluster = MemoryCluster::new(
-            vec![mk("a"), mk("b")],
-            CompressionLevel::Compressed,
-            &service.config.fsrs,
-        );
-        let summarize = |_p: String| async move { Ok::<_, String>(SUMMARY.to_string()) };
-
-        let result = service.consolidate_cluster(&cluster, &summarize).await;
-        assert!(
-            result.is_err(),
-            "a dimension-mismatched summary embedding must fail the add"
-        );
-
-        // The critical assertion: a failed add must NOT have deleted the sources.
-        assert_eq!(
-            service.count().await,
-            2,
-            "consolidation must never lose memories when the add fails"
-        );
-        assert!(service.get("a").await.is_some(), "source a survives");
-        assert!(service.get("b").await.is_some(), "source b survives");
+        let entries = service.store.all_entries().await;
+        let summary_named = |text: &str| entries.iter().find(|e| e.content == text);
+        let stamped = summary_named("CONSOLIDATED").expect("stored");
+        assert_eq!(stamped.embedding_model.as_deref(), Some("prov:test"));
+        assert!(stamped.embeddings.contains_key("prov:test"), "filed in its bucket");
+        let queued = summary_named(STALE).expect("kept, not discarded");
+        assert!(queued.embedding.is_empty(), "queued for backfill");
+        assert_eq!(queued.embedding_model, None);
     }
 
 

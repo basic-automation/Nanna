@@ -10924,6 +10924,53 @@ keep the phases readable; promote individual items into a phase when they become
       daemon closed with `webhook_chat_allowed` (`crates/nanna-server/src/webhooks/telegram.rs`,
       `src/commands/serve.rs` passes no allowlist). Pass it into `AppStateBuilder`.
 
+### Dreaming that could lose or double a memory (found 2026-10-11, audit of dreaming)
+
+- [x] **A merge whose save failed was reported applied**, and the fold then deleted the source it
+      had merged in (that delete did reach the disk) — after a restart the source's text existed
+      nowhere. `update_content_and_embedding_if` now undoes the rewrite in RAM and returns the
+      error; the fold keeps both. Test `a_rewrite_that_could_not_be_saved_is_refused_and_undone`.
+- [x] **A user's "Consolidate" ran beside the scheduled dream** (only the scheduler had a latch):
+      the same clusters were summarised twice and each cycle removed up to the compression budget.
+      `DreamingService` holds one gate for the whole cycle (`MemoryError::DreamInFlight`). Test
+      `a_second_dream_cycle_waits_for_none_and_is_refused`.
+- [x] **Summaries were stored with no embedding model** (re-filed under `legacy-*` and hidden from
+      search on every restart until backfill), and a summary embedded at a stale width failed its
+      add, discarding the paid summary. Resolved against the live binding like every other write.
+      Test `a_summary_is_stamped_with_the_model_or_queued_never_discarded`.
+- [x] A scheduled dream in which every summariser call failed was recorded as a success. Test
+      `a_dream_that_only_failed_is_reported_failed`.
+- [ ] **Durable facts in the Expand band are summarised away.** The episodic/durable guard
+      (`service.rs`, ~2324) covers only the Detailed band (weight 0.8–1.0); a fact feedback lifted
+      past 1.0 is clustered, rewritten and its original removed, while the same fact at 0.9 is
+      protected. Apply the split to Expand too.
+- [ ] `remove_many_matching` (`lib.rs`) does not take `persist_serial`, and ignores a failed disk
+      delete after removing in RAM — a concurrent backfill `save_entry` can re-insert a removed
+      source, which returns on restart beside the memory that absorbed it. Take the lock; remove
+      in RAM only what the disk confirmed (as `remove_many_durable` does).
+- [ ] **The testing effect uses the dream's clock, not the recall's.** Queued reviews are
+      `(id, Rating)`; `record_access` measures elapsed time and sets `last_access` from `now()` at
+      the dream, so a recall two days before the dream gets two days' extra boost and K queued
+      recalls become one review plus K−1 no-ops. Queue `recalled_at` and pass it through.
+
+### Board cards that stuck or lost their assignee (found 2026-10-11, audit of the P25 card runs)
+
+- [ ] **Reassigning a running card leaves the old member working it.** `CardTree::serves`
+      (`tasks.rs`) passes the root before checking its assignee, and `settle_after_run` /
+      `hand_back` never check the card still belongs to the run's member: a budget end then wipes
+      the human's new assignee (and counts a hand-back), and a Stop records the new member as
+      pausing itself, so the stall sweep skips the card forever. Cancel the run when `assignee`
+      changes on an `in_progress` card, and make `settle_after_run` only reset a card it no
+      longer owns. (`member_delete` checks `member_is_working` outside `fence_starts` — same class.)
+- [ ] **A rate limit during a run with sub-cards cancels the sub-cards.** `abandon` handles 429 and
+      refused keys only for `id == subtree_root`; a leaf falls through to `cancelled`, and
+      `provider_died` treats 429 as a crash and resumes (8 × 15 s) without the cooldown, cancelling
+      each sibling in turn. Route a rate limit on any card to the root's wait, and exclude
+      `is_rate_limited_error` from `provider_died`.
+- Minor: a crash between `finish_card_run` and `set_member_status(Idle)` leaves a member shown busy
+  with no boot reset; `cooling_down_until` is per card, so a reassigned card inherits the first
+  member's provider wait.
+
 ### Dependency bumps held back (found 2026-10-11, dependency-freshness pass)
 
 - [ ] **`rten 0.26 → 0.27` waits for an `ocrs` release.** `ocrs 0.13.1` (latest) takes
