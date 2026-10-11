@@ -94,6 +94,54 @@ mod tools_impl {
     /// wait noticeably.
     pub const RESYNC_INTERVAL_MIN: std::time::Duration = std::time::Duration::from_secs(1);
 
+    /// Keep the wrappers from `server` whose model-facing names are free,
+    /// claiming each kept name in `taken`. Sanitizing makes distinct tools
+    /// share a name (`home assistant` and `home.assistant` both become
+    /// `home_assistant`; server `a__b` tool `c` and server `a` tool `b__c`
+    /// both become `mcp__a__b__c`), and the registry's `insert` silently
+    /// replaced the earlier tool — so a call to it reached the other server.
+    /// The first holder of a name keeps it; a later one is skipped with a
+    /// warning naming both.
+    fn admit<T: Transport + 'static>(
+        server: &str,
+        wrappers: Vec<Arc<McpToolWrapper<T>>>,
+        taken: &mut HashMap<String, String>,
+    ) -> Vec<Arc<McpToolWrapper<T>>> {
+        let offered = wrappers.len();
+        let kept: Vec<Arc<McpToolWrapper<T>>> = wrappers
+            .into_iter()
+            .filter(|wrapper| {
+                let name = wrapper.full_name();
+                if let Some(holder) = taken.get(&name) {
+                    warn!(
+                        server = %server,
+                        tool = %wrapper.tool.name,
+                        name = %name,
+                        held_by = %holder,
+                        "MCP tool skipped: its name is already taken"
+                    );
+                    return false;
+                }
+                taken.insert(name, server.to_string());
+                true
+            })
+            .collect();
+        debug_assert!(kept.len() <= offered);
+        kept
+    }
+
+    /// Model-facing names held by every server other than `server`.
+    fn names_held_by_others<T: Transport + 'static>(
+        server: &str,
+        wrappers: &[Arc<McpToolWrapper<T>>],
+    ) -> HashMap<String, String> {
+        wrappers
+            .iter()
+            .filter(|wrapper| wrapper.prefix != server)
+            .map(|wrapper| (wrapper.full_name(), wrapper.prefix.clone()))
+            .collect()
+    }
+
     /// Wrapper that adapts an MCP tool to the nanna-tools `Tool` trait
     pub struct McpToolWrapper<T: Transport + 'static> {
         /// The MCP client
@@ -340,21 +388,21 @@ mod tools_impl {
             let tools = client.list_tools().await?;
             debug!(server = %name, count = tools.len(), "Registered MCP server tools");
 
-            let mut wrappers = Vec::new();
-            for tool in tools {
-                let wrapper = Arc::new(McpToolWrapper::new(client.clone(), tool, &name));
-                wrappers.push(wrapper);
-            }
+            let offered: Vec<Arc<McpToolWrapper<T>>> = tools
+                .into_iter()
+                .map(|tool| Arc::new(McpToolWrapper::new(client.clone(), tool, &name)))
+                .collect();
 
-            // Store
-            {
-                let mut clients = self.clients.write().await;
-                clients.insert(name, client);
-            }
-            {
+            // Admit and store under one write lock, so two servers
+            // registering at once cannot both claim a name.
+            let wrappers = {
                 let mut tool_wrappers = self.tool_wrappers.write().await;
-                tool_wrappers.extend(wrappers.iter().cloned());
-            }
+                let mut taken = names_held_by_others(&name, &tool_wrappers);
+                let admitted = admit(&name, offered, &mut taken);
+                tool_wrappers.extend(admitted.iter().cloned());
+                admitted
+            };
+            self.clients.write().await.insert(name, client);
 
             Ok(wrappers)
         }
@@ -391,15 +439,21 @@ mod tools_impl {
         /// Returns error if refresh fails for any server
         pub async fn refresh(&self) -> Result<(), McpError> {
             let mut new_wrappers = Vec::new();
+            let mut taken: HashMap<String, String> = HashMap::new();
 
             let clients = self.clients.read().await;
-            for (name, client) in clients.iter() {
+            // In name order, so which of two colliding servers keeps a name
+            // does not depend on the map's iteration order.
+            let mut ordered: Vec<(&String, &Arc<McpClient<T>>)> = clients.iter().collect();
+            ordered.sort_by(|a, b| a.0.cmp(b.0));
+            for (name, client) in ordered {
                 match client.refresh_tools().await {
                     Ok(tools) => {
-                        for tool in tools {
-                            let wrapper = Arc::new(McpToolWrapper::new(client.clone(), tool, name));
-                            new_wrappers.push(wrapper);
-                        }
+                        let offered = tools
+                            .into_iter()
+                            .map(|tool| Arc::new(McpToolWrapper::new(client.clone(), tool, name)))
+                            .collect();
+                        new_wrappers.extend(admit(name, offered, &mut taken));
                     }
                     Err(e) => {
                         warn!(server = %name, error = %e, "Failed to refresh tools");
@@ -437,16 +491,21 @@ mod tools_impl {
                 .get(server)
                 .cloned()
                 .ok_or_else(|| McpError::Protocol(format!("unknown MCP server '{server}'")))?;
-            let fresh: Vec<Arc<McpToolWrapper<T>>> = client
+            let offered: Vec<Arc<McpToolWrapper<T>>> = client
                 .refresh_tools()
                 .await?
                 .into_iter()
                 .map(|tool| Arc::new(McpToolWrapper::new(client.clone(), tool, server)))
                 .collect();
-            let fresh_names: HashSet<String> = fresh.iter().map(|w| w.full_name()).collect();
             let mut gone: Vec<String> = Vec::new();
-            {
+            let (fresh, fresh_names) = {
                 let mut wrappers = self.tool_wrappers.write().await;
+                // A name another server holds stays theirs: registering over
+                // it replaced their tool, and a later resync of this server
+                // then unregistered it outright.
+                let mut taken = names_held_by_others(server, &wrappers);
+                let fresh = admit(server, offered, &mut taken);
+                let fresh_names: HashSet<String> = fresh.iter().map(|w| w.full_name()).collect();
                 wrappers.retain(|wrapper| {
                     if wrapper.prefix != server {
                         return true;
@@ -458,7 +517,9 @@ mod tools_impl {
                     false
                 });
                 wrappers.extend(fresh.iter().cloned());
-            }
+                drop(wrappers);
+                (fresh, fresh_names)
+            };
             for name in &gone {
                 registry.unregister(name).await;
             }
@@ -625,6 +686,80 @@ mod tools_impl {
                 2,
                 "the manager's own list matches"
             );
+        }
+
+        /// Always serves the same tool names.
+        struct FixedTools(&'static [&'static str]);
+
+        #[async_trait::async_trait]
+        impl Transport for FixedTools {
+            async fn request(&self, request: JsonRpcRequest) -> crate::Result<JsonRpcResponse> {
+                let tools: Vec<_> = self
+                    .0
+                    .iter()
+                    .map(|n| serde_json::json!({ "name": n, "inputSchema": { "type": "object" } }))
+                    .collect();
+                Ok(JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id: request.id,
+                    result: Some(serde_json::json!({ "tools": tools })),
+                    error: None,
+                })
+            }
+            async fn notify(&self, _n: JsonRpcNotification) -> crate::Result<()> {
+                Ok(())
+            }
+            async fn close(&self) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+
+        async fn fixed(names: &'static [&'static str]) -> McpClient<FixedTools> {
+            let client = McpClient::new(FixedTools(names));
+            client.mark_initialized_for_test().await;
+            client.refresh_tools().await.expect("lists its tools");
+            client
+        }
+
+        /// The servers whose wrappers carry the model-facing `name`.
+        async fn owner(manager: &McpToolsManager<FixedTools>, name: &str) -> Vec<String> {
+            manager
+                .tools()
+                .await
+                .iter()
+                .filter(|w| w.full_name() == name)
+                .map(|w| w.prefix.clone())
+                .collect()
+        }
+
+        /// Server `a__b`'s tool `c` and server `a`'s tool `b__c` are both
+        /// `mcp__a__b__c`. The first keeps the name; the second is skipped,
+        /// not registered over it, and resyncing the second leaves it alone.
+        #[tokio::test]
+        async fn a_tool_name_another_server_holds_stays_theirs() {
+            let manager = McpToolsManager::new();
+            let first = manager.register("a__b", fixed(&["c"]).await).await.unwrap();
+            assert_eq!(first.len(), 1);
+            let second = manager
+                .register("a", fixed(&["b__c", "d", "d"]).await)
+                .await
+                .unwrap();
+            let kept: Vec<String> = second.iter().map(|w| w.full_name()).collect();
+            assert_eq!(kept, ["mcp__a__d"], "the taken name and the repeat are skipped");
+
+            let registry = nanna_tools::ToolRegistry::new();
+            manager.register_with_registry(&registry).await.unwrap();
+            assert_eq!(owner(&manager, "mcp__a__b__c").await, ["a__b"]);
+
+            let (registered, removed) = manager.resync_server("a", &registry).await.unwrap();
+            assert_eq!((registered, removed), (1, 0));
+            assert!(registry.get("mcp__a__b__c").await.is_some(), "still registered");
+            assert_eq!(
+                owner(&manager, "mcp__a__b__c").await,
+                ["a__b"],
+                "still the first server's"
+            );
+            assert_eq!(manager.tools().await.len(), 2);
         }
     }
 

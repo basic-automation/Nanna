@@ -204,40 +204,58 @@ impl McpIntegration {
         self.configs.push(config);
     }
 
-    /// Spawn all configured servers and register their tools.
+    /// Spawn all configured servers, concurrently, registering each one's
+    /// tools into `registry` the moment its handshake finishes.
     ///
-    /// One server failing does not stop the others. The outcome of each
-    /// auto-started server is returned in configuration order — `Ok(tools)` or
-    /// the reason it did not start — so a caller can report per-server state
-    /// instead of a single aggregate a failed server hides inside.
+    /// Servers used to start one after another and register only after the
+    /// whole loop, so one slow `npx -y` server (a package download, then a
+    /// 60 s probe and a 60 s `initialize`) held back every other server's
+    /// tools and status. Now each is usable as soon as it is up, and
+    /// `on_outcome` hears about each one as it settles — `Ok` or the reason
+    /// it did not start — so a caller can report per-server state live.
+    /// One server failing does not stop the others. Concurrency is bounded
+    /// by the configured server count (`MCP_SERVERS_MAX` in the daemon).
     ///
-    /// # Errors
-    ///
-    /// Returns error only if registering the started servers' tools fails.
+    /// Returns every auto-started server's outcome, in configuration order.
     pub async fn start_all(
         &self,
         registry: &ToolRegistry,
-    ) -> Result<Vec<(String, Result<McpStarted, String>)>, McpStartError> {
-        let mut outcomes = Vec::with_capacity(self.configs.len());
-        for config in &self.configs {
-            if !config.auto_start {
-                debug!(server = %config.name, "Skipping MCP server (auto_start=false)");
-                continue;
-            }
-            let outcome = self.start_server(config).await.map_err(|e| {
-                error!(server = %config.name, error = %e, "Failed to start MCP server");
-                e.to_string()
-            });
-            outcomes.push((config.name.clone(), outcome));
+        mut on_outcome: impl AsyncFnMut(&str, &Result<McpStarted, String>),
+    ) -> Vec<(String, Result<McpStarted, String>)> {
+        use futures::stream::{FuturesUnordered, StreamExt as _};
+        let mut pending: FuturesUnordered<_> = self
+            .configs
+            .iter()
+            .enumerate()
+            .filter(|(_, config)| {
+                if !config.auto_start {
+                    debug!(server = %config.name, "Skipping MCP server (auto_start=false)");
+                }
+                config.auto_start
+            })
+            .map(|(index, config)| async move {
+                let outcome = self.start_server(config, registry).await.map_err(|e| {
+                    error!(server = %config.name, error = %e, "Failed to start MCP server");
+                    e.to_string()
+                });
+                (index, outcome)
+            })
+            .collect();
+        let mut outcomes: Vec<(usize, String, Result<McpStarted, String>)> =
+            Vec::with_capacity(pending.len());
+        while let Some((index, outcome)) = pending.next().await {
+            let name = self.configs[index].name.clone();
+            on_outcome(&name, &outcome).await;
+            outcomes.push((index, name, outcome));
         }
+        outcomes.sort_by_key(|(index, _, _)| *index);
         debug_assert!(outcomes.len() <= self.configs.len());
-
-        // Register all tools with the registry
-        let registered = self.manager.register_with_registry(registry).await
-            .map_err(|e| McpStartError::Registration(e.to_string()))?;
-
-        info!(servers = self.configs.len(), tools = registered, "MCP integration started");
-        Ok(outcomes)
+        let started = outcomes.iter().filter(|(_, _, o)| o.is_ok()).count();
+        info!(servers = outcomes.len(), started, "MCP integration started");
+        outcomes
+            .into_iter()
+            .map(|(_, name, outcome)| (name, outcome))
+            .collect()
     }
 
     /// Spawn a `command` server or connect to a `url` one, and run the
@@ -289,8 +307,12 @@ impl McpIntegration {
         }
     }
 
-    /// Start a single MCP server
-    async fn start_server(&self, config: &McpServerConfig) -> Result<McpStarted, McpStartError> {
+    /// Start a single MCP server and register its tools into `registry`.
+    async fn start_server(
+        &self,
+        config: &McpServerConfig,
+        registry: &ToolRegistry,
+    ) -> Result<McpStarted, McpStartError> {
         if let Some(url) = &config.url {
             info!(server = %config.name, %url, "Connecting to MCP server");
         } else {
@@ -313,6 +335,9 @@ impl McpIntegration {
             .register(&config.name, client)
             .await
             .map_err(|e| McpStartError::Registration(e.to_string()))?;
+        for tool in &tools {
+            registry.register_boxed(tool.clone()).await;
+        }
 
         info!(
             server = %config.name,
@@ -484,5 +509,68 @@ mod tests {
             .filesystem(&["/tmp"])
             .fetch()
             .build();
+    }
+}
+
+#[cfg(all(test, unix, feature = "mcp"))]
+mod start_tests {
+    use super::{McpIntegration, McpServerConfig};
+    use nanna_tools::ToolRegistry;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A legacy-era stdio MCP server with one tool, `echo`.
+    const FAST_SERVER: &str = r#"
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if "id" not in msg:
+        continue
+    method = msg.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": msg["params"]["protocolVersion"],
+                  "capabilities": {"tools": {}}, "serverInfo": {"name": "fast"}}
+        reply = {"jsonrpc": "2.0", "id": msg["id"], "result": result}
+    elif method == "tools/list":
+        tools = [{"name": "echo", "inputSchema": {"type": "object"}}]
+        reply = {"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": tools}}
+    else:
+        reply = {"jsonrpc": "2.0", "id": msg["id"],
+                 "error": {"code": -32601, "message": "no such method"}}
+    sys.stdout.write(json.dumps(reply) + "\n")
+    sys.stdout.flush()
+"#;
+
+    /// One server that never answers must not hold back another's tools:
+    /// `start_all` used to start servers one after another and register only
+    /// after the loop, so the fast server's tools waited out the slow one's
+    /// probe and handshake timeouts (two minutes).
+    #[tokio::test]
+    async fn a_slow_server_does_not_hold_back_another_servers_tools() {
+        if std::process::Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        let mut integration = McpIntegration::new();
+        // Listed first, so a sequential start would reach it first.
+        integration.add_server(McpServerConfig::new("slow", "sh").args(["-c", "sleep 600"]));
+        integration.add_server(McpServerConfig::new("fast", "python3").args(["-c", FAST_SERVER]));
+        let integration = Arc::new(integration);
+        let registry = Arc::new(ToolRegistry::new());
+        let starting = {
+            let (integration, registry) = (Arc::clone(&integration), Arc::clone(&registry));
+            tokio::spawn(async move {
+                integration.start_all(&registry, async |_: &str, _: &_| {}).await
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while registry.get("mcp__fast__echo").await.is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fast server's tool waited on the slow server"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!starting.is_finished(), "the slow server is still starting");
+        starting.abort();
     }
 }

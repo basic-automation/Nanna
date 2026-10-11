@@ -10779,19 +10779,28 @@ keep the phases readable; promote individual items into a phase when they become
       to 600 s for the answer, but `McpToolWrapper::timeout_secs()` is 65 s and the registry
       backstop drops the call at about 75 s, so an answer given later never reaches the server.
       User think-time should not count against the tool's deadline.
-- [ ] **No server's tools appear until every server has started.** `start_all` starts servers one
+- [x] **No server's tools appear until every server has started.** `start_all` starts servers one
       after another and registers only after the loop, so one slow `npx -y` server (60 s probe +
       60 s `initialize`) holds back every other server's tools and status. Register each server
       as its handshake finishes, or start them concurrently.
+      *(2026-10-11)* Both: servers start concurrently (`FuturesUnordered`, bounded by
+      `MCP_SERVERS_MAX`), each registers its tools the moment its handshake finishes, and the
+      daemon records each server's status as it settles (`on_outcome`). Live test
+      `a_slow_server_does_not_hold_back_another_servers_tools`: a Python stdio server's tool is
+      registered in 0.05 s while a server that never answers is still starting.
 - [ ] **A cold start over 60 s fails a modern-only stdio server.** A probe timeout reads as
       "legacy"; the queued `server/discover` and `initialize` then both arrive, and a modern-only
       server rejects `initialize` with `-32022`. Re-classify that error and finish the modern
       handshake.
-- [ ] **Tool names from two servers can collide.** `mcp__{server}__{tool}` is sanitized after the
+- [x] **Tool names from two servers can collide.** `mcp__{server}__{tool}` is sanitized after the
       duplicate-name check (`home assistant` vs `home.assistant`, or `__` inside names), the
       registry's `insert` silently replaces the earlier tool, and `resync_server` can unregister
       the other server's tool. De-duplicate on the sanitized name and skip a name another server
       owns.
+      *(2026-10-11)* `admit` de-duplicates on the model-facing name under the wrappers' write lock
+      in `register`, `refresh` (servers in name order) and `resync_server`: the first holder keeps
+      a name, a later one is skipped with a warning naming both. Test
+      `a_tool_name_another_server_holds_stays_theirs` (`a__b`/`c` vs `a`/`b__c`, plus a repeat).
 - [ ] *(lead)* Under the AppImage, stdio MCP servers inherit the bundle's `LD_LIBRARY_PATH`;
       `exec` scrubs it (`scrub_appimage_library_path`), `StdioTransport::spawn_with_env` does not.
 

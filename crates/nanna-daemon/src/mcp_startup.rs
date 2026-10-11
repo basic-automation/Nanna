@@ -7,9 +7,9 @@
 //!
 //! **Started in the background.** A server launched through `npx -y` may
 //! download a package on its first run; waiting for it would hold the daemon's
-//! readiness hostage to the network. Tools register as each server finishes its
-//! handshake, and a server that fails is logged by name and skipped — the rest
-//! still start.
+//! readiness hostage to the network. Servers start concurrently and tools
+//! register as each server finishes its handshake, and a server that fails is
+//! logged by name and skipped — the rest still start.
 
 use std::sync::Arc;
 
@@ -160,33 +160,25 @@ pub async fn spawn_mcp_servers(
     );
     info!(servers = count, "Starting MCP servers in the background");
     let task = tokio::spawn(async move {
-        match integration.start_all(&tools).await {
-            Ok(outcomes) => {
-                let mut servers = status.write().await;
-                for (name, outcome) in outcomes {
-                    record_outcome(&mut servers, &name, outcome);
-                }
-                let registered: usize = servers.iter().map(|s| s.tools).sum();
-                drop(servers);
-                info!(
-                    servers = count,
-                    tools = registered,
-                    "MCP tools registered (named mcp__<server>__<tool>)"
-                );
-            }
-            Err(e) => {
-                warn!("MCP tools could not be registered: {e}");
-                for state in status
-                    .write()
-                    .await
-                    .iter_mut()
-                    .filter(|s| s.state == "starting")
-                {
-                    state.state = "failed";
-                    state.detail = Some(e.to_string());
-                }
-            }
-        }
+        // Each server's state lands the moment it settles, so a slow one no
+        // longer shows every other server as `starting`.
+        let status_for_outcomes = Arc::clone(&status);
+        let outcomes = integration
+            .start_all(&tools, async move |name: &str, outcome: &Result<_, String>| {
+                let mut servers = status_for_outcomes.write().await;
+                record_outcome(&mut servers, name, outcome.clone());
+            })
+            .await;
+        let registered: usize = outcomes
+            .iter()
+            .filter_map(|(_, outcome)| outcome.as_ref().ok())
+            .map(|started| started.tools)
+            .sum();
+        info!(
+            servers = count,
+            tools = registered,
+            "MCP tools registered (named mcp__<server>__<tool>)"
+        );
         // Keep the clients alive for the daemon's lifetime, following every
         // server's tool-list changes into the registry; close them on a clean
         // shutdown rather than leaving it to process exit.
