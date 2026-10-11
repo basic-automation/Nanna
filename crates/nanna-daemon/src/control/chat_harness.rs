@@ -1561,7 +1561,7 @@ impl ChatTurn {
                     // against evidence, not the clock.
                     let health = provider_answers(
                         &h.step_runner.router,
-                        &h.step_runner.agent_config.model,
+                        &h.step_runner.active_model(),
                     )
                     .await;
                     b.error_rounds += 1;
@@ -1850,7 +1850,7 @@ impl ChatTurn {
                 // tell the user which one happened.
                 let health = provider_answers(
                     &h.step_runner.router,
-                    &h.step_runner.agent_config.model,
+                    &h.step_runner.active_model(),
                 )
                 .await;
                 b.error_rounds += 1;
@@ -2094,7 +2094,7 @@ impl ChatTurn {
                     ParkedTurn {
                         scope: self.scope.clone(),
                         scope_id: self.scope_id.clone(),
-                        model: h.step_runner.agent_config.model.clone(),
+                        model: h.step_runner.active_model(),
                         goal: self.content.clone(),
                         error_rounds,
                         resumes: self.resumed_from_park,
@@ -2114,7 +2114,7 @@ impl ChatTurn {
                 Arc::clone(&self.registry),
                 self.session_id.clone(),
                 h.step_runner.router.clone(),
-                h.step_runner.agent_config.model.clone(),
+                h.step_runner.active_model(),
             );
         }
 
@@ -2291,6 +2291,38 @@ impl ChatTurn {
         if let Some(ref baselines) = self.turn_baselines {
             baselines.close_turn(&self.scope, self.scope_id.as_deref()).await;
         }
+        self.run_what_arrived_late().await;
+    }
+
+    /// Start a turn for messages that arrived after the run's last drain —
+    /// during the continuation loop or this tail, acked "interjected" and
+    /// queued — which nothing else would ever run: they sat until the user
+    /// happened to send another message. After a Stop they wait for the next
+    /// message instead (Stop is stop). Spawned: this is the old turn's task.
+    /// A turn that claims the session first takes them at its own boundary;
+    /// if one does here, `run_chat_turn` queues them back for it.
+    async fn run_what_arrived_late(&self) {
+        if self.run_handle.cancel.is_cancelled() {
+            return;
+        }
+        let pending = self.registry.pending_for(&self.session_id).await;
+        if pending.is_empty().await {
+            return;
+        }
+        let messages = pending.drain().await;
+        if messages.is_empty() {
+            return;
+        }
+        tracing::info!(
+            session_id = %self.session_id,
+            messages = messages.len(),
+            "messages arrived after the turn's last drain — starting a turn for them"
+        );
+        spawn_late_turn(
+            Arc::clone(&self.this),
+            self.session_id.clone(),
+            messages.join("\n\n"),
+        );
     }
 
     /// A turn that finished with nothing to show says so.
@@ -2679,6 +2711,9 @@ struct TurnWatcher {
     message_id: String,
     live: Arc<crate::liveness::SessionLiveness>,
     tools: Arc<ToolRegistry>,
+    storage: Arc<Storage>,
+    scope: String,
+    scope_id: Option<String>,
 }
 
 impl TurnWatcher {
@@ -2693,6 +2728,9 @@ impl TurnWatcher {
             message_id: turn.message_id.clone(),
             live: turn.live.clone(),
             tools: turn.agent.tools().clone(),
+            storage: turn.storage.clone(),
+            scope: turn.scope.clone(),
+            scope_id: turn.scope_id.clone(),
         }
     }
 
@@ -2708,6 +2746,9 @@ impl TurnWatcher {
             message_id: watcher_message_id,
             live: watcher_live,
             tools: watcher_tools,
+            storage: watcher_storage,
+            scope: watcher_scope,
+            scope_id: watcher_scope_id,
         } = self;
         let Err(join_error) = turn.await else {
             return;
@@ -2732,10 +2773,26 @@ impl TurnWatcher {
         // half of the leak: the next thing to resolve a path as this
         // session would silently use a dead turn's root.
         watcher_tools.clear_session_workdir(&watcher_session).await;
+        crate::run_workspace::release(&watcher_session);
+        // The tail demotes the turn's in-flight items; skipped here, a crashed
+        // turn's item stayed `in_progress`, which `next()` sorts first — the
+        // next message resumed the dead turn's work instead of being answered.
+        if let Err(message) = demote_in_progress(
+            &watcher_storage,
+            &watcher_scope,
+            watcher_scope_id.as_deref(),
+            "chat",
+        )
+        .await
+        {
+            tracing::warn!(%message, "could not release a crashed turn's in-flight items");
+        }
         watcher_agent.unregister_external_run(&watcher_session).await;
         watcher_registry.release(&watcher_session).await;
         if let Some(baselines) = watcher_baselines {
-            baselines.close_turn("session", Some(&watcher_session)).await;
+            // The turn's own scope, as the tail closes it (a workspace chat's
+            // baseline is not keyed by the session).
+            baselines.close_turn(&watcher_scope, watcher_scope_id.as_deref()).await;
         }
         // Close the liveness ledger too, or the beat task would keep
         // beating for a turn that no longer exists. `crashed` also gives
@@ -2920,6 +2977,17 @@ struct ProviderProbe {
 /// `resumes` count rides along and is bounded by the same
 /// [`CONTINUATION_ERROR_ROUNDS`] brake that bounds error rounds, so a flapping
 /// provider cannot loop forever.
+/// Start a turn for `content` on its own task. A plain `fn`, as
+/// [`spawn_park_waiter`] is: spawned from inside a turn's own future, the
+/// turn's type would otherwise contain itself.
+fn spawn_late_turn(control: Arc<super::ControlPlane>, session_id: String, content: String) {
+    tokio::spawn(async move {
+        if let Err(e) = control.run_chat_turn(&session_id, &content).await {
+            tracing::warn!(%session_id, error = %e, "late messages could not start a turn");
+        }
+    });
+}
+
 fn spawn_park_waiter(
     control: Arc<super::ControlPlane>,
     registry: Arc<ChatRunRegistry>,
@@ -2928,6 +2996,11 @@ fn spawn_park_waiter(
     model: String,
 ) {
     tokio::spawn(async move {
+        // Spawned inside the parking turn, before its tail releases the
+        // session. A first probe that answered at once resumed into a claim
+        // still held: the goal was queued behind a turn that was ending (and
+        // stuck there), with the resume already counted.
+        registry.wait_until_idle(&session_id).await;
         loop {
             // The park may have been claimed by a user message in the
             // meantime — that turn already carries the work forward.
@@ -2936,6 +3009,11 @@ fn spawn_park_waiter(
             }
             let probe = provider_answers(&router, &model).await;
             if !probe.answered {
+                // At most one probe per silence window. A provider that fails
+                // FAST (connection refused, a quick 5xx, no client at all)
+                // answered in microseconds and the loop re-probed at once,
+                // pegging a worker until a user message cleared the park.
+                tokio::time::sleep(park_probe_pause(probe.elapsed_secs)).await;
                 continue;
             }
             let Some(park) = registry.clear_park(&session_id).await else {
@@ -2965,6 +3043,16 @@ fn spawn_park_waiter(
             return;
         }
     });
+}
+
+/// How long the park waiter rests after a failed probe that took
+/// `elapsed_secs`: what is left of the transport's silence window, so a probe
+/// that hung for the whole window is retried at once and one that failed at
+/// once waits the window out. Pure.
+fn park_probe_pause(elapsed_secs: u64) -> std::time::Duration {
+    let pause = nanna_llm::STREAM_READ_TIMEOUT_SECS.saturating_sub(elapsed_secs);
+    debug_assert!(pause <= nanna_llm::STREAM_READ_TIMEOUT_SECS);
+    std::time::Duration::from_secs(pause)
 }
 
 async fn provider_answers(
@@ -4162,6 +4250,23 @@ pub(super) fn sanitize_timeline(items: Vec<TimelineItem>) -> Vec<TimelineItem> {
             other => Some(other),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod park_waiter_tests {
+    use super::park_probe_pause;
+    use std::time::Duration;
+
+    /// A probe that failed at once waits the silence window out; one that
+    /// hung for all of it goes again at once. Never a tight loop.
+    #[test]
+    fn a_failed_probe_is_paced_to_one_per_silence_window() {
+        let window = nanna_llm::STREAM_READ_TIMEOUT_SECS;
+        assert_eq!(park_probe_pause(0), Duration::from_secs(window));
+        assert_eq!(park_probe_pause(window), Duration::ZERO);
+        assert_eq!(park_probe_pause(window + 30), Duration::ZERO);
+        assert_eq!(park_probe_pause(20), Duration::from_secs(window - 20));
+    }
 }
 
 #[cfg(test)]

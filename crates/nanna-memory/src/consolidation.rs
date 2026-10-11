@@ -1126,8 +1126,8 @@ pub fn create_consolidated_entry(
         id: uuid::Uuid::new_v4().to_string(),
         content: consolidated_content,
         // A consolidated memory inherits no bucket: it is NEW text, so its
-        // vector belongs to whichever model just embedded it. The daemon stamps
-        // the model on write; until then it is simply unlabelled.
+        // vector belongs to whichever model just embedded it. The caller
+        // (`consolidate_cluster`) stamps that model and its bucket.
         embedding_model: None,
         embeddings: HashMap::new(),
         embedding: new_embedding,

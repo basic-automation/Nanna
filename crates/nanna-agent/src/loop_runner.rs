@@ -97,6 +97,44 @@ fn pressure_tier_active_tools() -> HashSet<String> {
 /// Matches the provider's `tool '<name>' not found` shape anywhere in the
 /// rendered error (the message arrives wrapped in transport prefixes like
 /// `API error: 500 - {...}`).
+/// Whether a provider error is a rate limit or an overload, which a short
+/// backoff can cure. `429` must stand alone: matched as a substring it caught
+/// "prompt is too long: 214290 tokens" — a context overflow, which needs
+/// compressing, not three waits of 5, 10 and 20 s. Pure.
+fn is_rate_limit_message(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    if ["rate limit", "rate_limit", "too many requests", "overloaded"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return true;
+    }
+    lower.match_indices("429").any(|(at, _)| {
+        let before = lower[..at].chars().next_back();
+        let after = lower[at + 3..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_digit()) && !after.is_some_and(|c| c.is_ascii_digit())
+    })
+}
+
+/// Longest a provider-named `retry-after` is waited out inside one call;
+/// past it the error goes to the step ladder (and a card run to its own
+/// cooldown) rather than holding the call for minutes.
+const RETRY_AFTER_WAIT_SECS_MAX: u64 = 60;
+
+/// How long attempt `attempt` (1-based) of the in-call rate-limit retry
+/// waits: the 5/10/20 s ladder, or the provider's own `retry-after` when it
+/// names a longer one (capped at [`RETRY_AFTER_WAIT_SECS_MAX`]). The ladder
+/// alone retried a provider that had said "30 s" at 5 and 10 s — two
+/// requests it had already refused. Pure apart from the clock
+/// `parse_retry_after` reads for an absolute reset.
+fn rate_limit_wait_secs(attempt: u32, message: &str) -> u64 {
+    debug_assert!(attempt >= 1, "attempts count from one");
+    let ladder = 5u64 << attempt.saturating_sub(1).min(8);
+    let named = nanna_llm::LlmError::parse_retry_after(message)
+        .map_or(0, |secs| secs.min(RETRY_AFTER_WAIT_SECS_MAX));
+    ladder.max(named)
+}
+
 fn provider_unknown_tool_name(message: &str) -> Option<&str> {
     let (_, rest) = message.split_once("tool '")?;
     let (name, tail) = rest.split_once('\'')?;
@@ -7000,6 +7038,7 @@ impl Agent {
         let mut attempt = 0;
 
         loop {
+            let streamed_before = state.streamed_text.len();
             let result = if let Some(ref on_text) = options.on_text {
                 self.call_llm_streaming(
                     request,
@@ -7030,17 +7069,15 @@ impl Agent {
             match result {
                 Ok(r) => return Ok(r),
                 Err(ref e) if attempt < max_retries => {
-                    let err_str = e.to_string().to_lowercase();
-                    let is_rate_limit = err_str.contains("rate limit")
-                        || err_str.contains("rate_limit")
-                        || err_str.contains("429")
-                        || err_str.contains("too many requests")
-                        || err_str.contains("overloaded");
-
-                    if is_rate_limit {
+                    // A retry here streams the reply again from the start; one
+                    // whose text already reached the user would show it twice
+                    // and persist both. Those go to the step ladder, which
+                    // retries with a fresh context.
+                    let emitted = state.streamed_text.len() > streamed_before;
+                    let message = e.to_string();
+                    if is_rate_limit_message(&message) && !emitted {
                         attempt += 1;
-                        // Exponential backoff: 5s, 10s, 20s
-                        let wait_secs = 5u64 * (1u64 << (attempt - 1));
+                        let wait_secs = rate_limit_wait_secs(attempt, &message);
                         warn!(
                             model = %request.model,
                             attempt = attempt,
@@ -10561,6 +10598,39 @@ fn parse_exit_code_prefix(text: &str) -> Option<i64> {
         return None;
     }
     rest[..digits_len].parse().ok()
+}
+
+#[cfg(test)]
+mod rate_limit_message_tests {
+    use super::is_rate_limit_message;
+
+    #[test]
+    fn a_named_retry_after_is_waited_out() {
+        use super::{RETRY_AFTER_WAIT_SECS_MAX, rate_limit_wait_secs};
+        assert_eq!(rate_limit_wait_secs(1, "API error: 429"), 5);
+        assert_eq!(rate_limit_wait_secs(3, "API error: 429"), 20);
+        assert_eq!(rate_limit_wait_secs(1, "Rate limit exceeded: retry-after: 30"), 30);
+        assert_eq!(
+            rate_limit_wait_secs(1, "Rate limit exceeded: retry-after: 900"),
+            RETRY_AFTER_WAIT_SECS_MAX,
+            "a long wait is capped; the card's own cooldown takes it from there"
+        );
+        assert_eq!(rate_limit_wait_secs(3, "retry-after: 2"), 20, "never below the ladder");
+    }
+
+    #[test]
+    fn a_429_must_stand_alone() {
+        assert!(is_rate_limit_message("API error: 429 - Too Many Requests"));
+        assert!(is_rate_limit_message("status 429"));
+        assert!(is_rate_limit_message("Rate limit exceeded: retry-after: 30"));
+        assert!(is_rate_limit_message("overloaded_error: Overloaded"));
+        assert!(
+            !is_rate_limit_message("prompt is too long: 214290 tokens > 200000 maximum"),
+            "a context overflow is compressed, not waited out"
+        );
+        assert!(!is_rate_limit_message("request 14295 failed"));
+        assert!(!is_rate_limit_message("API error: 500 - internal"));
+    }
 }
 
 #[cfg(test)]

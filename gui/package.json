@@ -1,6 +1,6 @@
 {
   "name": "nanna-gui",
-  "version": "0.3.42",
+  "version": "0.3.43",
   "type": "module",
   "private": true,
   "scripts": {
@@ -61,7 +61,7 @@
     "@axe-core/playwright": "^4.13.0",
     "@playwright/test": "^1.64.0",
     "@tailwindcss/postcss": "^4.3.3",
-    "@tauri-apps/cli": "^2.12.1",
+    "@tauri-apps/cli": "^2.12.2",
     "@vitejs/plugin-vue": "^6.0.10",
     "@vue/test-utils": "^2.5.1",
     "happy-dom": "^20.14.6",

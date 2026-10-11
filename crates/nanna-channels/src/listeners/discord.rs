@@ -230,6 +230,12 @@ impl DiscordListener {
             // Set by op 10 Hello; until then there is nothing to beat.
             let mut heartbeat: Option<tokio::time::Interval> = None;
             let mut awaiting_ack = false;
+            // Whether this connection reached READY/RESUMED. One that ends
+            // before it is a failed attempt and must back off; otherwise a
+            // gateway that closes every identify was re-dialled at once,
+            // forever, with the breaker's counters still at zero.
+            let mut established = false;
+            let mut fatal_close: Option<String> = None;
 
             'connection: loop {
                 tokio::select! {
@@ -254,9 +260,9 @@ impl DiscordListener {
 
                         let msg = match msg {
                             Ok(WsMessage::Text(text)) => text,
-                            Ok(WsMessage::Close(_)) => {
-                                info!("Discord Gateway sent close frame");
-                                should_resume = true;
+                            Ok(WsMessage::Close(frame)) => {
+                                fatal_close = fatal_close_detail(frame.as_ref());
+                                should_resume = fatal_close.is_none();
                                 break 'connection;
                             }
                             Ok(_) => continue,
@@ -267,18 +273,10 @@ impl DiscordListener {
                             }
                         };
 
-                        let payload: GatewayPayload = match serde_json::from_str(&msg) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                warn!("Failed to parse Gateway payload: {}", e);
-                                continue;
-                            }
+                        let Some(payload) = self.note_payload(&msg) else {
+                            continue;
                         };
-
-                        // Update sequence
-                        if let Some(seq) = payload.s {
-                            self.sequence.store(seq, Ordering::SeqCst);
-                        }
+                        established |= payload.establishes_session();
 
                         let mut conn = GatewayConnection {
                             write: &mut write,
@@ -297,11 +295,27 @@ impl DiscordListener {
                 }
             }
 
+            if settle_connection(&mut cb, fatal_close, established).await == BreakerAction::Stop {
+                break;
+            }
+
             // Backoff before reconnecting (no-op if counters are zero)
             cb.backoff().await;
         }
 
         info!("Discord Gateway listener stopped");
+    }
+
+    /// Parse one gateway message and keep its sequence number; `None` for a
+    /// message that does not parse (logged, skipped).
+    fn note_payload(&self, text: &str) -> Option<GatewayPayload> {
+        let payload: GatewayPayload = serde_json::from_str(text)
+            .map_err(|e| warn!("Failed to parse Gateway payload: {}", e))
+            .ok()?;
+        if let Some(seq) = payload.s {
+            self.sequence.store(seq, Ordering::SeqCst);
+        }
+        Some(payload)
     }
 
     /// Send one heartbeat. `false` means leave the connection (and resume): the
@@ -537,6 +551,44 @@ impl Listener for DiscordListener {
 }
 
 /// Discord Gateway payload
+/// Record how a gateway connection ended: a fatal close as an auth failure
+/// (bad token, or intents the application may not use — retrying cannot fix
+/// it, and every identify counts against Discord's daily cap, which resets
+/// the token when hit), and any other end before READY as a connection
+/// failure, so the reconnect backs off.
+async fn settle_connection(
+    cb: &mut CircuitBreaker,
+    fatal_close: Option<String>,
+    established: bool,
+) -> BreakerAction {
+    if let Some(detail) = fatal_close {
+        return cb.record_auth_failure(&detail).await;
+    }
+    if established {
+        return BreakerAction::Retry;
+    }
+    cb.record_conn_failure("the gateway closed before READY").await
+}
+
+/// What a close frame says, when its code is one of [`is_fatal_close`]'s.
+fn fatal_close_detail(
+    frame: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+) -> Option<String> {
+    let frame = frame?;
+    let code = u16::from(frame.code);
+    info!(code, "Discord Gateway sent close frame");
+    is_fatal_close(code).then(|| format!("Discord closed the gateway with {code}: {}", frame.reason))
+}
+
+/// Gateway close codes Discord documents as "do not reconnect": 4004
+/// authentication failed, 4010 invalid shard, 4011 sharding required, 4012
+/// invalid API version, 4013 invalid intents, 4014 disallowed intents (a
+/// privileged intent such as `MESSAGE_CONTENT` not enabled in the Developer
+/// Portal — the most common setup mistake). Pure.
+const fn is_fatal_close(code: u16) -> bool {
+    matches!(code, 4004 | 4010..=4014)
+}
+
 #[derive(Debug, Deserialize)]
 struct GatewayPayload {
     op: u8,
@@ -545,9 +597,28 @@ struct GatewayPayload {
     t: Option<String>,
 }
 
+impl GatewayPayload {
+    /// A dispatch that means the session is up (`READY`, or `RESUMED`).
+    fn establishes_session(&self) -> bool {
+        self.op == 0 && matches!(self.t.as_deref(), Some("READY" | "RESUMED"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The close codes Discord documents as final stop the retry loop (via
+    /// the breaker's auth path); every other close resumes.
+    #[test]
+    fn only_documented_fatal_close_codes_are_fatal() {
+        for code in [4004, 4010, 4011, 4012, 4013, 4014] {
+            assert!(is_fatal_close(code), "{code}");
+        }
+        for code in [1000, 1001, 4000, 4001, 4007, 4008, 4009, 4015] {
+            assert!(!is_fatal_close(code), "{code} is resumable");
+        }
+    }
 
     #[test]
     fn test_identify_payload() {

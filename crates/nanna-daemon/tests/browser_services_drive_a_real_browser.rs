@@ -13,7 +13,9 @@
 
 use std::collections::HashMap;
 
-use nanna_daemon::browser_service::{build_browser_services, find_browser_executable};
+use nanna_daemon::browser_service::{
+    BrowserSlot, build_browser_services, close_browser, find_browser_executable,
+};
 use nanna_scripting::ServiceFn;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -64,7 +66,8 @@ async fn call(services: &HashMap<String, ServiceFn>, name: &str, params: Value) 
 #[tokio::test]
 async fn the_browser_services_drive_a_real_page() {
     let data_dir = tempfile::tempdir().expect("temp data dir");
-    let services = build_browser_services(data_dir.path());
+    let browser = BrowserSlot::default();
+    let services = build_browser_services(data_dir.path(), &browser);
 
     let Some(executable) = find_browser_executable() else {
         assert!(
@@ -147,12 +150,14 @@ async fn the_browser_services_drive_a_real_page() {
         bytes.len(),
         "the reported size does not match the file"
     );
+    close_browser(&browser).await;
 }
 
 #[tokio::test]
 async fn a_service_call_without_a_url_is_refused_by_name() {
     let data_dir = tempfile::tempdir().expect("temp data dir");
-    let services = build_browser_services(data_dir.path());
+    let browser = BrowserSlot::default();
+    let services = build_browser_services(data_dir.path(), &browser);
     if services.is_empty() {
         return;
     }
@@ -193,7 +198,8 @@ async fn call_on_own_runtime(service: ServiceFn, name: &'static str, params: Val
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_browser_outlives_the_runtime_of_the_call_that_launched_it() {
     let data_dir = tempfile::tempdir().expect("temp data dir");
-    let services = build_browser_services(data_dir.path());
+    let browser = BrowserSlot::default();
+    let services = build_browser_services(data_dir.path(), &browser);
     if find_browser_executable().is_none() {
         assert!(services.is_empty(), "no browser, nothing registered");
         return;
@@ -212,4 +218,5 @@ async fn the_browser_outlives_the_runtime_of_the_call_that_launched_it() {
         .await;
         assert_eq!(evaluated["value"], "Probe", "call {round}: {evaluated}");
     }
+    close_browser(&browser).await;
 }

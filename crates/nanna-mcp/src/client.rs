@@ -93,6 +93,13 @@ impl<T: Transport> McpClient<T> {
         }
     }
 
+    /// How long the installed elicitor waits for one answer; `None` when
+    /// none is installed (a call is then never retried for input).
+    #[must_use]
+    pub fn elicitor_answer_wait_max(&self) -> Option<std::time::Duration> {
+        self.elicitor.as_ref().map(|elicitor| elicitor.answer_wait_max())
+    }
+
     /// Serve the server's form elicitations through `elicitor` (modern era).
     /// Set before [`Self::initialize`]: it decides what the client declares.
     #[must_use]
@@ -213,10 +220,44 @@ impl<T: Transport> McpClient<T> {
                 debug!(
                     "MCP server did not answer server/discover as a modern server; using initialize"
                 );
-                self.initialize_legacy().await
+                match self.initialize_legacy().await {
+                    Err(McpError::JsonRpc {
+                        code: crate::protocol::error_codes::UNSUPPORTED_PROTOCOL_VERSION,
+                        message,
+                        data,
+                    }) => self.recover_modern(message, data).await,
+                    other => other,
+                }
             }
             ProbeVerdict::Incompatible { reason } => Err(McpError::Protocol(reason)),
         }
+    }
+
+    /// A server that refused `initialize` as an unsupported revision is a
+    /// modern one after all: its answer to the probe came too late (a cold
+    /// `npx -y` start past the request timeout reads as "legacy"). Finish
+    /// the modern handshake in a revision it names, or fail with its refusal.
+    async fn recover_modern(
+        &self,
+        message: String,
+        data: Option<serde_json::Value>,
+    ) -> Result<InitializeResult> {
+        let refusal = |message: String, data: Option<serde_json::Value>| McpError::JsonRpc {
+            code: crate::protocol::error_codes::UNSUPPORTED_PROTOCOL_VERSION,
+            message,
+            data,
+        };
+        let verdict = classify_probe(Err(refusal(message.clone(), data.clone())))?;
+        let ProbeVerdict::Modern { version } = verdict else {
+            return Err(refusal(message, data));
+        };
+        info!(
+            protocol = %version,
+            "MCP server refused initialize as a modern server; probing again"
+        );
+        let params = with_modern_meta(None, &version)?;
+        let discover = self.request_value("server/discover", Some(params)).await?;
+        self.finish_modern(version, discover).await
     }
 
     /// Adopt the modern era from a `server/discover` answer.
@@ -1144,6 +1185,8 @@ mod tests {
     /// (discover is `-32601`, `initialize` answered). Records what it saw.
     struct EraTransport {
         modern: bool,
+        /// The first `server/discover` times out, as a cold start does.
+        slow_first_probe: bool,
         requests: std::sync::Mutex<Vec<JsonRpcRequest>>,
         notifications: std::sync::Mutex<Vec<String>>,
     }
@@ -1152,6 +1195,7 @@ mod tests {
         fn new(modern: bool) -> Self {
             Self {
                 modern,
+                slow_first_probe: false,
                 requests: std::sync::Mutex::new(Vec::new()),
                 notifications: std::sync::Mutex::new(Vec::new()),
             }
@@ -1188,7 +1232,17 @@ mod tests {
         async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
             let answer = self.answer(&request.method);
             let id = request.id.clone();
+            let first_probe = request.method == "server/discover"
+                && !self
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|seen| seen.method == "server/discover");
             self.requests.lock().unwrap().push(request);
+            if self.slow_first_probe && first_probe {
+                return Err(McpError::Timeout);
+            }
             let (result, error) = match answer {
                 Ok(result) => (Some(result), None),
                 Err((code, data)) => (
@@ -1214,6 +1268,40 @@ mod tests {
         async fn close(&self) -> Result<()> {
             Ok(())
         }
+    }
+
+    /// A modern-only server whose first probe answer came too late is read
+    /// as legacy and refuses `initialize` with -32022; that refusal names it
+    /// modern, so the client probes again and connects instead of failing.
+    #[tokio::test]
+    async fn a_modern_server_slow_to_start_still_connects() {
+        let mut transport = EraTransport::new(true);
+        transport.slow_first_probe = true;
+        let client = McpClient::new(transport);
+        let connected = client.initialize().await.expect("connects on the second probe");
+        assert_eq!(connected.protocol_version, "2026-07-28");
+        assert_eq!(
+            client.era().await,
+            ProtocolEra::Modern {
+                version: "2026-07-28".into()
+            }
+        );
+        let methods: Vec<String> = client
+            .transport
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.method.clone())
+            .collect();
+        assert_eq!(
+            methods,
+            ["server/discover", "initialize", "server/discover", "tools/list"]
+        );
+        assert!(
+            client.transport.notifications.lock().unwrap().is_empty(),
+            "no notifications/initialized to a modern server"
+        );
     }
 
     #[tokio::test]
@@ -1382,6 +1470,9 @@ mod tests {
         async fn ask(&self, question: &str) -> Option<String> {
             self.0.lock().unwrap().push(question.to_string());
             self.1.map(str::to_string)
+        }
+        fn answer_wait_max(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(1)
         }
     }
 

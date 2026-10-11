@@ -71,13 +71,15 @@ impl ProviderId {
         }
         let lower = model.to_lowercase();
 
-        if lower.starts_with("gpt-") || lower.starts_with("o1") || lower.starts_with("o3") {
+        // Tag notation ("deepseek-r1:14b", "llama3.2:latest") is Ollama's, and
+        // is read before the family prefixes: `gpt-oss:20b` is an Ollama
+        // model, and the `gpt-` rule used to send it to OpenAI.
+        if lower.contains(':') {
+            Self::Ollama
+        } else if lower.starts_with("gpt-") || lower.starts_with("o1") || lower.starts_with("o3") {
             Self::OpenAI
         } else if lower.starts_with("claude") {
             Self::Anthropic
-        } else if lower.contains(':') {
-            // Tag notation (e.g., "deepseek-r1:14b", "llama3.2:latest") = local Ollama model
-            Self::Ollama
         } else {
             // Default to Anthropic for unknown models
             Self::Anthropic
@@ -1122,6 +1124,8 @@ mod tests {
             ProviderId::from_model("Claude-Sonnet-4"),
             ProviderId::Anthropic
         );
+        // A tag is Ollama's even under an OpenAI family name.
+        assert_eq!(ProviderId::from_model("gpt-oss:20b"), ProviderId::Ollama);
     }
 
     #[test]

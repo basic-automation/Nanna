@@ -67,6 +67,12 @@ impl RepeatWatch {
     /// because any non-candidate fragment resets the run.
     const MAX_RUN: usize = 20;
     const MAX_FRAGMENT_CHARS: usize = 4;
+    /// The trip point for a run of one repeated all-digit fragment. Models
+    /// that tokenize one digit per token (Qwen, Gemma) stream a null SHA-1
+    /// as 40 identical `"0"` fragments, and 20 aborted it — at low
+    /// temperature on every retry. The longest such run real output carries
+    /// is a null SHA-512 in hex, 128 digits; one past it is degenerate.
+    const MAX_DIGIT_RUN: usize = 129;
 
     /// Record a fragment; returns the run length once it is degenerate.
     fn observe(&mut self, fragment: &str) -> Option<usize> {
@@ -83,7 +89,12 @@ impl RepeatWatch {
             self.last = Some(fragment.to_string());
             self.run = 1;
         }
-        (self.run >= Self::MAX_RUN).then_some(self.run)
+        let limit = if fragment.bytes().all(|byte| byte.is_ascii_digit()) {
+            Self::MAX_DIGIT_RUN
+        } else {
+            Self::MAX_RUN
+        };
+        (self.run >= limit).then_some(self.run)
     }
 }
 
@@ -5227,6 +5238,69 @@ impl StreamAccumulator {
     }
 }
 
+/// The error for a reply the output-token limit cut off while `open_tools`
+/// tool call(s) were being written. Their arguments end mid-value; the JSON
+/// healer would close the brackets and the call would run — a `write_file`
+/// writing half a file — so no call from such a reply may run. Retryable.
+fn cut_tool_call_error(open_tools: usize) -> LlmError {
+    debug_assert!(open_tools > 0, "only a reply with an open tool call is cut");
+    LlmError::from_api_response(
+        502,
+        format!(
+            "the reply hit the output token limit while {open_tools} tool call(s) were \
+             being written; their arguments are cut off, so none was run"
+        ),
+    )
+}
+
+/// The native Anthropic stream's per-event state, borrowed from the stream
+/// body so its event handling is one function rather than two copies.
+struct NativeStream<'a> {
+    accumulator: &'a mut StreamAccumulator,
+    stopped: &'a mut bool,
+}
+
+impl NativeStream<'_> {
+    /// Every complete event in `buffer`, in order, ending with an `Err` when
+    /// one ends the stream ([`native_stream_verdict`]); nothing after it.
+    fn take(
+        &mut self,
+        buffer: &mut String,
+        is_oauth: bool,
+        original_tools: &[ToolDefinition],
+    ) -> Vec<Result<StreamEvent, LlmError>> {
+        let mut items = Vec::new();
+        while let Some(event_str) = extract_sse_event(buffer) {
+            let Some(mut stream_event) = parse_sse_event(&event_str) else {
+                continue;
+            };
+            if is_oauth {
+                restore_oauth_tool_name(&mut stream_event, original_tools);
+            }
+            self.accumulator.process(&stream_event);
+            let verdict = native_stream_verdict(&stream_event, self.accumulator);
+            *self.stopped |= matches!(stream_event, StreamEvent::MessageStop { .. });
+            items.push(Ok(stream_event));
+            if let Some(error) = verdict {
+                items.push(Err(error));
+                break;
+            }
+        }
+        items
+    }
+}
+
+/// Whether `event` ends the native Anthropic stream as an error: a
+/// `max_tokens` stop after a `tool_use` block. Anthropic closes the open block
+/// itself (so the call looked complete) and only then says why it stopped.
+fn native_stream_verdict(event: &StreamEvent, accumulator: &StreamAccumulator) -> Option<LlmError> {
+    let StreamEvent::MessageDelta { stop_reason: Some(reason), .. } = event else {
+        return None;
+    };
+    (reason == "max_tokens" && !accumulator.tool_calls.is_empty())
+        .then(|| cut_tool_call_error(accumulator.tool_calls.len()))
+}
+
 /// The OAuth ("Claude Code") form of a streaming request: an array-based system
 /// prompt, and tool names remapped to Claude Code's canonical ones.
 fn oauth_stream_request(request: &AnthropicRequest) -> OAuthAnthropicRequest {
@@ -5493,6 +5567,7 @@ impl LlmClient {
             let mut byte_stream = response.bytes_stream();
             let mut buffer = String::new();
             let mut accumulator = StreamAccumulator::new();
+            let mut stopped = false;
 
             let mut utf8 = Utf8StreamDecoder::default();
             while let Some(chunk_result) = byte_stream.next().await {
@@ -5512,25 +5587,38 @@ impl LlmClient {
                     }
                 }
 
-                while let Some(event_str) = extract_sse_event(&mut buffer) {
-                    if let Some(mut stream_event) = parse_sse_event(&event_str) {
-                        if is_oauth {
-                            restore_oauth_tool_name(&mut stream_event, &original_tools);
-                        }
-                        accumulator.process(&stream_event);
-                        yield Ok(stream_event);
+                let mut native = NativeStream { accumulator: &mut accumulator, stopped: &mut stopped };
+                for item in native.take(&mut buffer, is_oauth, &original_tools) {
+                    let fatal = item.is_err();
+                    yield item;
+                    if fatal {
+                        return;
                     }
                 }
             }
 
-            if !buffer.trim().is_empty()
-                && let Some(mut stream_event) = parse_sse_event(&buffer) {
-                    if is_oauth {
-                        restore_oauth_tool_name(&mut stream_event, &original_tools);
+            if !buffer.trim().is_empty() {
+                // The last event may lack its blank-line terminator.
+                buffer.push_str("\n\n");
+                let mut native = NativeStream { accumulator: &mut accumulator, stopped: &mut stopped };
+                for item in native.take(&mut buffer, is_oauth, &original_tools) {
+                    let fatal = item.is_err();
+                    yield item;
+                    if fatal {
+                        return;
                     }
-                    accumulator.process(&stream_event);
-                    yield Ok(stream_event);
                 }
+            }
+            // A clean end of the body before `message_stop` is a cut reply,
+            // not a finished one: the OpenAI and Ollama paths already said so,
+            // and this one handed the truncated text on as the final answer.
+            if !stopped {
+                yield accumulator.interrupted(LlmError::from_api_response(
+                    502,
+                    "the Anthropic stream ended before message_stop; the reply is cut off"
+                        .to_string(),
+                ));
+            }
         }
     }
 
@@ -6715,6 +6803,10 @@ impl From<OpenAiRoleCheckedDelta> for OpenAiChunkDelta {
 
 #[derive(Deserialize, Debug)]
 struct OpenAiToolCallDelta {
+    /// Some OpenAI-compatible servers omit it (one call per chunk). Required,
+    /// a chunk without it failed to decode and was dropped whole — its
+    /// `finish_reason` with it — so the call never reached the agent.
+    #[serde(default)]
     index: usize,
     id: Option<String>,
     function: Option<OpenAiFunctionDelta>,
@@ -6876,12 +6968,18 @@ fn stream_error_envelope(data: &str) -> Option<LlmError> {
 }
 
 /// Block bookkeeping while translating an OpenAI-compatible SSE stream into
-/// Anthropic stream events: text is block 0, tool call `i` is block `i + 1`.
+/// Anthropic stream events: text is block 0, tool call `i` is block `i + 1`
+/// (a later call reusing an index gets the next free block).
 #[derive(Default)]
 struct OpenAiStreamState {
     text_block_started: bool,
     /// Block index -> (id, name) of every tool call started so far.
     tool_calls_started: std::collections::HashMap<usize, (String, String)>,
+    /// The provider's `tool_calls[].index` -> the block it streams into now.
+    /// Most providers give each call its own index; some send parallel calls
+    /// all at `index: 0` with different ids, and a new call then overwrote the
+    /// earlier one's block in the assembler — the earlier call vanished.
+    block_of_wire: std::collections::HashMap<usize, usize>,
     /// The stop reason a `finish_reason` announced. The message ends at
     /// `[DONE]`, not there: the usage chunk comes between the two, and the
     /// stream used to be dropped before it was read.
@@ -7005,6 +7103,9 @@ impl OpenAiStreamState {
 
             // Check for stop
             if let Some(reason) = choice.finish_reason {
+                if reason == "length" && !self.tool_calls_started.is_empty() {
+                    return Err(cut_tool_call_error(self.tool_calls_started.len()));
+                }
                 // Close any open blocks; the message itself stops at `[DONE]`.
                 events.extend(self.close_blocks());
                 self.text_block_started = false;
@@ -7012,6 +7113,7 @@ impl OpenAiStreamState {
                 let stop_reason = match reason.as_str() {
                     "tool_calls" => "tool_use",
                     "stop" => "end_turn",
+                    "length" => "max_tokens",
                     other => other,
                 };
                 self.finished_with = Some(stop_reason.to_string());
@@ -7070,8 +7172,8 @@ impl OpenAiStreamState {
         // Handle tool calls
         if let Some(tool_calls) = delta.tool_calls {
             for tc in tool_calls {
-                // Tool index offset by 1 (text is at 0)
-                let block_index = tc.index + 1;
+                // Tool blocks start at 1 (text is at 0).
+                let mut block_index = self.block_of_wire.get(&tc.index).copied().unwrap_or(tc.index + 1);
 
                 // Check if this is a new tool call
                 if let (Some(id), Some(func)) = (&tc.id, &tc.function)
@@ -7081,6 +7183,24 @@ impl OpenAiStreamState {
                             events.push(StreamEvent::ContentBlockStop { index: 0 });
                             self.text_block_started = false;
                         }
+                        // A different call at an index already in use: close
+                        // the earlier one and give this one a block of its own.
+                        if let Some((open_id, _)) = self.tool_calls_started.get(&block_index)
+                            && open_id != id
+                        {
+                            events.push(StreamEvent::ContentBlockStop { index: block_index });
+                            self.tool_calls_started.remove(&block_index);
+                            block_index = self
+                                .block_of_wire
+                                .values()
+                                .chain(self.tool_calls_started.keys())
+                                .max()
+                                .copied()
+                                .unwrap_or(block_index)
+                                .max(block_index)
+                                + 1;
+                        }
+                        self.block_of_wire.insert(tc.index, block_index);
 
                         // New tool call
                         self.tool_calls_started.insert(block_index, (id.clone(), name.clone()));
@@ -7358,10 +7478,16 @@ fn anthropic_to_wire_request(
 
 /// Convert an `OpenAI` chat completion response JSON to `AnthropicResponse`
 fn openai_response_to_anthropic(model: &str, response: &serde_json::Value) -> Result<AnthropicResponse, LlmError> {
-    let choice = response["choices"]
-        .as_array()
-        .and_then(|c| c.first())
-        .ok_or_else(|| LlmError::Api { status: 500, message: "No choices in response".to_string() })?;
+    let Some(choice) = response["choices"].as_array().and_then(|c| c.first()) else {
+        // OpenRouter answers some failures — a free-tier 429 among them — with
+        // HTTP 200 and an `error` body. Read as "no choices" (a 500 nothing
+        // falls back from) the rate limit and its message were lost; the
+        // OpenAI-native path already read the envelope (PR #130).
+        if let Some(error) = stream_error_envelope(&response.to_string()) {
+            return Err(error);
+        }
+        return Err(LlmError::Api { status: 500, message: "No choices in response".to_string() });
+    };
 
     let message = &choice["message"];
     let mut content = Vec::new();
@@ -7764,6 +7890,117 @@ mod tests {
         assert!(
             !end.iter().any(|item| matches!(item, Ok(StreamEvent::MessageStop { .. }))),
             "a cut call is not stopped as complete"
+        );
+    }
+
+    /// A reply the output-token limit cut inside a tool call is an error,
+    /// whether the provider says `length` (OpenAI-compatible) or `max_tokens`
+    /// after closing the block itself (native Anthropic). It used to be closed
+    /// like a finished call, healed, and run with half its arguments.
+    #[test]
+    fn a_tool_call_cut_by_the_token_limit_is_never_run() {
+        let mut state = OpenAiStreamState::default();
+        state
+            .on_line::<OpenAiChunkDelta>(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":"{\"path\":\"a.py\",\"content\":\"def f("}}]}}]}"#,
+            )
+            .expect("a chunk");
+        let cut = state.on_line::<OpenAiChunkDelta>(
+            r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+        );
+        assert!(matches!(cut, Err(LlmError::Api { status: 502, .. })), "{cut:?}");
+
+        let mut text = OpenAiStreamState::default();
+        text.on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"content":"long"}}]}"#)
+            .expect("a chunk");
+        text.on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#)
+            .expect("a text reply cut by length is not an error");
+        let (events, _) = text.on_line::<OpenAiChunkDelta>("data: [DONE]").expect("done");
+        assert!(
+            matches!(events.last(), Some(StreamEvent::MessageStop { stop_reason }) if stop_reason == "max_tokens"),
+            "{events:?}"
+        );
+
+        let mut accumulator = StreamAccumulator::new();
+        accumulator.process(&StreamEvent::ContentBlockStart {
+            index: 0,
+            content_type: "tool_use".to_string(),
+            tool_id: Some("toolu_1".to_string()),
+            tool_name: Some("write_file".to_string()),
+        });
+        let max_tokens = StreamEvent::MessageDelta {
+            stop_reason: Some("max_tokens".to_string()),
+            output_tokens: 4096,
+        };
+        assert!(native_stream_verdict(&max_tokens, &accumulator).is_some());
+        let tool_use = StreamEvent::MessageDelta {
+            stop_reason: Some("tool_use".to_string()),
+            output_tokens: 80,
+        };
+        assert!(native_stream_verdict(&tool_use, &accumulator).is_none());
+        assert!(
+            native_stream_verdict(&max_tokens, &StreamAccumulator::new()).is_none(),
+            "a text reply cut by max_tokens is still a reply"
+        );
+    }
+
+    /// An HTTP-200 error body on the Anthropic-over-OpenAI path keeps its
+    /// status (a 429 stays a rate limit the router falls back from).
+    #[test]
+    fn a_200_error_body_is_read_as_its_error_not_no_choices() {
+        let body = serde_json::json!({
+            "error": { "message": "Rate limit exceeded: free-models-per-day", "code": 429 }
+        });
+        let read = openai_response_to_anthropic("openrouter/x", &body);
+        assert!(
+            matches!(&read, Err(e) if !e.to_string().contains("No choices")),
+            "{read:?}"
+        );
+    }
+
+    /// Parallel calls a provider sends all at `index: 0`, each with its own
+    /// id, are two calls: the first is closed and kept, not overwritten.
+    #[test]
+    fn two_calls_at_one_index_are_two_calls() {
+        let mut state = OpenAiStreamState::default();
+        let (first, _) = state
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"ls","arguments":"{}"}}]}}]}"#)
+            .expect("a chunk");
+        let (second, _) = state
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"b","function":{"name":"pwd","arguments":"{}"}}]}}]}"#)
+            .expect("a chunk");
+        let start_of = |events: &[StreamEvent], want: &str| {
+            events.iter().find_map(|e| match e {
+                StreamEvent::ContentBlockStart { index, tool_id: Some(id), .. } if id == want => Some(*index),
+                _ => None,
+            })
+        };
+        let a = start_of(&first, "a").expect("a starts");
+        let b = start_of(&second, "b").expect("b starts");
+        assert_ne!(a, b, "each call has its own block");
+        assert!(
+            second.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { index } if *index == a)),
+            "the first call is closed, not overwritten: {second:?}"
+        );
+        assert!(
+            second.iter().any(|e| matches!(e, StreamEvent::ToolUseDelta { index, .. } if *index == b)),
+            "the second call's arguments go to its own block"
+        );
+    }
+
+    /// A tool-call delta without `index` is the first call, not a chunk to
+    /// drop.
+    #[test]
+    fn a_tool_call_delta_without_an_index_is_kept() {
+        let mut state = OpenAiStreamState::default();
+        let (events, _) = state
+            .on_line::<OpenAiChunkDelta>(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"c","function":{"name":"ls","arguments":"{}"}}]}}]}"#,
+            )
+            .expect("a chunk");
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::ContentBlockStart { tool_name: Some(name), .. } if name == "ls")),
+            "{events:?}"
         );
     }
 
@@ -9010,7 +9247,7 @@ mod tests {
         let mut w = RepeatWatch::default();
         let mut tripped_at = None;
         for i in 1..=60 {
-            if let Some(run) = w.observe("0") {
+            if let Some(run) = w.observe(",") {
                 tripped_at = Some((i, run));
                 break;
             }
@@ -9018,6 +9255,17 @@ mod tests {
         let (i, run) = tripped_at.expect("a stuck token must be caught");
         assert_eq!(i, RepeatWatch::MAX_RUN, "must trip exactly at the bound");
         assert_eq!(run, RepeatWatch::MAX_RUN);
+    }
+
+    /// A null SHA streamed one digit per token is content; a digit repeated
+    /// past the longest real run (a null SHA-512, 128) is still a fault.
+    #[test]
+    fn a_run_of_digits_is_held_to_the_longest_real_one() {
+        let mut w = RepeatWatch::default();
+        for _ in 0..128 {
+            assert!(w.observe("0").is_none(), "a null SHA-512 is not a wedge");
+        }
+        assert_eq!(w.observe("0"), Some(RepeatWatch::MAX_DIGIT_RUN));
     }
 
     #[test]

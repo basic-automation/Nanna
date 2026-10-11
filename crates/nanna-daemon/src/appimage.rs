@@ -56,6 +56,13 @@ pub enum Outcome {
 /// rewrites its own environment here.
 #[must_use]
 pub fn run_outside_the_mount() -> Outcome {
+    let outcome = stage_unless_staged();
+    scrub_library_path_for_children();
+    outcome
+}
+
+/// The staging decision of [`run_outside_the_mount`].
+fn stage_unless_staged() -> Outcome {
     if std::env::var_os(STAGED_MARKER).is_some() {
         restore_environment();
         return std::env::current_exe().map_or_else(
@@ -80,6 +87,60 @@ pub fn run_outside_the_mount() -> Outcome {
     }
     let Err(reason) = stage_and_exec(&appdir, &exe);
     Outcome::Failed(reason)
+}
+
+/// Drop the bundle's own directories from this process's `LD_LIBRARY_PATH`,
+/// so no child inherits them.
+///
+/// `AppRun` put the mount's `usr/lib` at the front for the GUI, and the
+/// daemon (staged or not) passed it on to every child: an MCP stdio server,
+/// Chromium, Python, a shell command. Each then loaded the bundle's
+/// `liblzma`/`libpcre2`/`libssl` instead of the system's — `git` warning "no
+/// version information available", a test binary failing at load with
+/// "version `XZ_5.4` not found" — and after the GUI exits those pages come
+/// from a mount that is gone. `exec` scrubbed its own children; MCP servers
+/// and everything else did not. The daemon itself is unaffected: the loader
+/// read the variable when this process started. Whatever the user had set
+/// stays.
+///
+/// Call only before any thread exists (it writes the environment).
+fn scrub_library_path_for_children() {
+    let Some(appdir) = std::env::var_os("APPDIR").filter(|dir| !dir.is_empty()) else {
+        return;
+    };
+    let Some(inherited) = std::env::var_os("LD_LIBRARY_PATH") else {
+        return;
+    };
+    let kept = without_bundle_entries(&inherited, Path::new(&appdir));
+    if kept.as_deref() == Some(inherited.as_os_str()) {
+        return;
+    }
+    // SAFETY: called from the top of `main` (through `run_outside_the_mount`),
+    // before this process has started any thread, so nothing reads the
+    // environment concurrently.
+    unsafe {
+        match kept {
+            Some(value) => std::env::set_var("LD_LIBRARY_PATH", value),
+            None => std::env::remove_var("LD_LIBRARY_PATH"),
+        }
+    }
+}
+
+/// `path` without the entries under `appdir`; `None` when nothing is left,
+/// so the variable is removed rather than set empty (an empty entry means the
+/// current directory to the loader). An entry that cannot be re-joined keeps
+/// the variable as it was. Pure.
+fn without_bundle_entries(path: &OsStr, appdir: &Path) -> Option<OsString> {
+    debug_assert!(!appdir.as_os_str().is_empty(), "an empty APPDIR would match everything");
+    let entries: Vec<PathBuf> = std::env::split_paths(path).collect();
+    let kept: Vec<&PathBuf> = entries.iter().filter(|dir| !dir.starts_with(appdir)).collect();
+    if kept.len() == entries.len() {
+        return Some(path.to_os_string());
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    Some(std::env::join_paths(kept).unwrap_or_else(|_| path.to_os_string()))
 }
 
 /// Put back what the re-exec changed, so this process and its children see
@@ -339,6 +400,28 @@ mod tests {
     use super::*;
 
     const MOUNT: &str = "/tmp/.mount_Nanna_kMlAkL";
+
+    #[test]
+    fn children_get_the_library_path_without_the_bundles_entries() {
+        let appdir = Path::new(MOUNT);
+        let inherited = format!("{MOUNT}/usr/lib/:/opt/cuda/lib64:{MOUNT}/usr/lib/x86_64-linux-gnu/");
+        assert_eq!(
+            without_bundle_entries(OsStr::new(&inherited), appdir),
+            Some(OsString::from("/opt/cuda/lib64")),
+            "the user's entry stays, the bundle's go"
+        );
+        assert_eq!(
+            without_bundle_entries(OsStr::new(&format!("{MOUNT}/usr/lib/")), appdir),
+            None,
+            "nothing left: the variable is removed, not set empty"
+        );
+        let untouched = "/opt/cuda/lib64:/tmp/.mount_Nanna_kMlAkL2/usr/lib";
+        assert_eq!(
+            without_bundle_entries(OsStr::new(untouched), appdir),
+            Some(OsString::from(untouched)),
+            "a sibling mount is not this bundle"
+        );
+    }
 
     #[test]
     fn only_files_mapped_from_the_mount_are_staged_once_each() {

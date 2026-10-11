@@ -319,6 +319,11 @@ impl nanna_mcp::Elicitor for McpAskUser {
         let session_id = nanna_tools::ToolRegistry::run_session_id()?;
         ask_in_conversation(&self.deps, &session_id, question).await
     }
+
+    fn answer_wait_max(&self) -> Duration {
+        // `ask_in_conversation` waits the default.
+        Duration::from_secs(ASK_USER_WAIT_SECS_DEFAULT)
+    }
 }
 
 #[cfg(test)]

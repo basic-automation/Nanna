@@ -214,7 +214,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -225,7 +225,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2197,7 +2197,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "socket2",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4580,11 +4580,11 @@ dependencies = [
 
 [[package]]
 name = "mac_address"
-version = "1.2.0"
+version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b367b50a9be9a5d3b5718c1da74e5d6b9c17647f89752ee2562a470cc3c4eb1a"
+checksum = "f3d0581a75c45969c63afd2bb87b1d8b25cfcc556c7a918cf9bb13b0fe8d2381"
 dependencies = [
- "nix 0.30.1",
+ "nix",
  "windows-sys 0.61.2",
 ]
 
@@ -4838,7 +4838,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.21",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4887,7 +4887,7 @@ dependencies = [
 
 [[package]]
 name = "nanna"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4916,7 +4916,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-agent"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -4944,7 +4944,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-bench"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "criterion",
  "nanna-simd",
@@ -4957,7 +4957,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-browser"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "async-trait",
  "chromiumoxide",
@@ -4973,7 +4973,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-channels"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "async-trait",
  "bitflags 2.13.2",
@@ -4994,7 +4994,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-client"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "futures-util",
  "nanna-daemon",
@@ -5009,7 +5009,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-config"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "aes-gcm 0.11.1",
  "base64 0.23.1",
@@ -5029,7 +5029,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-core"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "chrono",
  "nanna-channels",
@@ -5051,7 +5051,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-daemon"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "async-trait",
  "axum",
@@ -5098,7 +5098,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-gpu"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "bytemuck",
  "futures",
@@ -5112,7 +5112,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-gui"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "chrono",
  "futures-util",
@@ -5143,7 +5143,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-llm"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "async-stream",
  "directories",
@@ -5163,7 +5163,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-mcp"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -5181,7 +5181,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-memory"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "async-trait",
  "nanna-gpu",
@@ -5197,11 +5197,11 @@ dependencies = [
 
 [[package]]
 name = "nanna-numeric"
-version = "0.3.42"
+version = "0.3.43"
 
 [[package]]
 name = "nanna-proc"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "libc",
  "tempfile",
@@ -5212,7 +5212,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-scripting"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "boa_engine",
  "chrono",
@@ -5235,7 +5235,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-server"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "anyhow",
  "axum",
@@ -5264,7 +5264,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-simd"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "half",
  "wide",
@@ -5272,7 +5272,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-storage"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "chrono",
  "nanna-numeric",
@@ -5287,7 +5287,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-timeline"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "nanna-storage",
  "serde",
@@ -5298,7 +5298,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-tools"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "async-trait",
  "base64-simd",
@@ -5331,7 +5331,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-workspace"
-version = "0.3.42"
+version = "0.3.43"
 dependencies = [
  "serde",
  "serde_json",
@@ -5402,19 +5402,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77a5d83df9f36fe23f0c3648c6bbb8b0298bb5f1939c8f2704431371f4b84d43"
 dependencies = [
  "smallvec",
-]
-
-[[package]]
-name = "nix"
-version = "0.30.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
-dependencies = [
- "bitflags 2.13.2",
- "cfg-if",
- "cfg_aliases",
- "libc",
- "memoffset",
 ]
 
 [[package]]
@@ -7522,7 +7509,7 @@ dependencies = [
  "mac_address",
  "memchr",
  "memmap2",
- "nix 0.31.3",
+ "nix",
  "num-traits",
  "num_cpus",
  "parking_lot",
@@ -7800,7 +7787,7 @@ dependencies = [
  "libc",
  "log",
  "memchr",
- "nix 0.31.3",
+ "nix",
  "radix_trie",
  "unicode-segmentation",
  "unicode-width 0.2.2",
@@ -8432,7 +8419,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8529,7 +8516,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -9261,7 +9248,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.52.0",
@@ -9790,7 +9777,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.21",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10062,7 +10049,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10880,7 +10867,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-quartz-core",
  "raw-window-handle",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "windows-version",
 ]
 

@@ -81,8 +81,29 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// Where the services' browser is handed back to the daemon, so its shutdown
+/// can close it. Nothing used to: Chromium was killed by the process exit
+/// and its profile directory was left in the temp dir.
+pub type BrowserSlot = Arc<std::sync::OnceLock<Arc<BrowserManager>>>;
+
+/// Close the browser in `slot`, if one was ever built. Bounded by the
+/// backend's own close (a graceful exit, then a kill, each at most
+/// `nanna_browser::cdp::BROWSER_CLOSE_GRACE`).
+pub async fn close_browser(slot: &BrowserSlot) {
+    let Some(manager) = slot.get() else {
+        return;
+    };
+    if let Err(e) = manager.close().await {
+        warn!(error = %e, "closing the browser failed");
+    }
+}
+
 /// Build the four `browser.*` services, or an empty map with no browser.
-pub fn build_browser_services(data_dir: &std::path::Path) -> HashMap<String, ServiceFn> {
+/// The browser behind them is put in `slot` for the daemon's shutdown.
+pub fn build_browser_services(
+    data_dir: &std::path::Path,
+    slot: &BrowserSlot,
+) -> HashMap<String, ServiceFn> {
     let Some(executable) = find_browser_executable() else {
         info!(
             "No Chromium-family browser found; the four browser.* services stay \
@@ -105,6 +126,11 @@ pub fn build_browser_services(data_dir: &std::path::Path) -> HashMap<String, Ser
         }
     };
 
+    if slot.set(Arc::clone(&manager)).is_err() {
+        // Services built twice: the second browser is closed by nobody. The
+        // daemon builds them once; say so loudly if that ever changes.
+        warn!("browser services were built twice; only the first browser is closed at shutdown");
+    }
     info!(executable = ?executable, "Registering browser.action / evaluate / extract / screenshot");
     let screenshot_dir = data_dir.join(SCREENSHOT_DIR_NAME);
 

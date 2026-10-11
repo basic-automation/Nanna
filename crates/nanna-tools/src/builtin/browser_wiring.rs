@@ -9,6 +9,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 // Tracing available for future use
 
+/// What an extract reports for a selector that matches nothing. Pure.
+fn no_element_matches(selector: &str) -> String {
+    format!("no element on the page matches the selector `{selector}`")
+}
+
 /// Browser manager that maintains a browser instance for tool use.
 pub struct BrowserManager {
     browser: Arc<dyn Browser>,
@@ -112,11 +117,19 @@ impl BrowserManager {
                     "extracting an attribute needs a `selector` to read it from".to_string()
                 );
             };
-            return page
+            let value = page
                 .get_attribute(sel, attribute)
                 .await
-                .map(Option::unwrap_or_default)
-                .map_err(|e| e.to_string());
+                .map_err(|e| e.to_string())?;
+            if let Some(value) = value {
+                return Ok(value);
+            }
+            // `None` is both "no such element" and "no such attribute"; only
+            // the first is a mistake the model should hear about.
+            if !page.exists(sel).await.map_err(|e| e.to_string())? {
+                return Err(no_element_matches(sel));
+            }
+            return Ok(String::new());
         }
 
         if let Some(sel) = selector {
@@ -125,11 +138,22 @@ impl BrowserManager {
             // backslash and line break escaped; escaping only `'` broke a
             // selector with a backslash (`#a\\:b`) or let one end the literal.
             let literal = serde_json::to_string(sel).map_err(|e| e.to_string())?;
+            // `null` when nothing matches, so a mistyped selector (`#hedline`)
+            // is an error rather than a successful empty extract.
             let script = match mode {
-                "html" => format!("document.querySelector({literal})?.outerHTML || ''"),
-                _ => format!("document.querySelector({literal})?.textContent || ''"),
+                "html" => format!(
+                    "(() => {{ const el = document.querySelector({literal}); \
+                     return el === null ? null : el.outerHTML; }})()"
+                ),
+                _ => format!(
+                    "(() => {{ const el = document.querySelector({literal}); \
+                     return el === null ? null : (el.textContent || ''); }})()"
+                ),
             };
             let result = page.evaluate(&script).await.map_err(|e| e.to_string())?;
+            if result.is_null() {
+                return Err(no_element_matches(sel));
+            }
             Ok(result.as_str().unwrap_or("").to_string())
         } else {
             // Extract full page
@@ -426,13 +450,57 @@ mod tests {
         let page = FakePage(Arc::new(AtomicUsize::new(1)), std::sync::Mutex::default());
         let selector = r"#a\:b, a[title='x']";
         let params = HashMap::from([("selector".to_string(), Value::from(selector))]);
-        BrowserManager::extract_on(&page, &params).await.expect("extracts");
+        // The fake page evaluates everything to `null`: nothing matches.
+        let outcome = BrowserManager::extract_on(&page, &params).await;
+        assert_eq!(outcome, Err(no_element_matches(selector)));
         let scripts = page.1.lock().expect("lock").clone();
-        let expected = format!(
-            "document.querySelector({})?.textContent || ''",
-            serde_json::to_string(selector).expect("json")
+        assert_eq!(scripts.len(), 1);
+        let literal = serde_json::to_string(selector).expect("json");
+        assert!(
+            scripts[0].contains(&format!("document.querySelector({literal})")),
+            "{}",
+            scripts[0]
         );
-        assert_eq!(scripts, [expected]);
+    }
+
+    /// An attribute read from a selector that matches nothing says so; one
+    /// from an element without the attribute is an empty success.
+    #[tokio::test]
+    async fn a_missing_element_is_not_a_missing_attribute() {
+        let page = FakePage(Arc::new(AtomicUsize::new(1)), std::sync::Mutex::default());
+        let params = HashMap::from([
+            ("selector".to_string(), Value::from("a.next")),
+            ("attribute".to_string(), Value::from("href")),
+        ]);
+        // FakePage: no attribute, and `exists` is true.
+        assert_eq!(BrowserManager::extract_on(&page, &params).await, Ok(String::new()));
+        let gone = NoElementPage;
+        assert_eq!(
+            BrowserManager::extract_on(&gone, &params).await,
+            Err(no_element_matches("a.next"))
+        );
+    }
+
+    /// A page with no elements at all.
+    struct NoElementPage;
+
+    #[async_trait]
+    impl BrowserPage for NoElementPage {
+        fn url(&self) -> &'static str { "about:blank" }
+        async fn goto(&self, _url: &str) -> Result<(), BrowserError> { Ok(()) }
+        async fn screenshot(&self, _o: ScreenshotOptions) -> Result<Vec<u8>, BrowserError> { Ok(Vec::new()) }
+        async fn text_content(&self) -> Result<String, BrowserError> { Ok(String::new()) }
+        async fn html(&self) -> Result<String, BrowserError> { Ok(String::new()) }
+        async fn click(&self, s: &str) -> Result<(), BrowserError> { Err(BrowserError::ElementNotFound(s.into())) }
+        async fn type_text(&self, s: &str, _t: &str) -> Result<(), BrowserError> { Err(BrowserError::ElementNotFound(s.into())) }
+        async fn fill(&self, s: &str, _t: &str) -> Result<(), BrowserError> { Err(BrowserError::ElementNotFound(s.into())) }
+        async fn press(&self, s: &str, _k: &str) -> Result<(), BrowserError> { Err(BrowserError::ElementNotFound(s.into())) }
+        async fn wait_for_selector(&self, s: &str) -> Result<(), BrowserError> { Err(BrowserError::ElementNotFound(s.into())) }
+        async fn evaluate(&self, _s: &str) -> Result<Value, BrowserError> { Ok(Value::Null) }
+        async fn get_attribute(&self, _s: &str, _a: &str) -> Result<Option<String>, BrowserError> { Ok(None) }
+        async fn exists(&self, _s: &str) -> Result<bool, BrowserError> { Ok(false) }
+        async fn query_all_text(&self, _s: &str) -> Result<Vec<String>, BrowserError> { Ok(Vec::new()) }
+        async fn close(&self) -> Result<(), BrowserError> { Ok(()) }
     }
 
     #[test]

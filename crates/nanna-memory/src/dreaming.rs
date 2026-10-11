@@ -231,6 +231,10 @@ pub struct DreamingService {
     /// daemon's control plane) can stamp the **same** clock this service reads —
     /// see [`Self::with_activity_clock`].
     activity: Arc<ActivityClock>,
+    /// Held for the whole of one cycle ([`Self::dream_with`]): every entry
+    /// point — the scheduled dream, the idle dream, a user's "Consolidate" —
+    /// comes through it, so no two cycles overlap.
+    cycle: tokio::sync::Mutex<()>,
 }
 
 impl DreamingService {
@@ -265,6 +269,7 @@ impl DreamingService {
             memory,
             pending_feedback: RwLock::new(HashMap::new()),
             activity: Arc::new(ActivityClock::new()),
+            cycle: tokio::sync::Mutex::new(()),
         };
         // The store handle is retained (not dropped) for the service's lifetime.
         debug_assert!(Arc::strong_count(&service.memory) >= 1);
@@ -573,7 +578,8 @@ impl DreamingService {
     ///
     /// # Errors
     ///
-    /// Returns `MemoryError` if consolidation fails.
+    /// Returns `MemoryError` if consolidation fails, and
+    /// [`MemoryError::DreamInFlight`] when another cycle is running.
     pub async fn dream_with<F, Fut>(
         &self,
         consolidation: &ConsolidationConfig,
@@ -583,6 +589,12 @@ impl DreamingService {
         F: Fn(String) -> Fut + Send + Sync,
         Fut: std::future::Future<Output = Result<String, String>> + Send,
     {
+        // The daemon's scheduled dream had its own in-flight latch, but the
+        // control plane's "Consolidate" called in beside it with none.
+        let Ok(_cycle) = self.cycle.try_lock() else {
+            info!("A dream cycle is already running; not starting another");
+            return Err(MemoryError::DreamInFlight);
+        };
         let mut stats = DreamingStats::default();
 
         // 1. Apply pending feedback
@@ -751,6 +763,28 @@ pub trait LlmSummarizer: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// While one cycle runs, another — the scheduled dream beside a user's
+    /// "Consolidate" — is refused instead of consolidating the same clusters
+    /// a second time; once it ends, the next one runs.
+    #[tokio::test]
+    async fn a_second_dream_cycle_waits_for_none_and_is_refused() {
+        let service = DreamingService::new(DreamingConfig::default());
+        let running = service.cycle.lock().await;
+        let refused = service
+            .dream_with_consolidation(&ConsolidationConfig::default(), |_p| async {
+                Ok(String::from("summary"))
+            })
+            .await;
+        assert!(matches!(refused, Err(MemoryError::DreamInFlight)), "{refused:?}");
+        drop(running);
+        service
+            .dream_with_consolidation(&ConsolidationConfig::default(), |_p| async {
+                Ok(String::from("summary"))
+            })
+            .await
+            .expect("runs once the other cycle is done");
+    }
 
     #[tokio::test]
     async fn test_dreaming_service_creation() {

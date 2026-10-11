@@ -86,7 +86,10 @@ pub struct MemoryService {
     store: VectorStore,
     embed_fn: Option<EmbedFn>,
     /// Track memory IDs that need FSRS updates (for async batch updates)
-    pending_updates: RwLock<Vec<(String, Rating)>>,
+    /// Queued testing-effect reviews: the memory, the rating, and WHEN it
+    /// was recalled (unix seconds). Applied at the next dream, which may be
+    /// days later: the review is dated by the recall, not the dream.
+    pending_updates: RwLock<Vec<(String, Rating, i64)>>,
     /// Runtime-adjustable minimum score (overrides config)
     min_score_override: RwLock<Option<f32>>,
     /// Identity (`provider:model`) of the embedding model currently in use.
@@ -893,7 +896,7 @@ impl MemoryService {
                 // already holds this text verbatim may absorb it unwritten.
                 IngestAction::Reinforce if existing.content.trim().contains(content.trim()) => {
                     // Just strengthen existing memory
-                    self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
+                    self.pending_updates.write().await.push((existing.id.clone(), Rating::Good, crate::fsrs::unix_now()));
                     info!("Reinforced: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
                     return Ok((existing.id.clone(), action));
                 }
@@ -903,7 +906,7 @@ impl MemoryService {
                     self.pending_updates
                         .write()
                         .await
-                        .push((existing.id.clone(), Rating::Good));
+                        .push((existing.id.clone(), Rating::Good, crate::fsrs::unix_now()));
                 }
                 IngestAction::Update => {
                     // Related-but-distinct: fold new information into the existing
@@ -915,7 +918,7 @@ impl MemoryService {
                     self.pending_updates
                         .write()
                         .await
-                        .push((existing.id.clone(), Rating::Good));
+                        .push((existing.id.clone(), Rating::Good, crate::fsrs::unix_now()));
                     match folded {
                         FoldResult::Merged => {
                             info!(
@@ -1182,7 +1185,7 @@ impl MemoryService {
                     if !skip_reinforce && existing.content.trim().contains(content.trim()) =>
                 {
                     // Just strengthen existing memory (testing effect)
-                    self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
+                    self.pending_updates.write().await.push((existing.id.clone(), Rating::Good, crate::fsrs::unix_now()));
                     // Also boost importance if new fact has higher importance
                     let importance_normalized = (importance / 5.0).clamp(0.5, 1.5);
                     if let Err(e) = self.store.update_fsrs(&existing.id, |fsrs| {
@@ -1204,14 +1207,14 @@ impl MemoryService {
                     self.pending_updates
                         .write()
                         .await
-                        .push((existing.id.clone(), Rating::Good));
+                        .push((existing.id.clone(), Rating::Good, crate::fsrs::unix_now()));
                 }
                 IngestAction::Update if !skip_reinforce => {
                     // Related-but-distinct: fold new information in (dedup) and reinforce.
                     let folded = self
                         .fold_into_memory(embed_fn, &existing.id, &existing.content, content)
                         .await?;
-                    self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
+                    self.pending_updates.write().await.push((existing.id.clone(), Rating::Good, crate::fsrs::unix_now()));
                     // Same invariant as `remember_scoped`: an unabsorbed fold
                     // means the content landed nowhere, so it must still become
                     // a row. Only a provable superset may discard.
@@ -1393,12 +1396,12 @@ impl MemoryService {
             if addressable && matches!(action, IngestAction::Reinforce | IngestAction::Update) {
                 // Still a genuine hit: strengthen the neighbour. Just do not
                 // absorb the new record into it and orphan its handle.
-                self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
+                self.pending_updates.write().await.push((existing.id.clone(), Rating::Good, crate::fsrs::unix_now()));
             }
 
             if !addressable && matches!(action, IngestAction::Reinforce | IngestAction::Update) {
                 // The neighbour was a genuine hit either way: rate it.
-                self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
+                self.pending_updates.write().await.push((existing.id.clone(), Rating::Good, crate::fsrs::unix_now()));
 
                 // Provably redundant: the existing entry already contains this
                 // text verbatim. Only this case may discard.
@@ -1723,6 +1726,7 @@ impl MemoryService {
         // Filter by min score and weight, apply testing effect
         let mut filtered = Vec::new();
         let mut updates = Vec::new();
+        let recalled_at = crate::fsrs::unix_now();
         let mut scored: Vec<(MemoryEntry, f32, f32, Option<i64>)> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -1784,7 +1788,7 @@ impl MemoryService {
                 continue;
             }
 
-            updates.push((entry.id.clone(), Rating::Good));
+            updates.push((entry.id.clone(), Rating::Good, recalled_at));
 
             filtered.push(RecallResult {
                 id: entry.id,
@@ -1841,9 +1845,9 @@ impl MemoryService {
         }
 
         let count = updates.len();
-        for (id, rating) in updates {
+        for (id, rating, recalled_at) in updates {
             if let Err(e) = self.store.update_fsrs(&id, |fsrs| {
-                fsrs.record_access(&self.config.fsrs, rating);
+                fsrs.record_access_at(&self.config.fsrs, rating, recalled_at);
             }).await {
                 debug!("Failed to update FSRS for {}: {}", id, e);
             }
@@ -2321,20 +2325,38 @@ impl MemoryService {
             // individually cheap, and is exactly the material meant to be
             // compressed into narrative. So at `Detailed`, episodes consolidate
             // and durable facts are left alone.
-            let memories = if compression_level == CompressionLevel::Detailed {
-                let (episodic, durable): (Vec<_>, Vec<_>) =
-                    memories.into_iter().partition(is_episodic_memory);
-                result.memories_processed += durable.len();
-                if episodic.is_empty() {
-                    continue;
+            //
+            // `Expand` (weight above 1.0) is the same argument, stronger: a fact
+            // lands there because feedback said it mattered, and it used to be
+            // clustered, rewritten and its original removed while the same
+            // fact at 0.9 was protected. There a durable fact is still offered
+            // to `expand_memory` — alone, as a singleton — but never merged.
+            let mut durable_singletons: Vec<Vec<MemoryEntry>> = Vec::new();
+            let memories = match compression_level {
+                CompressionLevel::Detailed | CompressionLevel::Expand => {
+                    let (episodic, durable): (Vec<_>, Vec<_>) =
+                        memories.into_iter().partition(is_episodic_memory);
+                    if compression_level == CompressionLevel::Detailed {
+                        result.memories_processed += durable.len();
+                    } else {
+                        durable_singletons = durable.into_iter().map(|m| vec![m]).collect();
+                    }
+                    if episodic.is_empty() && durable_singletons.is_empty() {
+                        continue;
+                    }
+                    episodic
                 }
-                episodic
-            } else {
-                memories
+                _ => memories,
             };
 
             // Cluster using composite score (similarity + recall + importance + age)
-            let clusters = cluster_memories(&memories, config);
+            let mut clusters = cluster_memories(&memories, config);
+            if config.min_cluster_size > 1 {
+                clusters.extend(durable_singletons);
+            } else {
+                // A cluster of one would be summarised: leave them be.
+                result.memories_processed += durable_singletons.len();
+            }
             removal_budget = self
                 .consolidate_clusters(
                     clusters,
@@ -2745,8 +2767,18 @@ impl MemoryService {
             .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
 
         // Create consolidated entry (a fresh uuid, so it never collides with a
-        // source memory).
-        let consolidated = create_consolidated_entry(cluster, summary, embedding);
+        // source memory), its vector resolved against the CURRENT binding like
+        // every other write: stamped with the model and filed in its bucket, or,
+        // when the provider switched mid-dream, queued for backfill. It used to
+        // carry no model (so every restart re-filed it under a `legacy-*` key
+        // and hid it from search until backfill re-embedded it) and a vector of
+        // the wrong width failed the add, discarding the paid summary.
+        let (active_model, bound_dim) = self.active_binding().await;
+        let (embedding_model, embedding, embeddings) =
+            resolve_entry_vectors(active_model, bound_dim, embedding);
+        let mut consolidated = create_consolidated_entry(cluster, summary, embedding);
+        consolidated.embedding_model = embedding_model;
+        consolidated.embeddings = embeddings;
 
         // Add the consolidated memory FIRST, then remove the sources. If the add
         // fails (e.g. a dimension mismatch), `?` returns before any removal, so
@@ -3959,18 +3991,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consolidate_cluster_never_loses_memories_on_failed_add() {
+    async fn a_summary_is_stamped_with_the_model_or_queued_never_discarded() {
         use std::sync::Arc;
 
-        // The consolidated summary embeds to the WRONG dimension (2, not the
-        // store's 3), so `store.add(consolidated)` fails with a dimension
-        // mismatch — the exact partial failure the add-then-remove ordering
-        // guards against. The sources must survive: losing them would be
-        // irreversible data loss.
-        const SUMMARY: &str = "CONSOLIDATED";
+        // The second summary embeds to the WRONG width (2, not the store's 3):
+        // the provider switched mid-dream. It used to fail the add and discard
+        // the paid summary; it is now kept unembedded and queued for backfill.
+        const STALE: &str = "CONSOLIDATED AT A STALE WIDTH";
         let embed: EmbedFn = Arc::new(|text: &str| {
-            let v = if text == SUMMARY {
-                vec![1.0_f32, 0.0] // wrong dimension → add fails
+            let v = if text == STALE {
+                vec![1.0_f32, 0.0]
             } else {
                 vec![1.0_f32, 0.0, 0.0]
             };
@@ -3981,6 +4011,7 @@ mod tests {
             ..Default::default()
         };
         let service = MemoryService::new(config).with_embed_fn(embed);
+        service.rebind_embeddings("prov:test", 3, None).await;
 
         let mk = |id: &str| MemoryEntry {
             embedding_model: None,
@@ -3993,31 +4024,30 @@ mod tests {
             fsrs: FsrsState::default(),
             workspace_id: None,
         };
-        service.add_entry(mk("a")).await.unwrap();
-        service.add_entry(mk("b")).await.unwrap();
-        assert_eq!(service.count().await, 2);
+        for (ids, text) in [(["a", "b"], "CONSOLIDATED"), (["c", "d"], STALE)] {
+            for id in ids {
+                service.add_entry(mk(id)).await.unwrap();
+            }
+            let cluster = MemoryCluster::new(
+                ids.iter().map(|id| mk(id)).collect(),
+                CompressionLevel::Compressed,
+                &service.config.fsrs,
+            );
+            let summarize = move |_p: String| async move { Ok::<_, String>(text.to_string()) };
+            service
+                .consolidate_cluster(&cluster, &summarize)
+                .await
+                .expect("the summary lands");
+        }
 
-        let cluster = MemoryCluster::new(
-            vec![mk("a"), mk("b")],
-            CompressionLevel::Compressed,
-            &service.config.fsrs,
-        );
-        let summarize = |_p: String| async move { Ok::<_, String>(SUMMARY.to_string()) };
-
-        let result = service.consolidate_cluster(&cluster, &summarize).await;
-        assert!(
-            result.is_err(),
-            "a dimension-mismatched summary embedding must fail the add"
-        );
-
-        // The critical assertion: a failed add must NOT have deleted the sources.
-        assert_eq!(
-            service.count().await,
-            2,
-            "consolidation must never lose memories when the add fails"
-        );
-        assert!(service.get("a").await.is_some(), "source a survives");
-        assert!(service.get("b").await.is_some(), "source b survives");
+        let entries = service.store.all_entries().await;
+        let summary_named = |text: &str| entries.iter().find(|e| e.content == text);
+        let stamped = summary_named("CONSOLIDATED").expect("stored");
+        assert_eq!(stamped.embedding_model.as_deref(), Some("prov:test"));
+        assert!(stamped.embeddings.contains_key("prov:test"), "filed in its bucket");
+        let queued = summary_named(STALE).expect("kept, not discarded");
+        assert!(queued.embedding.is_empty(), "queued for backfill");
+        assert_eq!(queued.embedding_model, None);
     }
 
 
@@ -4533,6 +4563,42 @@ mod tests {
             "no LLM call may be made for the Detailed band"
         );
         assert!(service.count().await < 4, "the band must have compressed");
+    }
+
+    /// A durable fact feedback lifted into the `Expand` band (weight above
+    /// 1.0) is never merged into a summary: it used to be clustered, rewritten
+    /// and removed, while the same fact at 0.9 was protected.
+    #[tokio::test]
+    async fn an_expand_band_fact_is_never_summarized_away() {
+        let service = dedup_service();
+        for (id, content, vector) in [
+            ("port", "the daemon listens on 5149", vec![1.0, 0.0, 0.0]),
+            ("host", "the daemon binds 127.0.0.1", vec![0.9, 0.43, 0.0]),
+        ] {
+            let mut entry = dedup_entry(id, content, vector, None);
+            entry.fsrs.importance = 3.0;
+            entry.fsrs.stability = 100.0;
+            service.add_entry(entry).await.expect("seed");
+        }
+        let bands = service.get_consolidation_bands().await;
+        assert_eq!(bands.expand.len(), 2, "fixture must populate Expand");
+
+        let result = service
+            .consolidate(
+                &ConsolidationConfig {
+                    min_remaining_memories: 1,
+                    max_compression_ratio: 0.9,
+                    cluster_threshold: 0.65,
+                    ..ConsolidationConfig::default()
+                },
+                |_prompt| async { Ok(String::from("expanded with context")) },
+            )
+            .await
+            .expect("consolidate");
+
+        assert_eq!(result.clusters_formed, 0, "no durable fact is merged: {result:?}");
+        assert!(service.get("port").await.is_some(), "kept");
+        assert!(service.get("host").await.is_some(), "kept");
     }
 
     /// A rewritten survivor must not keep its pre-merge vector. Stale embeddings

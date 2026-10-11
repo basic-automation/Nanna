@@ -10466,6 +10466,12 @@ keep the phases readable; promote individual items into a phase when they become
   which the token item below covers.
 - [ ] **A per-launch token** (written 0600 beside the PID file, required in the first frame)
       would also stop a hostile *local process*, which the `Origin` check does not.
+      *(2026-10-11, scoped, not started)* A 0600 file stops only **other users** (and sandboxed
+      apps that reach loopback but not `$HOME`); a same-user process reads it. Clients know only
+      the URL (`ClientConfig::url`), so the token has to be found by port, not data dir (e2e
+      daemons use their own data dirs). Six client sites: `nanna-client`, `daemon_client.rs` ×2,
+      `daemon_manager.rs` ×3 — a header on the handshake (`IntoClientRequest`) is simpler than a
+      first frame and refuses before the upgrade. Decide the threat model first.
 
 ### The tool layer's guards had holes (found 2026-10-10, security audit)
 
@@ -10620,11 +10626,18 @@ keep the phases readable; promote individual items into a phase when they become
       entered (`SecureStore::set` under its own name) instead of `store_secrets()`. **Still
       open:** the channel wizard's `store_and_save` (`migrate_secrets_to_keyring`) — channels
       go with P25 decision 18, and `channel_secrets` has no per-channel filer.
-- [ ] **Non-secret environment overrides are written into `config.toml`** (`PORT`,
+- [x] **Non-secret environment overrides are written into `config.toml`** (`PORT`,
       `TELEGRAM_WEBHOOK_URL`, `DISCORD_*`, a whole channel section from a token), and a `set` of
       an overridden path answers `updated` and then silently reverts on the watcher's reload.
       Resolve `PORT` at `server_port`, limit `override_channels` to secrets, refuse a `set` of an
       env-overridden path.
+      *(2026-10-11)* Done without dropping any variable's support: `save_to` (every writer — daemon,
+      CLI, GUI) gives each non-secret setting the environment overrides the file's own value and
+      drops a channel section the environment built from a token alone
+      (`env_settings::keep_file_values_of_env_settings`); `config.set` of one is refused
+      `env_overrides_setting`, naming the variable. Tests
+      `a_save_writes_the_files_values_not_the_environments`,
+      `a_setting_the_environment_overrides_is_refused_and_never_saved`.
 
 ### File skills that answered wrongly (found 2026-10-10, audit of the file skills)
 
@@ -10775,25 +10788,48 @@ keep the phases readable; promote individual items into a phase when they become
       past 16 MiB (`STDIO_LINE_BYTES_MAX`), keeps a half-read line across the shutdown `select!`,
       and ends the session the same way a read error does. Test
       `a_stdio_line_is_capped_and_split_on_newlines`.
-- [ ] **An MCP question to the user is cut off by the tool's own deadline.** `McpAskUser` waits up
+- [x] **An MCP question to the user is cut off by the tool's own deadline.** `McpAskUser` waits up
       to 600 s for the answer, but `McpToolWrapper::timeout_secs()` is 65 s and the registry
       backstop drops the call at about 75 s, so an answer given later never reaches the server.
       User think-time should not count against the tool's deadline.
-- [ ] **No server's tools appear until every server has started.** `start_all` starts servers one
+      *(2026-10-11)* `Elicitor::answer_wait_max` (the daemon's: 600 s) and
+      `elicit::tool_call_time_max`: a call with an elicitor is allowed 4 requests of 60 s plus
+      3 rounds × 8 questions × the answer wait; without one it stays one request. Every inner
+      wait is still bounded (transport per request, `ask_user` per question, `MRTR_ROUNDS_MAX`).
+      Test `a_call_that_may_ask_the_user_gets_the_users_time`.
+- [x] **No server's tools appear until every server has started.** `start_all` starts servers one
       after another and registers only after the loop, so one slow `npx -y` server (60 s probe +
       60 s `initialize`) holds back every other server's tools and status. Register each server
       as its handshake finishes, or start them concurrently.
-- [ ] **A cold start over 60 s fails a modern-only stdio server.** A probe timeout reads as
+      *(2026-10-11)* Both: servers start concurrently (`FuturesUnordered`, bounded by
+      `MCP_SERVERS_MAX`), each registers its tools the moment its handshake finishes, and the
+      daemon records each server's status as it settles (`on_outcome`). Live test
+      `a_slow_server_does_not_hold_back_another_servers_tools`: a Python stdio server's tool is
+      registered in 0.05 s while a server that never answers is still starting.
+- [x] **A cold start over 60 s fails a modern-only stdio server.** A probe timeout reads as
       "legacy"; the queued `server/discover` and `initialize` then both arrive, and a modern-only
       server rejects `initialize` with `-32022`. Re-classify that error and finish the modern
       handshake.
-- [ ] **Tool names from two servers can collide.** `mcp__{server}__{tool}` is sanitized after the
+      *(2026-10-11)* `recover_modern`: a `-32022` refusal of `initialize` is classified like a
+      probe answer; a modern verdict probes again in the named revision and finishes the modern
+      handshake (no `notifications/initialized`). Test
+      `a_modern_server_slow_to_start_still_connects`.
+- [x] **Tool names from two servers can collide.** `mcp__{server}__{tool}` is sanitized after the
       duplicate-name check (`home assistant` vs `home.assistant`, or `__` inside names), the
       registry's `insert` silently replaces the earlier tool, and `resync_server` can unregister
       the other server's tool. De-duplicate on the sanitized name and skip a name another server
       owns.
-- [ ] *(lead)* Under the AppImage, stdio MCP servers inherit the bundle's `LD_LIBRARY_PATH`;
+      *(2026-10-11)* `admit` de-duplicates on the model-facing name under the wrappers' write lock
+      in `register`, `refresh` (servers in name order) and `resync_server`: the first holder keeps
+      a name, a later one is skipped with a warning naming both. Test
+      `a_tool_name_another_server_holds_stays_theirs` (`a__b`/`c` vs `a`/`b__c`, plus a repeat).
+- [x] *(lead)* Under the AppImage, stdio MCP servers inherit the bundle's `LD_LIBRARY_PATH`;
       `exec` scrubs it (`scrub_appimage_library_path`), `StdioTransport::spawn_with_env` does not.
+      *(2026-10-11)* Confirmed (the staged daemon restores the original variable, bundle entries
+      included, "for its own children") and fixed once for every child: the daemon drops the
+      bundle's entries from its own `LD_LIBRARY_PATH` at boot, before any thread
+      (`scrub_library_path_for_children`), so MCP servers, Chromium and Python get the system's
+      libraries too. Test `children_get_the_library_path_without_the_bundles_entries`.
 
 ### Browser tools that broke after one call (found 2026-10-10, audit of the browser services)
 
@@ -10807,21 +10843,37 @@ keep the phases readable; promote individual items into a phase when they become
       launches and drives the connection there (`launch_connected`). Test
       `the_browser_outlives_the_runtime_of_the_call_that_launched_it` (red before: the second
       call failed).
-- [ ] **Closed browsers leave `nanna-chromium-*` profiles behind.** `close()` drops the browser
+- [x] **Closed browsers leave `nanna-chromium-*` profiles behind.** `close()` drops the browser
       (SIGKILL, no wait) and deletes the profile at once; Chromium's NetworkService child
       outlives the kill and re-creates `Default/Network Persistent State` and its cache index in
       the deleted directory (reproduced by hand). Nothing calls `BrowserManager::close` either —
       not the daemon on shutdown, not the integration test. Close over CDP, wait for the process,
       then delete the profile; call `close` on shutdown and in the test.
-- [ ] **A navigation that times out leaks its tab.** `new_page(url)` only returns the page once it
+      *(2026-10-11)* Done: `close` sends `Browser.close`, waits for the process (kill + reap after
+      `BROWSER_CLOSE_GRACE` = 5 s each), then deletes the profile; the daemon keeps the services'
+      browser in a `BrowserSlot` and closes it in `finish_shutdown`; the integration tests close it.
+      Live test `a_closed_browser_leaves_no_profile_behind` (the old drop re-created the profile in
+      1 of 2 runs; 6/6 green after). The browser test runs now leave 0 profiles (68 had piled up
+      in `/var/tmp` from this run's own earlier tests).
+- [x] **A navigation that times out leaks its tab.** `new_page(url)` only returns the page once it
       has loaded, so a deadline that fires first leaves a live tab with no handle to close it.
       Open `about:blank`, then `goto` under the deadline and close the page on any error.
-- [ ] **`browser_evaluate` of an expression with no value fails.** chromiumoxide's `into_value`
+      *(2026-10-11)* Done; the load gets what the open left of the one budget, and a failed
+      load's tab is closed with `Target.closeTarget` from the browser side (`Page.close` runs the
+      stuck page's unload hooks). Live test `a_navigation_that_times_out_leaves_no_tab` against a
+      server that accepts and never answers: 2 tabs with the close skipped, 1 with it.
+- [x] **`browser_evaluate` of an expression with no value fails.** chromiumoxide's `into_value`
       errors with "No value found" for `undefined`, `NaN`, `Infinity` and `BigInt`, so
       `localStorage.setItem(...)` reports failure after it ran. Read the remote object's `value`
       or `unserializableValue` instead.
-- [ ] **A selector that matches nothing is a successful empty extract.** `#hedline` returns
+      *(2026-10-11)* `evaluated_json`: `undefined` → `null`, an unserializable number → its JS
+      spelling (`"NaN"`, `"10n"`), a function/symbol → its description. Tests
+      `results_without_a_json_value_still_have_one` + live `a_script_with_no_json_result_evaluates`.
+- [x] **A selector that matches nothing is a successful empty extract.** `#hedline` returns
       "(no content extracted)" as success; report "no element matches" instead.
+      *(2026-10-11)* The extract script returns `null` for no match and the call fails with "no
+      element on the page matches the selector"; an attribute read checks `exists` before
+      treating `None` as an absent attribute. Test `a_missing_element_is_not_a_missing_attribute`.
 
 ### The test suite stranded its scratch databases in tmpfs (found 2026-10-10)
 
@@ -10836,6 +10888,233 @@ keep the phases readable; promote individual items into a phase when they become
       returns the `Storage` and its guard together, declared so the database closes first. The
       unit test now removes the WAL too. Re-measured: 274 tests in the two crates, **0 entries
       left behind** (was 44 per run). The 1382 stale ones were deleted.
+
+### Channels that went deaf, looped or let strangers in (found 2026-10-11, audit of the channels)
+
+- [x] **Listeners stopped for good after ~8 minutes offline.** The breaker returned `Stop` after 10
+      connection failures (2 + 4 + … + 120 s of backoff) and nothing could restart a listener —
+      no restart action, `ChannelAction::Enable` answers `not_implemented`, and the "reconnect from
+      the Channels page" its message named does not exist. A connection failure now always retries
+      at the 120 s cap (reported `Unavailable` past the threshold); only auth failures stop. Test
+      `test_conn_failures_never_stop_the_listener`.
+- [x] **Discord's fatal close codes were retried at once, forever.** A close frame set
+      `should_resume` and broke out with nothing recorded, so backoff was a no-op: a missing
+      privileged intent (4014, the commonest setup mistake) re-identified about twice a second
+      against Discord's 1000/day cap, which resets the token when hit. 4004 and 4010–4014 now count
+      as auth failures (stopping after 3), and any connection that ends before READY/RESUMED as a
+      connection failure. Test `only_documented_fatal_close_codes_are_fatal`.
+- [x] **A half-open Slack Socket Mode socket was awaited forever** while reporting `Connected`.
+      Silent for 60 s it is pinged; silent for another 60 s it is dropped and redialled.
+- [x] **The daemon's Slack webhook answered bots, joins, edits and duplicates.** Every `message`
+      and `app_mention` started a turn: the bot's own replies (a loop wherever replies route back),
+      `channel_join`, `message_changed` with no user or text, and one @-mention twice when both
+      events are subscribed. `bot_id`/`subtype`/blank events are dropped and one message is handed
+      on once (bounded `(channel, ts)` window of 256). Tests `only_a_users_own_message_starts_a_turn`,
+      `one_message_delivered_twice_is_handed_on_once`.
+- [x] **`nanna serve`'s Telegram webhook answered 400 to custom-emoji and paid reactions** (the
+      field was read as `_custom_emoji_id`; `paid` was an unknown variant), so Telegram retried the
+      update and queued the user's later ones behind it. Test `custom_and_paid_reactions_parse`.
+- [ ] **Discord and Slack admit anyone who can reach the bot.** `server.rs` hard-codes
+      `allowed_guilds: vec![]` / `allowed_channels: vec![]` (no config keys exist), the guild check
+      skips DMs (`guild_id == None`), and there is no sender list — a stranger who invites a
+      public bot, or DMs it from a shared server, gets a full agent turn with tools. Needs config
+      (`allowed_users` per channel) and a fail-closed rule for DMs: a product call, with channels
+      going through P25 decision 18. Telegram also fails open when `allowed_users` is unset.
+- [~] **`nanna serve`'s Telegram (and Signal) webhooks ignore `allowed_users`** — the hole the
+      daemon closed with `webhook_chat_allowed` (`crates/nanna-server/src/webhooks/telegram.rs`,
+      `src/commands/serve.rs` passes no allowlist). Pass it into `AppStateBuilder`.
+      *(2026-10-11)* Telegram done (`telegram_allowed_users`, the daemon's rule). Test
+      `the_webhook_answers_only_allowed_chats`. **Still open:** Signal has no sender list in config.
+
+### Dreaming that could lose or double a memory (found 2026-10-11, audit of dreaming)
+
+- [x] **A merge whose save failed was reported applied**, and the fold then deleted the source it
+      had merged in (that delete did reach the disk) — after a restart the source's text existed
+      nowhere. `update_content_and_embedding_if` now undoes the rewrite in RAM and returns the
+      error; the fold keeps both. Test `a_rewrite_that_could_not_be_saved_is_refused_and_undone`.
+- [x] **A user's "Consolidate" ran beside the scheduled dream** (only the scheduler had a latch):
+      the same clusters were summarised twice and each cycle removed up to the compression budget.
+      `DreamingService` holds one gate for the whole cycle (`MemoryError::DreamInFlight`). Test
+      `a_second_dream_cycle_waits_for_none_and_is_refused`.
+- [x] **Summaries were stored with no embedding model** (re-filed under `legacy-*` and hidden from
+      search on every restart until backfill), and a summary embedded at a stale width failed its
+      add, discarding the paid summary. Resolved against the live binding like every other write.
+      Test `a_summary_is_stamped_with_the_model_or_queued_never_discarded`.
+- [x] A scheduled dream in which every summariser call failed was recorded as a success. Test
+      `a_dream_that_only_failed_is_reported_failed`.
+- [x] **Durable facts in the Expand band are summarised away.** The episodic/durable guard
+      (`service.rs`, ~2324) covers only the Detailed band (weight 0.8–1.0); a fact feedback lifted
+      past 1.0 is clustered, rewritten and its original removed, while the same fact at 0.9 is
+      protected. Apply the split to Expand too.
+      *(2026-10-11)* In Expand a durable fact is still offered to `expand_memory`, alone, but never
+      clustered (and with `min_cluster_size` ≤ 1 not touched at all). Test
+      `an_expand_band_fact_is_never_summarized_away` (red with the old Detailed-only split).
+- [x] `remove_many_matching` (`lib.rs`) does not take `persist_serial`, and ignores a failed disk
+      delete after removing in RAM — a concurrent backfill `save_entry` can re-insert a removed
+      source, which returns on restart beside the memory that absorbed it. Take the lock; remove
+      in RAM only what the disk confirmed (as `remove_many_durable` does).
+      *(2026-10-11)* Done, and the three writers that saved or rewrote without the lock now take
+      it too (`set_tags` — an upsert that could re-insert the row — `update_content` and
+      `flush_to_db`). Test `a_matched_removal_the_disk_refused_keeps_the_entry`.
+- [x] **The testing effect uses the dream's clock, not the recall's.** Queued reviews are
+      `(id, Rating)`; `record_access` measures elapsed time and sets `last_access` from `now()` at
+      the dream, so a recall two days before the dream gets two days' extra boost and K queued
+      recalls become one review plus K−1 no-ops. Queue `recalled_at` and pass it through.
+      *(2026-10-11)* Done (`record_access_at`; the clock never moves backwards). Test
+      `a_queued_recall_is_dated_by_the_recall_not_the_dream`.
+
+### Board cards that stuck or lost their assignee (found 2026-10-11, audit of the P25 card runs)
+
+- [x] **A defer date with a time of day never started its card.** The store announces `due` once,
+      at the start of the UTC day, and `is_deferred` compared the exact time — so a card deferred to
+      15:00 was refused at 00:05 and nothing re-checked it. A timestamp now defers to its day, like
+      a bare date, the store and the board. Case in `only_an_open_unblocked_agent_card_whose_date_has_come_starts`.
+- [x] **Cancelling or deleting a sub-card never woke the parent waiting on it** (only `complete`
+      emits a verdict). A cancel (not a parent's cascade) wakes it like a verdict, and a deleted
+      subtree's root names its parent in the event (`parent_id`), which is woken. Cases in
+      `an_agent_assignment_or_an_arriving_date_wakes_the_worker`.
+
+- [x] **Reassigning a running card leaves the old member working it.** `CardTree::serves`
+      (`tasks.rs`) passes the root before checking its assignee, and `settle_after_run` /
+      `hand_back` never check the card still belongs to the run's member: a budget end then wipes
+      the human's new assignee (and counts a hand-back), and a Stop records the new member as
+      pausing itself, so the stall sweep skips the card forever. Cancel the run when `assignee`
+      changes on an `in_progress` card, and make `settle_after_run` only reset a card it no
+      longer owns. (`member_delete` checks `member_is_working` outside `fence_starts` — same class.)
+      *(2026-10-11)* `CardTree::serves` checks the root's own assignee, so the old run stops being
+      served its card at the next boundary; `settle_after_run` and `hand_back` leave a card that is
+      no longer the member's alone except to put it back to `pending` (`release_reassigned`), and
+      the run's existing end wake (`announce_member_free`'s card wake) starts the new member.
+      Test `a_card_reassigned_mid_run_is_left_to_its_new_member` (three stop kinds).
+      *(same day)* `member_delete` now judges and releases inside one `fence_starts`, as the stall
+      sweep does.
+- [x] **A rate limit during a run with sub-cards cancels the sub-cards.** `abandon` handles 429 and
+      refused keys only for `id == subtree_root`; a leaf falls through to `cancelled`, and
+      `provider_died` treats 429 as a crash and resumes (8 × 15 s) without the cooldown, cancelling
+      each sibling in turn. Route a rate limit on any card to the root's wait, and exclude
+      `is_rate_limited_error` from `provider_died`.
+      *(2026-10-11)* Both, for refused keys too (the root asks the human); a chat run still
+      resumes on a 429 (`resumes_after`). Tests
+      `a_rate_limit_on_a_sub_card_waits_on_the_card_and_cancels_nothing`,
+      `a_rate_limited_card_run_is_not_resumed_as_a_crash`.
+- Minor: a crash between `finish_card_run` and `set_member_status(Idle)` leaves a member shown busy
+  with no boot reset; `cooling_down_until` is per card, so a reassigned card inherits the first
+  member's provider wait.
+
+### Chat turns that lost messages or spun (found 2026-10-11, audit of the agent loop and harness)
+
+- [x] **A failed interjection seed dropped the user's queued messages.** `SessionInterjector`
+      drained the whole queue, then `seed_plan(..)?` returned on a transient store error with
+      nothing pushed back — while the harness logs "stays pending and is retried". The current
+      message and the rest go back to `pending`, as the cancel branch already did. *No dedicated
+      test* (needs a store that fails a write on demand).
+- [x] **Sub-agent model fallback never switched models.** `AgentSpawnerImpl::spawn` checked each
+      `sub_agent_models` entry for a provider and logged it, but never pinned the new session to it,
+      so every attempt — and every "fallback" re-run of the prompt, tool side effects included — ran
+      on the global chat model (the 2026-07-25 "sub-agent model chain" item was never in effect).
+      The session is pinned with `set_chat_model` before its turn.
+- [x] **The park waiter re-probed a fast-failing provider in a tight loop** (connection refused, a
+      quick 5xx, or no client at all), pegging a worker until a user message cleared the park. A
+      failed probe now rests what is left of the 120 s silence window. Test
+      `a_failed_probe_is_paced_to_one_per_silence_window`.
+- [x] **Health probes and parks used the configured model, not the one the run fell back to**, so
+      a run that moved from a dead A to B was parked as "A stopped answering" and watched A.
+      `active_model()` at all four sites.
+- [x] **A message sent after the last drain waits for the next one.** A message that arrives after
+      `first_run`'s post-run drain (during `continue_mission`, `finish_mission`/`finish_turn`, or
+      right after a Stop) is acked "interjected" and pushed to `pending`, and nothing starts a turn
+      for it. In `finish_turn`, after `release`, drain a non-empty `pending` into a new turn.
+      *(2026-10-11)* `run_what_arrived_late` does that — except after a Stop, where the queue waits
+      for the next message (Stop is stop; a message typed right after Stop still waits — decide
+      whether that one should run). *No dedicated test*; e2e (57) and daemon suites green.
+- [x] The park waiter is spawned inside `finish_mission`, before `finish_turn` releases the claim: a
+      first probe that answers within ~1 s clears the park, finds the claim held, pushes the goal
+      to `pending` (stuck, as above) and leaves `resumed` set so the next turn skips
+      `TurnAdmission`. Spawn it after `release`, or `wait_until_idle` first.
+      *(2026-10-11)* The waiter now `wait_until_idle`s before its first probe.
+- [x] **A streamed reply that fails mid-way is streamed again** (`call_llm` retries an
+      `overloaded_error` from scratch after the first attempt's deltas reached `on_text` and
+      `streamed_text`): the user sees the partial reply then the full one, and both are persisted.
+      Retry automatically only when nothing was emitted. (Also: any error containing "429" is
+      treated as a rate limit — a "prompt is too long: 214290 tokens" is retried 3× instead of
+      compressed — and that retry ignores `retry_after`.)
+      *(2026-10-11)* `call_llm` retries only when nothing was streamed in the attempt, and
+      `is_rate_limit_message` requires a standalone `429` (test `a_429_must_stand_alone`).
+      *(same day)* The ladder now waits the provider's named `retry-after` when longer (capped at
+      60 s; past that the step ladder / card cooldown take it). Test
+      `a_named_retry_after_is_waited_out`.
+- [x] The crash watcher (`TurnWatcher::watch`) skips `demote_in_progress` and
+      `run_workspace::release`: a panicked turn's item stays `in_progress` (and is resumed first).
+      *(2026-10-11)* Both added, and the baseline is closed under the turn's own scope (it was
+      always `"session"`). *No dedicated test* — the watcher is only reachable by a panicking turn.
+
+### Provider replies read wrongly (found 2026-10-11, audit of the LLM clients)
+
+- [x] **A tool call cut off by the output-token limit was healed and run.** OpenAI-compatible
+      `finish_reason: "length"` closed open tool blocks like `tool_calls`; native Anthropic closes the
+      block itself and only then sends `stop_reason: "max_tokens"`, which nothing read. The JSON
+      healer closed the brackets and the call ran — a `write_file` writing half a file. Both now end
+      the stream with a retryable error (`cut_tool_call_error`); a text reply cut by the limit is
+      still a reply (stop reason `max_tokens`). Test `a_tool_call_cut_by_the_token_limit_is_never_run`.
+- [x] **A native Anthropic stream that ended before `message_stop` was a clean finish** (the OpenAI
+      and Ollama paths already refused this); it now ends interrupted, partial content kept.
+- [x] **An HTTP-200 error body on the Anthropic-over-OpenAI path read as a 500 "No choices"**, so a
+      free-tier 429 lost its status and nothing fell back. Test
+      `a_200_error_body_is_read_as_its_error_not_no_choices`.
+- [ ] `ContentBlock` has no `redacted_thinking` variant and no catch-all: a non-streaming response
+      carrying one fails to decode ("unknown variant") and the paid response is discarded; the
+      streaming path drops the block, which Anthropic may reject on the next tool turn.
+- [x] `RepeatWatch` aborts legitimate digit runs: one-digit-per-token models (Qwen, Gemma) streaming
+      40 zeros (a null SHA) trip `WedgedRunner` at the 20th `"0"`, and at low temperature the step
+      can never finish. Exempt all-digit fragments or require a longer run.
+      *(2026-10-11)* An all-digit fragment trips at 129 (one past a null SHA-512 in hex), others
+      still at 20. Test `a_run_of_digits_is_held_to_the_longest_real_one`.
+- [x] OpenAI-compatible tool-call deltas: `index` is required (a server that omits it loses every
+      such chunk, its `finish_reason` included), and a new `id` at a used index overwrites the
+      earlier call in the assembler. Default `index` to 0; give a new id a fresh block.
+      *(2026-10-11)* `index` defaults to 0 (test `a_tool_call_delta_without_an_index_is_kept`).
+      *(same day)* A new `id` at an index already in use closes the earlier call and gets the next
+      free block (`block_of_wire`). Test `two_calls_at_one_index_are_two_calls`.
+- [x] The router's `gpt-` prefix rule runs before the `:tag` (Ollama) rule, so a bare `gpt-oss:20b`
+      goes to OpenAI (`llm_router.rs:74`). Check `:` first. *(2026-10-11)* Done; case added to
+      `from_model_infers_provider_by_prefix`.
+
+### Storage rows written under the wrong key (found 2026-10-11, audit of the storage layer)
+
+- [x] **Reopening a workspace whose path was missing at boot orphaned its data.** The boot skips it
+      but keeps its row; `Open` minted a fresh id, the upsert (`ON CONFLICT(id)`) hit the UNIQUE
+      `path` and failed — logged only, Open still said "opened" — sessions and tasks were scoped to
+      the new id, and the next restart brought the old row back. Open now reuses the stored id.
+      Test `reopening_a_stored_workspace_keeps_its_id`.
+- [x] The hourly tool-stats window returned one bucket too many (`now − hours`, rounded down). Test
+      `the_last_n_hours_are_n_buckets`.
+- [x] **Tool stats lose `last_called` and `short_circuit_count` on every restart.** The save reads
+      `last_called_epoch_ms`, which the tracker never writes, and the table has no
+      `short_circuit_count` column — after a restart `call_count` exceeds success + failure +
+      short-circuit. Read `last_called`, add the column (migration), and add a
+      `export_json → save → load → import_json` round-trip test (`lib.rs` ~1214/1283).
+      *(2026-10-11)* Done: migration `022_tool_stats_short_circuits`; the save reads `last_called`
+      (still accepting the old key) and the load emits the tracker's own keys. Test
+      `the_trackers_export_survives_a_save_and_a_load`.
+- [ ] The daemon loads every session and all of its messages at boot, unbounded and under the
+      sessions write lock (`list_daemon_sessions` / `load_daemon_messages`); boot time and memory
+      grow with all history ever written. Load rows only; fetch messages lazily.
+
+### Dependency bumps held back (found 2026-10-11, dependency-freshness pass)
+
+- [ ] **`rten 0.26 → 0.27` waits for an `ocrs` release.** `ocrs 0.13.1` (latest) takes
+      `rten ^0.26` and our OCR code hands it an `rten::Model`, so bumping ours alone puts two
+      `rten`s in the graph and the types no longer meet. ocrs merged "Update to RTen v0.27"
+      ([robertknight/ocrs#278](https://github.com/robertknight/ocrs/pull/278), 2026-10-09) but
+      has not released it. Bump both together when it ships; dependabot #411 is the same bump
+      alone and cannot go green.
+- [ ] **`rustpython-ruff_python_* 0.16.10` breaks `rustpython-codegen 0.6.0`** (a patch release
+      replaced `ExprCompare`'s `left`/`comparators` with `operands`, 2026-10-07). The lock holds
+      all five ruff crates at 0.16.5; a plain `cargo update` re-breaks the build — re-pin with
+      `cargo update -p rustpython-ruff_python_parser --precise 0.16.5` first, then the rest.
+      Drop the hold once a `rustpython` release builds against 0.16.10.
+- [ ] `pymath 0.2.0` now resolves `malachite-bigint 0.13` while `rustpython-vm` takes 0.12; the
+      lock holds pymath on 0.12 so one malachite graph is built. Move with rustpython.
 
 ### The workspace is not rustfmt-formatted, and nothing checks (found 2026-09-24)
 

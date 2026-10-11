@@ -1561,7 +1561,12 @@ impl CardTree {
         let mut cursor = id;
         for _ in 0..=nanna_storage::TASK_DEPTH_MAX {
             if cursor == root {
-                return true;
+                // The root itself must still be this member's: a card
+                // reassigned mid-run used to stay served to the old member,
+                // who then handed back or paused the NEW assignee's card.
+                return member.is_none_or(|member| {
+                    self.assignee_of.get(&root).is_some_and(|assignee| assignee == member)
+                });
             }
             let delegated = self
                 .assignee_of
@@ -1911,6 +1916,15 @@ impl TursoTaskSource {
                 return;
             }
         };
+        if card.assignee != self.member_id {
+            // Reassigned while this run wound down: the card is the new
+            // assignee's. A hand-back would wipe their assignment (and count
+            // against the card), a pause would be recorded as theirs and
+            // freeze the card for good. Only put it back to `pending`; the
+            // run's end wakes it for its new member (`announce_member_free`).
+            self.release_reassigned(&card).await;
+            return;
+        }
         match card_after_run(&card, stop) {
             CardAfterRun::Closed => {}
             CardAfterRun::HandBack(reason) => {
@@ -1941,6 +1955,29 @@ impl TursoTaskSource {
             }
         }
     }
+    /// Put a card that was reassigned under this run back to `pending`, so
+    /// its new member's run can start; nothing else about it is this run's.
+    async fn release_reassigned(&self, card: &Task) {
+        debug_assert_ne!(card.assignee, self.member_id, "only a card no longer ours");
+        tracing::info!(
+            task_id = card.id,
+            from = ?self.member_id,
+            to = ?card.assignee,
+            "card reassigned during its run; leaving it to its new member"
+        );
+        self.handed_back.store(true, std::sync::atomic::Ordering::Release);
+        if card.status != "in_progress" {
+            return;
+        }
+        let wait = TaskPatch {
+            status: Some("pending".to_string()),
+            ..TaskPatch::default()
+        };
+        if let Err(e) = self.storage.tasks().update(card.id, wait, Some(&self.actor)).await {
+            tracing::warn!(task_id = card.id, error = %e, "reassigned card left in progress");
+        }
+    }
+
     /// The run's provider refused it outright: ask the human to fix the setup
     /// (P25 decision 6's clarification — the card waits on it, derived
     /// `blocked`) and put the card back to `pending` with its member, so the
@@ -2074,6 +2111,11 @@ impl TursoTaskSource {
             "only the run's own card is handed back"
         );
         let repo = self.storage.tasks();
+        let card = repo.get(id).await.map_err(|e| e.to_string())?;
+        if card.assignee != self.member_id {
+            self.release_reassigned(&card).await;
+            return Ok(());
+        }
         let reason = truncate_post(reason);
         repo.log_activity(
             id,
@@ -2324,30 +2366,34 @@ impl TaskSource for TursoTaskSource {
     }
 
     async fn abandon(&self, id: i64, reason: &str) -> Result<(), String> {
-        if self.member_id.is_some() && self.subtree_root == Some(id) {
+        if let (Some(_), Some(root)) = (&self.member_id, self.subtree_root) {
             // The harness abandons an item after persistent runner errors, so
             // a refused key surfaces here first, not as the run's stop.
-            if is_rate_limited_error(reason) {
+            //
+            // A rate limit or a refused key is the PROVIDER's, whichever card
+            // of the subtree met it: the run's own card waits it out or asks
+            // the human. Only the root used to get this; a sub-card fell
+            // through to `cancelled`, so a transient limit closed the card's
+            // sub-cards one after another (P25 decision 7: only the human
+            // closes a card unfinished).
+            let provider_fault = is_rate_limited_error(reason) || is_terminal_provider_error(reason);
+            if provider_fault {
                 let card = self
                     .storage
                     .tasks()
-                    .get(id)
+                    .get(root)
                     .await
                     .map_err(|e| e.to_string())?;
-                self.wait_out_rate_limit(&card, reason).await;
+                if is_rate_limited_error(reason) {
+                    self.wait_out_rate_limit(&card, reason).await;
+                } else {
+                    self.ask_human_to_fix(&card, reason).await;
+                }
                 return Ok(());
             }
-            if is_terminal_provider_error(reason) {
-                let card = self
-                    .storage
-                    .tasks()
-                    .get(id)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                self.ask_human_to_fix(&card, reason).await;
-                return Ok(());
+            if id == root {
+                return self.hand_back(id, reason).await;
             }
-            return self.hand_back(id, reason).await;
         }
         let repo = self.storage.tasks();
         repo.update(
@@ -5349,14 +5395,28 @@ impl Interjector for SessionInterjector {
             if let Err(e) = self.yield_current_item().await {
                 tracing::warn!(error = %e, "could not yield the in-flight item for an interjection");
             }
-            let ids = seed_plan(
+            let ids = match seed_plan(
                 &self.storage,
                 &self.scope,
                 self.scope_id.as_deref(),
                 &plan,
                 true,
             )
-            .await?;
+            .await
+            {
+                Ok(ids) => ids,
+                Err(e) => {
+                    // The queue was drained above: returning here dropped this
+                    // message and every one after it, while the harness logs
+                    // "stays pending and is retried next boundary". Put them
+                    // back so that is true.
+                    self.pending.push(message).await;
+                    for rest in queue {
+                        self.pending.push(rest).await;
+                    }
+                    return Err(e);
+                }
+            };
             admitted += ids.len();
             if let Some(tx) = &self.event_tx {
                 let _ = tx.send(Event::TaskRunProgress {
@@ -8723,6 +8783,21 @@ pub struct RunStatus {
 
 /// What a long-horizon run works on: the goal, the plan it drains, the runner
 /// that executes each step, the run's bounds, and the directory it runs in.
+/// Whether a run segment that ended with `stop` is a provider incident the
+/// run heals and resumes. A refused key or account does not heal by resuming:
+/// the card asks the human instead (`CardAfterRun::AskHuman`). Nor does a rate
+/// limit on a card run (`card_run`): the card waits out the provider's
+/// cooldown, and resuming 15 s later hit the same limit — up to
+/// `RUN_RESUMES_MAX` times. Pure.
+fn resumes_after(stop: &StopReason, card_run: bool) -> bool {
+    matches!(
+        stop,
+        StopReason::RunnerErrors { message }
+            if !is_terminal_provider_error(message)
+                && (!card_run || !is_rate_limited_error(message))
+    )
+}
+
 pub struct TaskRunSpec {
     pub goal: String,
     pub source: TursoTaskSource,
@@ -8931,12 +9006,7 @@ impl TaskRunManager {
                         interjector.as_deref().map(|i| i as &dyn Interjector),
                     )
                     .await;
-                // A refused key or account does not heal by resuming: the
-                // card asks the human instead (`CardAfterRun::AskHuman`).
-                let provider_died = matches!(
-                    &report.stop,
-                    StopReason::RunnerErrors { message } if !is_terminal_provider_error(message)
-                );
+                let provider_died = resumes_after(&report.stop, source.member_id.is_some());
                 segments.push(report);
                 if !provider_died
                     || resumes >= RUN_RESUMES_MAX
@@ -10603,6 +10673,10 @@ mod card_run_tests {
             "that member's run takes it"
         );
         assert!(
+            !tree.serves(1, Some("agent:other"), 1),
+            "a card reassigned away is no longer served to the old member's run"
+        );
+        assert!(
             tree.serves(1, None, 7),
             "a run with no member sees the whole subtree"
         );
@@ -11158,6 +11232,116 @@ mod card_run_tests {
             .is_none(),
             "and not after"
         );
+    }
+
+    /// A card reassigned while its run winds down is the new member's: the
+    /// old run's end neither hands it back (wiping the new assignee) nor
+    /// pauses it under the new member's name. It goes back to `pending`.
+    #[tokio::test]
+    async fn a_card_reassigned_mid_run_is_left_to_its_new_member() {
+        use nanna_agent::harness::StopReason;
+        for stop in [
+            StopReason::WallClockExhausted,
+            StopReason::Cancelled,
+            StopReason::RunnerErrors { message: "connection reset".to_string() },
+        ] {
+            let storage = builder_storage().await;
+            storage
+                .members()
+                .create(NewMember {
+                    id: "agent:other".to_string(),
+                    name: "Other".to_string(),
+                    avatar: None,
+                    kind: MemberKind::Agent,
+                    owner_kind: MemberOwner::Workspace,
+                    owner_id: None,
+                    status: MemberStatus::Idle,
+                    profile: json!({}),
+                })
+                .await
+                .expect("member");
+            let tasks = storage.tasks();
+            let id = card(&storage, "changes hands", None, 3).await;
+            let source = card_source(&storage, id);
+            source.start(id).await.expect("picked up");
+            tasks
+                .update(
+                    id,
+                    nanna_storage::TaskPatch {
+                        assignee: Some(Some("agent:other".to_string())),
+                        ..nanna_storage::TaskPatch::default()
+                    },
+                    Some("gui"),
+                )
+                .await
+                .expect("reassigned");
+            source.settle_after_run(&stop).await;
+
+            let card = tasks.get(id).await.expect("card");
+            assert_eq!(card.assignee.as_deref(), Some("agent:other"), "{stop:?}: kept");
+            assert_eq!(card.status, "pending", "{stop:?}: free for its new member");
+            let activity = tasks.activity(id, 32).await.expect("activity");
+            assert!(
+                !activity.iter().any(|a| a.action == super::HANDED_BACK_ACTION),
+                "{stop:?}: not a hand-back"
+            );
+        }
+    }
+
+    /// A rate limit met on a SUB-card is the provider's, not the sub-card's:
+    /// the run's own card waits it out and the sub-card stays open. It used to
+    /// be cancelled, and each sibling after it in turn.
+    #[tokio::test]
+    async fn a_rate_limit_on_a_sub_card_waits_on_the_card_and_cancels_nothing() {
+        let storage = builder_storage().await;
+        let tasks = storage.tasks();
+        let parent = card(&storage, "the card", None, 3).await;
+        let child = tasks
+            .create(NewTask {
+                title: "a sub-card".to_string(),
+                scope: "global".to_string(),
+                parent_id: Some(parent),
+                priority: 3,
+                assignee: Some(AGENT.to_string()),
+                ..NewTask::default()
+            })
+            .await
+            .expect("child")
+            .id;
+        let source = card_source(&storage, parent);
+        source.start(parent).await.expect("picked up");
+        source
+            .abandon(child, "Rate limit exceeded: retry-after: 90")
+            .await
+            .expect("abandoned");
+
+        let sub_card = tasks.get(child).await.expect("child");
+        assert_ne!(sub_card.status, "cancelled", "a provider limit closes nothing");
+        let waiting = tasks.get(parent).await.expect("card");
+        assert_eq!(waiting.assignee.as_deref(), Some(AGENT), "kept by its member");
+        let activity = tasks.activity(parent, 32).await.expect("activity");
+        assert!(
+            crate::card_run_trigger::cooling_down_until(&activity, chrono::Utc::now()).is_some(),
+            "the card waits the limit out"
+        );
+    }
+
+    #[test]
+    fn a_rate_limited_card_run_is_not_resumed_as_a_crash() {
+        use nanna_agent::harness::StopReason;
+        let limited = StopReason::RunnerErrors {
+            message: "Rate limit exceeded: retry-after: 90".to_string(),
+        };
+        let crashed = StopReason::RunnerErrors {
+            message: "connection reset by peer".to_string(),
+        };
+        assert!(!super::resumes_after(&limited, true), "the card waits instead");
+        assert!(super::resumes_after(&limited, false), "a chat run still resumes");
+        assert!(super::resumes_after(&crashed, true));
+        let refused = StopReason::RunnerErrors {
+            message: "API error: 401 - invalid x-api-key".to_string(),
+        };
+        assert!(!super::resumes_after(&refused, false));
     }
 
     /// The worker's loop guard: a card whose whole subtree waits on a card

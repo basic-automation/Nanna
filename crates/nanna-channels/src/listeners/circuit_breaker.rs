@@ -1,8 +1,8 @@
 //! Circuit breaker for channel listeners.
 //!
 //! Tracks consecutive connection and authentication failures, provides
-//! exponential backoff, and stops the listener when the failure threshold
-//! is exceeded.  Reports state transitions via the optional [`StatusManager`].
+//! exponential backoff, and stops the listener when authentication keeps
+//! failing (a connection failure only ever backs off).  Reports state transitions via the optional [`StatusManager`].
 
 use crate::status::{ConnectionState, StatusManager};
 use std::sync::Arc;
@@ -144,19 +144,27 @@ impl CircuitBreaker {
 
     /// Record a transient connection failure (network error, timeout, etc.).
     ///
-    /// Returns [`BreakerAction::Stop`] when the threshold is reached.
+    /// Always [`BreakerAction::Retry`]: past the threshold the channel is
+    /// reported `Unavailable` and keeps retrying at the backoff cap. It used
+    /// to stop — after about eight minutes of backoff (2 + 4 + … + 120 s) —
+    /// and nothing could restart a stopped listener (no restart action, no
+    /// "reconnect" on the Channels page its message pointed to), so a laptop
+    /// that lost Wi-Fi for ten minutes left its channels deaf until the
+    /// daemon restarted. A network that comes back is the common case;
+    /// only a refused credential, which retrying cannot fix, stops.
     pub async fn record_conn_failure(&mut self, detail: &str) -> BreakerAction {
-        self.conn_failures += 1;
+        self.conn_failures = self.conn_failures.saturating_add(1);
 
         if self.conn_failures >= self.max_conn_failures {
             let msg = format!(
-                "Connection failed after {} consecutive attempts: {}. \
-                 Check network / service availability and reconnect from the Channels page.",
-                self.conn_failures, detail
+                "Connection failed {} times in a row: {}. Still retrying every {} s; \
+                 check network / service availability.",
+                self.conn_failures,
+                detail,
+                self.backoff_duration().as_secs()
             );
             error!(provider = %self.provider, "{}", msg);
             self.report(ConnectionState::Unavailable, Some(msg)).await;
-            BreakerAction::Stop
         } else {
             warn!(
                 provider = %self.provider,
@@ -173,8 +181,8 @@ impl CircuitBreaker {
                 )),
             )
             .await;
-            BreakerAction::Retry
         }
+        BreakerAction::Retry
     }
 
     // ── Backoff ─────────────────────────────────────────────────────────
@@ -253,11 +261,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_conn_failure_trips_after_threshold() {
+    async fn test_conn_failures_never_stop_the_listener() {
         let mut cb = CircuitBreaker::new("test").with_max_conn_failures(3);
-        assert_eq!(cb.record_conn_failure("timeout").await, BreakerAction::Retry);
-        assert_eq!(cb.record_conn_failure("timeout").await, BreakerAction::Retry);
-        assert_eq!(cb.record_conn_failure("timeout").await, BreakerAction::Stop);
+        for _ in 0..50 {
+            assert_eq!(cb.record_conn_failure("timeout").await, BreakerAction::Retry);
+        }
+        assert_eq!(
+            cb.backoff_duration(),
+            Duration::from_secs(DEFAULT_MAX_BACKOFF_SECS),
+            "retries settle at the cap"
+        );
     }
 
     #[tokio::test]

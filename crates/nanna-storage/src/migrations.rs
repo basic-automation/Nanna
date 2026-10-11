@@ -23,6 +23,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("019_task_thread", MIGRATION_019),
     ("020_task_time_announcements", MIGRATION_020),
     ("021_task_activity_assignee", MIGRATION_021),
+    ("022_tool_stats_short_circuits", MIGRATION_022),
 ];
 
 const MIGRATION_001: &str = r"
@@ -678,6 +679,14 @@ const MIGRATION_020: &str = r"
 ALTER TABLE tasks ADD COLUMN due_announced_at TEXT;
 
 ALTER TABLE tasks ADD COLUMN overdue_announced_at TEXT;
+";
+
+const MIGRATION_022: &str = r"
+-- The tracker counts the calls the harness answered with a breaker replay
+-- instead of running (`short_circuit_count`), and they are part of
+-- `call_count`. The table had nowhere to keep them, so after every restart
+-- `call_count` exceeded success + failure + short-circuit.
+ALTER TABLE tool_stats ADD COLUMN short_circuit_count INTEGER NOT NULL DEFAULT 0;
 ";
 
 const MIGRATION_021: &str = r"

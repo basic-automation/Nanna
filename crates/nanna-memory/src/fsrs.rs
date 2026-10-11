@@ -278,8 +278,21 @@ impl FsrsState {
     /// 
     /// Every retrieval strengthens the memory
     pub fn record_access(&mut self, params: &FsrsParameters, rating: Rating) {
+        self.record_access_at(params, rating, now());
+    }
+
+    /// [`Self::record_access`] for a review that happened at `at` (unix
+    /// seconds). The dream applies queued recalls, possibly days after they
+    /// happened: measured from the dream, a recall two days earlier got two
+    /// days' extra stability boost, its decay clock restarted at the dream,
+    /// and K queued recalls became one review plus K−1 near no-ops. The clock
+    /// never moves backwards: a review older than the last access is measured
+    /// as immediate and leaves `last_access` where it is.
+    pub fn record_access_at(&mut self, params: &FsrsParameters, rating: Rating, at: i64) {
         // Update stability based on current state and rating
-        let r = self.retrievability(params);
+        let elapsed_days = (at - self.last_access).max(0).lossy_f32() / 86400.0;
+        let r = power_law_retrievability(elapsed_days, self.stability, params.w20);
+        debug_assert!(r.is_finite(), "retrievability is finite");
         
         // Stability increase formula from FSRS
         let stability_modifier = match rating {
@@ -304,7 +317,7 @@ impl FsrsState {
         self.storage_strength = (self.storage_strength + 0.1).min(1.0);
         
         // Update access tracking
-        self.last_access = now();
+        self.last_access = self.last_access.max(at);
         self.access_count += 1;
     }
 
@@ -383,10 +396,54 @@ impl IngestAction {
 }
 
 /// Get current Unix timestamp
+/// The current time in unix seconds — the clock `last_access` is kept in.
+pub fn unix_now() -> i64 {
+    now()
+}
+
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+#[cfg(test)]
+mod review_time_tests {
+    use super::{FsrsParameters, FsrsState, Rating, now};
+
+    /// A recall queued two days before the dream is measured at the recall:
+    /// the same stability gain as had it been applied then, and the decay
+    /// clock starts from the recall, not the dream.
+    #[test]
+    fn a_queued_recall_is_dated_by_the_recall_not_the_dream() {
+        let params = FsrsParameters::default();
+        let recalled_at = now() - 2 * 86_400;
+        let base = FsrsState {
+            last_access: recalled_at - 86_400,
+            ..FsrsState::default()
+        };
+
+        let mut on_time = base.clone();
+        on_time.record_access_at(&params, Rating::Good, recalled_at);
+        let mut late = base.clone();
+        late.record_access(&params, Rating::Good);
+
+        assert_eq!(on_time.last_access, recalled_at, "the clock starts at the recall");
+        assert!(late.last_access > recalled_at);
+        assert!(
+            late.stability > on_time.stability,
+            "measured at the dream, the boost was inflated: {} vs {}",
+            late.stability,
+            on_time.stability
+        );
+
+        // A review older than the last access never moves the clock back.
+        let mut newer = base;
+        newer.last_access = now();
+        let kept = newer.last_access;
+        newer.record_access_at(&params, Rating::Good, recalled_at);
+        assert_eq!(newer.last_access, kept);
+    }
 }
 
 #[cfg(test)]
