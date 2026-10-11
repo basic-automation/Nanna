@@ -11047,6 +11047,24 @@ keep the phases readable; promote individual items into a phase when they become
 - [ ] The router's `gpt-` prefix rule runs before the `:tag` (Ollama) rule, so a bare `gpt-oss:20b`
       goes to OpenAI (`llm_router.rs:74`). Check `:` first.
 
+### Storage rows written under the wrong key (found 2026-10-11, audit of the storage layer)
+
+- [x] **Reopening a workspace whose path was missing at boot orphaned its data.** The boot skips it
+      but keeps its row; `Open` minted a fresh id, the upsert (`ON CONFLICT(id)`) hit the UNIQUE
+      `path` and failed — logged only, Open still said "opened" — sessions and tasks were scoped to
+      the new id, and the next restart brought the old row back. Open now reuses the stored id.
+      Test `reopening_a_stored_workspace_keeps_its_id`.
+- [x] The hourly tool-stats window returned one bucket too many (`now − hours`, rounded down). Test
+      `the_last_n_hours_are_n_buckets`.
+- [ ] **Tool stats lose `last_called` and `short_circuit_count` on every restart.** The save reads
+      `last_called_epoch_ms`, which the tracker never writes, and the table has no
+      `short_circuit_count` column — after a restart `call_count` exceeds success + failure +
+      short-circuit. Read `last_called`, add the column (migration), and add a
+      `export_json → save → load → import_json` round-trip test (`lib.rs` ~1214/1283).
+- [ ] The daemon loads every session and all of its messages at boot, unbounded and under the
+      sessions write lock (`list_daemon_sessions` / `load_daemon_messages`); boot time and memory
+      grow with all history ever written. Load rows only; fetch messages lazily.
+
 ### Dependency bumps held back (found 2026-10-11, dependency-freshness pass)
 
 - [ ] **`rten 0.26 → 0.27` waits for an `ocrs` release.** `ocrs 0.13.1` (latest) takes

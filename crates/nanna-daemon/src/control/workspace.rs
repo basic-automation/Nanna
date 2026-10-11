@@ -27,6 +27,22 @@ impl ControlPlane {
         }
     }
 
+    /// The id a stored workspace row gives `path`, if one does.
+    async fn stored_workspace_id(&self, path: &std::path::Path) -> Option<String> {
+        let storage = self.storage.as_ref()?;
+        let wanted = path.display().to_string();
+        match storage.workspaces().list().await {
+            Ok(records) => records
+                .into_iter()
+                .find(|record| record.path == wanted)
+                .map(|record| record.id),
+            Err(e) => {
+                warn!("Could not read stored workspaces: {e}");
+                None
+            }
+        }
+    }
+
     /// Tell every connected client the known-workspace set changed.
     ///
     /// Registration is global state; activation is not, so this deliberately
@@ -172,6 +188,14 @@ impl ControlPlane {
 
         // Create and register workspace
         let mut ws = Workspace::new(&path);
+        if let Some(stored) = self.stored_workspace_id(&path).await {
+            // A workspace whose path was missing at boot (an unmounted drive)
+            // is skipped but keeps its row. Reopened under a fresh id, its save
+            // hit the UNIQUE path and failed (logged only), the sessions and
+            // tasks made next were scoped to an id no row names, and the next
+            // restart brought the old id back — orphaning all of them.
+            ws.id = stored;
+        }
         if let Err(e) = ws.load_context().await {
             warn!("Failed to load workspace context: {}", e);
         }

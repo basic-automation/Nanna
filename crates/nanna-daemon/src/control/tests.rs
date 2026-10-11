@@ -3312,3 +3312,40 @@ async fn a_setting_the_environment_overrides_is_refused_and_never_saved() {
     assert!(!saved.contains("8123"), "{saved}");
     assert!(saved.contains("name = \"Edited\""), "{saved}");
 }
+
+/// A workspace whose path was missing at boot keeps its stored row; opened
+/// again, it gets that row's id back. A fresh id failed the save on the
+/// UNIQUE path and orphaned everything scoped to it at the next restart.
+#[tokio::test]
+async fn reopening_a_stored_workspace_keeps_its_id() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    storage
+        .workspaces()
+        .upsert(&nanna_storage::WorkspaceRecord {
+            id: "ws-from-before".to_string(),
+            name: "proj".to_string(),
+            path: dir.path().display().to_string(),
+            active: false,
+            created_at: String::new(),
+            last_accessed: String::new(),
+        })
+        .await
+        .expect("stored");
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(Arc::clone(&storage));
+    let cp = Arc::new(cp);
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Workspace(WorkspaceAction::Open {
+                path: dir.path().display().to_string(),
+            }),
+        )
+        .await;
+    assert_eq!(resp["status"], "opened", "{resp}");
+    assert_eq!(resp["id"], "ws-from-before", "{resp}");
+    let rows = storage.workspaces().list().await.expect("list");
+    assert_eq!(rows.len(), 1, "no second row for the same path: {rows:?}");
+}
