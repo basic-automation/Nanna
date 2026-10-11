@@ -1475,6 +1475,9 @@ impl VectorStore {
             .filter(|tag| !tag.is_empty())
             .collect::<Vec<_>>()
             .join(",");
+        // The save below writes a whole snapshot: under `persist_serial`, so it
+        // cannot re-insert a row a matched removal just deleted.
+        let _serial = self.persist_serial.lock().await;
         let mut entries = self.entries.write().await;
         let entry = entries
             .iter_mut()
@@ -1500,6 +1503,9 @@ impl VectorStore {
     ///
     /// Returns `MemoryError::NotFound` if no entry with the given ID exists.
     pub async fn update_content(&self, id: &str, content: &str) -> Result<(), MemoryError> {
+        // Every content change is serialised with the matched removals, which
+        // decide what to delete from the content they see.
+        let serial = self.persist_serial.lock().await;
         let mut entries = self.entries.write().await;
         let entry = entries
             .iter_mut()
@@ -1536,6 +1542,7 @@ impl VectorStore {
         // single-chunk seed here: this path changes content without touching
         // the embedding, so that vector still describes the OLD text and
         // seeding it would assert a chunk had been embedded when it had not.
+        drop(serial);
         self.write_chunks(id, content, workspace_id.as_deref(), None).await;
 
         Ok(())
@@ -1717,50 +1724,68 @@ impl VectorStore {
         }
         let expected: std::collections::HashMap<&str, &str> = pairs.iter().copied().collect();
 
-        // Decide and remove inside ONE write-lock critical section, so no
-        // write can land between the content check and the removal.
-        let mut entries = self.entries.write().await;
-        let before = entries.len();
-        let mut removed_ids: Vec<String> = Vec::with_capacity(pairs.len());
-        entries.retain(|e| {
-            let matches = expected
-                .get(e.id.as_str())
-                .is_some_and(|want| e.content == **want);
-            if matches {
-                removed_ids.push(e.id.clone());
-            }
-            !matches
-        });
-        let removed = before - entries.len();
-        drop(entries);
-
-        debug_assert_eq!(removed, removed_ids.len(), "one id per removed entry");
-        debug_assert!(removed <= pairs.len(), "cannot remove more than requested");
-
-        if removed < pairs.len() {
+        // Under `persist_serial`, like every other write: a backfill or rewrite
+        // between snapshot and save could otherwise re-insert a row deleted
+        // here, and the source came back on the next restart beside the
+        // memory that absorbed it. Content changes take this lock too, so the
+        // match decided here still holds when the rows go.
+        let serial = self.persist_serial.lock().await;
+        let matching: Vec<String> = self
+            .entries
+            .read()
+            .await
+            .iter()
+            .filter(|e| expected.get(e.id.as_str()).is_some_and(|want| e.content == **want))
+            .map(|e| e.id.clone())
+            .collect();
+        if matching.len() < pairs.len() {
             debug!(
                 requested = pairs.len(),
-                removed,
+                matching = matching.len(),
                 "matched removal skipped concurrently-rewritten entries; they \
                  stay live for the next cycle"
             );
         }
+        // Only what the disk confirmed gone leaves RAM: a failed delete used
+        // to be logged and ignored after the entry had already left RAM, so
+        // the row came back on restart.
+        let confirmed = self.delete_confirmed(&matching).await;
+        let gone: std::collections::HashSet<&str> = confirmed.iter().map(String::as_str).collect();
+        let mut entries = self.entries.write().await;
+        let before = entries.len();
+        entries.retain(|e| !gone.contains(e.id.as_str()));
+        let removed = before - entries.len();
+        drop(entries);
+        drop(serial);
 
-        // Write-through: one batched persistence call for the whole set.
-        if let Some(ref db) = self.db
-            && !removed_ids.is_empty() {
-                let id_refs: Vec<&str> = removed_ids.iter().map(String::as_str).collect();
-                if let Err(e) = db.remove_entries(&id_refs).await {
-                    warn!(
-                        "Failed to batch-remove {} memory entries from persistence: {}",
-                        id_refs.len(),
-                        e
-                    );
-                    // Non-fatal
-                }
-            }
-
+        debug_assert!(removed <= matching.len(), "cannot remove more than matched");
+        debug_assert!(removed <= pairs.len(), "cannot remove more than requested");
         removed
+    }
+
+    /// Delete `ids` from persistence — one batch, then one by one if the
+    /// batch fails — and return the ids now gone from disk (all of them with
+    /// no backend). Called with `persist_serial` held.
+    async fn delete_confirmed(&self, ids: &[String]) -> Vec<String> {
+        let Some(ref db) = self.db else {
+            return ids.to_vec();
+        };
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        if db.remove_entries(&refs).await.is_ok() {
+            return ids.to_vec();
+        }
+        let mut confirmed = Vec::with_capacity(ids.len());
+        for id in ids {
+            match db.remove_entry(id).await {
+                Ok(()) => confirmed.push(id.clone()),
+                Err(e) => warn!("Memory {id} could not be removed from persistence; kept: {e}"),
+            }
+        }
+        debug_assert!(confirmed.len() <= ids.len());
+        confirmed
     }
 
     /// Get all entries (for consolidation)
@@ -1881,6 +1906,9 @@ impl VectorStore {
             MemoryError::Persistence("No persistence backend attached".to_string())
         })?;
 
+        // Serialised with removals: a flush between a matched removal's disk
+        // delete and its RAM removal would put the row back.
+        let _serial = self.persist_serial.lock().await;
         let entries = self.entries.read().await;
         let total = entries.len();
         let mut saved = 0usize;
@@ -3783,5 +3811,26 @@ mod tests {
 
         // Negative space: an empty batch is a no-op.
         assert_eq!(store.remove_many_matching(&[]).await, 0);
+    }
+
+    /// A matched removal the disk refused keeps the entry: it used to leave
+    /// RAM regardless, and the row the disk still held came back on restart
+    /// beside the memory that absorbed it.
+    #[tokio::test]
+    async fn a_matched_removal_the_disk_refused_keeps_the_entry() {
+        let config = VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        };
+        let store = VectorStore::new(config).with_persistence(Arc::new(RefusingDb { refuse: "kept" }));
+        store.add(entry_dim8("kept")).await.expect("saved");
+        store.add(entry_dim8("gone")).await.expect("saved");
+        let removed = store
+            .remove_many_matching(&[("kept", "content kept"), ("gone", "content gone")])
+            .await;
+        assert_eq!(removed, 1, "only the row the disk let go");
+        assert!(store.get("kept").await.is_some(), "the refused row stays in RAM too");
+        assert!(store.get("gone").await.is_none());
     }
 }

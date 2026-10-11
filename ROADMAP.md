@@ -10944,10 +10944,13 @@ keep the phases readable; promote individual items into a phase when they become
       (`service.rs`, ~2324) covers only the Detailed band (weight 0.8–1.0); a fact feedback lifted
       past 1.0 is clustered, rewritten and its original removed, while the same fact at 0.9 is
       protected. Apply the split to Expand too.
-- [ ] `remove_many_matching` (`lib.rs`) does not take `persist_serial`, and ignores a failed disk
+- [x] `remove_many_matching` (`lib.rs`) does not take `persist_serial`, and ignores a failed disk
       delete after removing in RAM — a concurrent backfill `save_entry` can re-insert a removed
       source, which returns on restart beside the memory that absorbed it. Take the lock; remove
       in RAM only what the disk confirmed (as `remove_many_durable` does).
+      *(2026-10-11)* Done, and the three writers that saved or rewrote without the lock now take
+      it too (`set_tags` — an upsert that could re-insert the row — `update_content` and
+      `flush_to_db`). Test `a_matched_removal_the_disk_refused_keeps_the_entry`.
 - [ ] **The testing effect uses the dream's clock, not the recall's.** Queued reviews are
       `(id, Rating)`; `record_access` measures elapsed time and sets `last_access` from `now()` at
       the dream, so a recall two days before the dream gets two days' extra boost and K queued
