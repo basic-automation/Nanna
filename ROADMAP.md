@@ -11037,7 +11037,9 @@ keep the phases readable; promote individual items into a phase when they become
       compressed — and that retry ignores `retry_after`.)
       *(2026-10-11)* `call_llm` retries only when nothing was streamed in the attempt, and
       `is_rate_limit_message` requires a standalone `429` (test `a_429_must_stand_alone`).
-      **Still open:** that retry's 5/10/20 s ladder ignores the provider's `retry_after`.
+      *(same day)* The ladder now waits the provider's named `retry-after` when longer (capped at
+      60 s; past that the step ladder / card cooldown take it). Test
+      `a_named_retry_after_is_waited_out`.
 - [x] The crash watcher (`TurnWatcher::watch`) skips `demote_in_progress` and
       `run_workspace::release`: a panicked turn's item stays `in_progress` (and is resumed first).
       *(2026-10-11)* Both added, and the baseline is closed under the turn's own scope (it was

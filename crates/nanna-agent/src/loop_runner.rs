@@ -116,6 +116,25 @@ fn is_rate_limit_message(message: &str) -> bool {
     })
 }
 
+/// Longest a provider-named `retry-after` is waited out inside one call;
+/// past it the error goes to the step ladder (and a card run to its own
+/// cooldown) rather than holding the call for minutes.
+const RETRY_AFTER_WAIT_SECS_MAX: u64 = 60;
+
+/// How long attempt `attempt` (1-based) of the in-call rate-limit retry
+/// waits: the 5/10/20 s ladder, or the provider's own `retry-after` when it
+/// names a longer one (capped at [`RETRY_AFTER_WAIT_SECS_MAX`]). The ladder
+/// alone retried a provider that had said "30 s" at 5 and 10 s — two
+/// requests it had already refused. Pure apart from the clock
+/// `parse_retry_after` reads for an absolute reset.
+fn rate_limit_wait_secs(attempt: u32, message: &str) -> u64 {
+    debug_assert!(attempt >= 1, "attempts count from one");
+    let ladder = 5u64 << attempt.saturating_sub(1).min(8);
+    let named = nanna_llm::LlmError::parse_retry_after(message)
+        .map_or(0, |secs| secs.min(RETRY_AFTER_WAIT_SECS_MAX));
+    ladder.max(named)
+}
+
 fn provider_unknown_tool_name(message: &str) -> Option<&str> {
     let (_, rest) = message.split_once("tool '")?;
     let (name, tail) = rest.split_once('\'')?;
@@ -7055,10 +7074,10 @@ impl Agent {
                     // and persist both. Those go to the step ladder, which
                     // retries with a fresh context.
                     let emitted = state.streamed_text.len() > streamed_before;
-                    if is_rate_limit_message(&e.to_string()) && !emitted {
+                    let message = e.to_string();
+                    if is_rate_limit_message(&message) && !emitted {
                         attempt += 1;
-                        // Exponential backoff: 5s, 10s, 20s
-                        let wait_secs = 5u64 * (1u64 << (attempt - 1));
+                        let wait_secs = rate_limit_wait_secs(attempt, &message);
                         warn!(
                             model = %request.model,
                             attempt = attempt,
@@ -10584,6 +10603,20 @@ fn parse_exit_code_prefix(text: &str) -> Option<i64> {
 #[cfg(test)]
 mod rate_limit_message_tests {
     use super::is_rate_limit_message;
+
+    #[test]
+    fn a_named_retry_after_is_waited_out() {
+        use super::{RETRY_AFTER_WAIT_SECS_MAX, rate_limit_wait_secs};
+        assert_eq!(rate_limit_wait_secs(1, "API error: 429"), 5);
+        assert_eq!(rate_limit_wait_secs(3, "API error: 429"), 20);
+        assert_eq!(rate_limit_wait_secs(1, "Rate limit exceeded: retry-after: 30"), 30);
+        assert_eq!(
+            rate_limit_wait_secs(1, "Rate limit exceeded: retry-after: 900"),
+            RETRY_AFTER_WAIT_SECS_MAX,
+            "a long wait is capped; the card's own cooldown takes it from there"
+        );
+        assert_eq!(rate_limit_wait_secs(3, "retry-after: 2"), 20, "never below the ladder");
+    }
 
     #[test]
     fn a_429_must_stand_alone() {
