@@ -1539,16 +1539,15 @@ mod tests {
 
     /// The Anthropic default is not the only place a hand-edited entry lands
     /// by accident. A name in another vendor's namespace (`meta-llama/…`) is
-    /// no provider prefix, so Anthropic is asked for it, slash and all; and a
-    /// tagged Ollama model whose name starts `gpt-` (`gpt-oss:20b`) is claimed
-    /// by the router's `OpenAI` family rule before its tag can mark it as
-    /// Ollama's. The old summarizers sent every one of these to Ollama.
+    /// no provider prefix, so Anthropic is asked for it, slash and all. (A
+    /// tagged `gpt-oss:20b` was flagged here too while the router's `OpenAI`
+    /// family rule claimed it before its tag; since 2026-10-11 the tag is read
+    /// first and it goes to Ollama, so it is no longer misplaced.)
     #[test]
     fn other_hand_edits_the_router_misplaces_are_flagged_too() {
         for (entry, destination) in [
             ("meta-llama/llama-3", "Anthropic"),
             ("claude-proxy/claude-3", "Anthropic"),
-            ("gpt-oss:20b", "OpenAI"),
         ] {
             let mut config = cfg();
             config.llm.summarization_priority = vec![entry.to_string()];
@@ -1787,9 +1786,9 @@ mod tests {
     /// Every model is expected on the Ollama server exactly when the code
     /// that serves it sends it there: chat models by the chat router's rule,
     /// embedding models by the embedding router's. The probe used one looser
-    /// rule of its own for both, so it expected `gpt-oss:20b` there though
-    /// chat sends it to `OpenAI`, and skipped a namespaced tagged chat model and
-    /// a bare embedding name that both go to Ollama.
+    /// rule of its own for both, and skipped a namespaced tagged chat model and
+    /// a bare embedding name that both go to Ollama. A tagged `gpt-oss:20b`
+    /// goes there too (the router reads the tag before the `gpt-` family rule).
     #[test]
     fn each_model_is_probed_where_its_router_sends_it() {
         let mut config = probe_config();
@@ -1805,7 +1804,7 @@ mod tests {
         let server = ollama_server_in_use(&config).expect("models are configured on Ollama");
         assert_eq!(
             server.models,
-            vec!["hf.co/org/model:q4_k_m", "mxbai-embed-large:latest"]
+            vec!["gpt-oss:20b", "hf.co/org/model:q4_k_m", "mxbai-embed-large:latest"]
         );
 
         // The chat model itself goes where the router sends it too, whatever
