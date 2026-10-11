@@ -30,13 +30,19 @@ that had been cut off half-way, or leave a chat channel deaf until Nanna restart
   one.
 - Sub-agents now really use the models you configured for them; every attempt used to run on your
   main chat model.
-- A paused chat waiting for a provider to come back no longer hammers a provider that is down.
+- A reply interrupted by an overloaded provider is no longer shown twice.
+- A "prompt is too long" error is no longer mistaken for a rate limit and waited out.
+- When a provider says how long to wait after a rate limit, Nanna waits that long.
+- A chat whose run crashed no longer resumes the crashed work instead of answering you.
+- A paused chat waiting for a provider to come back no longer hammers a provider that is down,
+  and resumes cleanly when it does.
 - Provider checks now ask the model the run actually fell back to.
 - A reply that stopped before the provider said it was done is reported as cut off, not complete.
 - A rate limit returned by OpenRouter with a success status is recognised as a rate limit.
 - A model that writes long runs of digits (such as a null hash) is no longer stopped as stuck.
 - `gpt-oss:20b` and other tagged names go to Ollama, not OpenAI.
-- Tool calls from servers that omit an index are no longer dropped.
+- Tool calls from servers that omit an index, or send several calls at one index, are no longer
+  dropped.
 
 ## Chat channels
 
@@ -47,12 +53,16 @@ that had been cut off half-way, or leave a chat channel deaf until Nanna restart
 - A Slack connection that silently died is noticed and reconnected.
 - Slack no longer answers its own replies, join messages and edits, or answers one @-mention twice.
 - Telegram reactions with custom or paid emoji no longer block later updates (`nanna serve`).
+- **`nanna serve` now answers only the Telegram chats in `allowed_users`**, as the app already did.
 
 ## The board
 
 - A card deferred to a time of day now starts that day; it used to never start.
 - Cancelling or deleting a sub-card wakes the card that was waiting on it.
 - A rate limit while working on a sub-card no longer cancels the sub-cards; the card waits it out.
+- **Reassigning a card while an agent works on it** no longer lets the old agent hand it back or
+  freeze it; the new agent picks it up.
+- Deleting an agent can no longer race a card it is just starting.
 
 ## MCP servers and the browser
 
@@ -74,5 +84,5 @@ that had been cut off half-way, or leave a chat channel deaf until Nanna restart
 
 ## Still open
 
-Recorded in the roadmap: Discord and Slack have no sender allowlist yet, a card reassigned while
-running can lose its new assignee, and a few smaller provider and storage issues.
+Recorded in the roadmap: Discord and Slack have no sender allowlist yet, Signal has no sender list,
+and a few smaller provider and storage issues.
