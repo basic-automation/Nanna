@@ -1210,18 +1210,27 @@ impl Storage {
                 let success_count = tool_data.get("success_count").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let failure_count = tool_data.get("failure_count").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let total_duration_ms = tool_data.get("total_duration_ms").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                let last_called_epoch_ms = tool_data.get("last_called_epoch_ms").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                // The tracker writes `last_called`; this read only
+                // `last_called_epoch_ms`, which nothing writes, so every save
+                // stored 0 and every restart forgot when a tool last ran.
+                let last_called_epoch_ms = tool_data
+                    .get("last_called")
+                    .or_else(|| tool_data.get("last_called_epoch_ms"))
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                let short_circuit_count = tool_data.get("short_circuit_count").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let latencies = tool_data.get("latencies_ms").map_or_else(|| "[]".to_string(), std::string::ToString::to_string);
                 let output_sizes = tool_data.get("output_sizes").map_or_else(|| "[]".to_string(), std::string::ToString::to_string);
                 let errors = tool_data.get("errors").map_or_else(|| "[]".to_string(), std::string::ToString::to_string);
 
                 conn.execute(
-                    "INSERT INTO tool_stats (tool_name, call_count, success_count, failure_count, total_duration_ms, last_called_epoch_ms, latencies_ms_json, output_sizes_json, errors_json, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))
+                    "INSERT INTO tool_stats (tool_name, call_count, success_count, failure_count, total_duration_ms, last_called_epoch_ms, latencies_ms_json, output_sizes_json, errors_json, short_circuit_count, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))
                      ON CONFLICT(tool_name) DO UPDATE SET
                         call_count = ?2, success_count = ?3, failure_count = ?4,
                         total_duration_ms = ?5, last_called_epoch_ms = ?6,
                         latencies_ms_json = ?7, output_sizes_json = ?8, errors_json = ?9,
+                        short_circuit_count = ?10,
                         updated_at = datetime('now')",
                     turso::params![
                         tool_name.as_str(),
@@ -1232,7 +1241,8 @@ impl Storage {
                         last_called_epoch_ms,
                         latencies.as_str(),
                         output_sizes.as_str(),
-                        errors.as_str()
+                        errors.as_str(),
+                        short_circuit_count
                     ],
                 ).await?;
             }
@@ -1251,7 +1261,7 @@ impl Storage {
     pub async fn load_tool_stats_aggregated(&self) -> Result<serde_json::Value, StorageError> {
         let conn = self.conn.lock().await;
         let mut rows = conn.query(
-            "SELECT tool_name, call_count, success_count, failure_count, total_duration_ms, last_called_epoch_ms, latencies_ms_json, output_sizes_json, errors_json
+            "SELECT tool_name, call_count, success_count, failure_count, total_duration_ms, last_called_epoch_ms, latencies_ms_json, output_sizes_json, errors_json, short_circuit_count
              FROM tool_stats",
             (),
         ).await?;
@@ -1268,6 +1278,7 @@ impl Storage {
             let latencies_str: String = row.get(6)?;
             let output_sizes_str: String = row.get(7)?;
             let errors_str: String = row.get(8)?;
+            let short_circuit_count: i64 = row.get(9)?;
 
             let latencies: serde_json::Value = serde_json::from_str(&latencies_str).unwrap_or(serde_json::json!([]));
             let output_sizes: serde_json::Value = serde_json::from_str(&output_sizes_str).unwrap_or(serde_json::json!([]));
@@ -1279,7 +1290,9 @@ impl Storage {
                 "success_count": success_count,
                 "failure_count": failure_count,
                 "total_duration_ms": total_duration_ms,
-                "last_called_epoch_ms": last_called_epoch_ms,
+                "short_circuit_count": short_circuit_count,
+                // The tracker's own key; none when the tool never ran.
+                "last_called": (last_called_epoch_ms > 0).then_some(last_called_epoch_ms),
                 "latencies_ms": latencies,
                 "output_sizes": output_sizes,
                 "errors": errors,
@@ -1614,6 +1627,36 @@ pub struct ToolCallLogEntry {
     pub error_message: Option<String>,
     pub session_id: Option<String>,
     pub created_at: String,
+}
+
+#[cfg(test)]
+mod tool_stats_round_trip_tests {
+    use super::Storage;
+
+    /// What the tracker exports comes back from a save and a load: when a
+    /// tool last ran and how many calls were breaker replays. Both were lost
+    /// on every restart (a key nothing wrote; a column that did not exist).
+    #[tokio::test]
+    async fn the_trackers_export_survives_a_save_and_a_load() {
+        let storage = Storage::in_memory().await.expect("storage");
+        let exported = serde_json::json!({
+            "tools": {
+                "read_file": {
+                    "call_count": 5, "success_count": 1, "failure_count": 1,
+                    "short_circuit_count": 3, "total_duration_ms": 40,
+                    "last_called": 1_760_000_000_000_i64,
+                    "latencies_ms": [10], "output_sizes": [50], "errors": []
+                }
+            },
+            "sessions": 1
+        });
+        storage.save_tool_stats_aggregated(&exported).await.expect("save");
+        let loaded = storage.load_tool_stats_aggregated().await.expect("load");
+        let tool = &loaded["tools"]["read_file"];
+        assert_eq!(tool["last_called"], 1_760_000_000_000_i64, "{tool}");
+        assert_eq!(tool["short_circuit_count"], 3, "{tool}");
+        assert_eq!(tool["call_count"], 5);
+    }
 }
 
 #[cfg(test)]

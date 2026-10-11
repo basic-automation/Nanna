@@ -11059,11 +11059,14 @@ keep the phases readable; promote individual items into a phase when they become
       Test `reopening_a_stored_workspace_keeps_its_id`.
 - [x] The hourly tool-stats window returned one bucket too many (`now − hours`, rounded down). Test
       `the_last_n_hours_are_n_buckets`.
-- [ ] **Tool stats lose `last_called` and `short_circuit_count` on every restart.** The save reads
+- [x] **Tool stats lose `last_called` and `short_circuit_count` on every restart.** The save reads
       `last_called_epoch_ms`, which the tracker never writes, and the table has no
       `short_circuit_count` column — after a restart `call_count` exceeds success + failure +
       short-circuit. Read `last_called`, add the column (migration), and add a
       `export_json → save → load → import_json` round-trip test (`lib.rs` ~1214/1283).
+      *(2026-10-11)* Done: migration `022_tool_stats_short_circuits`; the save reads `last_called`
+      (still accepting the old key) and the load emits the tracker's own keys. Test
+      `the_trackers_export_survives_a_save_and_a_load`.
 - [ ] The daemon loads every session and all of its messages at boot, unbounded and under the
       sessions write lock (`list_daemon_sessions` / `load_daemon_messages`); boot time and memory
       grow with all history ever written. Load rows only; fetch messages lazily.
