@@ -112,6 +112,15 @@ pub struct TelegramResponse {
     parse_mode: Option<&'static str>,
 }
 
+/// Whether the webhook answers chat `chat_id`: every chat when the list is
+/// empty or absent, otherwise only a listed one. Pure.
+fn chat_allowed(chat_id: i64, allowed: Option<&[i64]>) -> bool {
+    match allowed {
+        None | Some([]) => true,
+        Some(allowed) => allowed.contains(&chat_id),
+    }
+}
+
 /// Handle incoming Telegram webhook
 ///
 /// Origin proof is the `secret_token` given to Telegram's `setWebhook`, which
@@ -161,6 +170,13 @@ pub async fn handle(
     }
 
     let chat_id = message.chat.id;
+    // The secret proves the POST came from Telegram, not who wrote it: any
+    // Telegram user who found the bot got a full agent turn, with tools,
+    // whatever `allowed_users` said. The daemon's rule, here too.
+    if !chat_allowed(chat_id, state.telegram_allowed_users.as_deref()) {
+        warn!("Telegram webhook: chat {chat_id} is not in allowed_users; not answered");
+        return Err(StatusCode::OK);
+    }
     let user_id = message.from.as_ref().map_or(0, |u| u.id);
     let username = message.from.as_ref().and_then(|u| u.username.clone());
     let session_id = format!("telegram:{chat_id}:{user_id}");
@@ -248,6 +264,15 @@ async fn handle_reaction(state: &AppState, reaction: &MessageReactionUpdate) {
 #[cfg(test)]
 mod reaction_tests {
     use super::ReactionType;
+
+    #[test]
+    fn the_webhook_answers_only_allowed_chats() {
+        use super::chat_allowed;
+        assert!(chat_allowed(42, Some(&[42])));
+        assert!(!chat_allowed(7, Some(&[42])), "a stranger is not answered");
+        assert!(chat_allowed(7, None), "no list admits every chat");
+        assert!(chat_allowed(7, Some(&[])));
+    }
 
     /// Every reaction kind Telegram sends parses, so one never fails its
     /// whole update.

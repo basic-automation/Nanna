@@ -212,6 +212,9 @@ pub struct AppState {
     /// Secret token given to Telegram's `setWebhook`, echoed on every POST as
     /// `X-Telegram-Bot-Api-Secret-Token`. The only origin proof that route has.
     pub telegram_webhook_secret: Option<String>,
+    /// The Telegram chats the webhook answers (`channels.telegram.allowed_users`);
+    /// empty or absent admits every chat — the daemon's rule.
+    pub telegram_allowed_users: Option<Vec<i64>>,
     /// Shared secret the signal-cli-rest-api bridge must present. That bridge
     /// does not sign its callbacks, so this is the strongest proof available.
     pub signal_webhook_secret: Option<String>,
@@ -241,6 +244,7 @@ pub struct AppStateBuilder {
     discord_public_key: Option<String>,
     slack_signing_secret: Option<String>,
     telegram_webhook_secret: Option<String>,
+    telegram_allowed_users: Option<Vec<i64>>,
     signal_webhook_secret: Option<String>,
     default_model: String,
     telegram_token: Option<String>,
@@ -269,6 +273,7 @@ impl AppStateBuilder {
             tools: None,
             webhook_secret: None,
             telegram_webhook_secret: None,
+            telegram_allowed_users: None,
             signal_webhook_secret: None,
             discord_public_key: None,
             slack_signing_secret: None,
@@ -352,6 +357,14 @@ impl AppStateBuilder {
     #[must_use]
     pub fn telegram_webhook_secret(mut self, secret: Option<String>) -> Self {
         self.telegram_webhook_secret = secret;
+        self
+    }
+
+    /// Set the Telegram chats the webhook answers. Empty or absent admits
+    /// every chat.
+    #[must_use]
+    pub fn telegram_allowed_users(mut self, allowed: Option<Vec<i64>>) -> Self {
+        self.telegram_allowed_users = allowed;
         self
     }
 
@@ -482,6 +495,7 @@ impl AppStateBuilder {
             agents: Arc::new(RwLock::new(HashMap::new())),
             webhook_secret: self.webhook_secret,
             telegram_webhook_secret: self.telegram_webhook_secret,
+            telegram_allowed_users: self.telegram_allowed_users,
             signal_webhook_secret: self.signal_webhook_secret,
             discord_public_key: self.discord_public_key,
             slack_signing_secret: self.slack_signing_secret,

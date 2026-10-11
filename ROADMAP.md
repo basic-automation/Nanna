@@ -10920,9 +10920,11 @@ keep the phases readable; promote individual items into a phase when they become
       public bot, or DMs it from a shared server, gets a full agent turn with tools. Needs config
       (`allowed_users` per channel) and a fail-closed rule for DMs: a product call, with channels
       going through P25 decision 18. Telegram also fails open when `allowed_users` is unset.
-- [ ] **`nanna serve`'s Telegram (and Signal) webhooks ignore `allowed_users`** — the hole the
+- [~] **`nanna serve`'s Telegram (and Signal) webhooks ignore `allowed_users`** — the hole the
       daemon closed with `webhook_chat_allowed` (`crates/nanna-server/src/webhooks/telegram.rs`,
       `src/commands/serve.rs` passes no allowlist). Pass it into `AppStateBuilder`.
+      *(2026-10-11)* Telegram done (`telegram_allowed_users`, the daemon's rule). Test
+      `the_webhook_answers_only_allowed_chats`. **Still open:** Signal has no sender list in config.
 
 ### Dreaming that could lose or double a memory (found 2026-10-11, audit of dreaming)
 

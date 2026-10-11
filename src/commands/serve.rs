@@ -171,6 +171,13 @@ pub async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Res
                 .as_ref()
                 .and_then(|t| t.webhook_secret.clone()),
         )
+        .telegram_allowed_users(
+            config
+                .channels
+                .telegram
+                .as_ref()
+                .and_then(|t| t.allowed_users.clone()),
+        )
         .signal_webhook_secret(
             config
                 .channels
