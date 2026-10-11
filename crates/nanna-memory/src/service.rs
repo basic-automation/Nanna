@@ -86,7 +86,10 @@ pub struct MemoryService {
     store: VectorStore,
     embed_fn: Option<EmbedFn>,
     /// Track memory IDs that need FSRS updates (for async batch updates)
-    pending_updates: RwLock<Vec<(String, Rating)>>,
+    /// Queued testing-effect reviews: the memory, the rating, and WHEN it
+    /// was recalled (unix seconds). Applied at the next dream, which may be
+    /// days later: the review is dated by the recall, not the dream.
+    pending_updates: RwLock<Vec<(String, Rating, i64)>>,
     /// Runtime-adjustable minimum score (overrides config)
     min_score_override: RwLock<Option<f32>>,
     /// Identity (`provider:model`) of the embedding model currently in use.
@@ -893,7 +896,7 @@ impl MemoryService {
                 // already holds this text verbatim may absorb it unwritten.
                 IngestAction::Reinforce if existing.content.trim().contains(content.trim()) => {
                     // Just strengthen existing memory
-                    self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
+                    self.pending_updates.write().await.push((existing.id.clone(), Rating::Good, crate::fsrs::unix_now()));
                     info!("Reinforced: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
                     return Ok((existing.id.clone(), action));
                 }
@@ -903,7 +906,7 @@ impl MemoryService {
                     self.pending_updates
                         .write()
                         .await
-                        .push((existing.id.clone(), Rating::Good));
+                        .push((existing.id.clone(), Rating::Good, crate::fsrs::unix_now()));
                 }
                 IngestAction::Update => {
                     // Related-but-distinct: fold new information into the existing
@@ -915,7 +918,7 @@ impl MemoryService {
                     self.pending_updates
                         .write()
                         .await
-                        .push((existing.id.clone(), Rating::Good));
+                        .push((existing.id.clone(), Rating::Good, crate::fsrs::unix_now()));
                     match folded {
                         FoldResult::Merged => {
                             info!(
@@ -1182,7 +1185,7 @@ impl MemoryService {
                     if !skip_reinforce && existing.content.trim().contains(content.trim()) =>
                 {
                     // Just strengthen existing memory (testing effect)
-                    self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
+                    self.pending_updates.write().await.push((existing.id.clone(), Rating::Good, crate::fsrs::unix_now()));
                     // Also boost importance if new fact has higher importance
                     let importance_normalized = (importance / 5.0).clamp(0.5, 1.5);
                     if let Err(e) = self.store.update_fsrs(&existing.id, |fsrs| {
@@ -1204,14 +1207,14 @@ impl MemoryService {
                     self.pending_updates
                         .write()
                         .await
-                        .push((existing.id.clone(), Rating::Good));
+                        .push((existing.id.clone(), Rating::Good, crate::fsrs::unix_now()));
                 }
                 IngestAction::Update if !skip_reinforce => {
                     // Related-but-distinct: fold new information in (dedup) and reinforce.
                     let folded = self
                         .fold_into_memory(embed_fn, &existing.id, &existing.content, content)
                         .await?;
-                    self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
+                    self.pending_updates.write().await.push((existing.id.clone(), Rating::Good, crate::fsrs::unix_now()));
                     // Same invariant as `remember_scoped`: an unabsorbed fold
                     // means the content landed nowhere, so it must still become
                     // a row. Only a provable superset may discard.
@@ -1393,12 +1396,12 @@ impl MemoryService {
             if addressable && matches!(action, IngestAction::Reinforce | IngestAction::Update) {
                 // Still a genuine hit: strengthen the neighbour. Just do not
                 // absorb the new record into it and orphan its handle.
-                self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
+                self.pending_updates.write().await.push((existing.id.clone(), Rating::Good, crate::fsrs::unix_now()));
             }
 
             if !addressable && matches!(action, IngestAction::Reinforce | IngestAction::Update) {
                 // The neighbour was a genuine hit either way: rate it.
-                self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
+                self.pending_updates.write().await.push((existing.id.clone(), Rating::Good, crate::fsrs::unix_now()));
 
                 // Provably redundant: the existing entry already contains this
                 // text verbatim. Only this case may discard.
@@ -1723,6 +1726,7 @@ impl MemoryService {
         // Filter by min score and weight, apply testing effect
         let mut filtered = Vec::new();
         let mut updates = Vec::new();
+        let recalled_at = crate::fsrs::unix_now();
         let mut scored: Vec<(MemoryEntry, f32, f32, Option<i64>)> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -1784,7 +1788,7 @@ impl MemoryService {
                 continue;
             }
 
-            updates.push((entry.id.clone(), Rating::Good));
+            updates.push((entry.id.clone(), Rating::Good, recalled_at));
 
             filtered.push(RecallResult {
                 id: entry.id,
@@ -1841,9 +1845,9 @@ impl MemoryService {
         }
 
         let count = updates.len();
-        for (id, rating) in updates {
+        for (id, rating, recalled_at) in updates {
             if let Err(e) = self.store.update_fsrs(&id, |fsrs| {
-                fsrs.record_access(&self.config.fsrs, rating);
+                fsrs.record_access_at(&self.config.fsrs, rating, recalled_at);
             }).await {
                 debug!("Failed to update FSRS for {}: {}", id, e);
             }

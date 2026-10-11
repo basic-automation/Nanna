@@ -10954,10 +10954,12 @@ keep the phases readable; promote individual items into a phase when they become
       *(2026-10-11)* Done, and the three writers that saved or rewrote without the lock now take
       it too (`set_tags` — an upsert that could re-insert the row — `update_content` and
       `flush_to_db`). Test `a_matched_removal_the_disk_refused_keeps_the_entry`.
-- [ ] **The testing effect uses the dream's clock, not the recall's.** Queued reviews are
+- [x] **The testing effect uses the dream's clock, not the recall's.** Queued reviews are
       `(id, Rating)`; `record_access` measures elapsed time and sets `last_access` from `now()` at
       the dream, so a recall two days before the dream gets two days' extra boost and K queued
       recalls become one review plus K−1 no-ops. Queue `recalled_at` and pass it through.
+      *(2026-10-11)* Done (`record_access_at`; the clock never moves backwards). Test
+      `a_queued_recall_is_dated_by_the_recall_not_the_dream`.
 
 ### Board cards that stuck or lost their assignee (found 2026-10-11, audit of the P25 card runs)
 
