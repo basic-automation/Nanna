@@ -10986,6 +10986,42 @@ keep the phases readable; promote individual items into a phase when they become
   with no boot reset; `cooling_down_until` is per card, so a reassigned card inherits the first
   member's provider wait.
 
+### Chat turns that lost messages or spun (found 2026-10-11, audit of the agent loop and harness)
+
+- [x] **A failed interjection seed dropped the user's queued messages.** `SessionInterjector`
+      drained the whole queue, then `seed_plan(..)?` returned on a transient store error with
+      nothing pushed back — while the harness logs "stays pending and is retried". The current
+      message and the rest go back to `pending`, as the cancel branch already did. *No dedicated
+      test* (needs a store that fails a write on demand).
+- [x] **Sub-agent model fallback never switched models.** `AgentSpawnerImpl::spawn` checked each
+      `sub_agent_models` entry for a provider and logged it, but never pinned the new session to it,
+      so every attempt — and every "fallback" re-run of the prompt, tool side effects included — ran
+      on the global chat model (the 2026-07-25 "sub-agent model chain" item was never in effect).
+      The session is pinned with `set_chat_model` before its turn.
+- [x] **The park waiter re-probed a fast-failing provider in a tight loop** (connection refused, a
+      quick 5xx, or no client at all), pegging a worker until a user message cleared the park. A
+      failed probe now rests what is left of the 120 s silence window. Test
+      `a_failed_probe_is_paced_to_one_per_silence_window`.
+- [x] **Health probes and parks used the configured model, not the one the run fell back to**, so
+      a run that moved from a dead A to B was parked as "A stopped answering" and watched A.
+      `active_model()` at all four sites.
+- [ ] **A message sent after the last drain waits for the next one.** A message that arrives after
+      `first_run`'s post-run drain (during `continue_mission`, `finish_mission`/`finish_turn`, or
+      right after a Stop) is acked "interjected" and pushed to `pending`, and nothing starts a turn
+      for it. In `finish_turn`, after `release`, drain a non-empty `pending` into a new turn.
+- [ ] The park waiter is spawned inside `finish_mission`, before `finish_turn` releases the claim: a
+      first probe that answers within ~1 s clears the park, finds the claim held, pushes the goal
+      to `pending` (stuck, as above) and leaves `resumed` set so the next turn skips
+      `TurnAdmission`. Spawn it after `release`, or `wait_until_idle` first.
+- [ ] **A streamed reply that fails mid-way is streamed again** (`call_llm` retries an
+      `overloaded_error` from scratch after the first attempt's deltas reached `on_text` and
+      `streamed_text`): the user sees the partial reply then the full one, and both are persisted.
+      Retry automatically only when nothing was emitted. (Also: any error containing "429" is
+      treated as a rate limit — a "prompt is too long: 214290 tokens" is retried 3× instead of
+      compressed — and that retry ignores `retry_after`.)
+- [ ] The crash watcher (`TurnWatcher::watch`) skips `demote_in_progress` and
+      `run_workspace::release`: a panicked turn's item stays `in_progress` (and is resumed first).
+
 ### Dependency bumps held back (found 2026-10-11, dependency-freshness pass)
 
 - [ ] **`rten 0.26 → 0.27` waits for an `ocrs` release.** `ocrs 0.13.1` (latest) takes

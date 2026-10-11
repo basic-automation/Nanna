@@ -107,6 +107,19 @@ impl AgentSpawner for AgentSpawnerImpl {
                 .create(Some(format!("sub-agent: {description}")))
                 .await;
             let session_id = session.id.clone();
+            // The attempt runs on ITS model. Without the pin every attempt ran
+            // on the global chat model: `sub_agent_models` was checked for a
+            // provider and logged, never used, and a "fallback" re-ran the
+            // whole prompt — tool side effects included — on the same model.
+            if !control
+                .sessions
+                .set_chat_model(&session_id, Some(model_spec.clone()))
+                .await
+            {
+                last_error = format!("could not pin sub-agent session {session_id} to '{model_spec}'");
+                warn!("{last_error}");
+                continue;
+            }
             info!(
                 description,
                 session_id = %session_id,

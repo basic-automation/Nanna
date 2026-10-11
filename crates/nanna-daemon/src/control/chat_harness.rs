@@ -1561,7 +1561,7 @@ impl ChatTurn {
                     // against evidence, not the clock.
                     let health = provider_answers(
                         &h.step_runner.router,
-                        &h.step_runner.agent_config.model,
+                        &h.step_runner.active_model(),
                     )
                     .await;
                     b.error_rounds += 1;
@@ -1850,7 +1850,7 @@ impl ChatTurn {
                 // tell the user which one happened.
                 let health = provider_answers(
                     &h.step_runner.router,
-                    &h.step_runner.agent_config.model,
+                    &h.step_runner.active_model(),
                 )
                 .await;
                 b.error_rounds += 1;
@@ -2094,7 +2094,7 @@ impl ChatTurn {
                     ParkedTurn {
                         scope: self.scope.clone(),
                         scope_id: self.scope_id.clone(),
-                        model: h.step_runner.agent_config.model.clone(),
+                        model: h.step_runner.active_model(),
                         goal: self.content.clone(),
                         error_rounds,
                         resumes: self.resumed_from_park,
@@ -2114,7 +2114,7 @@ impl ChatTurn {
                 Arc::clone(&self.registry),
                 self.session_id.clone(),
                 h.step_runner.router.clone(),
-                h.step_runner.agent_config.model.clone(),
+                h.step_runner.active_model(),
             );
         }
 
@@ -2936,6 +2936,11 @@ fn spawn_park_waiter(
             }
             let probe = provider_answers(&router, &model).await;
             if !probe.answered {
+                // At most one probe per silence window. A provider that fails
+                // FAST (connection refused, a quick 5xx, no client at all)
+                // answered in microseconds and the loop re-probed at once,
+                // pegging a worker until a user message cleared the park.
+                tokio::time::sleep(park_probe_pause(probe.elapsed_secs)).await;
                 continue;
             }
             let Some(park) = registry.clear_park(&session_id).await else {
@@ -2965,6 +2970,16 @@ fn spawn_park_waiter(
             return;
         }
     });
+}
+
+/// How long the park waiter rests after a failed probe that took
+/// `elapsed_secs`: what is left of the transport's silence window, so a probe
+/// that hung for the whole window is retried at once and one that failed at
+/// once waits the window out. Pure.
+fn park_probe_pause(elapsed_secs: u64) -> std::time::Duration {
+    let pause = nanna_llm::STREAM_READ_TIMEOUT_SECS.saturating_sub(elapsed_secs);
+    debug_assert!(pause <= nanna_llm::STREAM_READ_TIMEOUT_SECS);
+    std::time::Duration::from_secs(pause)
 }
 
 async fn provider_answers(
@@ -4162,6 +4177,23 @@ pub(super) fn sanitize_timeline(items: Vec<TimelineItem>) -> Vec<TimelineItem> {
             other => Some(other),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod park_waiter_tests {
+    use super::park_probe_pause;
+    use std::time::Duration;
+
+    /// A probe that failed at once waits the silence window out; one that
+    /// hung for all of it goes again at once. Never a tight loop.
+    #[test]
+    fn a_failed_probe_is_paced_to_one_per_silence_window() {
+        let window = nanna_llm::STREAM_READ_TIMEOUT_SECS;
+        assert_eq!(park_probe_pause(0), Duration::from_secs(window));
+        assert_eq!(park_probe_pause(window), Duration::ZERO);
+        assert_eq!(park_probe_pause(window + 30), Duration::ZERO);
+        assert_eq!(park_probe_pause(20), Duration::from_secs(window - 20));
+    }
 }
 
 #[cfg(test)]

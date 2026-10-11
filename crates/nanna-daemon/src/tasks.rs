@@ -5349,14 +5349,28 @@ impl Interjector for SessionInterjector {
             if let Err(e) = self.yield_current_item().await {
                 tracing::warn!(error = %e, "could not yield the in-flight item for an interjection");
             }
-            let ids = seed_plan(
+            let ids = match seed_plan(
                 &self.storage,
                 &self.scope,
                 self.scope_id.as_deref(),
                 &plan,
                 true,
             )
-            .await?;
+            .await
+            {
+                Ok(ids) => ids,
+                Err(e) => {
+                    // The queue was drained above: returning here dropped this
+                    // message and every one after it, while the harness logs
+                    // "stays pending and is retried next boundary". Put them
+                    // back so that is true.
+                    self.pending.push(message).await;
+                    for rest in queue {
+                        self.pending.push(rest).await;
+                    }
+                    return Err(e);
+                }
+            };
             admitted += ids.len();
             if let Some(tx) = &self.event_tx {
                 let _ = tx.send(Event::TaskRunProgress {
