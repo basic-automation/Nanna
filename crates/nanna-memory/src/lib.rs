@@ -1620,6 +1620,7 @@ impl VectorStore {
             && entry.content != expected {
                 return Ok(false);
             }
+        let previous = entry.clone();
         entry.content = content.to_string();
         entry.embeddings.clear();
         if embedding.is_empty() {
@@ -1642,13 +1643,23 @@ impl VectorStore {
         // leaving the durable copies behind would let a restart resurrect what
         // the rewrite discarded. `save_entry` then writes back only the vector
         // that actually matches the new content.
+        //
+        // A failed save is an error, and the in-memory entry goes back to
+        // what it was. It used to be logged as "non-fatal" and reported as
+        // applied: a dream fold then removed the source it had merged in —
+        // and that delete did reach the disk — so after a restart the
+        // survivor still held its old text and the source's existed nowhere.
         if let Some(ref db) = self.db {
             if let Err(e) = db.clear_memory_buckets(id).await {
                 warn!("Could not clear stale buckets for {id}: {e}");
             }
             if let Err(e) = db.save_entry(&snapshot).await {
-                warn!("Failed to persist merged memory {}: {}", id, e);
-                // Non-fatal: in-memory cache already updated.
+                warn!("Failed to persist merged memory {id}; the rewrite is undone: {e}");
+                self.restore_entry(previous).await;
+                drop(serial);
+                return Err(MemoryError::Persistence(format!(
+                    "the rewrite of memory {id} could not be saved: {e}"
+                )));
             }
         }
         drop(serial);
@@ -1667,6 +1678,16 @@ impl VectorStore {
 
         debug_assert_eq!(snapshot.id, id, "merged entry id must be unchanged");
         Ok(true)
+    }
+
+    /// Put `previous` back in place of the entry with its id, if that entry
+    /// is still there: the undo of a rewrite whose save failed. Called with
+    /// `persist_serial` held, so no other write to it can have landed since.
+    async fn restore_entry(&self, previous: MemoryEntry) {
+        let mut entries = self.entries.write().await;
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == previous.id) {
+            *entry = previous;
+        }
     }
 
     /// Remove entries whose content STILL MATCHES the snapshot the caller
@@ -3147,6 +3168,57 @@ mod tests {
         );
         assert!(store.get("lost").await.is_none(), "nothing was kept in RAM");
         assert!(store.all_entries().await.is_empty());
+    }
+
+    /// A backend that saves the first entry and fails every save after it.
+    struct FailsAfterFirstSave(std::sync::atomic::AtomicUsize);
+    #[async_trait]
+    impl MemoryPersistence for FailsAfterFirstSave {
+        async fn save_entry(&self, _e: &MemoryEntry) -> Result<(), MemoryError> {
+            if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Ok(());
+            }
+            Err(MemoryError::Persistence("database is locked".to_string()))
+        }
+        async fn remove_entry(&self, _id: &str) -> Result<(), MemoryError> {
+            Ok(())
+        }
+        async fn update_entry_fsrs(&self, _id: &str, _f: &FsrsState) -> Result<(), MemoryError> {
+            Ok(())
+        }
+        async fn update_entry_content(&self, _id: &str, _c: &str) -> Result<(), MemoryError> {
+            Ok(())
+        }
+        async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
+            Ok(vec![])
+        }
+    }
+
+    /// A rewrite the backend could not save is an error and is undone in
+    /// RAM. Reported as applied, a dream fold went on to delete the source
+    /// it had merged in, and after a restart that text existed nowhere.
+    #[tokio::test]
+    async fn a_rewrite_that_could_not_be_saved_is_refused_and_undone() {
+        let config = VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        };
+        let store = VectorStore::new(config)
+            .with_persistence(Arc::new(FailsAfterFirstSave(std::sync::atomic::AtomicUsize::new(0))));
+        store.add(entry_dim8("survivor")).await.expect("the first save lands");
+        let refused = store
+            .update_content_and_embedding_if(
+                "survivor",
+                Some("content survivor"),
+                "content survivor\ncontent source",
+                vec![0.5; 8],
+                Some("prov:a"),
+            )
+            .await;
+        assert!(matches!(refused, Err(MemoryError::Persistence(_))), "{refused:?}");
+        let kept = store.get("survivor").await.expect("still there");
+        assert_eq!(kept.content, "content survivor", "the rewrite is undone in RAM");
     }
 
     /// A backend that refuses to delete one named row, and whose batch delete
