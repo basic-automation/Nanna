@@ -10807,12 +10807,18 @@ keep the phases readable; promote individual items into a phase when they become
       launches and drives the connection there (`launch_connected`). Test
       `the_browser_outlives_the_runtime_of_the_call_that_launched_it` (red before: the second
       call failed).
-- [ ] **Closed browsers leave `nanna-chromium-*` profiles behind.** `close()` drops the browser
+- [x] **Closed browsers leave `nanna-chromium-*` profiles behind.** `close()` drops the browser
       (SIGKILL, no wait) and deletes the profile at once; Chromium's NetworkService child
       outlives the kill and re-creates `Default/Network Persistent State` and its cache index in
       the deleted directory (reproduced by hand). Nothing calls `BrowserManager::close` either —
       not the daemon on shutdown, not the integration test. Close over CDP, wait for the process,
       then delete the profile; call `close` on shutdown and in the test.
+      *(2026-10-11)* Done: `close` sends `Browser.close`, waits for the process (kill + reap after
+      `BROWSER_CLOSE_GRACE` = 5 s each), then deletes the profile; the daemon keeps the services'
+      browser in a `BrowserSlot` and closes it in `finish_shutdown`; the integration tests close it.
+      Live test `a_closed_browser_leaves_no_profile_behind` (the old drop re-created the profile in
+      1 of 2 runs; 6/6 green after). The browser test runs now leave 0 profiles (68 had piled up
+      in `/var/tmp` from this run's own earlier tests).
 - [x] **A navigation that times out leaks its tab.** `new_page(url)` only returns the page once it
       has loaded, so a deadline that fires first leaves a live tab with no handle to close it.
       Open `about:blank`, then `goto` under the deadline and close the page on any error.

@@ -768,9 +768,10 @@ struct ScriptServiceDeps {
     /// `OpenAI` key plus the data dir generated speech is written under. `None` or
     /// no key leaves `audio.tts` / `audio.transcribe` unregistered.
     audio: Option<(Option<String>, PathBuf)>,
-    /// The data dir page screenshots are written under. `None`, or no
-    /// Chromium-family browser on the host, leaves `browser.*` unregistered.
-    browser_data_dir: Option<PathBuf>,
+    /// The data dir page screenshots are written under, and the slot the
+    /// browser is handed back in for shutdown. `None`, or no Chromium-family
+    /// browser on the host, leaves `browser.*` unregistered.
+    browser: Option<(PathBuf, crate::browser_service::BrowserSlot)>,
     /// The data dir desktop captures are written under. `None`, or no capture
     /// tool / display session, leaves `screenshot.capture` unregistered.
     screenshot_data_dir: Option<PathBuf>,
@@ -1589,7 +1590,7 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
         vision,
         pdf_ocr,
         audio,
-        browser_data_dir,
+        browser,
         screenshot_data_dir,
         reminders,
         ask_user,
@@ -1688,8 +1689,10 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
 
     // Browser. The four browser_* skills declare these; nanna-browser was
     // complete and the `browser` feature was enabled nowhere.
-    if let Some(data_dir) = browser_data_dir {
-        services.extend(crate::browser_service::build_browser_services(&data_dir));
+    if let Some((data_dir, slot)) = browser {
+        services.extend(crate::browser_service::build_browser_services(
+            &data_dir, &slot,
+        ));
     }
 
     // Audio. `text_to_speech` and `transcribe` declare these; the OpenAI
@@ -3160,6 +3163,8 @@ pub struct DaemonServer {
     mcp_status: crate::mcp_startup::McpStatus,
     /// The MCP background task, awaited by `finish_shutdown`.
     mcp_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The `browser.*` services' browser, closed by `finish_shutdown`.
+    browser_slot: crate::browser_service::BrowserSlot,
     /// The dreaming orchestrator, for `memory.get`'s use feedback. Filled once
     /// in `run()`, right after it is built.
     dreaming_slot: DreamingSlot,
@@ -3348,6 +3353,7 @@ impl DaemonServer {
             scheduler_slot: Arc::new(std::sync::OnceLock::new()),
             mcp_status: crate::mcp_startup::McpStatus::default(),
             mcp_task: std::sync::Mutex::new(None),
+            browser_slot: Arc::new(std::sync::OnceLock::new()),
             dreaming_slot: Arc::new(std::sync::OnceLock::new()),
             ipc,
             persistence,
@@ -4910,6 +4916,10 @@ impl DaemonServer {
             crate::mcp_startup::await_mcp_shutdown(task).await;
         }
 
+        // Chromium and its profile directory, which a process exit left
+        // behind (the browser killed, the profile never deleted).
+        crate::browser_service::close_browser(&self.browser_slot).await;
+
         ipc_handle.abort();
 
         // Release PID file
@@ -5166,7 +5176,10 @@ impl DaemonServer {
                 self.config.llm.openai_api_key.clone(),
                 self.config.data_dir.clone(),
             )),
-            browser_data_dir: Some(self.config.data_dir.clone()),
+            browser: Some((
+                self.config.data_dir.clone(),
+                Arc::clone(&self.browser_slot),
+            )),
             screenshot_data_dir: Some(self.config.data_dir.clone()),
             reminders: Some((Arc::clone(&self.scheduler_slot), Arc::clone(&self.sessions))),
             feedback: Some(Arc::clone(&self.dreaming_slot)),

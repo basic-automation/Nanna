@@ -243,12 +243,18 @@ impl Browser for CdpBrowser {
 
     async fn close(&self) -> Result<(), BrowserError> {
         let mut browser_guard = self.browser.write().await;
-        // The taken browser is dropped inside this statement, so it is still
-        // torn down under the write lock, before any `launch()` can proceed.
-        let was_open = browser_guard.take().is_some();
+        // Shut down under the write lock, so no `launch()` can proceed until
+        // the old browser has exited.
+        let taken = browser_guard.take();
+        let was_open = taken.is_some();
+        if let Some(browser) = taken {
+            shut_down(browser).await;
+        }
         drop(browser_guard);
-        // Dropping the handle deletes the profile directory; the browser that
-        // held it is already gone.
+        // Only now is the profile deleted: dropping the browser used to kill
+        // it without waiting and delete the profile at once, and Chromium's
+        // NetworkService child, which outlives that kill, re-created files in
+        // the deleted directory — one `nanna-chromium-*` left per browser.
         self.profile.write().await.take();
         if was_open {
             info!("CDP browser closed");
@@ -258,6 +264,35 @@ impl Browser for CdpBrowser {
 
     fn config(&self) -> &BrowserConfig {
         &self.config
+    }
+}
+
+/// How long a closing browser gets to exit on its own, and again after a kill.
+///
+/// A clean `Browser.close` takes well under a second;
+/// five is room for a loaded machine without holding a daemon's shutdown long.
+pub const BROWSER_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ask Chromium to exit over CDP and wait until it has, killing it if it does
+/// not within [`BROWSER_CLOSE_GRACE`]. A graceful exit lets Chromium stop its
+/// own child processes first, which a kill of the main process does not.
+async fn shut_down(mut browser: CoBrowser) {
+    let graceful = tokio::time::timeout(BROWSER_CLOSE_GRACE, async {
+        if let Err(e) = browser.close().await {
+            debug!("Browser.close failed: {e}");
+        }
+        browser.wait().await
+    })
+    .await;
+    if matches!(graceful, Ok(Ok(_))) {
+        return;
+    }
+    tracing::warn!("Chromium did not exit when asked; killing it");
+    if let Some(Err(e)) = browser.kill().await {
+        tracing::warn!("killing Chromium failed: {e}");
+    }
+    if tokio::time::timeout(BROWSER_CLOSE_GRACE, browser.wait()).await.is_err() {
+        tracing::warn!("Chromium was not reaped after the kill");
     }
 }
 
@@ -820,8 +855,10 @@ mod tests {
     /// reports them (chromiumoxide's own page list lags a closed target).
     async fn tabs(browser: &super::CdpBrowser) -> usize {
         use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
-        let slot = browser.browser.read().await;
-        let targets = slot
+        let targets = browser
+            .browser
+            .read()
+            .await
             .as_ref()
             .expect("launched")
             .execute(GetTargetsParams::default())
@@ -864,6 +901,30 @@ mod tests {
         }
         browser.close().await.expect("closes");
         silent.abort();
+    }
+
+    /// Live: closing deletes the browser's profile, and it stays deleted —
+    /// Chromium's children used to re-create it after the kill.
+    #[tokio::test]
+    #[ignore = "launches Chromium"]
+    async fn a_closed_browser_leaves_no_profile_behind() {
+        use crate::{Browser, BrowserConfig};
+        let browser = super::CdpBrowser::new(BrowserConfig::default());
+        let page = browser.navigate("about:blank").await.expect("launch");
+        let profile = browser
+            .profile
+            .read()
+            .await
+            .as_ref()
+            .expect("a profile while open")
+            .path()
+            .to_path_buf();
+        assert!(profile.is_dir());
+        page.close().await.expect("closes the tab");
+        browser.close().await.expect("closes");
+        // Long enough for a surviving child to have written again.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!profile.exists(), "{} came back", profile.display());
     }
 
     /// Positive space: the deadline must not interfere with work that finishes.
