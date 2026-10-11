@@ -1648,11 +1648,13 @@ impl TaskRepository {
         }
 
         for gone in scope_tasks.iter().filter(|t| doomed.contains(&t.id)) {
+            // The parent travels with the event: the row is gone, and a
+            // parent that waited on this card may be workable now.
             self.emit(
                 TaskEventKind::Deleted,
                 gone,
                 actor,
-                serde_json::json!({ "subtree_of": id }),
+                serde_json::json!({ "subtree_of": id, "parent_id": gone.parent_id }),
             );
         }
         let count = doomed.len() as u64;

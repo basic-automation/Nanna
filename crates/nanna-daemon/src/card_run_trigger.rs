@@ -116,8 +116,19 @@ pub fn run_wake_for(event: &TaskEvent) -> Option<RunWake> {
     if event.scope == "session" {
         return None;
     }
-    if event.kind == TaskEventKind::Verdict {
+    if event.kind == TaskEventKind::Verdict || closed_by_hand(event) {
         return Some(RunWake::ChildClosed(event.task_id));
+    }
+    // The root of a deleted subtree: its row is gone, so its parent is named
+    // in the event. Cancelled or deleted, a sub-card the parent waited on
+    // used to wake nothing — only `complete` emits a verdict — and the parent
+    // sat until its member happened to free up from other work.
+    if event.kind == TaskEventKind::Deleted
+        && event.detail.get("subtree_of").and_then(serde_json::Value::as_i64)
+            == Some(event.task_id)
+        && let Some(parent_id) = event.detail.get("parent_id").and_then(serde_json::Value::as_i64)
+    {
+        return Some(RunWake::Card(parent_id));
     }
     let wakes = match event.kind {
         // Assigned to an agent, or created already assigned to one (a
@@ -135,6 +146,14 @@ pub fn run_wake_for(event: &TaskEvent) -> Option<RunWake> {
     };
     debug_assert!(event.task_id > 0, "store ids start at 1");
     wakes.then_some(RunWake::Card(event.task_id))
+}
+
+/// Whether `event` is a card cancelled on its own (not as part of its
+/// parent's cascade, where the parent is closed too). Pure.
+fn closed_by_hand(event: &TaskEvent) -> bool {
+    event.kind == TaskEventKind::StatusChanged
+        && event.detail.get("status").and_then(serde_json::Value::as_str) == Some("cancelled")
+        && event.detail.get("cascade_from").is_none()
 }
 
 /// Whether `card` can be worked by its assignee right now: open and not yet
@@ -162,6 +181,11 @@ pub fn is_startable(card: &Task, now: chrono::DateTime<chrono::Utc>) -> bool {
 /// `due` announcement uses. Reading only full timestamps here made every such
 /// date "unreadable", so an agent started at once on a card the board showed
 /// as "Deferred until …".
+///
+/// A timestamp defers to the start of its UTC day too. The store announces
+/// `due` once, when that day starts, and nothing re-checks a card refused at
+/// that wake: compared to the exact time, a card deferred to 15:00 was
+/// refused at 00:05 and never started. The board shows defer dates by day.
 #[must_use]
 pub fn is_deferred(card: &Task, now: chrono::DateTime<chrono::Utc>) -> bool {
     card.due_at
@@ -170,15 +194,14 @@ pub fn is_deferred(card: &Task, now: chrono::DateTime<chrono::Utc>) -> bool {
         .is_some_and(|date| date > now)
 }
 
-/// When a stored defer date arrives: a timestamp as written, a bare date at
-/// 00:00 UTC of that day.
+/// When a stored defer date arrives: 00:00 UTC of its day, whether it was
+/// stored as a bare date or a timestamp. Pure.
 fn defer_instant(stored: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    crate::tasks::parse_db_time(stored).or_else(|| {
-        chrono::NaiveDate::parse_from_str(stored, "%Y-%m-%d")
-            .ok()
-            .and_then(|day| day.and_hms_opt(0, 0, 0))
-            .map(|midnight| midnight.and_utc())
-    })
+    let day = crate::tasks::parse_db_time(stored).map_or_else(
+        || chrono::NaiveDate::parse_from_str(stored, "%Y-%m-%d").ok(),
+        |instant| Some(instant.date_naive()),
+    )?;
+    day.and_hms_opt(0, 0, 0).map(|midnight| midnight.and_utc())
 }
 
 /// Whether a card made by `creator` is board work a member may be started on.
@@ -925,6 +948,30 @@ mod tests {
         );
         let closed = event(TaskEventKind::Verdict, "global", json!({}));
         assert_eq!(run_wake_for(&closed), Some(RunWake::ChildClosed(5)));
+        let cancelled = event(
+            TaskEventKind::StatusChanged,
+            "global",
+            json!({"status": "cancelled"}),
+        );
+        assert_eq!(run_wake_for(&cancelled), Some(RunWake::ChildClosed(5)));
+        let cascaded = event(
+            TaskEventKind::StatusChanged,
+            "global",
+            json!({"status": "cancelled", "cascade_from": 4}),
+        );
+        assert_eq!(run_wake_for(&cascaded), None, "the parent is closed too");
+        let deleted = event(
+            TaskEventKind::Deleted,
+            "global",
+            json!({"subtree_of": 5, "parent_id": 4}),
+        );
+        assert_eq!(run_wake_for(&deleted), Some(RunWake::Card(4)), "its parent");
+        let inside = event(
+            TaskEventKind::Deleted,
+            "global",
+            json!({"subtree_of": 3, "parent_id": 4}),
+        );
+        assert_eq!(run_wake_for(&inside), None, "inside a deleted subtree");
         let posted = event(TaskEventKind::Posted, "global", json!({}));
         assert_eq!(run_wake_for(&posted), None);
     }
@@ -996,6 +1043,17 @@ mod tests {
                 now
             ),
             "deferred to tomorrow"
+        );
+        assert!(
+            is_startable(
+                &card(
+                    "pending",
+                    Some("agent:builder"),
+                    Some("2026-10-01T15:00:00Z")
+                ),
+                now
+            ),
+            "deferred to later today: its day has come, and its one `due` wake was this morning"
         );
         assert!(
             !is_startable(&card("in_progress", Some("agent:builder"), None), now),

@@ -10955,6 +10955,15 @@ keep the phases readable; promote individual items into a phase when they become
 
 ### Board cards that stuck or lost their assignee (found 2026-10-11, audit of the P25 card runs)
 
+- [x] **A defer date with a time of day never started its card.** The store announces `due` once,
+      at the start of the UTC day, and `is_deferred` compared the exact time — so a card deferred to
+      15:00 was refused at 00:05 and nothing re-checked it. A timestamp now defers to its day, like
+      a bare date, the store and the board. Case in `only_an_open_unblocked_agent_card_whose_date_has_come_starts`.
+- [x] **Cancelling or deleting a sub-card never woke the parent waiting on it** (only `complete`
+      emits a verdict). A cancel (not a parent's cascade) wakes it like a verdict, and a deleted
+      subtree's root names its parent in the event (`parent_id`), which is woken. Cases in
+      `an_agent_assignment_or_an_arriving_date_wakes_the_worker`.
+
 - [ ] **Reassigning a running card leaves the old member working it.** `CardTree::serves`
       (`tasks.rs`) passes the root before checking its assignee, and `settle_after_run` /
       `hand_back` never check the card still belongs to the run's member: a budget end then wipes
