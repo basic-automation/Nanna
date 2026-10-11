@@ -36,11 +36,23 @@ pub struct MessageReactionUpdate {
 }
 
 /// Reaction type (emoji or custom)
+///
+/// The custom emoji's field was read as a key literally named
+/// `_custom_emoji_id` (an enum's `rename_all` renames variants, not fields),
+/// and a `paid` reaction was an unknown variant: either failed the whole
+/// update with 400, and Telegram retried it, holding back the user's later
+/// updates behind it.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReactionType {
     Emoji { emoji: String },
-    CustomEmoji { _custom_emoji_id: String },
+    CustomEmoji {
+        #[serde(rename = "custom_emoji_id")]
+        _custom_emoji_id: String,
+    },
+    /// `paid`, or a kind Telegram adds later.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,7 +233,7 @@ async fn handle_reaction(state: &AppState, reaction: &MessageReactionUpdate) {
                     continue; // Neutral reaction, skip
                 }
             }
-            ReactionType::CustomEmoji { .. } => continue, // Skip custom emojis
+            ReactionType::CustomEmoji { .. } | ReactionType::Other => continue, // Skip custom and paid
         };
         
         info!(
@@ -230,5 +242,29 @@ async fn handle_reaction(state: &AppState, reaction: &MessageReactionUpdate) {
         );
         
         state.record_message_feedback(&message_key, positive).await;
+    }
+}
+
+#[cfg(test)]
+mod reaction_tests {
+    use super::ReactionType;
+
+    /// Every reaction kind Telegram sends parses, so one never fails its
+    /// whole update.
+    #[test]
+    fn custom_and_paid_reactions_parse() {
+        let parse = |json: serde_json::Value| serde_json::from_value::<ReactionType>(json);
+        assert!(matches!(
+            parse(serde_json::json!({ "type": "emoji", "emoji": "👍" })),
+            Ok(ReactionType::Emoji { .. })
+        ));
+        assert!(matches!(
+            parse(serde_json::json!({ "type": "custom_emoji", "custom_emoji_id": "5368" })),
+            Ok(ReactionType::CustomEmoji { .. })
+        ));
+        assert!(matches!(
+            parse(serde_json::json!({ "type": "paid" })),
+            Ok(ReactionType::Other)
+        ));
     }
 }

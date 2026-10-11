@@ -26,6 +26,12 @@ use tracing::{debug, error, info, warn};
 
 const SLACK_API_BASE: &str = "https://slack.com/api";
 
+/// How long the Socket Mode connection may be silent before it is pinged,
+/// and then again before it is given up as dead. Slack pings an open
+/// connection far more often than this, so a healthy one never trips it; a
+/// dead one is found within two intervals.
+const SLACK_IDLE_PROBE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Slack Socket Mode listener
 pub struct SlackListener {
     /// App-level token (xapp-*)
@@ -262,6 +268,11 @@ impl SlackListener {
 
             info!("Slack Socket Mode connected");
 
+            // Whether the socket went quiet for a whole probe interval and was
+            // pinged; quiet for another one, it is dead. Without this a
+            // half-open socket (sleep/resume, a NAT timeout) was awaited
+            // forever while the channel still reported `Connected`.
+            let mut probed = false;
             'connection: loop {
                 tokio::select! {
                     _ = shutdown_rx.recv() => {
@@ -269,38 +280,25 @@ impl SlackListener {
                         let _ = write.close().await;
                         break 'connection;
                     }
-                    msg = read.next() => {
+                    next = tokio::time::timeout(SLACK_IDLE_PROBE, read.next()) => {
+                        let Ok(msg) = next else {
+                            if probed {
+                                warn!("Slack Socket Mode went silent, even to a ping; reconnecting");
+                                break 'connection;
+                            }
+                            probed = true;
+                            if write.send(WsMessage::Ping(Vec::new().into())).await.is_err() {
+                                break 'connection;
+                            }
+                            continue;
+                        };
+                        probed = false;
                         let Some(msg) = msg else {
                             warn!("Slack Socket Mode connection closed");
                             break 'connection;
                         };
 
-                        let text = match msg {
-                            Ok(WsMessage::Text(text)) => text,
-                            Ok(WsMessage::Close(_)) => {
-                                info!("Slack sent close frame");
-                                break 'connection;
-                            }
-                            Ok(WsMessage::Ping(data)) => {
-                                let _ = write.send(WsMessage::Pong(data)).await;
-                                continue;
-                            }
-                            Ok(_) => continue,
-                            Err(e) => {
-                                warn!("Slack Socket Mode error: {}", e);
-                                break 'connection;
-                            }
-                        };
-
-                        let payload: SocketModePayload = match serde_json::from_str(&text) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                warn!("Failed to parse Socket Mode payload: {}", e);
-                                continue;
-                            }
-                        };
-
-                        if self.handle_envelope(&payload, &mut write, &sender).await == EnvelopeFlow::Reconnect {
+                        if self.on_frame(msg, &mut write, &sender).await == EnvelopeFlow::Reconnect {
                             break 'connection;
                         }
                     }
@@ -312,6 +310,38 @@ impl SlackListener {
         }
 
         info!("Slack Socket Mode listener stopped");
+    }
+
+    /// Act on one frame read from the Socket Mode connection.
+    async fn on_frame(
+        &self,
+        msg: Result<WsMessage, tokio_tungstenite::tungstenite::Error>,
+        write: &mut SocketSink,
+        sender: &mpsc::Sender<IncomingMessage>,
+    ) -> EnvelopeFlow {
+        let text = match msg {
+            Ok(WsMessage::Text(text)) => text,
+            Ok(WsMessage::Close(_)) => {
+                info!("Slack sent close frame");
+                return EnvelopeFlow::Reconnect;
+            }
+            Ok(WsMessage::Ping(data)) => {
+                let _ = write.send(WsMessage::Pong(data)).await;
+                return EnvelopeFlow::Continue;
+            }
+            Ok(_) => return EnvelopeFlow::Continue,
+            Err(e) => {
+                warn!("Slack Socket Mode error: {}", e);
+                return EnvelopeFlow::Reconnect;
+            }
+        };
+        match serde_json::from_str::<SocketModePayload>(&text) {
+            Ok(payload) => self.handle_envelope(&payload, write, sender).await,
+            Err(e) => {
+                warn!("Failed to parse Socket Mode payload: {}", e);
+                EnvelopeFlow::Continue
+            }
+        }
     }
 
     /// Act on one decoded Socket Mode envelope: acknowledge it and forward any

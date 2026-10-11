@@ -10889,6 +10889,41 @@ keep the phases readable; promote individual items into a phase when they become
       unit test now removes the WAL too. Re-measured: 274 tests in the two crates, **0 entries
       left behind** (was 44 per run). The 1382 stale ones were deleted.
 
+### Channels that went deaf, looped or let strangers in (found 2026-10-11, audit of the channels)
+
+- [x] **Listeners stopped for good after ~8 minutes offline.** The breaker returned `Stop` after 10
+      connection failures (2 + 4 + … + 120 s of backoff) and nothing could restart a listener —
+      no restart action, `ChannelAction::Enable` answers `not_implemented`, and the "reconnect from
+      the Channels page" its message named does not exist. A connection failure now always retries
+      at the 120 s cap (reported `Unavailable` past the threshold); only auth failures stop. Test
+      `test_conn_failures_never_stop_the_listener`.
+- [x] **Discord's fatal close codes were retried at once, forever.** A close frame set
+      `should_resume` and broke out with nothing recorded, so backoff was a no-op: a missing
+      privileged intent (4014, the commonest setup mistake) re-identified about twice a second
+      against Discord's 1000/day cap, which resets the token when hit. 4004 and 4010–4014 now count
+      as auth failures (stopping after 3), and any connection that ends before READY/RESUMED as a
+      connection failure. Test `only_documented_fatal_close_codes_are_fatal`.
+- [x] **A half-open Slack Socket Mode socket was awaited forever** while reporting `Connected`.
+      Silent for 60 s it is pinged; silent for another 60 s it is dropped and redialled.
+- [x] **The daemon's Slack webhook answered bots, joins, edits and duplicates.** Every `message`
+      and `app_mention` started a turn: the bot's own replies (a loop wherever replies route back),
+      `channel_join`, `message_changed` with no user or text, and one @-mention twice when both
+      events are subscribed. `bot_id`/`subtype`/blank events are dropped and one message is handed
+      on once (bounded `(channel, ts)` window of 256). Tests `only_a_users_own_message_starts_a_turn`,
+      `one_message_delivered_twice_is_handed_on_once`.
+- [x] **`nanna serve`'s Telegram webhook answered 400 to custom-emoji and paid reactions** (the
+      field was read as `_custom_emoji_id`; `paid` was an unknown variant), so Telegram retried the
+      update and queued the user's later ones behind it. Test `custom_and_paid_reactions_parse`.
+- [ ] **Discord and Slack admit anyone who can reach the bot.** `server.rs` hard-codes
+      `allowed_guilds: vec![]` / `allowed_channels: vec![]` (no config keys exist), the guild check
+      skips DMs (`guild_id == None`), and there is no sender list — a stranger who invites a
+      public bot, or DMs it from a shared server, gets a full agent turn with tools. Needs config
+      (`allowed_users` per channel) and a fail-closed rule for DMs: a product call, with channels
+      going through P25 decision 18. Telegram also fails open when `allowed_users` is unset.
+- [ ] **`nanna serve`'s Telegram (and Signal) webhooks ignore `allowed_users`** — the hole the
+      daemon closed with `webhook_chat_allowed` (`crates/nanna-server/src/webhooks/telegram.rs`,
+      `src/commands/serve.rs` passes no allowlist). Pass it into `AppStateBuilder`.
+
 ### Dependency bumps held back (found 2026-10-11, dependency-freshness pass)
 
 - [ ] **`rten 0.26 → 0.27` waits for an `ocrs` release.** `ocrs 0.13.1` (latest) takes

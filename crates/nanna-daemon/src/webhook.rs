@@ -262,12 +262,18 @@ pub struct WebhookState {
     pub config: WebhookConfig,
     /// Channel to send parsed events
     pub event_tx: mpsc::Sender<WebhookEvent>,
+    /// Slack messages already handed on ([`first_delivery_of`]).
+    slack_seen: std::sync::Mutex<std::collections::VecDeque<(String, String)>>,
 }
 
 impl WebhookState {
     #[must_use]
     pub const fn new(config: WebhookConfig, event_tx: mpsc::Sender<WebhookEvent>) -> Self {
-        Self { config, event_tx }
+        Self {
+            config,
+            event_tx,
+            slack_seen: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        }
     }
 }
 
@@ -650,6 +656,67 @@ struct SlackEvent {
     channel: Option<String>,
     text: Option<String>,
     ts: Option<String>,
+    /// Set on a bot's message — this app's own replies included.
+    bot_id: Option<String>,
+    /// Set on everything but a plain user message: `channel_join`,
+    /// `message_changed`, `bot_message`, …
+    subtype: Option<String>,
+}
+
+/// Slack messages already handed on, by `(channel, ts)`, newest last.
+/// Bounded: one message's two events arrive within milliseconds of each
+/// other, so the last few hundred are plenty.
+const SLACK_SEEN_MESSAGES_MAX: usize = 256;
+
+/// Whether this is the first event for the message `(channel, ts)`; records
+/// it if so. One @-mention with `app_mention` and `message.channels` both
+/// subscribed is two events for the same message, and each started a turn.
+fn first_delivery_of(
+    seen: &std::sync::Mutex<std::collections::VecDeque<(String, String)>>,
+    channel: &str,
+    ts: &str,
+) -> bool {
+    let mut seen = seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if seen.iter().any(|(c, t)| c == channel && t == ts) {
+        return false;
+    }
+    if seen.len() >= SLACK_SEEN_MESSAGES_MAX {
+        seen.pop_front();
+    }
+    seen.push_back((channel.to_string(), ts.to_string()));
+    debug_assert!(seen.len() <= SLACK_SEEN_MESSAGES_MAX);
+    drop(seen);
+    true
+}
+
+/// The user message a Slack event carries, if it is one to answer. Pure.
+///
+/// Every `message` and `app_mention` used to start a turn: a bot's own
+/// replies came back as user turns (a loop wherever replies route back to
+/// Slack), `channel_join` ("<@U> has joined") started one, an edit
+/// (`message_changed`) arrived with no user and no text, and one @-mention
+/// with both `app_mention` and `message.channels` subscribed was two events,
+/// so two turns and two replies. The Socket Mode listener already filtered
+/// these. The duplicate pair is dropped by [`first_delivery_of`].
+fn slack_event_message(event: SlackEvent) -> Option<WebhookMessage> {
+    if event.event_type != "message" && event.event_type != "app_mention" {
+        return None;
+    }
+    if event.bot_id.is_some() || event.subtype.is_some() {
+        return None;
+    }
+    let user = event.user.filter(|user| !user.trim().is_empty())?;
+    let text = event.text.filter(|text| !text.trim().is_empty())?;
+    Some(WebhookMessage {
+        sender_id: user,
+        sender_name: None,
+        chat_id: event.channel.unwrap_or_default(),
+        content: text,
+        message_id: event.ts,
+        is_command: event.event_type == "app_mention",
+    })
 }
 
 /// Verify a Slack request signature (HMAC-SHA256).
@@ -755,20 +822,14 @@ async fn slack_webhook(
     debug!("Slack webhook: received event type {}", event_wrapper.event_type);
     
     // Extract message from event
-    let webhook_message = event_wrapper.event.and_then(|evt| {
-        if evt.event_type != "message" && evt.event_type != "app_mention" {
-            return None;
-        }
-        
-        Some(WebhookMessage {
-            sender_id: evt.user.unwrap_or_default(),
-            sender_name: None,
-            chat_id: evt.channel.unwrap_or_default(),
-            content: evt.text.unwrap_or_default(),
-            message_id: evt.ts,
-            is_command: evt.event_type == "app_mention",
-        })
-    });
+    let webhook_message = event_wrapper
+        .event
+        .and_then(slack_event_message)
+        .filter(|message| {
+            message.message_id.as_deref().is_none_or(|ts| {
+                first_delivery_of(&state.slack_seen, &message.chat_id, ts)
+            })
+        });
     
     // Send event
     let event = WebhookEvent {
@@ -1209,6 +1270,49 @@ impl WebhookServer {
 
 /// Default webhook server port
 pub const DEFAULT_WEBHOOK_PORT: u16 = 3000;
+
+#[cfg(test)]
+mod slack_event_tests {
+    use super::{SlackEvent, first_delivery_of, slack_event_message};
+
+    fn event(json: serde_json::Value) -> SlackEvent {
+        serde_json::from_value(json).expect("a Slack event parses")
+    }
+
+    #[test]
+    fn only_a_users_own_message_starts_a_turn() {
+        let plain = event(serde_json::json!({
+            "type": "message", "user": "U1", "channel": "C1", "text": "hi", "ts": "1.1"
+        }));
+        let message = slack_event_message(plain).expect("a user's message");
+        assert_eq!((message.sender_id.as_str(), message.content.as_str()), ("U1", "hi"));
+        for skipped in [
+            serde_json::json!({ "type": "message", "bot_id": "B1", "user": "U2", "text": "reply" }),
+            serde_json::json!({ "type": "message", "subtype": "channel_join", "user": "U1", "text": "<@U1> has joined" }),
+            serde_json::json!({ "type": "message", "subtype": "message_changed" }),
+            serde_json::json!({ "type": "message", "user": "U1", "text": "  " }),
+            serde_json::json!({ "type": "reaction_added", "user": "U1", "text": "x" }),
+        ] {
+            assert!(slack_event_message(event(skipped.clone())).is_none(), "{skipped}");
+        }
+    }
+
+    #[test]
+    fn one_message_delivered_twice_is_handed_on_once() {
+        let seen = std::sync::Mutex::default();
+        assert!(first_delivery_of(&seen, "C1", "1.1"), "the app_mention");
+        assert!(!first_delivery_of(&seen, "C1", "1.1"), "the message.channels twin");
+        assert!(first_delivery_of(&seen, "C2", "1.1"), "same ts, other channel");
+        for n in 0..super::SLACK_SEEN_MESSAGES_MAX {
+            first_delivery_of(&seen, "C3", &n.to_string());
+        }
+        assert_eq!(
+            seen.lock().expect("lock").len(),
+            super::SLACK_SEEN_MESSAGES_MAX,
+            "bounded"
+        );
+    }
+}
 
 #[cfg(test)]
 mod discord_content_tests {
