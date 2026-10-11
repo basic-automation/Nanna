@@ -4,6 +4,8 @@ use crate::{Browser, BrowserConfig, BrowserError, BrowserPage, BrowserType, Imag
 use async_trait::async_trait;
 use chromiumoxide::browser::{Browser as CoBrowser, BrowserConfig as CoConfig};
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+use chromiumoxide::cdp::browser_protocol::target::CloseTargetParams;
+use chromiumoxide::cdp::js_protocol::runtime::{RemoteObject, RemoteObjectType};
 use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide::Page;
 use futures::StreamExt;
@@ -191,17 +193,49 @@ impl Browser for CdpBrowser {
         // every `close()`, which queues on the write side of this lock. The lock
         // is still held until navigation settles (so `close()` cannot tear the
         // browser down underneath it), but now only for at most the deadline.
+        //
+        // The tab is opened blank and loaded second: `new_page(url)` returns
+        // the page only once it has loaded, so a deadline that fired first
+        // left a live tab nobody held a handle to — one leaked tab, still
+        // running its scripts, per timed-out call.
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(self.config.timeout_ms);
         let page = bounded_operation(self.config.timeout_ms, "navigate", async {
-            let page = browser
-                .new_page(url)
+            browser
+                .new_page("about:blank")
+                .await
+                .map_err(|e| BrowserError::NavigationFailed(e.to_string()))
+        })
+        .await?;
+        let remaining_ms = remaining_budget_ms(deadline, tokio::time::Instant::now());
+        let loaded = bounded_operation(remaining_ms, "navigate", async {
+            page.goto(url)
                 .await
                 .map_err(|e| BrowserError::NavigationFailed(e.to_string()))?;
             page.wait_for_navigation()
                 .await
                 .map_err(|e| BrowserError::NavigationFailed(e.to_string()))?;
-            Ok(page)
+            Ok(())
         })
-        .await?;
+        .await;
+        if let Err(e) = loaded {
+            // Closed from the browser's side: `Page.close` goes to the page's
+            // own session and runs its unload hooks, which a page stuck
+            // mid-load may never answer.
+            let target = CloseTargetParams::new(page.target_id().clone());
+            let closed = bounded_operation(self.config.timeout_ms, "close", async {
+                browser
+                    .execute(target)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| BrowserError::ExecutionFailed(e.to_string()))
+            })
+            .await;
+            if let Err(close_error) = closed {
+                tracing::warn!("closing the tab of a failed navigation failed: {close_error}");
+            }
+            return Err(e);
+        }
         drop(browser_guard);
 
         Ok(Arc::new(CdpPage::new(page, self.config.timeout_ms)))
@@ -310,6 +344,43 @@ const SELECTOR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 /// (ES2019 admits U+2028/U+2029), and `serde_json` escapes everything needed.
 fn js_string(s: &str) -> String {
     serde_json::Value::String(s.to_owned()).to_string()
+}
+
+/// Milliseconds left before `deadline`, at least one: the second step of a
+/// two-step operation gets what the first left of their shared budget, and a
+/// first step that used all of it leaves the second an immediate timeout
+/// rather than a zero (which `bounded_operation` refuses). Pure.
+fn remaining_budget_ms(deadline: tokio::time::Instant, now: tokio::time::Instant) -> u64 {
+    let left = deadline.saturating_duration_since(now);
+    let left_ms = u64::try_from(left.as_millis()).unwrap_or(u64::MAX).max(1);
+    debug_assert!(left_ms >= 1);
+    left_ms
+}
+
+/// The JSON a script's result stands for.
+///
+/// chromiumoxide's `into_value` fails with "No value found" whenever the
+/// remote object carries no `value` — which is what CDP sends for
+/// `undefined` (any statement, `localStorage.setItem(..)`, a `void` call),
+/// and for `NaN`, `Infinity`, `-0` and a `BigInt`, which it sends as
+/// `unserializableValue` instead. So a script that ran and returned nothing
+/// was reported as a failure. `undefined` is JSON `null`; an unserializable
+/// number is its JavaScript spelling as a string (`"NaN"`, `"10n"`); anything
+/// else without a value (a function, a symbol) is its description. Pure.
+fn evaluated_json(object: &RemoteObject) -> serde_json::Value {
+    if let Some(value) = &object.value {
+        return value.clone();
+    }
+    if let Some(unserializable) = &object.unserializable_value {
+        return serde_json::Value::String(unserializable.inner().clone());
+    }
+    if object.r#type == RemoteObjectType::Undefined {
+        return serde_json::Value::Null;
+    }
+    object
+        .description
+        .clone()
+        .map_or(serde_json::Value::Null, serde_json::Value::String)
 }
 
 /// The deadline itself, as a free function over primitives.
@@ -520,12 +591,12 @@ impl BrowserPage for CdpPage {
 
     async fn evaluate(&self, script: &str) -> Result<serde_json::Value, BrowserError> {
         self.bounded("evaluate", async {
-            self.page
+            let result = self
+                .page
                 .evaluate(script)
                 .await
-                .map_err(|e| BrowserError::ExecutionFailed(e.to_string()))?
-                .into_value()
-                .map_err(|e| BrowserError::ExecutionFailed(e.to_string()))
+                .map_err(|e| BrowserError::ExecutionFailed(e.to_string()))?;
+            Ok(evaluated_json(result.object()))
         })
         .await
     }
@@ -677,6 +748,122 @@ mod tests {
         assert!(browser.launched_alive());
         page.close().await.expect("closes");
         browser.close().await.expect("closes");
+    }
+
+    /// A script that ran and returned nothing, or returned a number JSON
+    /// cannot spell, is a value — not "No value found".
+    #[test]
+    fn results_without_a_json_value_still_have_one() {
+        use super::evaluated_json;
+        use chromiumoxide::cdp::js_protocol::runtime::RemoteObject;
+        use serde_json::{Value, json};
+        let object = |wire: Value| -> RemoteObject {
+            serde_json::from_value(wire).expect("a CDP RemoteObject")
+        };
+        assert_eq!(evaluated_json(&object(json!({"type": "undefined"}))), Value::Null);
+        assert_eq!(
+            evaluated_json(&object(json!({"type": "number", "unserializableValue": "NaN"}))),
+            json!("NaN")
+        );
+        assert_eq!(
+            evaluated_json(&object(json!({"type": "bigint", "unserializableValue": "10n"}))),
+            json!("10n")
+        );
+        assert_eq!(
+            evaluated_json(&object(json!({"type": "number", "value": 3}))),
+            json!(3),
+            "a value is passed through"
+        );
+        assert_eq!(
+            evaluated_json(&object(json!({"type": "object", "subtype": "null", "value": null}))),
+            Value::Null
+        );
+        assert_eq!(
+            evaluated_json(&object(
+                json!({"type": "function", "description": "function f() {}"})
+            )),
+            json!("function f() {}")
+        );
+    }
+
+    /// The second step of a navigation gets what the first left, never zero.
+    #[test]
+    fn the_load_gets_what_the_open_left_of_the_budget() {
+        use super::remaining_budget_ms;
+        let now = tokio::time::Instant::now();
+        assert_eq!(remaining_budget_ms(now + Duration::from_millis(750), now), 750);
+        assert_eq!(remaining_budget_ms(now, now), 1, "spent: an immediate timeout");
+        assert_eq!(
+            remaining_budget_ms(now, now + Duration::from_secs(1)),
+            1,
+            "overspent: still not zero"
+        );
+    }
+
+    /// Live: `undefined`, `NaN` and a `BigInt` evaluate to values.
+    #[tokio::test]
+    #[ignore = "launches Chromium"]
+    async fn a_script_with_no_json_result_evaluates() {
+        use crate::{Browser, BrowserConfig};
+        use serde_json::{Value, json};
+        let browser = super::CdpBrowser::new(BrowserConfig::default());
+        let page = browser.navigate("about:blank").await.expect("launch");
+        assert_eq!(page.evaluate("void 0").await.expect("undefined"), Value::Null);
+        assert_eq!(page.evaluate("0/0").await.expect("NaN"), json!("NaN"));
+        assert_eq!(page.evaluate("10n").await.expect("bigint"), json!("10n"));
+        assert_eq!(page.evaluate("1 + 1").await.expect("number"), json!(2));
+        page.close().await.expect("closes");
+        browser.close().await.expect("closes");
+    }
+
+    /// How many tabs the launched browser has open, as Chromium itself
+    /// reports them (chromiumoxide's own page list lags a closed target).
+    async fn tabs(browser: &super::CdpBrowser) -> usize {
+        use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
+        let slot = browser.browser.read().await;
+        let targets = slot
+            .as_ref()
+            .expect("launched")
+            .execute(GetTargetsParams::default())
+            .await
+            .expect("targets");
+        targets.result.target_infos.iter().filter(|t| t.r#type == "page").count()
+    }
+
+    /// Live: a navigation cut off by its deadline closes the tab it opened.
+    /// The server accepts and never answers, so the load cannot finish.
+    #[tokio::test]
+    #[ignore = "launches Chromium"]
+    async fn a_navigation_that_times_out_leaves_no_tab() {
+        use crate::{Browser, BrowserConfig};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let silent = tokio::spawn(async move {
+            // Accepted and held open, never answered.
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _held = socket;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        let config = BrowserConfig { timeout_ms: 2_000, ..BrowserConfig::default() };
+        let browser = super::CdpBrowser::new(config);
+        browser.launch().await.expect("launch");
+        let before = tabs(&browser).await;
+        let outcome = browser.navigate(&format!("http://127.0.0.1:{port}/")).await;
+        assert!(
+            matches!(outcome, Err(BrowserError::Timeout { .. })),
+            "the load never finishes: {:?}",
+            outcome.err()
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tabs(&browser).await > before {
+            assert!(tokio::time::Instant::now() < deadline, "the timed-out tab stayed open");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        browser.close().await.expect("closes");
+        silent.abort();
     }
 
     /// Positive space: the deadline must not interfere with work that finishes.

@@ -10813,15 +10813,25 @@ keep the phases readable; promote individual items into a phase when they become
       the deleted directory (reproduced by hand). Nothing calls `BrowserManager::close` either —
       not the daemon on shutdown, not the integration test. Close over CDP, wait for the process,
       then delete the profile; call `close` on shutdown and in the test.
-- [ ] **A navigation that times out leaks its tab.** `new_page(url)` only returns the page once it
+- [x] **A navigation that times out leaks its tab.** `new_page(url)` only returns the page once it
       has loaded, so a deadline that fires first leaves a live tab with no handle to close it.
       Open `about:blank`, then `goto` under the deadline and close the page on any error.
-- [ ] **`browser_evaluate` of an expression with no value fails.** chromiumoxide's `into_value`
+      *(2026-10-11)* Done; the load gets what the open left of the one budget, and a failed
+      load's tab is closed with `Target.closeTarget` from the browser side (`Page.close` runs the
+      stuck page's unload hooks). Live test `a_navigation_that_times_out_leaves_no_tab` against a
+      server that accepts and never answers: 2 tabs with the close skipped, 1 with it.
+- [x] **`browser_evaluate` of an expression with no value fails.** chromiumoxide's `into_value`
       errors with "No value found" for `undefined`, `NaN`, `Infinity` and `BigInt`, so
       `localStorage.setItem(...)` reports failure after it ran. Read the remote object's `value`
       or `unserializableValue` instead.
-- [ ] **A selector that matches nothing is a successful empty extract.** `#hedline` returns
+      *(2026-10-11)* `evaluated_json`: `undefined` → `null`, an unserializable number → its JS
+      spelling (`"NaN"`, `"10n"`), a function/symbol → its description. Tests
+      `results_without_a_json_value_still_have_one` + live `a_script_with_no_json_result_evaluates`.
+- [x] **A selector that matches nothing is a successful empty extract.** `#hedline` returns
       "(no content extracted)" as success; report "no element matches" instead.
+      *(2026-10-11)* The extract script returns `null` for no match and the call fails with "no
+      element on the page matches the selector"; an attribute read checks `exists` before
+      treating `None` as an absent attribute. Test `a_missing_element_is_not_a_missing_attribute`.
 
 ### The test suite stranded its scratch databases in tmpfs (found 2026-10-10)
 
