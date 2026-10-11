@@ -67,6 +67,12 @@ impl RepeatWatch {
     /// because any non-candidate fragment resets the run.
     const MAX_RUN: usize = 20;
     const MAX_FRAGMENT_CHARS: usize = 4;
+    /// The trip point for a run of one repeated all-digit fragment. Models
+    /// that tokenize one digit per token (Qwen, Gemma) stream a null SHA-1
+    /// as 40 identical `"0"` fragments, and 20 aborted it — at low
+    /// temperature on every retry. The longest such run real output carries
+    /// is a null SHA-512 in hex, 128 digits; one past it is degenerate.
+    const MAX_DIGIT_RUN: usize = 129;
 
     /// Record a fragment; returns the run length once it is degenerate.
     fn observe(&mut self, fragment: &str) -> Option<usize> {
@@ -83,7 +89,12 @@ impl RepeatWatch {
             self.last = Some(fragment.to_string());
             self.run = 1;
         }
-        (self.run >= Self::MAX_RUN).then_some(self.run)
+        let limit = if fragment.bytes().all(|byte| byte.is_ascii_digit()) {
+            Self::MAX_DIGIT_RUN
+        } else {
+            Self::MAX_RUN
+        };
+        (self.run >= limit).then_some(self.run)
     }
 }
 
@@ -9162,7 +9173,7 @@ mod tests {
         let mut w = RepeatWatch::default();
         let mut tripped_at = None;
         for i in 1..=60 {
-            if let Some(run) = w.observe("0") {
+            if let Some(run) = w.observe(",") {
                 tripped_at = Some((i, run));
                 break;
             }
@@ -9170,6 +9181,17 @@ mod tests {
         let (i, run) = tripped_at.expect("a stuck token must be caught");
         assert_eq!(i, RepeatWatch::MAX_RUN, "must trip exactly at the bound");
         assert_eq!(run, RepeatWatch::MAX_RUN);
+    }
+
+    /// A null SHA streamed one digit per token is content; a digit repeated
+    /// past the longest real run (a null SHA-512, 128) is still a fault.
+    #[test]
+    fn a_run_of_digits_is_held_to_the_longest_real_one() {
+        let mut w = RepeatWatch::default();
+        for _ in 0..128 {
+            assert!(w.observe("0").is_none(), "a null SHA-512 is not a wedge");
+        }
+        assert_eq!(w.observe("0"), Some(RepeatWatch::MAX_DIGIT_RUN));
     }
 
     #[test]
