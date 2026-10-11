@@ -1,123 +1,78 @@
-# Nanna v0.3.42-beta.51 — Web pages can no longer reach your agent, and a long list of quiet fixes
+# Nanna v0.3.43-beta.52 — Memories that stay put, tool calls that are never half-run, and channels that come back
 
-This release closes a security hole: any web page you visited could connect to Nanna's background
-service on your computer and run commands through it. It also fixes more than forty bugs found by
-reviewing the board, memory, scheduler, file tools and settings code line by line. Most of them
-gave a wrong answer without any error.
-
-## Security
-
-**Web pages can no longer control Nanna.** The background service listens only on your own
-computer, but browsers allow any page to open a connection to it. A malicious page could have run
-shell commands, read your settings and shut the service down. Connections from web pages are now
-refused; the Nanna app and the `nanna` command line are unaffected.
-
-**Settings no longer leak your API keys.** Reading or exporting the settings through the background
-service returned your API keys and sign-in token in plain text. They are now left out.
-
-**`nanna server` no longer answers web pages.** Its chat API, which can use tools, accepted requests
-from any web site. It now accepts only requests from programs on your computer.
-
-**Your rules for the agent are enforced everywhere.** A rule such as "never delete anything under
-tests/" was not enforced for shell commands, and the agent could overwrite the file that holds those
-rules. Both are fixed, and the agent can no longer erase the records its safety checks rely on.
-
-## The board
-
-- A card that the router split off, or that an agent handed on, is no longer stranded with nobody
-  on it when its run gives up or stalls.
-- A card no longer goes back to the router when its own agent asked you a question; the answer goes
-  to that agent.
-- The limit on retries before Nanna asks you now holds, however busy the card is.
-- Text you are typing in a card's description or labels is no longer wiped when the board refreshes.
-- A card opened from your Inbox can only be given to someone on that card's own board.
-- Deleting an agent releases its open cards back to the router instead of leaving them pointing at
-  an agent that is gone, and you can now unassign a card.
-- Renaming, re-dating or deleting a card now updates every open view right away.
-- Recurring cards open on the right day: not again on the day you finished them, and on the current
-  round after the computer was off.
-- Deadlines written with a time zone are no longer marked overdue before they pass.
-- A dependency that could never be finished is now refused, dates that are not real dates are
-  refused, and reopening or cancelling a card updates everything that follows it.
+This release fixes more than thirty bugs found by reviewing the memory, chat, board, channel, MCP,
+browser and provider code line by line. The most serious could lose a memory's text, run a tool call
+that had been cut off half-way, or leave a chat channel deaf until Nanna restarted.
 
 ## Memory
 
-- Memory now belongs to the right project. An agent working on one project's card no longer reads
-  or writes another project's memories.
-- Consolidation can no longer delete an unrelated memory when it re-folds a card's history.
-- A fact you stated is no longer merged into an observation and reworded later.
-- Saving a memory no longer fails when the embedding service is briefly unavailable.
-- Recalling memories no longer strengthens ones that were never shown.
+- **A memory can no longer lose its text during consolidation.** If saving a merged memory failed,
+  Nanna still went on to delete the memory it had merged in, so after a restart that text existed
+  nowhere. The merge is now undone and both memories are kept for the next pass.
+- **Your most important facts are no longer summarised away.** Facts you marked as helpful could be
+  rewritten into a summary and the original deleted, while less important facts were protected.
+- **Only one consolidation runs at a time.** Pressing "Consolidate" while a scheduled one was running
+  summarised the same memories twice and could remove more than the safety limit allows.
+- Summaries now keep their search index across restarts, and a summary is no longer thrown away
+  when you switch embedding providers in the middle of a pass.
+- A memory deleted during consolidation no longer comes back after a restart.
+- Recalling a memory now strengthens it as of the moment you recalled it, not the moment the next
+  consolidation ran.
+- A scheduled consolidation that failed everywhere is now reported as failed.
 
-## Scheduled jobs
+## Chat and the agent
 
-- A daily job that came due while Nanna was busy runs as soon as it is free, instead of skipping
-  the day.
-- Turning a job, or the scheduler, back on no longer runs it immediately off schedule.
-- "Run now" no longer freezes Settings and reminders while the job runs.
-- Editing a job now saves its new prompt.
+- **A tool call cut off by the model's output limit is never run.** A reply that ran out of room
+  in the middle of, say, writing a file had its half-written arguments patched up and executed —
+  writing half a file. It is now retried instead.
+- **Messages you send while the agent is working are no longer lost** if saving them fails, and a
+  message sent just as a reply finishes now starts its own reply instead of waiting for your next
+  one.
+- Sub-agents now really use the models you configured for them; every attempt used to run on your
+  main chat model.
+- A paused chat waiting for a provider to come back no longer hammers a provider that is down.
+- Provider checks now ask the model the run actually fell back to.
+- A reply that stopped before the provider said it was done is reported as cut off, not complete.
+- A rate limit returned by OpenRouter with a success status is recognised as a rate limit.
+- A model that writes long runs of digits (such as a null hash) is no longer stopped as stuck.
+- `gpt-oss:20b` and other tagged names go to Ollama, not OpenAI.
+- Tool calls from servers that omit an index are no longer dropped.
 
-## Files and tools
+## Chat channels
 
-- Editing a file with Windows line endings no longer mixes in Unix line endings.
-- Searches find matches at the end of lines in Windows-style files, and every match is marked.
-- `find_files` patterns with folders (`src/**/*.rs`) work without an explicit path.
-- PDF, image, audio and OCR tools can read files in projects outside your home folder (on a second
-  drive, for example). Existing installs are updated automatically unless you changed these
-  permissions yourself.
-- Paths with `~` or an apostrophe no longer break the syntax checks, and `.env.local` beside `.env`
-  is no longer refused as a copy.
-- File history no longer fills up with temporary drafts, every saved checkpoint can be listed, and
-  restoring over a file too large for history to keep is refused instead of losing it.
-- Web pages in other character sets (Latin-1, Shift-JIS and others) are fetched with their text
-  intact.
-- The browser tools keep working after their first use. Before, every browser call after the
-  first failed until Nanna was restarted.
-- An MCP server that sends an enormous message can no longer use up Nanna's memory.
+- **Telegram, Discord and Slack reconnect after a long outage.** After about eight minutes offline
+  a channel gave up for good until Nanna restarted. It now keeps retrying every two minutes.
+- A Discord bot set up without a required permission no longer reconnects twice a second (which can
+  get its token reset); it stops and says why.
+- A Slack connection that silently died is noticed and reconnected.
+- Slack no longer answers its own replies, join messages and edits, or answers one @-mention twice.
+- Telegram reactions with custom or paid emoji no longer block later updates (`nanna serve`).
 
-## Conversations with the model
+## The board
 
-- Requests sized for a small local model now count the project context, the tool list and the real
-  size of attached images, so a request that looked small enough no longer overflows the model's
-  window.
-- A file the agent re-read to edit is no longer swapped for a "seen before" note on the next step.
-- Empty-looking messages that Anthropic rejects are no longer sent, so a session that stored one no
-  longer fails on every later turn.
-- When a request is cut to fit, the agent is told; a message too long for the summarizer is no
-  longer dropped after only its beginning was read.
+- A card deferred to a time of day now starts that day; it used to never start.
+- Cancelling or deleting a sub-card wakes the card that was waiting on it.
+- A rate limit while working on a sub-card no longer cancels the sub-cards; the card waits it out.
 
-## Settings
+## MCP servers and the browser
 
-- A mistake in `config.toml` can no longer cause Nanna to overwrite the whole file with defaults.
-  Settings are also saved safely if the computer loses power.
-- Your custom system prompt and agent name are now used.
-- "Remember my choice" in the close dialog is remembered after a restart.
-- Saving one API key no longer copies keys from environment variables into your keyring.
-- Changing two settings in quick succession no longer undoes the first.
-- The Tools and Memory pages no longer show stale results after a quick switch, the scheduler switch
-  shows its real state when a change is refused, and a failed settings import now says so.
+- **MCP servers start together**, and each one's tools are available as soon as it is up. One slow
+  server used to hold back every other server's tools for minutes.
+- A question an MCP server asks you is no longer cut off after about 75 seconds.
+- Two servers whose tools end up with the same name no longer replace each other's tools.
+- A server that is slow to start for the first time now connects instead of failing.
+- MCP servers no longer load the app's own bundled libraries instead of your system's (AppImage).
+- The browser tools report `undefined` results correctly, say when a selector matches nothing, close
+  tabs whose page never finished loading, and no longer leave profile folders behind.
 
-## Command line
+## Settings and storage
 
-- `nanna config` no longer prints your API keys.
-- `nanna daemon stop` waits until the daemon has exited, so `stop` followed by `start` works, and
-  `nanna daemon start` reports a daemon that fails to start instead of claiming success.
-- `--config` is honoured by `nanna credentials`, `init` and `status`.
-- First-run key setup saves only your config file and the key you typed, not values from
-  environment variables.
-
-## Under the hood
-
-- **Dependencies:** Tauri 2.12.3 and its plugins, Nuxt 4.6.1 (it now builds on Windows), uuid
-  1.28, vue-router 5.4.0.
-- **Held back:** `rten` 0.27 (waiting on `ocrs`) and the newer rustpython parser crates.
-- The test suite no longer leaves temporary databases in `/tmp`.
+- Environment variables such as `PORT` are no longer written into your config file, and changing a
+  setting the environment controls now says so instead of silently reverting.
+- Reopening a project folder that was unavailable at startup keeps its sessions and tasks.
+- Tool statistics remember when each tool last ran across restarts.
 
 ## Still open
 
-- Channel setup (Telegram, Discord and others) still copies environment-variable secrets into the
-  keyring. Channels are due to be removed.
-- `nanna daemon stop` on macOS and Windows cannot yet confirm that the recorded process is the
-  daemon before stopping it.
-- MCP: a question a server asks you times out after about a minute, and one slow server delays
-  the tools of the others while Nanna starts.
+Recorded in the roadmap: Discord and Slack have no sender allowlist yet, a card reassigned while
+running can lose its new assignee, and a few smaller provider and storage issues.
