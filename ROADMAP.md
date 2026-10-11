@@ -10837,6 +10837,22 @@ keep the phases readable; promote individual items into a phase when they become
       unit test now removes the WAL too. Re-measured: 274 tests in the two crates, **0 entries
       left behind** (was 44 per run). The 1382 stale ones were deleted.
 
+### Dependency bumps held back (found 2026-10-11, dependency-freshness pass)
+
+- [ ] **`rten 0.26 → 0.27` waits for an `ocrs` release.** `ocrs 0.13.1` (latest) takes
+      `rten ^0.26` and our OCR code hands it an `rten::Model`, so bumping ours alone puts two
+      `rten`s in the graph and the types no longer meet. ocrs merged "Update to RTen v0.27"
+      ([robertknight/ocrs#278](https://github.com/robertknight/ocrs/pull/278), 2026-10-09) but
+      has not released it. Bump both together when it ships; dependabot #411 is the same bump
+      alone and cannot go green.
+- [ ] **`rustpython-ruff_python_* 0.16.10` breaks `rustpython-codegen 0.6.0`** (a patch release
+      replaced `ExprCompare`'s `left`/`comparators` with `operands`, 2026-10-07). The lock holds
+      all five ruff crates at 0.16.5; a plain `cargo update` re-breaks the build — re-pin with
+      `cargo update -p rustpython-ruff_python_parser --precise 0.16.5` first, then the rest.
+      Drop the hold once a `rustpython` release builds against 0.16.10.
+- [ ] `pymath 0.2.0` now resolves `malachite-bigint 0.13` while `rustpython-vm` takes 0.12; the
+      lock holds pymath on 0.12 so one malachite graph is built. Move with rustpython.
+
 ### The workspace is not rustfmt-formatted, and nothing checks (found 2026-09-24)
 
 - [ ] **`cargo fmt --check` reports 3407 hunks across 212 files on a clean `origin/master`**, and
