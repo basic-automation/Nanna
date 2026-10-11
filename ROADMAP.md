@@ -10793,10 +10793,14 @@ keep the phases readable; promote individual items into a phase when they become
       daemon records each server's status as it settles (`on_outcome`). Live test
       `a_slow_server_does_not_hold_back_another_servers_tools`: a Python stdio server's tool is
       registered in 0.05 s while a server that never answers is still starting.
-- [ ] **A cold start over 60 s fails a modern-only stdio server.** A probe timeout reads as
+- [x] **A cold start over 60 s fails a modern-only stdio server.** A probe timeout reads as
       "legacy"; the queued `server/discover` and `initialize` then both arrive, and a modern-only
       server rejects `initialize` with `-32022`. Re-classify that error and finish the modern
       handshake.
+      *(2026-10-11)* `recover_modern`: a `-32022` refusal of `initialize` is classified like a
+      probe answer; a modern verdict probes again in the named revision and finishes the modern
+      handshake (no `notifications/initialized`). Test
+      `a_modern_server_slow_to_start_still_connects`.
 - [x] **Tool names from two servers can collide.** `mcp__{server}__{tool}` is sanitized after the
       duplicate-name check (`home assistant` vs `home.assistant`, or `__` inside names), the
       registry's `insert` silently replaces the earlier tool, and `resync_server` can unregister
