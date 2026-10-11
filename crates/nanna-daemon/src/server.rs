@@ -2737,19 +2737,47 @@ async fn dream_once(
                 stats.auto_promoted,
                 stats.auto_demoted,
             );
-            (
-                true,
-                Some(format!(
-                    "Processed {} memories",
-                    stats.consolidation.memories_processed
-                )),
-                None,
-            )
+            scheduled_dream_outcome(&stats.consolidation)
         }
         Err(e) => {
             error!("Scheduled consolidation failed: {e}");
             (false, None, Some(e.to_string()))
         }
+    }
+}
+
+/// The scheduler's `(success, output, error)` for a dream cycle that ran.
+/// A cycle that changed nothing and hit errors failed: every summariser call
+/// refusing used to be recorded as "Processed N memories", a success, with
+/// the errors only in the log. A cycle that did some of its work succeeds
+/// and says how many parts failed. Pure.
+fn scheduled_dream_outcome(
+    result: &nanna_memory::ConsolidationResult,
+) -> (bool, Option<String>, Option<String>) {
+    let changed = result.memories_merged + result.memories_deduped + result.memories_expanded;
+    match result.errors.first() {
+        Some(first) if changed == 0 => (
+            false,
+            None,
+            Some(format!(
+                "{} errors and nothing consolidated; the first: {first}",
+                result.errors.len()
+            )),
+        ),
+        Some(_) => (
+            true,
+            Some(format!(
+                "Processed {} memories ({} errors)",
+                result.memories_processed,
+                result.errors.len()
+            )),
+            None,
+        ),
+        None => (
+            true,
+            Some(format!("Processed {} memories", result.memories_processed)),
+            None,
+        ),
     }
 }
 
@@ -6752,6 +6780,42 @@ fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsC
 /// get the same treatment, rate-limited (see `crate::heap`).
 fn release_boot_heap() {
     crate::heap::release_freed_heap();
+}
+
+#[cfg(test)]
+mod dream_outcome_tests {
+    use super::scheduled_dream_outcome;
+
+    #[test]
+    fn a_dream_that_only_failed_is_reported_failed() {
+        let failed = nanna_memory::ConsolidationResult {
+            memories_processed: 40,
+            errors: vec!["summarizer refused".into(), "summarizer refused".into()],
+            ..Default::default()
+        };
+        let (success, _, error) = scheduled_dream_outcome(&failed);
+        assert!(!success);
+        assert!(error.is_some_and(|e| e.contains("summarizer refused")));
+
+        let partial = nanna_memory::ConsolidationResult {
+            memories_processed: 40,
+            memories_merged: 3,
+            errors: vec!["one cluster failed".into()],
+            ..Default::default()
+        };
+        let (success, output, _) = scheduled_dream_outcome(&partial);
+        assert!(success);
+        assert_eq!(output.as_deref(), Some("Processed 40 memories (1 errors)"));
+
+        let clean = nanna_memory::ConsolidationResult {
+            memories_processed: 40,
+            ..Default::default()
+        };
+        assert_eq!(
+            scheduled_dream_outcome(&clean),
+            (true, Some("Processed 40 memories".to_string()), None)
+        );
+    }
 }
 
 #[cfg(test)]

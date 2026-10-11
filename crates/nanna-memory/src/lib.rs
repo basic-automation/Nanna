@@ -151,6 +151,12 @@ pub enum MemoryError {
     /// the merge had already happened.
     #[error("invalid clustering configuration: {0}")]
     InvalidClusteringConfig(String),
+    /// A dream cycle is already running on this store; this one was not
+    /// started. Two at once summarised the same clusters twice (two
+    /// summaries that never fold into each other) and each removed up to the
+    /// compression budget, together twice what one cycle may.
+    #[error("a memory consolidation is already running; try again when it finishes")]
+    DreamInFlight,
 }
 
 /// Trait for pluggable persistence backends (Turso, etc.)
