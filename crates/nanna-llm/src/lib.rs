@@ -5227,6 +5227,69 @@ impl StreamAccumulator {
     }
 }
 
+/// The error for a reply the output-token limit cut off while `open_tools`
+/// tool call(s) were being written. Their arguments end mid-value; the JSON
+/// healer would close the brackets and the call would run — a `write_file`
+/// writing half a file — so no call from such a reply may run. Retryable.
+fn cut_tool_call_error(open_tools: usize) -> LlmError {
+    debug_assert!(open_tools > 0, "only a reply with an open tool call is cut");
+    LlmError::from_api_response(
+        502,
+        format!(
+            "the reply hit the output token limit while {open_tools} tool call(s) were \
+             being written; their arguments are cut off, so none was run"
+        ),
+    )
+}
+
+/// The native Anthropic stream's per-event state, borrowed from the stream
+/// body so its event handling is one function rather than two copies.
+struct NativeStream<'a> {
+    accumulator: &'a mut StreamAccumulator,
+    stopped: &'a mut bool,
+}
+
+impl NativeStream<'_> {
+    /// Every complete event in `buffer`, in order, ending with an `Err` when
+    /// one ends the stream ([`native_stream_verdict`]); nothing after it.
+    fn take(
+        &mut self,
+        buffer: &mut String,
+        is_oauth: bool,
+        original_tools: &[ToolDefinition],
+    ) -> Vec<Result<StreamEvent, LlmError>> {
+        let mut items = Vec::new();
+        while let Some(event_str) = extract_sse_event(buffer) {
+            let Some(mut stream_event) = parse_sse_event(&event_str) else {
+                continue;
+            };
+            if is_oauth {
+                restore_oauth_tool_name(&mut stream_event, original_tools);
+            }
+            self.accumulator.process(&stream_event);
+            let verdict = native_stream_verdict(&stream_event, self.accumulator);
+            *self.stopped |= matches!(stream_event, StreamEvent::MessageStop { .. });
+            items.push(Ok(stream_event));
+            if let Some(error) = verdict {
+                items.push(Err(error));
+                break;
+            }
+        }
+        items
+    }
+}
+
+/// Whether `event` ends the native Anthropic stream as an error: a
+/// `max_tokens` stop after a `tool_use` block. Anthropic closes the open block
+/// itself (so the call looked complete) and only then says why it stopped.
+fn native_stream_verdict(event: &StreamEvent, accumulator: &StreamAccumulator) -> Option<LlmError> {
+    let StreamEvent::MessageDelta { stop_reason: Some(reason), .. } = event else {
+        return None;
+    };
+    (reason == "max_tokens" && !accumulator.tool_calls.is_empty())
+        .then(|| cut_tool_call_error(accumulator.tool_calls.len()))
+}
+
 /// The OAuth ("Claude Code") form of a streaming request: an array-based system
 /// prompt, and tool names remapped to Claude Code's canonical ones.
 fn oauth_stream_request(request: &AnthropicRequest) -> OAuthAnthropicRequest {
@@ -5493,6 +5556,7 @@ impl LlmClient {
             let mut byte_stream = response.bytes_stream();
             let mut buffer = String::new();
             let mut accumulator = StreamAccumulator::new();
+            let mut stopped = false;
 
             let mut utf8 = Utf8StreamDecoder::default();
             while let Some(chunk_result) = byte_stream.next().await {
@@ -5512,25 +5576,38 @@ impl LlmClient {
                     }
                 }
 
-                while let Some(event_str) = extract_sse_event(&mut buffer) {
-                    if let Some(mut stream_event) = parse_sse_event(&event_str) {
-                        if is_oauth {
-                            restore_oauth_tool_name(&mut stream_event, &original_tools);
-                        }
-                        accumulator.process(&stream_event);
-                        yield Ok(stream_event);
+                let mut native = NativeStream { accumulator: &mut accumulator, stopped: &mut stopped };
+                for item in native.take(&mut buffer, is_oauth, &original_tools) {
+                    let fatal = item.is_err();
+                    yield item;
+                    if fatal {
+                        return;
                     }
                 }
             }
 
-            if !buffer.trim().is_empty()
-                && let Some(mut stream_event) = parse_sse_event(&buffer) {
-                    if is_oauth {
-                        restore_oauth_tool_name(&mut stream_event, &original_tools);
+            if !buffer.trim().is_empty() {
+                // The last event may lack its blank-line terminator.
+                buffer.push_str("\n\n");
+                let mut native = NativeStream { accumulator: &mut accumulator, stopped: &mut stopped };
+                for item in native.take(&mut buffer, is_oauth, &original_tools) {
+                    let fatal = item.is_err();
+                    yield item;
+                    if fatal {
+                        return;
                     }
-                    accumulator.process(&stream_event);
-                    yield Ok(stream_event);
                 }
+            }
+            // A clean end of the body before `message_stop` is a cut reply,
+            // not a finished one: the OpenAI and Ollama paths already said so,
+            // and this one handed the truncated text on as the final answer.
+            if !stopped {
+                yield accumulator.interrupted(LlmError::from_api_response(
+                    502,
+                    "the Anthropic stream ended before message_stop; the reply is cut off"
+                        .to_string(),
+                ));
+            }
         }
     }
 
@@ -7005,6 +7082,9 @@ impl OpenAiStreamState {
 
             // Check for stop
             if let Some(reason) = choice.finish_reason {
+                if reason == "length" && !self.tool_calls_started.is_empty() {
+                    return Err(cut_tool_call_error(self.tool_calls_started.len()));
+                }
                 // Close any open blocks; the message itself stops at `[DONE]`.
                 events.extend(self.close_blocks());
                 self.text_block_started = false;
@@ -7012,6 +7092,7 @@ impl OpenAiStreamState {
                 let stop_reason = match reason.as_str() {
                     "tool_calls" => "tool_use",
                     "stop" => "end_turn",
+                    "length" => "max_tokens",
                     other => other,
                 };
                 self.finished_with = Some(stop_reason.to_string());
@@ -7358,10 +7439,16 @@ fn anthropic_to_wire_request(
 
 /// Convert an `OpenAI` chat completion response JSON to `AnthropicResponse`
 fn openai_response_to_anthropic(model: &str, response: &serde_json::Value) -> Result<AnthropicResponse, LlmError> {
-    let choice = response["choices"]
-        .as_array()
-        .and_then(|c| c.first())
-        .ok_or_else(|| LlmError::Api { status: 500, message: "No choices in response".to_string() })?;
+    let Some(choice) = response["choices"].as_array().and_then(|c| c.first()) else {
+        // OpenRouter answers some failures — a free-tier 429 among them — with
+        // HTTP 200 and an `error` body. Read as "no choices" (a 500 nothing
+        // falls back from) the rate limit and its message were lost; the
+        // OpenAI-native path already read the envelope (PR #130).
+        if let Some(error) = stream_error_envelope(&response.to_string()) {
+            return Err(error);
+        }
+        return Err(LlmError::Api { status: 500, message: "No choices in response".to_string() });
+    };
 
     let message = &choice["message"];
     let mut content = Vec::new();
@@ -7764,6 +7851,71 @@ mod tests {
         assert!(
             !end.iter().any(|item| matches!(item, Ok(StreamEvent::MessageStop { .. }))),
             "a cut call is not stopped as complete"
+        );
+    }
+
+    /// A reply the output-token limit cut inside a tool call is an error,
+    /// whether the provider says `length` (OpenAI-compatible) or `max_tokens`
+    /// after closing the block itself (native Anthropic). It used to be closed
+    /// like a finished call, healed, and run with half its arguments.
+    #[test]
+    fn a_tool_call_cut_by_the_token_limit_is_never_run() {
+        let mut state = OpenAiStreamState::default();
+        state
+            .on_line::<OpenAiChunkDelta>(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":"{\"path\":\"a.py\",\"content\":\"def f("}}]}}]}"#,
+            )
+            .expect("a chunk");
+        let cut = state.on_line::<OpenAiChunkDelta>(
+            r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+        );
+        assert!(matches!(cut, Err(LlmError::Api { status: 502, .. })), "{cut:?}");
+
+        let mut text = OpenAiStreamState::default();
+        text.on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"content":"long"}}]}"#)
+            .expect("a chunk");
+        text.on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#)
+            .expect("a text reply cut by length is not an error");
+        let (events, _) = text.on_line::<OpenAiChunkDelta>("data: [DONE]").expect("done");
+        assert!(
+            matches!(events.last(), Some(StreamEvent::MessageStop { stop_reason }) if stop_reason == "max_tokens"),
+            "{events:?}"
+        );
+
+        let mut accumulator = StreamAccumulator::new();
+        accumulator.process(&StreamEvent::ContentBlockStart {
+            index: 0,
+            content_type: "tool_use".to_string(),
+            tool_id: Some("toolu_1".to_string()),
+            tool_name: Some("write_file".to_string()),
+        });
+        let max_tokens = StreamEvent::MessageDelta {
+            stop_reason: Some("max_tokens".to_string()),
+            output_tokens: 4096,
+        };
+        assert!(native_stream_verdict(&max_tokens, &accumulator).is_some());
+        let tool_use = StreamEvent::MessageDelta {
+            stop_reason: Some("tool_use".to_string()),
+            output_tokens: 80,
+        };
+        assert!(native_stream_verdict(&tool_use, &accumulator).is_none());
+        assert!(
+            native_stream_verdict(&max_tokens, &StreamAccumulator::new()).is_none(),
+            "a text reply cut by max_tokens is still a reply"
+        );
+    }
+
+    /// An HTTP-200 error body on the Anthropic-over-OpenAI path keeps its
+    /// status (a 429 stays a rate limit the router falls back from).
+    #[test]
+    fn a_200_error_body_is_read_as_its_error_not_no_choices() {
+        let body = serde_json::json!({
+            "error": { "message": "Rate limit exceeded: free-models-per-day", "code": 429 }
+        });
+        let read = openai_response_to_anthropic("openrouter/x", &body);
+        assert!(
+            matches!(&read, Err(e) if !e.to_string().contains("No choices")),
+            "{read:?}"
         );
     }
 

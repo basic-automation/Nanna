@@ -11022,6 +11022,31 @@ keep the phases readable; promote individual items into a phase when they become
 - [ ] The crash watcher (`TurnWatcher::watch`) skips `demote_in_progress` and
       `run_workspace::release`: a panicked turn's item stays `in_progress` (and is resumed first).
 
+### Provider replies read wrongly (found 2026-10-11, audit of the LLM clients)
+
+- [x] **A tool call cut off by the output-token limit was healed and run.** OpenAI-compatible
+      `finish_reason: "length"` closed open tool blocks like `tool_calls`; native Anthropic closes the
+      block itself and only then sends `stop_reason: "max_tokens"`, which nothing read. The JSON
+      healer closed the brackets and the call ran — a `write_file` writing half a file. Both now end
+      the stream with a retryable error (`cut_tool_call_error`); a text reply cut by the limit is
+      still a reply (stop reason `max_tokens`). Test `a_tool_call_cut_by_the_token_limit_is_never_run`.
+- [x] **A native Anthropic stream that ended before `message_stop` was a clean finish** (the OpenAI
+      and Ollama paths already refused this); it now ends interrupted, partial content kept.
+- [x] **An HTTP-200 error body on the Anthropic-over-OpenAI path read as a 500 "No choices"**, so a
+      free-tier 429 lost its status and nothing fell back. Test
+      `a_200_error_body_is_read_as_its_error_not_no_choices`.
+- [ ] `ContentBlock` has no `redacted_thinking` variant and no catch-all: a non-streaming response
+      carrying one fails to decode ("unknown variant") and the paid response is discarded; the
+      streaming path drops the block, which Anthropic may reject on the next tool turn.
+- [ ] `RepeatWatch` aborts legitimate digit runs: one-digit-per-token models (Qwen, Gemma) streaming
+      40 zeros (a null SHA) trip `WedgedRunner` at the 20th `"0"`, and at low temperature the step
+      can never finish. Exempt all-digit fragments or require a longer run.
+- [ ] OpenAI-compatible tool-call deltas: `index` is required (a server that omits it loses every
+      such chunk, its `finish_reason` included), and a new `id` at a used index overwrites the
+      earlier call in the assembler. Default `index` to 0; give a new id a fresh block.
+- [ ] The router's `gpt-` prefix rule runs before the `:tag` (Ollama) rule, so a bare `gpt-oss:20b`
+      goes to OpenAI (`llm_router.rs:74`). Check `:` first.
+
 ### Dependency bumps held back (found 2026-10-11, dependency-freshness pass)
 
 - [ ] **`rten 0.26 → 0.27` waits for an `ocrs` release.** `ocrs 0.13.1` (latest) takes
