@@ -2321,20 +2321,38 @@ impl MemoryService {
             // individually cheap, and is exactly the material meant to be
             // compressed into narrative. So at `Detailed`, episodes consolidate
             // and durable facts are left alone.
-            let memories = if compression_level == CompressionLevel::Detailed {
-                let (episodic, durable): (Vec<_>, Vec<_>) =
-                    memories.into_iter().partition(is_episodic_memory);
-                result.memories_processed += durable.len();
-                if episodic.is_empty() {
-                    continue;
+            //
+            // `Expand` (weight above 1.0) is the same argument, stronger: a fact
+            // lands there because feedback said it mattered, and it used to be
+            // clustered, rewritten and its original removed while the same
+            // fact at 0.9 was protected. There a durable fact is still offered
+            // to `expand_memory` — alone, as a singleton — but never merged.
+            let mut durable_singletons: Vec<Vec<MemoryEntry>> = Vec::new();
+            let memories = match compression_level {
+                CompressionLevel::Detailed | CompressionLevel::Expand => {
+                    let (episodic, durable): (Vec<_>, Vec<_>) =
+                        memories.into_iter().partition(is_episodic_memory);
+                    if compression_level == CompressionLevel::Detailed {
+                        result.memories_processed += durable.len();
+                    } else {
+                        durable_singletons = durable.into_iter().map(|m| vec![m]).collect();
+                    }
+                    if episodic.is_empty() && durable_singletons.is_empty() {
+                        continue;
+                    }
+                    episodic
                 }
-                episodic
-            } else {
-                memories
+                _ => memories,
             };
 
             // Cluster using composite score (similarity + recall + importance + age)
-            let clusters = cluster_memories(&memories, config);
+            let mut clusters = cluster_memories(&memories, config);
+            if config.min_cluster_size > 1 {
+                clusters.extend(durable_singletons);
+            } else {
+                // A cluster of one would be summarised: leave them be.
+                result.memories_processed += durable_singletons.len();
+            }
             removal_budget = self
                 .consolidate_clusters(
                     clusters,
@@ -4541,6 +4559,42 @@ mod tests {
             "no LLM call may be made for the Detailed band"
         );
         assert!(service.count().await < 4, "the band must have compressed");
+    }
+
+    /// A durable fact feedback lifted into the `Expand` band (weight above
+    /// 1.0) is never merged into a summary: it used to be clustered, rewritten
+    /// and removed, while the same fact at 0.9 was protected.
+    #[tokio::test]
+    async fn an_expand_band_fact_is_never_summarized_away() {
+        let service = dedup_service();
+        for (id, content, vector) in [
+            ("port", "the daemon listens on 5149", vec![1.0, 0.0, 0.0]),
+            ("host", "the daemon binds 127.0.0.1", vec![0.9, 0.43, 0.0]),
+        ] {
+            let mut entry = dedup_entry(id, content, vector, None);
+            entry.fsrs.importance = 3.0;
+            entry.fsrs.stability = 100.0;
+            service.add_entry(entry).await.expect("seed");
+        }
+        let bands = service.get_consolidation_bands().await;
+        assert_eq!(bands.expand.len(), 2, "fixture must populate Expand");
+
+        let result = service
+            .consolidate(
+                &ConsolidationConfig {
+                    min_remaining_memories: 1,
+                    max_compression_ratio: 0.9,
+                    cluster_threshold: 0.65,
+                    ..ConsolidationConfig::default()
+                },
+                |_prompt| async { Ok(String::from("expanded with context")) },
+            )
+            .await
+            .expect("consolidate");
+
+        assert_eq!(result.clusters_formed, 0, "no durable fact is merged: {result:?}");
+        assert!(service.get("port").await.is_some(), "kept");
+        assert!(service.get("host").await.is_some(), "kept");
     }
 
     /// A rewritten survivor must not keep its pre-merge vector. Stale embeddings

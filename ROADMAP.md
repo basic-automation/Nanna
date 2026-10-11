@@ -10940,10 +10940,13 @@ keep the phases readable; promote individual items into a phase when they become
       Test `a_summary_is_stamped_with_the_model_or_queued_never_discarded`.
 - [x] A scheduled dream in which every summariser call failed was recorded as a success. Test
       `a_dream_that_only_failed_is_reported_failed`.
-- [ ] **Durable facts in the Expand band are summarised away.** The episodic/durable guard
+- [x] **Durable facts in the Expand band are summarised away.** The episodic/durable guard
       (`service.rs`, ~2324) covers only the Detailed band (weight 0.8–1.0); a fact feedback lifted
       past 1.0 is clustered, rewritten and its original removed, while the same fact at 0.9 is
       protected. Apply the split to Expand too.
+      *(2026-10-11)* In Expand a durable fact is still offered to `expand_memory`, alone, but never
+      clustered (and with `min_cluster_size` ≤ 1 not touched at all). Test
+      `an_expand_band_fact_is_never_summarized_away` (red with the old Detailed-only split).
 - [x] `remove_many_matching` (`lib.rs`) does not take `persist_serial`, and ignores a failed disk
       delete after removing in RAM — a concurrent backfill `save_entry` can re-insert a removed
       source, which returns on restart beside the memory that absorbed it. Take the lock; remove
