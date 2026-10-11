@@ -1561,7 +1561,12 @@ impl CardTree {
         let mut cursor = id;
         for _ in 0..=nanna_storage::TASK_DEPTH_MAX {
             if cursor == root {
-                return true;
+                // The root itself must still be this member's: a card
+                // reassigned mid-run used to stay served to the old member,
+                // who then handed back or paused the NEW assignee's card.
+                return member.is_none_or(|member| {
+                    self.assignee_of.get(&root).is_some_and(|assignee| assignee == member)
+                });
             }
             let delegated = self
                 .assignee_of
@@ -1911,6 +1916,15 @@ impl TursoTaskSource {
                 return;
             }
         };
+        if card.assignee != self.member_id {
+            // Reassigned while this run wound down: the card is the new
+            // assignee's. A hand-back would wipe their assignment (and count
+            // against the card), a pause would be recorded as theirs and
+            // freeze the card for good. Only put it back to `pending`; the
+            // run's end wakes it for its new member (`announce_member_free`).
+            self.release_reassigned(&card).await;
+            return;
+        }
         match card_after_run(&card, stop) {
             CardAfterRun::Closed => {}
             CardAfterRun::HandBack(reason) => {
@@ -1941,6 +1955,29 @@ impl TursoTaskSource {
             }
         }
     }
+    /// Put a card that was reassigned under this run back to `pending`, so
+    /// its new member's run can start; nothing else about it is this run's.
+    async fn release_reassigned(&self, card: &Task) {
+        debug_assert_ne!(card.assignee, self.member_id, "only a card no longer ours");
+        tracing::info!(
+            task_id = card.id,
+            from = ?self.member_id,
+            to = ?card.assignee,
+            "card reassigned during its run; leaving it to its new member"
+        );
+        self.handed_back.store(true, std::sync::atomic::Ordering::Release);
+        if card.status != "in_progress" {
+            return;
+        }
+        let wait = TaskPatch {
+            status: Some("pending".to_string()),
+            ..TaskPatch::default()
+        };
+        if let Err(e) = self.storage.tasks().update(card.id, wait, Some(&self.actor)).await {
+            tracing::warn!(task_id = card.id, error = %e, "reassigned card left in progress");
+        }
+    }
+
     /// The run's provider refused it outright: ask the human to fix the setup
     /// (P25 decision 6's clarification — the card waits on it, derived
     /// `blocked`) and put the card back to `pending` with its member, so the
@@ -2074,6 +2111,11 @@ impl TursoTaskSource {
             "only the run's own card is handed back"
         );
         let repo = self.storage.tasks();
+        let card = repo.get(id).await.map_err(|e| e.to_string())?;
+        if card.assignee != self.member_id {
+            self.release_reassigned(&card).await;
+            return Ok(());
+        }
         let reason = truncate_post(reason);
         repo.log_activity(
             id,
@@ -10631,6 +10673,10 @@ mod card_run_tests {
             "that member's run takes it"
         );
         assert!(
+            !tree.serves(1, Some("agent:other"), 1),
+            "a card reassigned away is no longer served to the old member's run"
+        );
+        assert!(
             tree.serves(1, None, 7),
             "a run with no member sees the whole subtree"
         );
@@ -11186,6 +11232,60 @@ mod card_run_tests {
             .is_none(),
             "and not after"
         );
+    }
+
+    /// A card reassigned while its run winds down is the new member's: the
+    /// old run's end neither hands it back (wiping the new assignee) nor
+    /// pauses it under the new member's name. It goes back to `pending`.
+    #[tokio::test]
+    async fn a_card_reassigned_mid_run_is_left_to_its_new_member() {
+        use nanna_agent::harness::StopReason;
+        for stop in [
+            StopReason::WallClockExhausted,
+            StopReason::Cancelled,
+            StopReason::RunnerErrors { message: "connection reset".to_string() },
+        ] {
+            let storage = builder_storage().await;
+            storage
+                .members()
+                .create(NewMember {
+                    id: "agent:other".to_string(),
+                    name: "Other".to_string(),
+                    avatar: None,
+                    kind: MemberKind::Agent,
+                    owner_kind: MemberOwner::Workspace,
+                    owner_id: None,
+                    status: MemberStatus::Idle,
+                    profile: json!({}),
+                })
+                .await
+                .expect("member");
+            let tasks = storage.tasks();
+            let id = card(&storage, "changes hands", None, 3).await;
+            let source = card_source(&storage, id);
+            source.start(id).await.expect("picked up");
+            tasks
+                .update(
+                    id,
+                    nanna_storage::TaskPatch {
+                        assignee: Some(Some("agent:other".to_string())),
+                        ..nanna_storage::TaskPatch::default()
+                    },
+                    Some("gui"),
+                )
+                .await
+                .expect("reassigned");
+            source.settle_after_run(&stop).await;
+
+            let card = tasks.get(id).await.expect("card");
+            assert_eq!(card.assignee.as_deref(), Some("agent:other"), "{stop:?}: kept");
+            assert_eq!(card.status, "pending", "{stop:?}: free for its new member");
+            let activity = tasks.activity(id, 32).await.expect("activity");
+            assert!(
+                !activity.iter().any(|a| a.action == super::HANDED_BACK_ACTION),
+                "{stop:?}: not a hand-back"
+            );
+        }
     }
 
     /// A rate limit met on a SUB-card is the provider's, not the sub-card's:

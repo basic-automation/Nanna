@@ -10972,13 +10972,19 @@ keep the phases readable; promote individual items into a phase when they become
       subtree's root names its parent in the event (`parent_id`), which is woken. Cases in
       `an_agent_assignment_or_an_arriving_date_wakes_the_worker`.
 
-- [ ] **Reassigning a running card leaves the old member working it.** `CardTree::serves`
+- [x] **Reassigning a running card leaves the old member working it.** `CardTree::serves`
       (`tasks.rs`) passes the root before checking its assignee, and `settle_after_run` /
       `hand_back` never check the card still belongs to the run's member: a budget end then wipes
       the human's new assignee (and counts a hand-back), and a Stop records the new member as
       pausing itself, so the stall sweep skips the card forever. Cancel the run when `assignee`
       changes on an `in_progress` card, and make `settle_after_run` only reset a card it no
       longer owns. (`member_delete` checks `member_is_working` outside `fence_starts` — same class.)
+      *(2026-10-11)* `CardTree::serves` checks the root's own assignee, so the old run stops being
+      served its card at the next boundary; `settle_after_run` and `hand_back` leave a card that is
+      no longer the member's alone except to put it back to `pending` (`release_reassigned`), and
+      the run's existing end wake (`announce_member_free`'s card wake) starts the new member.
+      Test `a_card_reassigned_mid_run_is_left_to_its_new_member` (three stop kinds).
+      **Still open:** the `member_delete` fence race.
 - [x] **A rate limit during a run with sub-cards cancels the sub-cards.** `abandon` handles 429 and
       refused keys only for `id == subtree_root`; a leaf falls through to `cancelled`, and
       `provider_died` treats 429 as a crash and resumes (8 × 15 s) without the cooldown, cancelling
