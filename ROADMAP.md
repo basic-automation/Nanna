@@ -11028,8 +11028,10 @@ keep the phases readable; promote individual items into a phase when they become
       Retry automatically only when nothing was emitted. (Also: any error containing "429" is
       treated as a rate limit — a "prompt is too long: 214290 tokens" is retried 3× instead of
       compressed — and that retry ignores `retry_after`.)
-- [ ] The crash watcher (`TurnWatcher::watch`) skips `demote_in_progress` and
+- [x] The crash watcher (`TurnWatcher::watch`) skips `demote_in_progress` and
       `run_workspace::release`: a panicked turn's item stays `in_progress` (and is resumed first).
+      *(2026-10-11)* Both added, and the baseline is closed under the turn's own scope (it was
+      always `"session"`). *No dedicated test* — the watcher is only reachable by a panicking turn.
 
 ### Provider replies read wrongly (found 2026-10-11, audit of the LLM clients)
 

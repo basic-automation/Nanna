@@ -2711,6 +2711,9 @@ struct TurnWatcher {
     message_id: String,
     live: Arc<crate::liveness::SessionLiveness>,
     tools: Arc<ToolRegistry>,
+    storage: Arc<Storage>,
+    scope: String,
+    scope_id: Option<String>,
 }
 
 impl TurnWatcher {
@@ -2725,6 +2728,9 @@ impl TurnWatcher {
             message_id: turn.message_id.clone(),
             live: turn.live.clone(),
             tools: turn.agent.tools().clone(),
+            storage: turn.storage.clone(),
+            scope: turn.scope.clone(),
+            scope_id: turn.scope_id.clone(),
         }
     }
 
@@ -2740,6 +2746,9 @@ impl TurnWatcher {
             message_id: watcher_message_id,
             live: watcher_live,
             tools: watcher_tools,
+            storage: watcher_storage,
+            scope: watcher_scope,
+            scope_id: watcher_scope_id,
         } = self;
         let Err(join_error) = turn.await else {
             return;
@@ -2764,10 +2773,26 @@ impl TurnWatcher {
         // half of the leak: the next thing to resolve a path as this
         // session would silently use a dead turn's root.
         watcher_tools.clear_session_workdir(&watcher_session).await;
+        crate::run_workspace::release(&watcher_session);
+        // The tail demotes the turn's in-flight items; skipped here, a crashed
+        // turn's item stayed `in_progress`, which `next()` sorts first — the
+        // next message resumed the dead turn's work instead of being answered.
+        if let Err(message) = demote_in_progress(
+            &watcher_storage,
+            &watcher_scope,
+            watcher_scope_id.as_deref(),
+            "chat",
+        )
+        .await
+        {
+            tracing::warn!(%message, "could not release a crashed turn's in-flight items");
+        }
         watcher_agent.unregister_external_run(&watcher_session).await;
         watcher_registry.release(&watcher_session).await;
         if let Some(baselines) = watcher_baselines {
-            baselines.close_turn("session", Some(&watcher_session)).await;
+            // The turn's own scope, as the tail closes it (a workspace chat's
+            // baseline is not keyed by the session).
+            baselines.close_turn(&watcher_scope, watcher_scope_id.as_deref()).await;
         }
         // Close the liveness ledger too, or the beat task would keep
         // beating for a turn that no longer exists. `crashed` also gives
