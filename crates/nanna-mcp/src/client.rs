@@ -93,6 +93,13 @@ impl<T: Transport> McpClient<T> {
         }
     }
 
+    /// How long the installed elicitor waits for one answer; `None` when
+    /// none is installed (a call is then never retried for input).
+    #[must_use]
+    pub fn elicitor_answer_wait_max(&self) -> Option<std::time::Duration> {
+        self.elicitor.as_ref().map(|elicitor| elicitor.answer_wait_max())
+    }
+
     /// Serve the server's form elicitations through `elicitor` (modern era).
     /// Set before [`Self::initialize`]: it decides what the client declares.
     #[must_use]
@@ -1382,6 +1389,9 @@ mod tests {
         async fn ask(&self, question: &str) -> Option<String> {
             self.0.lock().unwrap().push(question.to_string());
             self.1.map(str::to_string)
+        }
+        fn answer_wait_max(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(1)
         }
     }
 

@@ -43,6 +43,36 @@ pub trait Elicitor: Send + Sync {
     /// Ask `question`; `None` when no answer came (no conversation to ask
     /// in, or the user did not reply in time).
     async fn ask(&self, question: &str) -> Option<String>;
+
+    /// The longest one [`Self::ask`] waits for a reply. A tool call that
+    /// may ask the user is given this much more time per question, so the
+    /// user's think-time is not cut off by a deadline sized for the server.
+    fn answer_wait_max(&self) -> std::time::Duration;
+}
+
+/// The longest one tool call may take, end to end.
+///
+/// Every request takes at most [`crate::MCP_REQUEST_TIMEOUT`], and — when an
+/// elicitor answering within `answer_wait_max` is installed — there are up to
+/// [`MRTR_ROUNDS_MAX`] retries, each after at most [`INPUT_REQUESTS_MAX`]
+/// questions to the user. Without an
+/// elicitor there are no retries, so it is one request. Pure.
+///
+/// The call's deadline used to be one request's (60 s + margin) whatever
+/// happened inside it, so a question to the user that waited up to 600 s
+/// was cut off at about 75 s and the answer never reached the server.
+#[must_use]
+pub fn tool_call_time_max(answer_wait_max: Option<std::time::Duration>) -> std::time::Duration {
+    let Some(answer_wait_max) = answer_wait_max else {
+        return crate::MCP_REQUEST_TIMEOUT;
+    };
+    let rounds = u32::try_from(MRTR_ROUNDS_MAX).unwrap_or(u32::MAX);
+    let questions = u32::try_from(INPUT_REQUESTS_MAX).unwrap_or(u32::MAX);
+    let requests = crate::MCP_REQUEST_TIMEOUT.saturating_mul(rounds.saturating_add(1));
+    let asking = answer_wait_max.saturating_mul(rounds.saturating_mul(questions));
+    let total = requests.saturating_add(asking);
+    debug_assert!(total >= crate::MCP_REQUEST_TIMEOUT);
+    total
 }
 
 /// The question the user sees for one form request. Pure.
@@ -291,6 +321,25 @@ pub fn retry_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without an elicitor a call is one request; with one, every question
+    /// the call may ask gets the user's whole wait, so an answer given after
+    /// a minute still reaches the server.
+    #[test]
+    fn a_call_that_may_ask_the_user_gets_the_users_time() {
+        use std::time::Duration;
+        assert_eq!(tool_call_time_max(None), crate::MCP_REQUEST_TIMEOUT);
+        let wait = Duration::from_secs(600);
+        let with_asking = tool_call_time_max(Some(wait));
+        // 4 requests of 60 s, plus 3 rounds of at most 8 questions of 10 min.
+        assert_eq!(with_asking, Duration::from_mins(4 + 3 * 8 * 10));
+        assert!(with_asking > wait, "one whole answer fits inside the call");
+        assert_eq!(
+            tool_call_time_max(Some(Duration::MAX)),
+            Duration::MAX,
+            "saturates rather than overflowing"
+        );
+    }
 
     fn color_schema() -> Value {
         json!({ "type": "object", "properties": {

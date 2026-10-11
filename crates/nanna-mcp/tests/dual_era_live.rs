@@ -119,6 +119,9 @@ impl nanna_mcp::Elicitor for ScriptedUser {
         self.0.lock().expect("lock").push(question.to_string());
         Some(self.1.to_string())
     }
+    fn answer_wait_max(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(1)
+    }
 }
 
 #[tokio::test]

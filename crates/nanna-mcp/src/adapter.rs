@@ -344,12 +344,15 @@ mod tools_impl {
             Ok(tool_result)
         }
 
-        /// The registry's deadline sits just past the transport's own, so the
-        /// transport's timeout — which names the server — is the one a slow
-        /// call reports, not the registry's generic one. The two used to
-        /// disagree outright: 60 s advertised here, 30 s enforced below.
+        /// The registry's deadline sits just past the call's own longest
+        /// time, so the transport's timeout — which names the server — is the
+        /// one a slow call reports, not the registry's generic one. The two
+        /// used to disagree outright: 60 s advertised here, 30 s enforced
+        /// below. A call that may ask the user gets the user's time on top
+        /// (see [`crate::elicit::tool_call_time_max`]).
         fn timeout_secs(&self) -> Option<u64> {
-            Some(crate::MCP_REQUEST_TIMEOUT.as_secs() + crate::MCP_DEADLINE_MARGIN_SECS)
+            let call = crate::elicit::tool_call_time_max(self.client.elicitor_answer_wait_max());
+            Some(call.as_secs().saturating_add(crate::MCP_DEADLINE_MARGIN_SECS))
         }
     }
 

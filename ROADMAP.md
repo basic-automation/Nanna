@@ -10775,10 +10775,15 @@ keep the phases readable; promote individual items into a phase when they become
       past 16 MiB (`STDIO_LINE_BYTES_MAX`), keeps a half-read line across the shutdown `select!`,
       and ends the session the same way a read error does. Test
       `a_stdio_line_is_capped_and_split_on_newlines`.
-- [ ] **An MCP question to the user is cut off by the tool's own deadline.** `McpAskUser` waits up
+- [x] **An MCP question to the user is cut off by the tool's own deadline.** `McpAskUser` waits up
       to 600 s for the answer, but `McpToolWrapper::timeout_secs()` is 65 s and the registry
       backstop drops the call at about 75 s, so an answer given later never reaches the server.
       User think-time should not count against the tool's deadline.
+      *(2026-10-11)* `Elicitor::answer_wait_max` (the daemon's: 600 s) and
+      `elicit::tool_call_time_max`: a call with an elicitor is allowed 4 requests of 60 s plus
+      3 rounds × 8 questions × the answer wait; without one it stays one request. Every inner
+      wait is still bounded (transport per request, `ask_user` per question, `MRTR_ROUNDS_MAX`).
+      Test `a_call_that_may_ask_the_user_gets_the_users_time`.
 - [x] **No server's tools appear until every server has started.** `start_all` starts servers one
       after another and registers only after the loop, so one slow `npx -y` server (60 s probe +
       60 s `initialize`) holds back every other server's tools and status. Register each server
