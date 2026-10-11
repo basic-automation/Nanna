@@ -2324,30 +2324,34 @@ impl TaskSource for TursoTaskSource {
     }
 
     async fn abandon(&self, id: i64, reason: &str) -> Result<(), String> {
-        if self.member_id.is_some() && self.subtree_root == Some(id) {
+        if let (Some(_), Some(root)) = (&self.member_id, self.subtree_root) {
             // The harness abandons an item after persistent runner errors, so
             // a refused key surfaces here first, not as the run's stop.
-            if is_rate_limited_error(reason) {
+            //
+            // A rate limit or a refused key is the PROVIDER's, whichever card
+            // of the subtree met it: the run's own card waits it out or asks
+            // the human. Only the root used to get this; a sub-card fell
+            // through to `cancelled`, so a transient limit closed the card's
+            // sub-cards one after another (P25 decision 7: only the human
+            // closes a card unfinished).
+            let provider_fault = is_rate_limited_error(reason) || is_terminal_provider_error(reason);
+            if provider_fault {
                 let card = self
                     .storage
                     .tasks()
-                    .get(id)
+                    .get(root)
                     .await
                     .map_err(|e| e.to_string())?;
-                self.wait_out_rate_limit(&card, reason).await;
+                if is_rate_limited_error(reason) {
+                    self.wait_out_rate_limit(&card, reason).await;
+                } else {
+                    self.ask_human_to_fix(&card, reason).await;
+                }
                 return Ok(());
             }
-            if is_terminal_provider_error(reason) {
-                let card = self
-                    .storage
-                    .tasks()
-                    .get(id)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                self.ask_human_to_fix(&card, reason).await;
-                return Ok(());
+            if id == root {
+                return self.hand_back(id, reason).await;
             }
-            return self.hand_back(id, reason).await;
         }
         let repo = self.storage.tasks();
         repo.update(
@@ -8737,6 +8741,21 @@ pub struct RunStatus {
 
 /// What a long-horizon run works on: the goal, the plan it drains, the runner
 /// that executes each step, the run's bounds, and the directory it runs in.
+/// Whether a run segment that ended with `stop` is a provider incident the
+/// run heals and resumes. A refused key or account does not heal by resuming:
+/// the card asks the human instead (`CardAfterRun::AskHuman`). Nor does a rate
+/// limit on a card run (`card_run`): the card waits out the provider's
+/// cooldown, and resuming 15 s later hit the same limit — up to
+/// `RUN_RESUMES_MAX` times. Pure.
+fn resumes_after(stop: &StopReason, card_run: bool) -> bool {
+    matches!(
+        stop,
+        StopReason::RunnerErrors { message }
+            if !is_terminal_provider_error(message)
+                && (!card_run || !is_rate_limited_error(message))
+    )
+}
+
 pub struct TaskRunSpec {
     pub goal: String,
     pub source: TursoTaskSource,
@@ -8945,12 +8964,7 @@ impl TaskRunManager {
                         interjector.as_deref().map(|i| i as &dyn Interjector),
                     )
                     .await;
-                // A refused key or account does not heal by resuming: the
-                // card asks the human instead (`CardAfterRun::AskHuman`).
-                let provider_died = matches!(
-                    &report.stop,
-                    StopReason::RunnerErrors { message } if !is_terminal_provider_error(message)
-                );
+                let provider_died = resumes_after(&report.stop, source.member_id.is_some());
                 segments.push(report);
                 if !provider_died
                     || resumes >= RUN_RESUMES_MAX
@@ -11172,6 +11186,62 @@ mod card_run_tests {
             .is_none(),
             "and not after"
         );
+    }
+
+    /// A rate limit met on a SUB-card is the provider's, not the sub-card's:
+    /// the run's own card waits it out and the sub-card stays open. It used to
+    /// be cancelled, and each sibling after it in turn.
+    #[tokio::test]
+    async fn a_rate_limit_on_a_sub_card_waits_on_the_card_and_cancels_nothing() {
+        let storage = builder_storage().await;
+        let tasks = storage.tasks();
+        let parent = card(&storage, "the card", None, 3).await;
+        let child = tasks
+            .create(NewTask {
+                title: "a sub-card".to_string(),
+                scope: "global".to_string(),
+                parent_id: Some(parent),
+                priority: 3,
+                assignee: Some(AGENT.to_string()),
+                ..NewTask::default()
+            })
+            .await
+            .expect("child")
+            .id;
+        let source = card_source(&storage, parent);
+        source.start(parent).await.expect("picked up");
+        source
+            .abandon(child, "Rate limit exceeded: retry-after: 90")
+            .await
+            .expect("abandoned");
+
+        let sub_card = tasks.get(child).await.expect("child");
+        assert_ne!(sub_card.status, "cancelled", "a provider limit closes nothing");
+        let waiting = tasks.get(parent).await.expect("card");
+        assert_eq!(waiting.assignee.as_deref(), Some(AGENT), "kept by its member");
+        let activity = tasks.activity(parent, 32).await.expect("activity");
+        assert!(
+            crate::card_run_trigger::cooling_down_until(&activity, chrono::Utc::now()).is_some(),
+            "the card waits the limit out"
+        );
+    }
+
+    #[test]
+    fn a_rate_limited_card_run_is_not_resumed_as_a_crash() {
+        use nanna_agent::harness::StopReason;
+        let limited = StopReason::RunnerErrors {
+            message: "Rate limit exceeded: retry-after: 90".to_string(),
+        };
+        let crashed = StopReason::RunnerErrors {
+            message: "connection reset by peer".to_string(),
+        };
+        assert!(!super::resumes_after(&limited, true), "the card waits instead");
+        assert!(super::resumes_after(&limited, false), "a chat run still resumes");
+        assert!(super::resumes_after(&crashed, true));
+        let refused = StopReason::RunnerErrors {
+            message: "API error: 401 - invalid x-api-key".to_string(),
+        };
+        assert!(!super::resumes_after(&refused, false));
     }
 
     /// The worker's loop guard: a card whose whole subtree waits on a card

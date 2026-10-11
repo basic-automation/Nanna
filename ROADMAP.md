@@ -10977,11 +10977,15 @@ keep the phases readable; promote individual items into a phase when they become
       pausing itself, so the stall sweep skips the card forever. Cancel the run when `assignee`
       changes on an `in_progress` card, and make `settle_after_run` only reset a card it no
       longer owns. (`member_delete` checks `member_is_working` outside `fence_starts` — same class.)
-- [ ] **A rate limit during a run with sub-cards cancels the sub-cards.** `abandon` handles 429 and
+- [x] **A rate limit during a run with sub-cards cancels the sub-cards.** `abandon` handles 429 and
       refused keys only for `id == subtree_root`; a leaf falls through to `cancelled`, and
       `provider_died` treats 429 as a crash and resumes (8 × 15 s) without the cooldown, cancelling
       each sibling in turn. Route a rate limit on any card to the root's wait, and exclude
       `is_rate_limited_error` from `provider_died`.
+      *(2026-10-11)* Both, for refused keys too (the root asks the human); a chat run still
+      resumes on a 429 (`resumes_after`). Tests
+      `a_rate_limit_on_a_sub_card_waits_on_the_card_and_cancels_nothing`,
+      `a_rate_limited_card_run_is_not_resumed_as_a_crash`.
 - Minor: a crash between `finish_card_run` and `set_member_status(Idle)` leaves a member shown busy
   with no boot reset; `cooling_down_until` is per card, so a reassigned card inherits the first
   member's provider wait.
