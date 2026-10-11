@@ -10806,8 +10806,13 @@ keep the phases readable; promote individual items into a phase when they become
       in `register`, `refresh` (servers in name order) and `resync_server`: the first holder keeps
       a name, a later one is skipped with a warning naming both. Test
       `a_tool_name_another_server_holds_stays_theirs` (`a__b`/`c` vs `a`/`b__c`, plus a repeat).
-- [ ] *(lead)* Under the AppImage, stdio MCP servers inherit the bundle's `LD_LIBRARY_PATH`;
+- [x] *(lead)* Under the AppImage, stdio MCP servers inherit the bundle's `LD_LIBRARY_PATH`;
       `exec` scrubs it (`scrub_appimage_library_path`), `StdioTransport::spawn_with_env` does not.
+      *(2026-10-11)* Confirmed (the staged daemon restores the original variable, bundle entries
+      included, "for its own children") and fixed once for every child: the daemon drops the
+      bundle's entries from its own `LD_LIBRARY_PATH` at boot, before any thread
+      (`scrub_library_path_for_children`), so MCP servers, Chromium and Python get the system's
+      libraries too. Test `children_get_the_library_path_without_the_bundles_entries`.
 
 ### Browser tools that broke after one call (found 2026-10-10, audit of the browser services)
 
