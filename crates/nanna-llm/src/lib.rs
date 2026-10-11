@@ -6968,12 +6968,18 @@ fn stream_error_envelope(data: &str) -> Option<LlmError> {
 }
 
 /// Block bookkeeping while translating an OpenAI-compatible SSE stream into
-/// Anthropic stream events: text is block 0, tool call `i` is block `i + 1`.
+/// Anthropic stream events: text is block 0, tool call `i` is block `i + 1`
+/// (a later call reusing an index gets the next free block).
 #[derive(Default)]
 struct OpenAiStreamState {
     text_block_started: bool,
     /// Block index -> (id, name) of every tool call started so far.
     tool_calls_started: std::collections::HashMap<usize, (String, String)>,
+    /// The provider's `tool_calls[].index` -> the block it streams into now.
+    /// Most providers give each call its own index; some send parallel calls
+    /// all at `index: 0` with different ids, and a new call then overwrote the
+    /// earlier one's block in the assembler — the earlier call vanished.
+    block_of_wire: std::collections::HashMap<usize, usize>,
     /// The stop reason a `finish_reason` announced. The message ends at
     /// `[DONE]`, not there: the usage chunk comes between the two, and the
     /// stream used to be dropped before it was read.
@@ -7166,8 +7172,8 @@ impl OpenAiStreamState {
         // Handle tool calls
         if let Some(tool_calls) = delta.tool_calls {
             for tc in tool_calls {
-                // Tool index offset by 1 (text is at 0)
-                let block_index = tc.index + 1;
+                // Tool blocks start at 1 (text is at 0).
+                let mut block_index = self.block_of_wire.get(&tc.index).copied().unwrap_or(tc.index + 1);
 
                 // Check if this is a new tool call
                 if let (Some(id), Some(func)) = (&tc.id, &tc.function)
@@ -7177,6 +7183,24 @@ impl OpenAiStreamState {
                             events.push(StreamEvent::ContentBlockStop { index: 0 });
                             self.text_block_started = false;
                         }
+                        // A different call at an index already in use: close
+                        // the earlier one and give this one a block of its own.
+                        if let Some((open_id, _)) = self.tool_calls_started.get(&block_index)
+                            && open_id != id
+                        {
+                            events.push(StreamEvent::ContentBlockStop { index: block_index });
+                            self.tool_calls_started.remove(&block_index);
+                            block_index = self
+                                .block_of_wire
+                                .values()
+                                .chain(self.tool_calls_started.keys())
+                                .max()
+                                .copied()
+                                .unwrap_or(block_index)
+                                .max(block_index)
+                                + 1;
+                        }
+                        self.block_of_wire.insert(tc.index, block_index);
 
                         // New tool call
                         self.tool_calls_started.insert(block_index, (id.clone(), name.clone()));
@@ -7931,6 +7955,36 @@ mod tests {
         assert!(
             matches!(&read, Err(e) if !e.to_string().contains("No choices")),
             "{read:?}"
+        );
+    }
+
+    /// Parallel calls a provider sends all at `index: 0`, each with its own
+    /// id, are two calls: the first is closed and kept, not overwritten.
+    #[test]
+    fn two_calls_at_one_index_are_two_calls() {
+        let mut state = OpenAiStreamState::default();
+        let (first, _) = state
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"ls","arguments":"{}"}}]}}]}"#)
+            .expect("a chunk");
+        let (second, _) = state
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"b","function":{"name":"pwd","arguments":"{}"}}]}}]}"#)
+            .expect("a chunk");
+        let start_of = |events: &[StreamEvent], want: &str| {
+            events.iter().find_map(|e| match e {
+                StreamEvent::ContentBlockStart { index, tool_id: Some(id), .. } if id == want => Some(*index),
+                _ => None,
+            })
+        };
+        let a = start_of(&first, "a").expect("a starts");
+        let b = start_of(&second, "b").expect("b starts");
+        assert_ne!(a, b, "each call has its own block");
+        assert!(
+            second.iter().any(|e| matches!(e, StreamEvent::ContentBlockStop { index } if *index == a)),
+            "the first call is closed, not overwritten: {second:?}"
+        );
+        assert!(
+            second.iter().any(|e| matches!(e, StreamEvent::ToolUseDelta { index, .. } if *index == b)),
+            "the second call's arguments go to its own block"
         );
     }
 
