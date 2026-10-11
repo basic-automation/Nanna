@@ -2291,6 +2291,38 @@ impl ChatTurn {
         if let Some(ref baselines) = self.turn_baselines {
             baselines.close_turn(&self.scope, self.scope_id.as_deref()).await;
         }
+        self.run_what_arrived_late().await;
+    }
+
+    /// Start a turn for messages that arrived after the run's last drain —
+    /// during the continuation loop or this tail, acked "interjected" and
+    /// queued — which nothing else would ever run: they sat until the user
+    /// happened to send another message. After a Stop they wait for the next
+    /// message instead (Stop is stop). Spawned: this is the old turn's task.
+    /// A turn that claims the session first takes them at its own boundary;
+    /// if one does here, `run_chat_turn` queues them back for it.
+    async fn run_what_arrived_late(&self) {
+        if self.run_handle.cancel.is_cancelled() {
+            return;
+        }
+        let pending = self.registry.pending_for(&self.session_id).await;
+        if pending.is_empty().await {
+            return;
+        }
+        let messages = pending.drain().await;
+        if messages.is_empty() {
+            return;
+        }
+        tracing::info!(
+            session_id = %self.session_id,
+            messages = messages.len(),
+            "messages arrived after the turn's last drain — starting a turn for them"
+        );
+        spawn_late_turn(
+            Arc::clone(&self.this),
+            self.session_id.clone(),
+            messages.join("\n\n"),
+        );
     }
 
     /// A turn that finished with nothing to show says so.
@@ -2920,6 +2952,17 @@ struct ProviderProbe {
 /// `resumes` count rides along and is bounded by the same
 /// [`CONTINUATION_ERROR_ROUNDS`] brake that bounds error rounds, so a flapping
 /// provider cannot loop forever.
+/// Start a turn for `content` on its own task. A plain `fn`, as
+/// [`spawn_park_waiter`] is: spawned from inside a turn's own future, the
+/// turn's type would otherwise contain itself.
+fn spawn_late_turn(control: Arc<super::ControlPlane>, session_id: String, content: String) {
+    tokio::spawn(async move {
+        if let Err(e) = control.run_chat_turn(&session_id, &content).await {
+            tracing::warn!(%session_id, error = %e, "late messages could not start a turn");
+        }
+    });
+}
+
 fn spawn_park_waiter(
     control: Arc<super::ControlPlane>,
     registry: Arc<ChatRunRegistry>,

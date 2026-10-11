@@ -11009,10 +11009,13 @@ keep the phases readable; promote individual items into a phase when they become
 - [x] **Health probes and parks used the configured model, not the one the run fell back to**, so
       a run that moved from a dead A to B was parked as "A stopped answering" and watched A.
       `active_model()` at all four sites.
-- [ ] **A message sent after the last drain waits for the next one.** A message that arrives after
+- [x] **A message sent after the last drain waits for the next one.** A message that arrives after
       `first_run`'s post-run drain (during `continue_mission`, `finish_mission`/`finish_turn`, or
       right after a Stop) is acked "interjected" and pushed to `pending`, and nothing starts a turn
       for it. In `finish_turn`, after `release`, drain a non-empty `pending` into a new turn.
+      *(2026-10-11)* `run_what_arrived_late` does that — except after a Stop, where the queue waits
+      for the next message (Stop is stop; a message typed right after Stop still waits — decide
+      whether that one should run). *No dedicated test*; e2e (57) and daemon suites green.
 - [ ] The park waiter is spawned inside `finish_mission`, before `finish_turn` releases the claim: a
       first probe that answers within ~1 s clears the park, finds the claim held, pushes the goal
       to `pending` (stuck, as above) and leaves `resumed` set so the next turn skips
