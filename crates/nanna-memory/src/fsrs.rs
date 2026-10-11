@@ -397,7 +397,7 @@ impl IngestAction {
 
 /// Get current Unix timestamp
 /// The current time in unix seconds — the clock `last_access` is kept in.
-pub(crate) fn unix_now() -> i64 {
+pub fn unix_now() -> i64 {
     now()
 }
 
@@ -438,7 +438,7 @@ mod review_time_tests {
         );
 
         // A review older than the last access never moves the clock back.
-        let mut newer = base.clone();
+        let mut newer = base;
         newer.last_access = now();
         let kept = newer.last_access;
         newer.record_access_at(&params, Rating::Good, recalled_at);
